@@ -2,7 +2,7 @@ rust-p2w
 ========
 
 A Rust reimplementation of the p2w Python-subset -> WebAssembly (WAT) compiler,
-built for the People's Edge K-12 IDE.
+built for the AcornSTEM K-12 IDE.
 
 This project derives from two MIT-licensed works:
 

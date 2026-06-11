@@ -1,5 +1,5 @@
 //! rust-p2w — a Rust reimplementation of the p2w Python-subset -> WebAssembly
-//! (WAT) compiler, for the People's Edge K-12 IDE.
+//! (WAT) compiler, for the AcornSTEM K-12 IDE.
 //!
 //! Pipeline: source -> [lexer] -> tokens -> [parser] -> AST -> [codegen] -> WAT.
 //!
