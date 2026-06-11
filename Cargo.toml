@@ -1,0 +1,12 @@
+[package]
+name = "rust-p2w"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust reimplementation of the p2w Python-subset to WebAssembly (WAT) compiler"
+
+[dependencies]
+
+[dev-dependencies]
+wat = "1"
+wasmi = "0.40"
