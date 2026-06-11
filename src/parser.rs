@@ -7,7 +7,10 @@ use crate::ast::{BinOp, Expr, Stmt, UnOp};
 use crate::lexer::{Tok, Token};
 
 pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>, String> {
-    let mut p = Parser { toks: tokens, pos: 0 };
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+    };
     p.program()
 }
 

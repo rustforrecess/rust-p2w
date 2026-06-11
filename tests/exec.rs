@@ -20,14 +20,24 @@ fn run(src: &str) -> String {
     let mut store: Store<Vec<u8>> = Store::new(&engine, Vec::new());
     let mut linker: Linker<Vec<u8>> = Linker::new(&engine);
     linker
-        .func_wrap("env", "write_char", |mut caller: Caller<'_, Vec<u8>>, c: i32| {
-            caller.data_mut().push(c as u8);
-        })
+        .func_wrap(
+            "env",
+            "write_char",
+            |mut caller: Caller<'_, Vec<u8>>, c: i32| {
+                caller.data_mut().push(c as u8);
+            },
+        )
         .unwrap();
     linker
-        .func_wrap("env", "write_i32", |mut caller: Caller<'_, Vec<u8>>, v: i32| {
-            caller.data_mut().extend_from_slice(v.to_string().as_bytes());
-        })
+        .func_wrap(
+            "env",
+            "write_i32",
+            |mut caller: Caller<'_, Vec<u8>>, v: i32| {
+                caller
+                    .data_mut()
+                    .extend_from_slice(v.to_string().as_bytes());
+            },
+        )
         .unwrap();
 
     let instance = linker
@@ -67,8 +77,14 @@ fn and_or_short_circuit_skips_the_right_side() {
 
 #[test]
 fn truthiness_in_conditions() {
-    assert_output("if 2 and 4:\n    print(\"yes\")\nelse:\n    print(\"no\")\n", "yes\n");
-    assert_output("if 0 or 0:\n    print(\"yes\")\nelse:\n    print(\"no\")\n", "no\n");
+    assert_output(
+        "if 2 and 4:\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
+        "yes\n",
+    );
+    assert_output(
+        "if 0 or 0:\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
+        "no\n",
+    );
 }
 
 // --- chained comparisons ---
@@ -108,7 +124,10 @@ fn floordiv_and_mod_use_floor_semantics() {
 #[test]
 fn range_bounds_are_evaluated_once() {
     // Mutating the bound variable in the body must not extend the loop.
-    assert_output("n = 3\nfor i in range(0, n):\n    n = n + 1\nprint(n)", "6\n");
+    assert_output(
+        "n = 3\nfor i in range(0, n):\n    n = n + 1\nprint(n)",
+        "6\n",
+    );
 }
 
 #[test]

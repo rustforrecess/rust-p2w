@@ -70,8 +70,7 @@ print(\"sum of evens:\", total)
     /// string-contains assertions would miss.
     fn assert_valid_wasm(src: &str) {
         let wat = compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
-        wat::parse_str(&wat)
-            .unwrap_or_else(|e| panic!("emitted WAT is invalid: {e}\n---\n{wat}"));
+        wat::parse_str(&wat).unwrap_or_else(|e| panic!("emitted WAT is invalid: {e}\n---\n{wat}"));
     }
 
     #[test]
@@ -88,9 +87,7 @@ print(\"sum of evens:\", total)
 
     #[test]
     fn emitted_wat_parses_nested_for() {
-        assert_valid_wasm(
-            "for i in range(3):\n    for j in range(3):\n        print(i * j)\n",
-        );
+        assert_valid_wasm("for i in range(3):\n    for j in range(3):\n        print(i * j)\n");
     }
 
     #[test]

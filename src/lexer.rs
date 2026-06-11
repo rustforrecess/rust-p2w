@@ -89,11 +89,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             let top = *indent_stack.last().unwrap();
             if col > top {
                 indent_stack.push(col);
-                out.push(Token { tok: Tok::Indent, line });
+                out.push(Token {
+                    tok: Tok::Indent,
+                    line,
+                });
             } else if col < top {
                 while col < *indent_stack.last().unwrap() {
                     indent_stack.pop();
-                    out.push(Token { tok: Tok::Dedent, line });
+                    out.push(Token {
+                        tok: Tok::Dedent,
+                        line,
+                    });
                 }
                 if col != *indent_stack.last().unwrap() {
                     return Err(format!("line {line}: inconsistent indentation"));
@@ -119,7 +125,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 if paren_depth == 0 {
                     // Emit NEWLINE only after content on the line.
                     if !matches!(out.last().map(|t| &t.tok), None | Some(Tok::Newline)) {
-                        out.push(Token { tok: Tok::Newline, line });
+                        out.push(Token {
+                            tok: Tok::Newline,
+                            line,
+                        });
                     }
                     at_line_start = true;
                 }
@@ -131,28 +140,46 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
             }
             '+' => {
-                out.push(Token { tok: Tok::Plus, line });
+                out.push(Token {
+                    tok: Tok::Plus,
+                    line,
+                });
                 i += 1;
             }
             '-' => {
-                out.push(Token { tok: Tok::Minus, line });
+                out.push(Token {
+                    tok: Tok::Minus,
+                    line,
+                });
                 i += 1;
             }
             '*' => {
-                out.push(Token { tok: Tok::Star, line });
+                out.push(Token {
+                    tok: Tok::Star,
+                    line,
+                });
                 i += 1;
             }
             '/' => {
                 if i + 1 < chars.len() && chars[i + 1] == '/' {
-                    out.push(Token { tok: Tok::SlashSlash, line });
+                    out.push(Token {
+                        tok: Tok::SlashSlash,
+                        line,
+                    });
                     i += 2;
                 } else {
-                    out.push(Token { tok: Tok::Slash, line });
+                    out.push(Token {
+                        tok: Tok::Slash,
+                        line,
+                    });
                     i += 1;
                 }
             }
             '%' => {
-                out.push(Token { tok: Tok::Percent, line });
+                out.push(Token {
+                    tok: Tok::Percent,
+                    line,
+                });
                 i += 1;
             }
             '<' => {
@@ -175,7 +202,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             '=' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    out.push(Token { tok: Tok::EqEq, line });
+                    out.push(Token {
+                        tok: Tok::EqEq,
+                        line,
+                    });
                     i += 2;
                 } else {
                     out.push(Token { tok: Tok::Eq, line });
@@ -184,19 +214,28 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             '!' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    out.push(Token { tok: Tok::BangEq, line });
+                    out.push(Token {
+                        tok: Tok::BangEq,
+                        line,
+                    });
                     i += 2;
                 } else {
                     return Err(format!("line {line}: use 'not' instead of '!'"));
                 }
             }
             ':' => {
-                out.push(Token { tok: Tok::Colon, line });
+                out.push(Token {
+                    tok: Tok::Colon,
+                    line,
+                });
                 i += 1;
             }
             '(' => {
                 paren_depth += 1;
-                out.push(Token { tok: Tok::LParen, line });
+                out.push(Token {
+                    tok: Tok::LParen,
+                    line,
+                });
                 i += 1;
             }
             ')' => {
@@ -204,21 +243,33 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 if paren_depth < 0 {
                     return Err(format!("line {line}: unmatched ')'"));
                 }
-                out.push(Token { tok: Tok::RParen, line });
+                out.push(Token {
+                    tok: Tok::RParen,
+                    line,
+                });
                 i += 1;
             }
             ',' => {
-                out.push(Token { tok: Tok::Comma, line });
+                out.push(Token {
+                    tok: Tok::Comma,
+                    line,
+                });
                 i += 1;
             }
             '"' | '\'' => {
                 let (s, ni) = lex_string(&chars, i, line)?;
-                out.push(Token { tok: Tok::Str(s), line });
+                out.push(Token {
+                    tok: Tok::Str(s),
+                    line,
+                });
                 i = ni;
             }
             c if c.is_ascii_digit() => {
                 let (n, ni) = lex_number(&chars, i, line)?;
-                out.push(Token { tok: Tok::Int(n), line });
+                out.push(Token {
+                    tok: Tok::Int(n),
+                    line,
+                });
                 i = ni;
             }
             c if c.is_alphabetic() || c == '_' => {
@@ -227,7 +278,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     i += 1;
                 }
                 let name: String = chars[start..i].iter().collect();
-                out.push(Token { tok: Tok::Name(name), line });
+                out.push(Token {
+                    tok: Tok::Name(name),
+                    line,
+                });
             }
             other => {
                 return Err(format!("line {line}: unexpected character '{other}'"));
@@ -241,13 +295,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 
     // Terminate the final line, then unwind any open indentation.
     if !matches!(out.last().map(|t| &t.tok), None | Some(Tok::Newline)) {
-        out.push(Token { tok: Tok::Newline, line });
+        out.push(Token {
+            tok: Tok::Newline,
+            line,
+        });
     }
     while *indent_stack.last().unwrap() > 0 {
         indent_stack.pop();
-        out.push(Token { tok: Tok::Dedent, line });
+        out.push(Token {
+            tok: Tok::Dedent,
+            line,
+        });
     }
-    out.push(Token { tok: Tok::Eof, line });
+    out.push(Token {
+        tok: Tok::Eof,
+        line,
+    });
     Ok(out)
 }
 

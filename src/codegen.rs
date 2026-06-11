@@ -186,7 +186,9 @@ impl Gen {
         let c = self.int_expr(cond)?;
         let then_body = self.stmts(body)?;
         let else_chain = self.gen_else_chain(elifs, else_body)?;
-        Ok(format!("    (if {c} (then\n{then_body}    ){else_chain})\n"))
+        Ok(format!(
+            "    (if {c} (then\n{then_body}    ){else_chain})\n"
+        ))
     }
 
     fn gen_else_chain(
@@ -343,11 +345,9 @@ impl Gen {
                     BinOp::Ge => "i32.ge_s",
                     BinOp::Eq => "i32.eq",
                     BinOp::Ne => "i32.ne",
-                    BinOp::And
-                    | BinOp::Or
-                    | BinOp::Div
-                    | BinOp::FloorDiv
-                    | BinOp::Mod => unreachable!("handled above"),
+                    BinOp::And | BinOp::Or | BinOp::Div | BinOp::FloorDiv | BinOp::Mod => {
+                        unreachable!("handled above")
+                    }
                 };
                 Ok(format!("({instr} {lhs} {rhs})"))
             }
@@ -438,7 +438,8 @@ mod tests {
 
     #[test]
     fn elif_chain_nests() {
-        let src = "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n";
+        let src =
+            "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n";
         let wat = compile(src).unwrap();
         // Two `if` constructs: the outer and the elif lowered to a nested if.
         assert_eq!(wat.matches("(if ").count(), 2);
