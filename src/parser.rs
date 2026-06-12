@@ -113,6 +113,22 @@ impl<'a> Parser<'a> {
         if self.is_keyword("while") {
             return self.while_stmt();
         }
+        if self.is_keyword("def") {
+            return self.def_stmt();
+        }
+        if self.is_keyword("return") {
+            self.advance();
+            let value = if matches!(self.peek(), Tok::Newline) {
+                None
+            } else {
+                Some(self.expr(0)?)
+            };
+            self.expect(&Tok::Newline, "a new line")?;
+            return Ok(Stmt {
+                kind: StmtKind::Return(value),
+                line,
+            });
+        }
         if self.is_keyword("break") {
             self.advance();
             self.expect(&Tok::Newline, "a new line")?;
@@ -186,6 +202,63 @@ impl<'a> Parser<'a> {
                 elifs,
                 else_body,
             },
+            line,
+        })
+    }
+
+    fn def_stmt(&mut self) -> Result<Stmt> {
+        let line = self.line();
+        self.eat_keyword("def")?;
+        let name = match self.peek().clone() {
+            Tok::Name(n) => {
+                self.advance();
+                n
+            }
+            other => {
+                return Err(CompileError::at(
+                    self.line(),
+                    format!("expected a function name after 'def', found {other:?}"),
+                ))
+            }
+        };
+        self.expect(&Tok::LParen, "'(' after the function name")?;
+        let mut params = Vec::new();
+        if !matches!(self.peek(), Tok::RParen) {
+            loop {
+                match self.peek().clone() {
+                    Tok::Name(p) => {
+                        self.advance();
+                        if params.contains(&p) {
+                            return Err(CompileError::at(
+                                self.line(),
+                                format!("duplicate parameter name '{p}'"),
+                            ));
+                        }
+                        params.push(p);
+                    }
+                    other => {
+                        return Err(CompileError::at(
+                            self.line(),
+                            format!("expected a parameter name, found {other:?}"),
+                        ))
+                    }
+                }
+                if matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    if matches!(self.peek(), Tok::RParen) {
+                        break; // trailing comma
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RParen, "')'")?;
+        self.expect(&Tok::Colon, "':'")?;
+        self.expect(&Tok::Newline, "a new line")?;
+        let body = self.block()?;
+        Ok(Stmt {
+            kind: StmtKind::Def { name, params, body },
             line,
         })
     }
@@ -291,6 +364,15 @@ impl<'a> Parser<'a> {
                 break;
             }
             let op_line = self.line();
+            // The middle operand is cloned into both pairwise comparisons; a
+            // function call there would run twice, so refuse it.
+            if contains_call(&prev) {
+                return Err(CompileError::at(
+                    op_line,
+                    "chained comparisons around a function call aren't supported — \
+                     store the call's result in a variable first",
+                ));
+            }
             self.advance();
             let next = self.expr(r_bp)?;
             let pair = Expr {
@@ -355,6 +437,7 @@ impl<'a> Parser<'a> {
                 match name.as_str() {
                     "True" => Ok(expr(ExprKind::Bool(true))),
                     "False" => Ok(expr(ExprKind::Bool(false))),
+                    "None" => Ok(expr(ExprKind::NoneLit)),
                     _ if matches!(self.peek(), Tok::LParen) => {
                         self.advance();
                         let args = self.call_args()?;
@@ -430,6 +513,16 @@ fn is_comparison(op: BinOp) -> bool {
         op,
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
     )
+}
+
+/// Whether the expression contains a function call (side effects possible).
+fn contains_call(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call(..) => true,
+        ExprKind::Unary(_, inner) => contains_call(inner),
+        ExprKind::Bin(_, a, b) => contains_call(a) || contains_call(b),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

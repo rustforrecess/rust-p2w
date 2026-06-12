@@ -46,6 +46,14 @@ pub enum StmtKind {
     Break,
     /// `continue` (inside a loop)
     Continue,
+    /// `def name(params): ...` (top level only)
+    Def {
+        name: String,
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
+    /// `return [expr]` (inside a function; bare return yields None)
+    Return(Option<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +75,8 @@ pub enum ExprKind {
     /// `True` / `False` — a distinct runtime type (prints as True/False),
     /// numerically equal to 1/0 like Python.
     Bool(bool),
+    /// `None` — the singleton a function returns when it doesn't `return`.
+    NoneLit,
     Str(String),
     Name(String),
     Unary(UnOp, Box<Expr>),

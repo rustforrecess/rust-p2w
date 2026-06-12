@@ -126,6 +126,87 @@ fn booleans_count_as_one_and_zero_in_arithmetic() {
     assert_output("x = True\nprint(x + x)", "2\n");
 }
 
+// --- functions ---
+
+#[test]
+fn simple_function_call() {
+    assert_output(
+        "def add(a, b):\n    return a + b\nprint(add(2, 3))\nprint(add(\"ab\", \"cd\"))",
+        "5\nabcd\n",
+    );
+}
+
+#[test]
+fn recursion_factorial_and_fib() {
+    assert_output(
+        "def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\nprint(fact(10))",
+        "3628800\n",
+    );
+    assert_output(
+        "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\nprint(fib(15))",
+        "610\n",
+    );
+}
+
+#[test]
+fn mutual_recursion() {
+    let src = "\
+def is_even(n):
+    if n == 0:
+        return True
+    return is_odd(n - 1)
+def is_odd(n):
+    if n == 0:
+        return False
+    return is_even(n - 1)
+print(is_even(10), is_odd(7))
+";
+    assert_output(src, "True True\n");
+}
+
+#[test]
+fn functions_read_globals_and_locals_shadow() {
+    assert_output(
+        "bonus = 10\ndef score(p):\n    return p + bonus\nprint(score(5))",
+        "15\n",
+    );
+    assert_output(
+        "x = 1\ndef f():\n    x = 2\n    return x\nprint(f(), x)",
+        "2 1\n",
+    );
+}
+
+#[test]
+fn implicit_and_bare_return_give_none() {
+    assert_output("def f():\n    x = 1\nprint(f())", "None\n");
+    assert_output("def f():\n    return\nprint(f())", "None\n");
+    assert_output("print(None)", "None\n");
+    assert_output(
+        "print(None == None, None == 0, None == \"\")",
+        "True False False\n",
+    );
+    assert_output(
+        "if None:\n    print(\"y\")\nelse:\n    print(\"n\")\n",
+        "n\n",
+    );
+}
+
+#[test]
+fn bare_call_statement_runs_for_effects() {
+    assert_output(
+        "total = 0\ndef bump():\n    print(\"bump\")\nbump()\nbump()",
+        "bump\nbump\n",
+    );
+}
+
+#[test]
+fn function_with_loop_and_early_return() {
+    assert_output(
+        "def first_div(n, d):\n    for i in range(1, n):\n        if i % d == 0:\n            return i\n    return -1\nprint(first_div(100, 7))\nprint(first_div(5, 9))",
+        "7\n-1\n",
+    );
+}
+
 // --- strings are values ---
 
 #[test]
@@ -391,6 +472,11 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(7.5 // 2, -3.5 // 1, 7.5 % 2, -7.5 % 2)",
     "print(1.5 < 2, 1 == 1.0, 2.0 == 2)",
     "x = 0.0\nif x:\n    print(\"t\")\nelse:\n    print(\"f\")",
+    "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\nprint(fib(12))",
+    "def greet(name):\n    return \"hi \" + name\nprint(greet(\"Felicia\"))",
+    "bonus = 10\ndef score(p):\n    return p + bonus\nprint(score(5), score(0.5))",
+    "def f():\n    x = 1\nprint(f(), None == None, not None)",
+    "def is_even(n):\n    if n == 0:\n        return True\n    return is_odd(n - 1)\ndef is_odd(n):\n    if n == 0:\n        return False\n    return is_even(n - 1)\nprint(is_even(8), is_odd(8))",
     "if \"\":\n    print(\"y\")\nelse:\n    print(\"n\")\nprint(\"\" or \"fb\", \"a\" and \"b\")",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",

@@ -51,10 +51,45 @@ const I31_MIN: i64 = -(1 << 30);
 
 pub fn generate(stmts: &[Stmt]) -> Result<String> {
     let mut g = Gen::default();
-    let mut cx = FuncCx::default();
+
+    // Pass 1: collect function signatures so calls (including mutual
+    // recursion) resolve regardless of definition order.
+    for s in stmts {
+        if let StmtKind::Def { name, params, .. } = &s.kind {
+            if name == "print" {
+                return Err(CompileError::at(s.line, "can't redefine print"));
+            }
+            if g.funcs.insert(name.clone(), params.len()).is_some() {
+                return Err(CompileError::at(
+                    s.line,
+                    format!("function '{name}' is defined twice"),
+                ));
+            }
+        }
+    }
+
+    // Pass 2a: top-level statements become _start; top-level variables are
+    // module globals so functions can read them.
+    let mut cx = FuncCx {
+        is_top: true,
+        ..Default::default()
+    };
     let mut body = Body::new();
-    g.stmts(&mut cx, stmts, &mut body)?;
+    for s in stmts {
+        if !matches!(s.kind, StmtKind::Def { .. }) {
+            g.stmt(&mut cx, s, &mut body)?;
+        }
+    }
     body.push("(i32.const 0)");
+
+    // Pass 2b: each def becomes its own function (after 2a, so every module
+    // global is known).
+    let mut user_funcs = Vec::new();
+    for s in stmts {
+        if let StmtKind::Def { name, params, body } = &s.kind {
+            user_funcs.push(g.gen_def(name, params, body)?);
+        }
+    }
 
     let mut module = Module::default();
     module.types.push("(type $INT (struct (field i32)))".into());
@@ -62,8 +97,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .types
         .push("(type $FLOAT (struct (field f64)))".into());
+    module.types.push("(type $NONE_T (struct))".into());
     // NOTE: WASM-GC type canonicalization is structural — keep these
-    // shapes distinct or ref.test misfires (see $BOOL's i8 field).
+    // shapes distinct or ref.test misfires (see $BOOL's i8 field; $NONE_T
+    // must stay the only fieldless struct).
     module.types.push("(type $STR (array (mut i8)))".into());
     module
         .imports
@@ -80,6 +117,14 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .globals
         .push("(global $FALSE (ref $BOOL) (struct.new $BOOL (i32.const 0)))".into());
+    module
+        .globals
+        .push("(global $NONE (ref $NONE_T) (struct.new $NONE_T))".into());
+    for name in &g.globals {
+        module.globals.push(format!(
+            "(global $g_{name} (mut (ref null eq)) (ref.null eq))"
+        ));
+    }
 
     module.funcs.push(Func {
         signature: r#"(func $_start (export "_start") (result i32)"#.into(),
@@ -90,6 +135,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             .collect(),
         body,
     });
+    for f in user_funcs {
+        module.funcs.push(f);
+    }
     for f in runtime_helpers() {
         module.funcs.push(f);
     }
@@ -198,6 +246,9 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (f64.ne (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))) (f64.const 0))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $NONE_T) (local.get $r))");
+    b.push_in(1, "(then (return (i32.const 0)))"); // None is falsy
+    b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
     fs.push(Func {
         signature: "(func $truthy (param $r (ref null eq)) (result i32)".into(),
@@ -239,6 +290,13 @@ fn runtime_helpers() -> Vec<Func> {
         1,
         "(then (return (call $write_f64 (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))))",
     );
+    b.push(")");
+    b.push("(if (ref.test (ref $NONE_T) (local.get $r))");
+    b.push_in(1, "(then");
+    for c in "None".bytes() {
+        b.push_in(2, format!("(call $write_char (i32.const {c}))"));
+    }
+    b.push_in(1, "(return))");
     b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
     b.push_in(1, "(then");
@@ -398,9 +456,16 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_eq: Python `==` — strings by value, string-vs-number is False,
-    // numbers (ints, bools as 1/0, floats) compared as f64 (exact for i32).
+    // $py_eq: Python `==` — None only equals None; strings by value,
+    // string-vs-number is False; numbers (ints, bools as 1/0, floats)
+    // compared as f64 (exact for i32).
     let mut b = Body::new();
+    b.push("(if (i32.or (ref.test (ref $NONE_T) (local.get $a)) (ref.test (ref $NONE_T) (local.get $b)))");
+    b.push_in(
+        1,
+        "(then (return (i32.and (ref.test (ref $NONE_T) (local.get $a)) (ref.test (ref $NONE_T) (local.get $b)))))",
+    );
+    b.push(")");
     b.push(
         "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
     );
@@ -537,11 +602,31 @@ fn floormod_helper() -> Func {
 struct Gen {
     uses_floordiv: bool,
     uses_floormod: bool,
+    /// User functions: name -> arity (collected before any body compiles).
+    funcs: HashMap<String, usize>,
+    /// Top-level Python variables, in definition order — WASM globals named
+    /// `$g_<name>` so function bodies can read them.
+    globals: Vec<String>,
+}
+
+impl Gen {
+    fn ensure_global(&mut self, name: &str) {
+        if !self.globals.iter().any(|g| g == name) {
+            self.globals.push(name.to_string());
+        }
+    }
+
+    fn is_global(&self, name: &str) -> bool {
+        self.globals.iter().any(|g| g == name)
+    }
 }
 
 /// Per-function codegen state.
 #[derive(Default)]
 struct FuncCx {
+    /// True for _start: assignments target module globals, `return` is an
+    /// error.
+    is_top: bool,
     vars: Vars,
     /// `(name, wat_type)` — Python variables are boxed values; compiler
     /// bookkeeping (loop counters, bound snapshots) stays raw i32.
@@ -589,25 +674,52 @@ impl Gen {
     fn stmt(&mut self, cx: &mut FuncCx, s: &Stmt, out: &mut Body) -> Result<()> {
         match &s.kind {
             StmtKind::Assign(name, expr) => {
-                type_of(expr, &cx.vars)?; // surface literal-misuse errors
-                cx.ensure_local(name);
+                self.type_of(cx, expr)?; // surface literal-misuse errors
                 let value = self.value_expr(cx, expr)?;
-                out.push(format!("(local.set ${name} {value})"));
+                if cx.is_top {
+                    self.ensure_global(name);
+                    out.push(format!("(global.set $g_{name} {value})"));
+                } else {
+                    // Function locals are pre-registered by gen_def.
+                    out.push(format!("(local.set ${name} {value})"));
+                }
                 Ok(())
             }
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::Call(name, args) if name == "print" => self.gen_print(cx, args, out),
-                ExprKind::Call(name, _) => Err(CompileError::at(
-                    s.line,
-                    format!(
-                        "only print(...) is supported so far — '{name}(...)' isn't implemented yet"
-                    ),
-                )),
+                ExprKind::Call(..) => {
+                    // A bare call: evaluate for its effects, drop the result.
+                    let v = self.value_expr(cx, e)?;
+                    out.push(format!("(drop {v})"));
+                    Ok(())
+                }
                 _ => Err(CompileError::at(
                     s.line,
                     "a bare value on its own line has no effect; did you mean print(...)?",
                 )),
             },
+            StmtKind::Def { .. } => Err(CompileError::at(
+                s.line,
+                "functions can only be defined at the top level (not inside \
+                 another function, loop, or if)",
+            )),
+            StmtKind::Return(value) => {
+                if cx.is_top {
+                    return Err(CompileError::at(
+                        s.line,
+                        "'return' can only be used inside a function",
+                    ));
+                }
+                let v = match value {
+                    Some(e) => {
+                        self.type_of(cx, e)?;
+                        self.value_expr(cx, e)?
+                    }
+                    None => "(global.get $NONE)".to_string(),
+                };
+                out.push(format!("(return {v})"));
+                Ok(())
+            }
             StmtKind::If {
                 cond,
                 body,
@@ -650,7 +762,7 @@ impl Gen {
             if idx > 0 {
                 emit_char(out, b' ');
             }
-            type_of(arg, &cx.vars)?; // surface literal-misuse errors
+            self.type_of(cx, arg)?; // surface literal-misuse errors
             if let ExprKind::Str(s) = &arg.kind {
                 // Literal fast path: no allocation, identical output bytes.
                 for byte in s.bytes() {
@@ -674,7 +786,7 @@ impl Gen {
         else_body: &Option<Vec<Stmt>>,
         out: &mut Body,
     ) -> Result<()> {
-        type_of(cond, &cx.vars)?; // any value is a condition (strings: non-empty)
+        self.type_of(cx, cond)?; // any value is a condition (strings: non-empty)
         let c = self.cond_i32(cx, cond)?;
         let mut then_b = Body::new();
         self.stmts(cx, body, &mut then_b)?;
@@ -702,7 +814,7 @@ impl Gen {
         else_body: &Option<Vec<Stmt>>,
     ) -> Result<Option<Body>> {
         if let Some(((cond, body), rest)) = elifs.split_first() {
-            type_of(cond, &cx.vars)?;
+            self.type_of(cx, cond)?;
             let c = self.cond_i32(cx, cond)?;
             let mut then_b = Body::new();
             self.stmts(cx, body, &mut then_b)?;
@@ -736,7 +848,7 @@ impl Gen {
         body: &[Stmt],
         out: &mut Body,
     ) -> Result<()> {
-        type_of(cond, &cx.vars)?;
+        self.type_of(cx, cond)?;
         let c = self.cond_i32(cx, cond)?;
         let n = cx.fresh();
 
@@ -768,8 +880,8 @@ impl Gen {
         line: usize,
         out: &mut Body,
     ) -> Result<()> {
-        require_value(start, &cx.vars, "a range start")?;
-        require_value(end, &cx.vars, "a range end")?;
+        self.require_value(cx, start, "a range start")?;
+        self.require_value(cx, end, "a range end")?;
         if [start, end, step].iter().any(|b| const_float(b).is_some()) {
             return Err(CompileError::at(
                 line,
@@ -814,7 +926,12 @@ impl Gen {
         let n = cx.fresh();
         let ctr = format!(".f{n}");
         cx.locals.push((ctr.clone(), "i32".to_string()));
-        cx.ensure_local(var);
+        let set_var = if cx.is_top {
+            self.ensure_global(var);
+            format!("(global.set $g_{var} (call $box (local.get ${ctr})))")
+        } else {
+            format!("(local.set ${var} (call $box (local.get ${ctr})))")
+        };
 
         cx.loops.push((format!("$b{n}"), format!("$c{n}")));
         let mut body_b = Body::new();
@@ -829,10 +946,7 @@ impl Gen {
             2,
             format!("(br_if $b{n} ({done_cmp} (local.get ${ctr}) {end_operand}))"),
         );
-        out.push_in(
-            2,
-            format!("(local.set ${var} (call $box (local.get ${ctr})))"),
-        );
+        out.push_in(2, set_var);
         out.push_in(2, format!("(block $c{n}"));
         out.append(body_b, 3);
         out.push_in(2, ")");
@@ -844,6 +958,44 @@ impl Gen {
         out.push_in(1, ")");
         out.push(")");
         Ok(())
+    }
+
+    /// Compile one `def` into its own WASM function. Python scoping rule:
+    /// names assigned anywhere in the body (plus parameters) are locals;
+    /// everything else resolves to module globals.
+    fn gen_def(&mut self, name: &str, params: &[String], body: &[Stmt]) -> Result<Func> {
+        let mut cx = FuncCx::default();
+        for p in params {
+            cx.vars.insert(p.clone(), Ty::Value);
+        }
+        let mut assigned = std::collections::HashSet::new();
+        collect_assigned(body, &mut assigned);
+        let mut local_names: Vec<&String> = assigned.iter().collect();
+        local_names.sort(); // deterministic output
+        for a in local_names {
+            if !cx.vars.contains_key(a) {
+                cx.ensure_local(a);
+            }
+        }
+
+        let mut b = Body::new();
+        self.stmts(&mut cx, body, &mut b)?;
+        // Falling off the end returns None, like Python.
+        b.push("(global.get $NONE)");
+
+        let param_decls: String = params
+            .iter()
+            .map(|p| format!(" (param ${p} (ref null eq))"))
+            .collect();
+        Ok(Func {
+            signature: format!("(func $f_{name}{param_decls} (result (ref null eq))"),
+            locals: cx
+                .locals
+                .iter()
+                .map(|(n, ty)| format!("(local ${n} {ty})"))
+                .collect(),
+            body: b,
+        })
     }
 
     /// Generate WAT producing the boxed `(ref null eq)` value of `e`.
@@ -877,10 +1029,21 @@ impl Gen {
             ExprKind::Float(_) => unreachable!("float literals are folded above"),
             ExprKind::Bool(true) => Ok("(global.get $TRUE)".into()),
             ExprKind::Bool(false) => Ok("(global.get $FALSE)".into()),
-            ExprKind::Name(n) => match cx.vars.get(n) {
-                Some(_) => Ok(format!("(local.get ${n})")),
-                None => Err(CompileError::at(e.line, format!("unknown name '{n}'"))),
-            },
+            ExprKind::NoneLit => Ok("(global.get $NONE)".into()),
+            ExprKind::Name(n) => {
+                if cx.vars.contains_key(n) {
+                    Ok(format!("(local.get ${n})"))
+                } else if self.is_global(n) {
+                    Ok(format!("(global.get $g_{n})"))
+                } else if self.funcs.contains_key(n) {
+                    Err(CompileError::at(
+                        e.line,
+                        format!("'{n}' is a function — call it with {n}(...)"),
+                    ))
+                } else {
+                    Err(CompileError::at(e.line, format!("unknown name '{n}'")))
+                }
+            }
             ExprKind::Unary(UnOp::Neg, inner) => {
                 let v = self.value_expr(cx, inner)?;
                 Ok(format!("(call $py_neg {v})"))
@@ -973,10 +1136,35 @@ impl Gen {
                     bytes.join(" ")
                 ))
             }
-            ExprKind::Call(n, _) => Err(CompileError::at(
-                e.line,
-                format!("can't use the result of '{n}(...)' yet"),
-            )),
+            ExprKind::Call(n, args) => {
+                if n == "print" {
+                    return Err(CompileError::at(
+                        e.line,
+                        "print(...) can't be used inside an expression",
+                    ));
+                }
+                let Some(&arity) = self.funcs.get(n) else {
+                    return Err(CompileError::at(e.line, format!("unknown function '{n}'")));
+                };
+                if args.len() != arity {
+                    return Err(CompileError::at(
+                        e.line,
+                        format!(
+                            "{n}() takes {arity} argument{} but {} {} given",
+                            if arity == 1 { "" } else { "s" },
+                            args.len(),
+                            if args.len() == 1 { "was" } else { "were" }
+                        ),
+                    ));
+                }
+                let mut wat = format!("(call $f_{n}");
+                for a in args {
+                    wat.push(' ');
+                    wat.push_str(&self.value_expr(cx, a)?);
+                }
+                wat.push(')');
+                Ok(wat)
+            }
         }
     }
 
@@ -1070,75 +1258,116 @@ fn const_float(e: &Expr) -> Option<f64> {
     }
 }
 
-fn require_value(e: &Expr, vars: &Vars, what: &str) -> Result<()> {
-    match type_of(e, vars)? {
-        Ty::Num | Ty::Value => Ok(()),
-        Ty::Str => Err(CompileError::at(
-            e.line,
-            format!("{what} needs to be a number, not text"),
-        )),
+/// Names assigned anywhere in a statement list (assignment targets and
+/// for-loop variables) — Python's "assigned anywhere in the body = local".
+fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, _) => {
+                out.insert(name.clone());
+            }
+            StmtKind::For { var, body, .. } => {
+                out.insert(var.clone());
+                collect_assigned(body, out);
+            }
+            StmtKind::While { body, .. } => collect_assigned(body, out),
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                collect_assigned(body, out);
+                for (_, b) in elifs {
+                    collect_assigned(b, out);
+                }
+                if let Some(b) = else_body {
+                    collect_assigned(b, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
-/// Static type of an expression, given the variables in scope. This is a
-/// friendliness pass — it catches *definite* misuse (`5 - "a"`) at compile
-/// time; expressions involving variables are `Value` (unknown) and dynamic
-/// misuse traps at run time until real runtime type errors land.
-fn type_of(e: &Expr, vars: &Vars) -> Result<Ty> {
-    match &e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => Ok(Ty::Num),
-        ExprKind::Str(_) => Ok(Ty::Str),
-        ExprKind::Unary(op, inner) => {
-            let t = type_of(inner, vars)?;
-            match op {
-                UnOp::Not => Ok(Ty::Num), // `not "x"` is a bool
-                UnOp::Neg => match t {
-                    Ty::Str => Err(CompileError::at(
-                        e.line,
-                        "operator needs a number, not text",
-                    )),
-                    _ => Ok(Ty::Num),
-                },
-            }
+impl Gen {
+    fn require_value(&self, cx: &FuncCx, e: &Expr, what: &str) -> Result<()> {
+        match self.type_of(cx, e)? {
+            Ty::Num | Ty::Value => Ok(()),
+            Ty::Str => Err(CompileError::at(
+                e.line,
+                format!("{what} needs to be a number, not text"),
+            )),
         }
-        ExprKind::Bin(op, a, b) => {
-            let (ta, tb) = (type_of(a, vars)?, type_of(b, vars)?);
-            match op {
-                // Equality and and/or accept any mix of types.
-                BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or => Ok(Ty::Value),
-                // `+` concatenates strings or adds numbers — but never across
-                // (only flagged when both sides are statically known).
-                BinOp::Add => match (ta, tb) {
-                    (Ty::Str, Ty::Str) => Ok(Ty::Str),
-                    (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Err(CompileError::at(
-                        e.line,
-                        "can't add text and a number together",
-                    )),
-                    (Ty::Num, Ty::Num) => Ok(Ty::Num),
-                    _ => Ok(Ty::Value),
-                },
-                _ => {
-                    if ta == Ty::Str || tb == Ty::Str {
-                        Err(CompileError::at(
+    }
+
+    /// Static type of an expression. This is a friendliness pass — it catches
+    /// *definite* misuse (`5 - "a"`) at compile time; expressions involving
+    /// variables or calls are `Value` (unknown) and dynamic misuse traps at
+    /// run time until real runtime type errors land.
+    fn type_of(&self, cx: &FuncCx, e: &Expr) -> Result<Ty> {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => Ok(Ty::Num),
+            ExprKind::NoneLit => Ok(Ty::Value),
+            ExprKind::Str(_) => Ok(Ty::Str),
+            ExprKind::Unary(op, inner) => {
+                let t = self.type_of(cx, inner)?;
+                match op {
+                    UnOp::Not => Ok(Ty::Num), // `not "x"` is a bool
+                    UnOp::Neg => match t {
+                        Ty::Str => Err(CompileError::at(
                             e.line,
-                            "this operator needs numbers on both sides",
-                        ))
-                    } else {
-                        Ok(Ty::Num)
+                            "operator needs a number, not text",
+                        )),
+                        _ => Ok(Ty::Num),
+                    },
+                }
+            }
+            ExprKind::Bin(op, a, b) => {
+                let (ta, tb) = (self.type_of(cx, a)?, self.type_of(cx, b)?);
+                match op {
+                    // Equality and and/or accept any mix of types.
+                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or => Ok(Ty::Value),
+                    // `+` concatenates strings or adds numbers — never across
+                    // (only flagged when both sides are statically known).
+                    BinOp::Add => match (ta, tb) {
+                        (Ty::Str, Ty::Str) => Ok(Ty::Str),
+                        (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Err(CompileError::at(
+                            e.line,
+                            "can't add text and a number together",
+                        )),
+                        (Ty::Num, Ty::Num) => Ok(Ty::Num),
+                        _ => Ok(Ty::Value),
+                    },
+                    _ => {
+                        if ta == Ty::Str || tb == Ty::Str {
+                            Err(CompileError::at(
+                                e.line,
+                                "this operator needs numbers on both sides",
+                            ))
+                        } else {
+                            Ok(Ty::Num)
+                        }
                     }
                 }
             }
+            ExprKind::Name(n) => {
+                if cx.vars.contains_key(n) || self.is_global(n) {
+                    Ok(Ty::Value)
+                } else if self.funcs.contains_key(n) {
+                    Err(CompileError::at(
+                        e.line,
+                        format!("'{n}' is a function — call it with {n}(...)"),
+                    ))
+                } else {
+                    Err(CompileError::at(
+                        e.line,
+                        format!("unknown name '{n}' (define it with `{n} = ...` first)"),
+                    ))
+                }
+            }
+            ExprKind::Call(..) => Ok(Ty::Value),
         }
-        ExprKind::Name(n) => vars.get(n).copied().ok_or_else(|| {
-            CompileError::at(
-                e.line,
-                format!("unknown name '{n}' (define it with `{n} = ...` first)"),
-            )
-        }),
-        ExprKind::Call(n, _) => Err(CompileError::at(
-            e.line,
-            format!("can't use the result of '{n}(...)' yet"),
-        )),
     }
 }
 
@@ -1166,10 +1395,10 @@ mod tests {
     fn strings_are_gc_arrays() {
         let wat = compile("x = \"hi\"\nprint(x)").unwrap();
         assert!(wat.contains("(type $STR (array (mut i8)))"));
-        assert!(
-            wat.contains("(local.set $x (array.new_fixed $STR 2 (i32.const 104) (i32.const 105)))")
-        );
-        assert!(wat.contains("(call $print_value (local.get $x))"));
+        assert!(wat.contains(
+            "(global.set $g_x (array.new_fixed $STR 2 (i32.const 104) (i32.const 105)))"
+        ));
+        assert!(wat.contains("(call $print_value (global.get $g_x))"));
     }
 
     #[test]
@@ -1198,15 +1427,15 @@ mod tests {
     #[test]
     fn variable_then_print() {
         let wat = compile("x = 5\nprint(x)").unwrap();
-        assert!(wat.contains("(local $x (ref null eq))"));
-        assert!(wat.contains("(local.set $x (ref.i31 (i32.const 5)))"));
-        assert!(wat.contains("(call $print_value (local.get $x))"));
+        assert!(wat.contains("(global $g_x (mut (ref null eq)) (ref.null eq))"));
+        assert!(wat.contains("(global.set $g_x (ref.i31 (i32.const 5)))"));
+        assert!(wat.contains("(call $print_value (global.get $g_x))"));
     }
 
     #[test]
     fn booleans_are_singletons_not_ints() {
         let wat = compile("x = True\nprint(x, False)").unwrap();
-        assert!(wat.contains("(local.set $x (global.get $TRUE))"));
+        assert!(wat.contains("(global.set $g_x (global.get $TRUE))"));
         assert!(wat.contains("(call $print_value (global.get $FALSE))"));
         // The runtime knows how to spell them.
         assert!(wat.contains("(type $BOOL (struct (field i8)))"));
@@ -1231,7 +1460,7 @@ mod tests {
     fn if_else_emits_branches() {
         let wat = compile("x = 3\nif x < 5:\n    print(1)\nelse:\n    print(2)\n").unwrap();
         // Comparison conditions skip the boxed-bool round-trip.
-        assert!(wat.contains("(if (f64.lt (call $unbox_f64 (local.get $x)) (f64.const 5))"));
+        assert!(wat.contains("(if (f64.lt (call $unbox_f64 (global.get $g_x)) (f64.const 5))"));
         assert!(wat.contains("(then"));
         assert!(wat.contains("(else"));
     }
@@ -1248,12 +1477,12 @@ mod tests {
     #[test]
     fn for_loop_uses_raw_i32_counter() {
         let wat = compile("for i in range(3):\n    print(i)\n").unwrap();
-        assert!(wat.contains("(local $i (ref null eq))"));
+        assert!(wat.contains("(global $g_i (mut (ref null eq)) (ref.null eq))"));
         assert!(wat.contains("(local $.f0 i32)"));
         assert!(wat.contains("(local.set $.f0 (i32.const 0))"));
         assert!(wat.contains("(br_if $b0 (i32.ge_s (local.get $.f0) (i32.const 3)))"));
         // The Python-visible loop variable gets the boxed counter.
-        assert!(wat.contains("(local.set $i (call $box (local.get $.f0)))"));
+        assert!(wat.contains("(global.set $g_i (call $box (local.get $.f0)))"));
         assert!(wat.contains("(local.set $.f0 (i32.add (local.get $.f0) (i32.const 1)))"));
     }
 
@@ -1262,7 +1491,7 @@ mod tests {
         let wat = compile("n = 3\nfor i in range(0, n):\n    n = n + 1\n").unwrap();
         // The end bound is unboxed once into an i32 scratch local.
         assert!(wat.contains("(local $.t0 i32)"));
-        assert!(wat.contains("(local.set $.t0 (call $unbox (local.get $n)))"));
+        assert!(wat.contains("(local.set $.t0 (call $unbox (global.get $g_n)))"));
         assert!(wat.contains("(br_if $b0 (i32.ge_s (local.get $.f0) (local.get $.t0)))"));
     }
 
@@ -1309,7 +1538,7 @@ mod tests {
     fn while_emits_loop_with_negated_test() {
         let wat = compile("i = 3\nwhile i > 0:\n    i = i - 1\n").unwrap();
         assert!(wat.contains(
-            "(br_if $b0 (i32.eqz (f64.gt (call $unbox_f64 (local.get $i)) (f64.const 0))))"
+            "(br_if $b0 (i32.eqz (f64.gt (call $unbox_f64 (global.get $g_i)) (f64.const 0))))"
         ));
         assert!(wat.contains("(br $l0)"));
     }
@@ -1381,7 +1610,7 @@ mod tests {
     #[test]
     fn float_literals_fold_to_float_structs() {
         let wat = compile("x = 3.5\nprint(-2.5)").unwrap();
-        assert!(wat.contains("(local.set $x (struct.new $FLOAT (f64.const 3.5)))"));
+        assert!(wat.contains("(global.set $g_x (struct.new $FLOAT (f64.const 3.5)))"));
         assert!(wat.contains("(struct.new $FLOAT (f64.const -2.5))"));
     }
 
@@ -1398,5 +1627,70 @@ mod tests {
         // The i32 boundary values themselves are fine.
         assert!(compile("print(2147483647)").is_ok());
         assert!(compile("print(-2147483648)").is_ok());
+    }
+
+    #[test]
+    fn def_compiles_to_a_function() {
+        let wat = compile("def add(a, b):\n    return a + b\nprint(add(2, 3))\n").unwrap();
+        assert!(wat.contains(
+            "(func $f_add (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+        ));
+        assert!(wat.contains("(call $f_add (ref.i31 (i32.const 2)) (ref.i31 (i32.const 3)))"));
+        // Falling off the end returns None.
+        assert!(wat.contains("(global.get $NONE)"));
+    }
+
+    #[test]
+    fn function_locals_shadow_globals() {
+        let wat = compile("x = 1\ndef f():\n    x = 2\n    return x\nprint(f(), x)\n").unwrap();
+        // Global x exists; inside f, x is a local.
+        assert!(wat.contains("(global $g_x (mut (ref null eq)) (ref.null eq))"));
+        assert!(wat.contains("(local $x (ref null eq))"));
+        assert!(wat.contains("(local.set $x (ref.i31 (i32.const 2)))"));
+    }
+
+    #[test]
+    fn def_error_cases() {
+        // Arity mismatch is a compile error.
+        let err = compile("def f(a):\n    return a\nprint(f(1, 2))\n").unwrap_err();
+        assert!(err.message.contains("takes 1 argument"));
+        // return at top level.
+        assert!(compile("return 1\n")
+            .unwrap_err()
+            .message
+            .contains("inside a function"));
+        // Nested def.
+        let err = compile("def f():\n    def g():\n        return 1\n    return 2\n").unwrap_err();
+        assert!(err.message.contains("top level"));
+        // Unknown function.
+        assert!(compile("print(nope(1))\n")
+            .unwrap_err()
+            .message
+            .contains("unknown function"));
+        // Duplicate definition.
+        assert!(compile("def f():\n    return 1\ndef f():\n    return 2\n")
+            .unwrap_err()
+            .message
+            .contains("defined twice"));
+        // Function used without calling.
+        let err = compile("def f():\n    return 1\nprint(f + 1)\n").unwrap_err();
+        assert!(err.message.contains("call it"));
+    }
+
+    #[test]
+    fn chained_comparison_around_call_is_rejected() {
+        // The guard fires in the parser (the middle operand would be cloned).
+        let err = parse(&lex("def f():\n    return 2\nif 1 < f() < 3:\n    print(1)\n").unwrap())
+            .unwrap_err();
+        assert!(err
+            .message
+            .contains("chained comparisons around a function call"));
+    }
+
+    #[test]
+    fn none_is_a_value() {
+        let wat = compile("x = None\nprint(x == None)\n").unwrap();
+        assert!(wat.contains("(global.set $g_x (global.get $NONE))"));
+        assert!(wat.contains("(type $NONE_T (struct))"));
     }
 }
