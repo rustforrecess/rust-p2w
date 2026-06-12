@@ -109,6 +109,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .types
         .push("(type $LIST (struct (field (mut i32)) (field (mut (ref null $ITEMS)))))".into());
+    // A dict is an insertion-ordered association: parallel key/value arrays
+    // with linear-scan lookup (classroom-sized; order matches Python).
+    module.types.push(
+        "(type $DICT (struct (field (mut i32)) (field (mut (ref null $ITEMS))) (field (mut (ref null $ITEMS)))))".into(),
+    );
     module
         .imports
         .push(r#"(import "env" "write_char" (func $write_char (param i32)))"#.into());
@@ -262,6 +267,12 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (i32.ne (struct.get $LIST 0 (ref.cast (ref $LIST) (local.get $r))) (i32.const 0))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $DICT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (i32.ne (struct.get $DICT 0 (ref.cast (ref $DICT) (local.get $r))) (i32.const 0))))",
+    );
+    b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
     fs.push(Func {
         signature: "(func $truthy (param $r (ref null eq)) (result i32)".into(),
@@ -269,12 +280,18 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_len: sequence length (lists and strings).
+    // $py_len: sequence length (lists, dicts, strings).
     let mut b = Body::new();
     b.push("(if (ref.test (ref $LIST) (local.get $r))");
     b.push_in(
         1,
         "(then (return (struct.get $LIST 0 (ref.cast (ref $LIST) (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $DICT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (struct.get $DICT 0 (ref.cast (ref $DICT) (local.get $r)))))",
     );
     b.push(")");
     b.push("(if (ref.test (ref $STR) (local.get $r))");
@@ -308,6 +325,14 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(
         1,
         "(then (return (array.get $ITEMS (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $r))) (local.get $i))))",
+    );
+    b.push(")");
+    // Positional access on a dict yields its i-th KEY — this is what makes
+    // `for k in d:` iterate keys in insertion order.
+    b.push("(if (ref.test (ref $DICT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (array.get $ITEMS (struct.get $DICT 1 (ref.cast (ref $DICT) (local.get $r))) (local.get $i))))",
     );
     b.push(")");
     b.push("(local.set $c (array.new_default $STR (i32.const 1)))");
@@ -374,6 +399,226 @@ fn runtime_helpers() -> Vec<Func> {
             "(local $new (ref null $ITEMS))".into(),
             "(local $len i32)".into(),
         ],
+        body: b,
+    });
+
+    // $dict_find: index of a key (by py_eq), or -1.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $DICT 0 (local.get $d)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (call $py_eq (array.get $ITEMS (struct.get $DICT 1 (local.get $d)) (local.get $i)) (local.get $k))",
+    );
+    b.push_in(3, "(then (return (local.get $i)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const -1)");
+    fs.push(Func {
+        signature:
+            "(func $dict_find (param $d (ref null $DICT)) (param $k (ref null eq)) (result i32)"
+                .into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
+    // $dict_get: value for a key; missing key traps (Python's KeyError).
+    let mut b = Body::new();
+    b.push("(local.set $dict (ref.cast (ref $DICT) (local.get $d)))");
+    b.push("(local.set $i (call $dict_find (local.get $dict) (local.get $k)))");
+    b.push("(if (i32.lt_s (local.get $i) (i32.const 0))");
+    b.push_in(1, "(then unreachable)");
+    b.push(")");
+    b.push("(array.get $ITEMS (struct.get $DICT 2 (local.get $dict)) (local.get $i))");
+    fs.push(Func {
+        signature:
+            "(func $dict_get (param $d (ref null eq)) (param $k (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $dict (ref null $DICT))".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $dict_set: update an existing key or append a new entry (growing both
+    // parallel arrays together).
+    let mut b = Body::new();
+    b.push("(local.set $dict (ref.cast (ref $DICT) (local.get $d)))");
+    b.push("(local.set $i (call $dict_find (local.get $dict) (local.get $k)))");
+    b.push("(if (i32.ge_s (local.get $i) (i32.const 0))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(array.set $ITEMS (struct.get $DICT 2 (local.get $dict)) (local.get $i) (local.get $v))",
+    );
+    b.push_in(2, "(return)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.set $len (struct.get $DICT 0 (local.get $dict)))");
+    b.push("(local.set $keys (struct.get $DICT 1 (local.get $dict)))");
+    b.push("(local.set $vals (struct.get $DICT 2 (local.get $dict)))");
+    b.push("(if (i32.ge_s (local.get $len) (array.len (local.get $keys)))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $cap (i32.shl (i32.add (array.len (local.get $keys)) (i32.const 4)) (i32.const 1)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $nk (array.new_default $ITEMS (local.get $cap)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $nv (array.new_default $ITEMS (local.get $cap)))",
+    );
+    b.push_in(
+        2,
+        "(array.copy $ITEMS $ITEMS (local.get $nk) (i32.const 0) (local.get $keys) (i32.const 0) (local.get $len))",
+    );
+    b.push_in(
+        2,
+        "(array.copy $ITEMS $ITEMS (local.get $nv) (i32.const 0) (local.get $vals) (i32.const 0) (local.get $len))",
+    );
+    b.push_in(2, "(struct.set $DICT 1 (local.get $dict) (local.get $nk))");
+    b.push_in(2, "(struct.set $DICT 2 (local.get $dict) (local.get $nv))");
+    b.push_in(2, "(local.set $keys (local.get $nk))");
+    b.push_in(2, "(local.set $vals (local.get $nv))");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(array.set $ITEMS (local.get $keys) (local.get $len) (local.get $k))");
+    b.push("(array.set $ITEMS (local.get $vals) (local.get $len) (local.get $v))");
+    b.push("(struct.set $DICT 0 (local.get $dict) (i32.add (local.get $len) (i32.const 1)))");
+    fs.push(Func {
+        signature:
+            "(func $dict_set (param $d (ref null eq)) (param $k (ref null eq)) (param $v (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $dict (ref null $DICT))".into(),
+            "(local $i i32)".into(),
+            "(local $len i32)".into(),
+            "(local $cap i32)".into(),
+            "(local $keys (ref null $ITEMS))".into(),
+            "(local $vals (ref null $ITEMS))".into(),
+            "(local $nk (ref null $ITEMS))".into(),
+            "(local $nv (ref null $ITEMS))".into(),
+        ],
+        body: b,
+    });
+
+    // $py_subscript / $py_set_subscript: general `obj[key]` — dicts take the
+    // key as a value; lists/strings unbox it as a position.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $DICT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $dict_get (local.get $r) (local.get $k))))",
+    );
+    b.push(")");
+    b.push("(call $py_index (local.get $r) (call $unbox (local.get $k)))");
+    fs.push(Func {
+        signature:
+            "(func $py_subscript (param $r (ref null eq)) (param $k (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $DICT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $dict_set (local.get $r) (local.get $k) (local.get $v))))",
+    );
+    b.push(")");
+    b.push("(call $py_set_index (local.get $r) (call $unbox (local.get $k)) (local.get $v))");
+    fs.push(Func {
+        signature:
+            "(func $py_set_subscript (param $r (ref null eq)) (param $k (ref null eq)) (param $v (ref null eq))"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $dict_eq: same keys and values, order-insensitive (Python).
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $DICT 0 (local.get $a)))");
+    b.push("(if (i32.ne (local.get $n) (struct.get $DICT 0 (local.get $b)))");
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $j (call $dict_find (local.get $b) (array.get $ITEMS (struct.get $DICT 1 (local.get $a)) (local.get $i))))",
+    );
+    b.push_in(2, "(if (i32.lt_s (local.get $j) (i32.const 0))");
+    b.push_in(3, "(then (return (i32.const 0)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(if (i32.eqz (call $py_eq");
+    b.push_in(
+        4,
+        "(array.get $ITEMS (struct.get $DICT 2 (local.get $a)) (local.get $i))",
+    );
+    b.push_in(
+        4,
+        "(array.get $ITEMS (struct.get $DICT 2 (local.get $b)) (local.get $j))))",
+    );
+    b.push_in(3, "(then (return (i32.const 0)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const 1)");
+    fs.push(Func {
+        signature:
+            "(func $dict_eq (param $a (ref null $DICT)) (param $b (ref null $DICT)) (result i32)"
+                .into(),
+        locals: vec![
+            "(local $i i32)".into(),
+            "(local $j i32)".into(),
+            "(local $n i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $print_dict: `{'k': v, ...}` with repr for both keys and values.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 123))"); // {
+    b.push("(local.set $n (struct.get $DICT 0 (local.get $d)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(2, "(if (i32.gt_s (local.get $i) (i32.const 0))");
+    b.push_in(
+        3,
+        "(then (call $write_char (i32.const 44)) (call $write_char (i32.const 32)))",
+    );
+    b.push_in(2, ")");
+    b.push_in(
+        2,
+        "(call $print_repr (array.get $ITEMS (struct.get $DICT 1 (local.get $d)) (local.get $i)))",
+    );
+    b.push_in(2, "(call $write_char (i32.const 58))"); // :
+    b.push_in(2, "(call $write_char (i32.const 32))");
+    b.push_in(
+        2,
+        "(call $print_repr (array.get $ITEMS (struct.get $DICT 2 (local.get $d)) (local.get $i)))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(call $write_char (i32.const 125))"); // }
+    fs.push(Func {
+        signature: "(func $print_dict (param $d (ref null $DICT))".into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
     });
 
@@ -503,6 +748,12 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(
         1,
         "(then (return (call $print_list (ref.cast (ref $LIST) (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $DICT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $print_dict (ref.cast (ref $DICT) (local.get $r)))))",
     );
     b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
@@ -713,6 +964,19 @@ fn runtime_helpers() -> Vec<Func> {
     b.push(")");
     b.push(
         "(if (i32.or (ref.test (ref $LIST) (local.get $a)) (ref.test (ref $LIST) (local.get $b)))",
+    );
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push(
+        "(if (i32.and (ref.test (ref $DICT) (local.get $a)) (ref.test (ref $DICT) (local.get $b)))",
+    );
+    b.push_in(
+        1,
+        "(then (return (call $dict_eq (ref.cast (ref $DICT) (local.get $a)) (ref.cast (ref $DICT) (local.get $b)))))",
+    );
+    b.push(")");
+    b.push(
+        "(if (i32.or (ref.test (ref $DICT) (local.get $a)) (ref.test (ref $DICT) (local.get $b)))",
     );
     b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
@@ -995,9 +1259,9 @@ impl Gen {
             } => {
                 self.type_of(cx, value)?;
                 let t = self.value_expr(cx, target)?;
-                let i = self.i32_expr(cx, index)?;
+                let k = self.value_expr(cx, index)?;
                 let v = self.value_expr(cx, value)?;
-                out.push(format!("(call $py_set_index {t} {i} {v})"));
+                out.push(format!("(call $py_set_subscript {t} {k} {v})"));
                 Ok(())
             }
             StmtKind::While { cond, body } => self.gen_while(cx, cond, body, out),
@@ -1466,10 +1730,26 @@ impl Gen {
                     "(struct.new $LIST (i32.const {n}) (array.new_fixed $ITEMS {n}{items}))"
                 ))
             }
-            ExprKind::Index(obj, idx) => {
+            ExprKind::Dict(entries) => {
+                // Known divergence: duplicate literal keys keep the FIRST
+                // entry here (Python keeps the last) — rare enough to defer.
+                let mut keys = String::new();
+                let mut vals = String::new();
+                for (k, v) in entries {
+                    keys.push(' ');
+                    keys.push_str(&self.value_expr(cx, k)?);
+                    vals.push(' ');
+                    vals.push_str(&self.value_expr(cx, v)?);
+                }
+                let n = entries.len();
+                Ok(format!(
+                    "(struct.new $DICT (i32.const {n}) (array.new_fixed $ITEMS {n}{keys}) (array.new_fixed $ITEMS {n}{vals}))"
+                ))
+            }
+            ExprKind::Index(obj, key) => {
                 let o = self.value_expr(cx, obj)?;
-                let i = self.i32_expr(cx, idx)?;
-                Ok(format!("(call $py_index {o} {i})"))
+                let k = self.value_expr(cx, key)?;
+                Ok(format!("(call $py_subscript {o} {k})"))
             }
             ExprKind::MethodCall(recv, method, args) => {
                 if method == "append" && args.len() == 1 {
@@ -1735,6 +2015,13 @@ impl Gen {
             ExprKind::List(elems) => {
                 for el in elems {
                     self.type_of(cx, el)?;
+                }
+                Ok(Ty::Value)
+            }
+            ExprKind::Dict(entries) => {
+                for (k, v) in entries {
+                    self.type_of(cx, k)?;
+                    self.type_of(cx, v)?;
                 }
                 Ok(Ty::Value)
             }

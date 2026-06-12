@@ -288,6 +288,63 @@ fn lists_are_references_and_functions_take_them() {
     );
 }
 
+// --- dicts ---
+
+#[test]
+fn dict_literals_print_like_python() {
+    assert_output("print({})", "{}\n");
+    assert_output("print({\"a\": 1, \"b\": 2})", "{'a': 1, 'b': 2}\n");
+    assert_output(
+        "print({1: \"one\", \"two\": 2, 2.5: True})",
+        "{1: 'one', 'two': 2, 2.5: True}\n",
+    );
+}
+
+#[test]
+fn dict_get_set_update_insert() {
+    assert_output(
+        "d = {\"hp\": 10}\nd[\"hp\"] = d[\"hp\"] + 5\nd[\"mp\"] = 3\nprint(d[\"hp\"], d[\"mp\"], len(d))\nprint(d)",
+        "15 3 2\n{'hp': 15, 'mp': 3}\n",
+    );
+    assert_output("d = {1: \"a\", 2: \"b\"}\nprint(d[2], d[1])", "b a\n");
+}
+
+#[test]
+fn for_in_dict_iterates_keys_in_insertion_order() {
+    assert_output(
+        "d = {\"x\": 1, \"y\": 2, \"z\": 3}\nfor k in d:\n    print(k, d[k])",
+        "x 1\ny 2\nz 3\n",
+    );
+}
+
+#[test]
+fn dict_equality_is_order_insensitive() {
+    assert_output(
+        "a = {\"x\": 1, \"y\": 2}\nb = {\"y\": 2, \"x\": 1}\nprint(a == b, a == {\"x\": 1}, {} == {})",
+        "True False True\n",
+    );
+}
+
+#[test]
+fn dict_truthiness_and_references() {
+    assert_output(
+        "if {}:\n    print(\"y\")\nelse:\n    print(\"n\")\nif {\"k\": 0}:\n    print(\"t\")\n",
+        "n\nt\n",
+    );
+    assert_output(
+        "def bump(d, k):\n    d[k] = d[k] + 1\nscores = {\"sam\": 1}\nbump(scores, \"sam\")\nprint(scores)",
+        "{'sam': 2}\n",
+    );
+}
+
+#[test]
+fn dicts_nest_with_lists() {
+    assert_output(
+        "d = {\"xs\": [1, 2]}\nd[\"xs\"].append(3)\nprint(d)\nprint([{\"a\": 1}])",
+        "{'xs': [1, 2, 3]}\n[{'a': 1}]\n",
+    );
+}
+
 // --- strings are values ---
 
 #[test]
@@ -563,6 +620,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "xs = []\nfor i in range(12):\n    xs.append(i)\nprint(len(xs), xs[-1], xs == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])",
     "total = 0\nfor x in [2, 4, 6]:\n    total = total + x\nfor c in \"ab\":\n    print(c)\nprint(total, [1] + [2, 3])",
     "def tail(xs):\n    return xs[-1]\nprint(tail([5, 6, 7]), tail(\"xyz\"))",
+    "d = {\"a\": 1, \"b\": 2}\nd[\"a\"] = 10\nd[\"c\"] = 3\nprint(d, len(d), d[\"c\"])",
+    "d = {\"x\": 1, \"y\": 2}\nfor k in d:\n    print(k, d[k])\nprint(d == {\"y\": 2, \"x\": 1})",
+    "print({})\nprint({1: \"one\", \"two\": [2, 2.5]})",
+    "counts = {}\nfor c in \"abracadabra\":\n    if counts == {}:\n        counts[c] = 0\n    counts[c] = 0\nfor c in \"abracadabra\":\n    counts[c] = counts[c] + 1\nprint(counts)",
     "if \"\":\n    print(\"y\")\nelse:\n    print(\"n\")\nprint(\"\" or \"fb\", \"a\" and \"b\")",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",

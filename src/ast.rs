@@ -97,6 +97,8 @@ pub enum ExprKind {
     Call(String, Vec<Expr>),
     /// A list literal, e.g. `[1, 2, 3]`.
     List(Vec<Expr>),
+    /// A dict literal, e.g. `{"a": 1}` (insertion-ordered, like Python).
+    Dict(Vec<(Expr, Expr)>),
     /// Subscript read, e.g. `xs[i]` (lists and strings).
     Index(Box<Expr>, Box<Expr>),
     /// A method call, e.g. `xs.append(v)`.

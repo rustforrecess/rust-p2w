@@ -524,6 +524,28 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::RBracket, "']'")?;
                 Ok(expr(ExprKind::List(elements)))
             }
+            Tok::LBrace => {
+                self.advance();
+                let mut entries = Vec::new();
+                if !matches!(self.peek(), Tok::RBrace) {
+                    loop {
+                        let key = self.expr(0)?;
+                        self.expect(&Tok::Colon, "':' between a dict key and its value")?;
+                        let value = self.expr(0)?;
+                        entries.push((key, value));
+                        if matches!(self.peek(), Tok::Comma) {
+                            self.advance();
+                            if matches!(self.peek(), Tok::RBrace) {
+                                break; // trailing comma
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RBrace, "'}'")?;
+                Ok(expr(ExprKind::Dict(entries)))
+            }
             Tok::Name(name) => {
                 self.advance();
                 match name.as_str() {
@@ -614,6 +636,9 @@ fn contains_call(e: &Expr) -> bool {
         ExprKind::Unary(_, inner) => contains_call(inner),
         ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => contains_call(a) || contains_call(b),
         ExprKind::List(elems) => elems.iter().any(contains_call),
+        ExprKind::Dict(entries) => entries
+            .iter()
+            .any(|(k, v)| contains_call(k) || contains_call(v)),
         _ => false,
     }
 }

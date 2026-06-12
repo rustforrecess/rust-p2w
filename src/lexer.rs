@@ -38,6 +38,8 @@ pub enum Tok {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Dot,
     Comma,
 
@@ -279,6 +281,25 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
             '.' => {
                 out.push(Token {
                     tok: Tok::Dot,
+                    line,
+                });
+                i += 1;
+            }
+            '{' => {
+                paren_depth += 1;
+                out.push(Token {
+                    tok: Tok::LBrace,
+                    line,
+                });
+                i += 1;
+            }
+            '}' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return Err(CompileError::at(line, "unmatched '}'"));
+                }
+                out.push(Token {
+                    tok: Tok::RBrace,
                     line,
                 });
                 i += 1;
