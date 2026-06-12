@@ -1,12 +1,15 @@
 //! Recursive-descent parser with Pratt (precedence-climbing) expression
 //! parsing — the structure Ruff's Python parser uses. Compound statements
-//! (`if`, `for`) consume indented blocks delimited by INDENT/DEDENT; simple
-//! statements consume their trailing NEWLINE.
+//! (`if`, `for`, `while`) consume indented blocks delimited by INDENT/DEDENT;
+//! simple statements consume their trailing NEWLINE.
 
-use crate::ast::{BinOp, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::error::CompileError;
 use crate::lexer::{Tok, Token};
 
-pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>, String> {
+type Result<T> = std::result::Result<T, CompileError>;
+
+pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
@@ -40,15 +43,14 @@ impl<'a> Parser<'a> {
         t
     }
 
-    fn expect(&mut self, want: &Tok, what: &str) -> Result<(), String> {
+    fn expect(&mut self, want: &Tok, what: &str) -> Result<()> {
         if self.peek() == want {
             self.advance();
             Ok(())
         } else {
-            Err(format!(
-                "line {}: expected {what}, found {:?}",
+            Err(CompileError::at(
                 self.line(),
-                self.peek()
+                format!("expected {what}, found {:?}", self.peek()),
             ))
         }
     }
@@ -57,16 +59,16 @@ impl<'a> Parser<'a> {
         matches!(self.peek(), Tok::Name(n) if n == kw)
     }
 
-    fn eat_keyword(&mut self, kw: &str) -> Result<(), String> {
+    fn eat_keyword(&mut self, kw: &str) -> Result<()> {
         if self.is_keyword(kw) {
             self.advance();
             Ok(())
         } else {
-            Err(format!("line {}: expected '{kw}'", self.line()))
+            Err(CompileError::at(self.line(), format!("expected '{kw}'")))
         }
     }
 
-    fn program(&mut self) -> Result<Vec<Stmt>, String> {
+    fn program(&mut self) -> Result<Vec<Stmt>> {
         let mut stmts = Vec::new();
         loop {
             while matches!(self.peek(), Tok::Newline) {
@@ -81,7 +83,7 @@ impl<'a> Parser<'a> {
     }
 
     /// An indented block: INDENT, one or more statements, DEDENT.
-    fn block(&mut self) -> Result<Vec<Stmt>, String> {
+    fn block(&mut self) -> Result<Vec<Stmt>> {
         self.expect(&Tok::Indent, "an indented block")?;
         let mut stmts = Vec::new();
         loop {
@@ -95,12 +97,13 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::Dedent, "the end of the indented block")?;
         if stmts.is_empty() {
-            return Err(format!("line {}: this block is empty", self.line()));
+            return Err(CompileError::at(self.line(), "this block is empty"));
         }
         Ok(stmts)
     }
 
-    fn statement(&mut self) -> Result<Stmt, String> {
+    fn statement(&mut self) -> Result<Stmt> {
+        let line = self.line();
         if self.is_keyword("if") {
             return self.if_stmt();
         }
@@ -113,12 +116,18 @@ impl<'a> Parser<'a> {
         if self.is_keyword("break") {
             self.advance();
             self.expect(&Tok::Newline, "a new line")?;
-            return Ok(Stmt::Break);
+            return Ok(Stmt {
+                kind: StmtKind::Break,
+                line,
+            });
         }
         if self.is_keyword("continue") {
             self.advance();
             self.expect(&Tok::Newline, "a new line")?;
-            return Ok(Stmt::Continue);
+            return Ok(Stmt {
+                kind: StmtKind::Continue,
+                line,
+            });
         }
         // Assignment: `name = expr`.
         if let Tok::Name(name) = self.peek().clone() {
@@ -127,16 +136,23 @@ impl<'a> Parser<'a> {
                 self.advance(); // '='
                 let value = self.expr(0)?;
                 self.expect(&Tok::Newline, "a new line")?;
-                return Ok(Stmt::Assign(name, value));
+                return Ok(Stmt {
+                    kind: StmtKind::Assign(name, value),
+                    line,
+                });
             }
         }
         // Expression statement.
         let e = self.expr(0)?;
         self.expect(&Tok::Newline, "a new line")?;
-        Ok(Stmt::Expr(e))
+        Ok(Stmt {
+            kind: StmtKind::Expr(e),
+            line,
+        })
     }
 
-    fn if_stmt(&mut self) -> Result<Stmt, String> {
+    fn if_stmt(&mut self) -> Result<Stmt> {
+        let line = self.line();
         self.eat_keyword("if")?;
         let cond = self.expr(0)?;
         self.expect(&Tok::Colon, "':'")?;
@@ -163,24 +179,32 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(Stmt::If {
-            cond,
-            body,
-            elifs,
-            else_body,
+        Ok(Stmt {
+            kind: StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            },
+            line,
         })
     }
 
-    fn while_stmt(&mut self) -> Result<Stmt, String> {
+    fn while_stmt(&mut self) -> Result<Stmt> {
+        let line = self.line();
         self.eat_keyword("while")?;
         let cond = self.expr(0)?;
         self.expect(&Tok::Colon, "':'")?;
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
-        Ok(Stmt::While { cond, body })
+        Ok(Stmt {
+            kind: StmtKind::While { cond, body },
+            line,
+        })
     }
 
-    fn for_stmt(&mut self) -> Result<Stmt, String> {
+    fn for_stmt(&mut self) -> Result<Stmt> {
+        let line = self.line();
         self.eat_keyword("for")?;
         let var = match self.peek().clone() {
             Tok::Name(n) => {
@@ -188,10 +212,9 @@ impl<'a> Parser<'a> {
                 n
             }
             other => {
-                return Err(format!(
-                    "line {}: expected a loop variable, found {:?}",
+                return Err(CompileError::at(
                     self.line(),
-                    other
+                    format!("expected a loop variable, found {other:?}"),
                 ))
             }
         };
@@ -199,31 +222,38 @@ impl<'a> Parser<'a> {
         self.eat_keyword("range")?;
         self.expect(&Tok::LParen, "'(' after range")?;
         let args = self.call_args()?;
+        let int = |n: i64| Expr {
+            kind: ExprKind::Int(n),
+            line,
+        };
         let (start, end, step) = match args.len() {
-            1 => (Expr::Int(0), args[0].clone(), Expr::Int(1)),
-            2 => (args[0].clone(), args[1].clone(), Expr::Int(1)),
+            1 => (int(0), args[0].clone(), int(1)),
+            2 => (args[0].clone(), args[1].clone(), int(1)),
             3 => (args[0].clone(), args[1].clone(), args[2].clone()),
             n => {
-                return Err(format!(
-                    "line {}: range() takes 1 to 3 arguments, got {n}",
-                    self.line()
+                return Err(CompileError::at(
+                    self.line(),
+                    format!("range() takes 1 to 3 arguments, got {n}"),
                 ))
             }
         };
         self.expect(&Tok::Colon, "':'")?;
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
-        Ok(Stmt::For {
-            var,
-            start,
-            end,
-            step,
-            body,
+        Ok(Stmt {
+            kind: StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            },
+            line,
         })
     }
 
     /// Pratt expression parser.
-    fn expr(&mut self, min_bp: u8) -> Result<Expr, String> {
+    fn expr(&mut self, min_bp: u8) -> Result<Expr> {
         let mut lhs = self.prefix()?;
         loop {
             let Some((op, l_bp, r_bp)) = self.peek_infix() else {
@@ -232,12 +262,16 @@ impl<'a> Parser<'a> {
             if l_bp < min_bp {
                 break;
             }
+            let op_line = self.line();
             self.advance();
             let rhs = self.expr(r_bp)?;
             if is_comparison(op) {
-                lhs = self.comparison_chain(lhs, op, rhs)?;
+                lhs = self.comparison_chain(lhs, op, rhs, op_line)?;
             } else {
-                lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+                lhs = Expr {
+                    kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs)),
+                    line: op_line,
+                };
             }
         }
         Ok(lhs)
@@ -246,46 +280,65 @@ impl<'a> Parser<'a> {
     /// Python chains comparisons: `a < b < c` means `a < b and b < c` (each
     /// middle operand evaluated once — safe to duplicate here because the
     /// supported expressions have no side effects).
-    fn comparison_chain(&mut self, lhs: Expr, op: BinOp, rhs: Expr) -> Result<Expr, String> {
-        let mut chain = Expr::Bin(op, Box::new(lhs), Box::new(rhs.clone()));
+    fn comparison_chain(&mut self, lhs: Expr, op: BinOp, rhs: Expr, line: usize) -> Result<Expr> {
+        let mut chain = Expr {
+            kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs.clone())),
+            line,
+        };
         let mut prev = rhs;
         while let Some((next_op, _, r_bp)) = self.peek_infix() {
             if !is_comparison(next_op) {
                 break;
             }
+            let op_line = self.line();
             self.advance();
             let next = self.expr(r_bp)?;
-            let pair = Expr::Bin(next_op, Box::new(prev), Box::new(next.clone()));
-            chain = Expr::Bin(BinOp::And, Box::new(chain), Box::new(pair));
+            let pair = Expr {
+                kind: ExprKind::Bin(next_op, Box::new(prev), Box::new(next.clone())),
+                line: op_line,
+            };
+            chain = Expr {
+                kind: ExprKind::Bin(BinOp::And, Box::new(chain), Box::new(pair)),
+                line: op_line,
+            };
             prev = next;
         }
         Ok(chain)
     }
 
-    fn prefix(&mut self) -> Result<Expr, String> {
+    fn prefix(&mut self) -> Result<Expr> {
+        let line = self.line();
         if matches!(self.peek(), Tok::Minus) {
             self.advance();
             let operand = self.expr(PREFIX_BP)?;
-            return Ok(Expr::Unary(UnOp::Neg, Box::new(operand)));
+            return Ok(Expr {
+                kind: ExprKind::Unary(UnOp::Neg, Box::new(operand)),
+                line,
+            });
         }
         if self.is_keyword("not") {
             self.advance();
             // `not` binds looser than comparisons but tighter than and/or.
             let operand = self.expr(7)?;
-            return Ok(Expr::Unary(UnOp::Not, Box::new(operand)));
+            return Ok(Expr {
+                kind: ExprKind::Unary(UnOp::Not, Box::new(operand)),
+                line,
+            });
         }
         self.primary()
     }
 
-    fn primary(&mut self) -> Result<Expr, String> {
+    fn primary(&mut self) -> Result<Expr> {
+        let line = self.line();
+        let expr = |kind| Expr { kind, line };
         match self.peek().clone() {
             Tok::Int(n) => {
                 self.advance();
-                Ok(Expr::Int(n))
+                Ok(expr(ExprKind::Int(n)))
             }
             Tok::Str(s) => {
                 self.advance();
-                Ok(Expr::Str(s))
+                Ok(expr(ExprKind::Str(s)))
             }
             Tok::LParen => {
                 self.advance();
@@ -296,25 +349,24 @@ impl<'a> Parser<'a> {
             Tok::Name(name) => {
                 self.advance();
                 match name.as_str() {
-                    "True" => Ok(Expr::Int(1)),
-                    "False" => Ok(Expr::Int(0)),
+                    "True" => Ok(expr(ExprKind::Int(1))),
+                    "False" => Ok(expr(ExprKind::Int(0))),
                     _ if matches!(self.peek(), Tok::LParen) => {
                         self.advance();
                         let args = self.call_args()?;
-                        Ok(Expr::Call(name, args))
+                        Ok(expr(ExprKind::Call(name, args)))
                     }
-                    _ => Ok(Expr::Name(name)),
+                    _ => Ok(expr(ExprKind::Name(name))),
                 }
             }
-            other => Err(format!(
-                "line {}: expected a value, found {:?}",
-                self.line(),
-                other
+            other => Err(CompileError::at(
+                line,
+                format!("expected a value, found {other:?}"),
             )),
         }
     }
 
-    fn call_args(&mut self) -> Result<Vec<Expr>, String> {
+    fn call_args(&mut self) -> Result<Vec<Expr>> {
         let mut args = Vec::new();
         if matches!(self.peek(), Tok::RParen) {
             self.advance();
@@ -331,10 +383,9 @@ impl<'a> Parser<'a> {
                 }
                 Tok::RParen => break,
                 other => {
-                    return Err(format!(
-                        "line {}: expected ',' or ')' in call, found {:?}",
+                    return Err(CompileError::at(
                         self.line(),
-                        other
+                        format!("expected ',' or ')' in call, found {other:?}"),
                     ));
                 }
             }
@@ -382,88 +433,73 @@ mod tests {
     use super::*;
     use crate::lexer::lex;
 
-    fn parse_src(src: &str) -> Result<Vec<Stmt>, String> {
+    fn parse_src(src: &str) -> Result<Vec<Stmt>> {
         parse(&lex(src).unwrap())
     }
 
+    /// Build an expectation node; line is irrelevant (PartialEq ignores it).
+    fn e(kind: ExprKind) -> Expr {
+        Expr { kind, line: 0 }
+    }
+
+    fn bin(op: BinOp, a: Expr, b: Expr) -> Expr {
+        e(ExprKind::Bin(op, Box::new(a), Box::new(b)))
+    }
+
+    fn int(n: i64) -> Expr {
+        e(ExprKind::Int(n))
+    }
+
+    fn name(n: &str) -> Expr {
+        e(ExprKind::Name(n.into()))
+    }
+
     fn one_expr(src: &str) -> Expr {
-        match parse_src(src).unwrap().pop().unwrap() {
-            Stmt::Expr(e) => e,
+        match parse_src(src).unwrap().pop().unwrap().kind {
+            StmtKind::Expr(e) => e,
             other => panic!("expected expression statement, got {other:?}"),
         }
     }
 
     #[test]
     fn precedence_mul_over_add() {
-        let e = one_expr("2 + 3 * 4");
+        let got = one_expr("2 + 3 * 4");
         assert_eq!(
-            e,
-            Expr::Bin(
-                BinOp::Add,
-                Box::new(Expr::Int(2)),
-                Box::new(Expr::Bin(
-                    BinOp::Mul,
-                    Box::new(Expr::Int(3)),
-                    Box::new(Expr::Int(4))
-                ))
-            )
+            got,
+            bin(BinOp::Add, int(2), bin(BinOp::Mul, int(3), int(4)))
         );
     }
 
     #[test]
     fn comparison_binds_looser_than_arithmetic() {
         // x + 1 < 10  ==>  Lt(Add(x,1), 10)
-        let e = one_expr("x + 1 < 10");
+        let got = one_expr("x + 1 < 10");
         assert_eq!(
-            e,
-            Expr::Bin(
-                BinOp::Lt,
-                Box::new(Expr::Bin(
-                    BinOp::Add,
-                    Box::new(Expr::Name("x".into())),
-                    Box::new(Expr::Int(1))
-                )),
-                Box::new(Expr::Int(10))
-            )
+            got,
+            bin(BinOp::Lt, bin(BinOp::Add, name("x"), int(1)), int(10))
         );
     }
 
     #[test]
     fn and_binds_looser_than_comparison() {
         // a < b and c  ==> And(Lt(a,b), c)
-        let e = one_expr("a < b and c");
+        let got = one_expr("a < b and c");
         assert_eq!(
-            e,
-            Expr::Bin(
-                BinOp::And,
-                Box::new(Expr::Bin(
-                    BinOp::Lt,
-                    Box::new(Expr::Name("a".into())),
-                    Box::new(Expr::Name("b".into()))
-                )),
-                Box::new(Expr::Name("c".into()))
-            )
+            got,
+            bin(BinOp::And, bin(BinOp::Lt, name("a"), name("b")), name("c"))
         );
     }
 
     #[test]
     fn chained_comparison_desugars_to_and() {
         // 1 < 2 < 3  ==>  And(Lt(1,2), Lt(2,3)), like Python — NOT Lt(Lt(1,2), 3)
-        let e = one_expr("1 < 2 < 3");
+        let got = one_expr("1 < 2 < 3");
         assert_eq!(
-            e,
-            Expr::Bin(
+            got,
+            bin(
                 BinOp::And,
-                Box::new(Expr::Bin(
-                    BinOp::Lt,
-                    Box::new(Expr::Int(1)),
-                    Box::new(Expr::Int(2))
-                )),
-                Box::new(Expr::Bin(
-                    BinOp::Lt,
-                    Box::new(Expr::Int(2)),
-                    Box::new(Expr::Int(3))
-                ))
+                bin(BinOp::Lt, int(1), int(2)),
+                bin(BinOp::Lt, int(2), int(3))
             )
         );
     }
@@ -472,11 +508,8 @@ mod tests {
     fn parses_assignment() {
         let s = parse_src("x = 2 + 3").unwrap().pop().unwrap();
         assert_eq!(
-            s,
-            Stmt::Assign(
-                "x".into(),
-                Expr::Bin(BinOp::Add, Box::new(Expr::Int(2)), Box::new(Expr::Int(3)))
-            )
+            s.kind,
+            StmtKind::Assign("x".into(), bin(BinOp::Add, int(2), int(3)))
         );
     }
 
@@ -484,8 +517,8 @@ mod tests {
     fn parses_if_else() {
         let src = "if x:\n    print(1)\nelse:\n    print(2)\n";
         let s = parse_src(src).unwrap().pop().unwrap();
-        match s {
-            Stmt::If {
+        match s.kind {
+            StmtKind::If {
                 body,
                 else_body,
                 elifs,
@@ -503,15 +536,34 @@ mod tests {
     fn parses_for_range() {
         let src = "for i in range(3):\n    print(i)\n";
         let s = parse_src(src).unwrap().pop().unwrap();
-        match s {
-            Stmt::For {
+        match s.kind {
+            StmtKind::For {
                 var, start, end, ..
             } => {
                 assert_eq!(var, "i");
-                assert_eq!(start, Expr::Int(0));
-                assert_eq!(end, Expr::Int(3));
+                assert_eq!(start, int(0));
+                assert_eq!(end, int(3));
             }
             other => panic!("expected for, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nodes_carry_source_lines() {
+        let stmts = parse_src("x = 1\ny = 2\nif x:\n    z = 3\n").unwrap();
+        assert_eq!(stmts[0].line, 1);
+        assert_eq!(stmts[1].line, 2);
+        assert_eq!(stmts[2].line, 3);
+        if let StmtKind::If { body, .. } = &stmts[2].kind {
+            assert_eq!(body[0].line, 4);
+        } else {
+            panic!("expected if");
+        }
+    }
+
+    #[test]
+    fn errors_carry_lines() {
+        let err = parse_src("x = 1\ny = +\n").unwrap_err();
+        assert_eq!(err.line, Some(2));
     }
 }

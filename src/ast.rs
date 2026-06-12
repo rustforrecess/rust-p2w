@@ -1,10 +1,26 @@
 //! Typed AST for the p2w Python subset.
 //!
 //! Deliberately small: it contains only the nodes the codegen handles, so the
-//! parser and codegen grow together.
+//! parser and codegen grow together. Every node carries the 1-based source
+//! line it started on, so any later stage can report a located error.
+//!
+//! `PartialEq` compares structure only (lines are ignored): two programs are
+//! "equal" when they mean the same thing, which is also what tests want.
+
+#[derive(Debug, Clone)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub line: usize,
+}
+
+impl PartialEq for Stmt {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub enum StmtKind {
     /// A bare expression used as a statement, e.g. `print("hi")`.
     Expr(Expr),
     /// Assignment to a simple name, e.g. `x = 5`.
@@ -32,8 +48,20 @@ pub enum Stmt {
     Continue,
 }
 
+#[derive(Debug, Clone)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub line: usize,
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum ExprKind {
     Int(i64),
     Str(String),
     Name(String),

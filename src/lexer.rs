@@ -6,6 +6,8 @@
 //! (the CPython approach). Blank and comment-only lines don't affect
 //! indentation.
 
+use crate::error::CompileError;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(i64),
@@ -48,7 +50,7 @@ pub struct Token {
     pub line: usize,
 }
 
-pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
     let chars: Vec<char> = src.chars().collect();
     let mut out: Vec<Token> = Vec::new();
     let mut i = 0usize;
@@ -102,7 +104,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     });
                 }
                 if col != *indent_stack.last().unwrap() {
-                    return Err(format!("line {line}: inconsistent indentation"));
+                    return Err(CompileError::at(line, "inconsistent indentation"));
                 }
             }
             at_line_start = false;
@@ -220,7 +222,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     });
                     i += 2;
                 } else {
-                    return Err(format!("line {line}: use 'not' instead of '!'"));
+                    return Err(CompileError::at(line, "use 'not' instead of '!'"));
                 }
             }
             ':' => {
@@ -241,7 +243,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             ')' => {
                 paren_depth -= 1;
                 if paren_depth < 0 {
-                    return Err(format!("line {line}: unmatched ')'"));
+                    return Err(CompileError::at(line, "unmatched ')'"));
                 }
                 out.push(Token {
                     tok: Tok::RParen,
@@ -284,13 +286,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 });
             }
             other => {
-                return Err(format!("line {line}: unexpected character '{other}'"));
+                return Err(CompileError::at(
+                    line,
+                    format!("unexpected character '{other}'"),
+                ));
             }
         }
     }
 
     if paren_depth != 0 {
-        return Err(format!("line {line}: unclosed '('"));
+        return Err(CompileError::at(line, "unclosed '('"));
     }
 
     // Terminate the final line, then unwind any open indentation.
@@ -314,7 +319,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     Ok(out)
 }
 
-fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(i64, usize), String> {
+fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(i64, usize), CompileError> {
     let mut i = start;
     let mut digits = String::new();
     while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
@@ -324,17 +329,18 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(i64, usize),
         i += 1;
     }
     if i < chars.len() && chars[i] == '.' {
-        return Err(format!(
-            "line {line}: floating-point numbers aren't supported yet"
+        return Err(CompileError::at(
+            line,
+            "floating-point numbers aren't supported yet",
         ));
     }
     let n: i64 = digits
         .parse()
-        .map_err(|_| format!("line {line}: invalid integer '{digits}'"))?;
+        .map_err(|_| CompileError::at(line, format!("invalid integer '{digits}'")))?;
     Ok((n, i))
 }
 
-fn lex_string(chars: &[char], start: usize, line: usize) -> Result<(String, usize), String> {
+fn lex_string(chars: &[char], start: usize, line: usize) -> Result<(String, usize), CompileError> {
     let quote = chars[start];
     let mut i = start + 1;
     let mut s = String::new();
@@ -364,7 +370,7 @@ fn lex_string(chars: &[char], start: usize, line: usize) -> Result<(String, usiz
         s.push(c);
         i += 1;
     }
-    Err(format!("line {line}: unterminated string literal"))
+    Err(CompileError::at(line, "unterminated string literal"))
 }
 
 #[cfg(test)]

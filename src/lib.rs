@@ -1,7 +1,8 @@
 //! rust-p2w — a Rust reimplementation of the p2w Python-subset -> WebAssembly
 //! (WAT) compiler, for the AcornSTEM K-12 IDE.
 //!
-//! Pipeline: source -> [lexer] -> tokens -> [parser] -> AST -> [codegen] -> WAT.
+//! Pipeline: source -> [lexer] -> tokens -> [parser] -> spanned AST ->
+//! [codegen] -> WAT (via the emit module's module/function builders).
 //!
 //! Derived from MIT-licensed p2w (semantics / WAT conventions) and informed by
 //! the design of ruff_python_parser (front-end architecture). See the NOTICE
@@ -9,16 +10,25 @@
 
 mod ast;
 mod codegen;
+mod emit;
+mod error;
 mod lexer;
 mod parser;
 
-pub use ast::{BinOp, Expr, Stmt, UnOp};
+pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+pub use error::CompileError;
 
 /// Compile Python (the supported subset) to WebAssembly text (WAT).
 ///
-/// Returns a friendly, line-numbered error string on failure — suitable to show
-/// a K-12 student directly.
+/// Returns a friendly, line-numbered error string on failure — suitable to
+/// show a K-12 student directly.
 pub fn compile_to_wat(source: &str) -> Result<String, String> {
+    try_compile(source).map_err(|e| e.to_string())
+}
+
+/// Like [`compile_to_wat`], but returns the structured error (line +
+/// message) so callers can highlight the offending line (e.g. the IDE).
+pub fn try_compile(source: &str) -> Result<String, CompileError> {
     let tokens = lexer::lex(source)?;
     let stmts = parser::parse(&tokens)?;
     codegen::generate(&stmts)
@@ -47,6 +57,14 @@ mod tests {
     fn errors_are_friendly() {
         let err = compile_to_wat("print(3.14)").unwrap_err();
         assert!(err.contains("floating-point"));
+        assert!(err.starts_with("line 1:"));
+    }
+
+    #[test]
+    fn structured_errors_carry_the_line() {
+        let err = try_compile("x = 1\nprint(\"ok\")\nprint(zzz)\n").unwrap_err();
+        assert_eq!(err.line, Some(3));
+        assert!(err.message.contains("zzz"));
     }
 
     #[test]
@@ -88,6 +106,13 @@ print(\"sum of evens:\", total)
     #[test]
     fn emitted_wat_parses_nested_for() {
         assert_valid_wasm("for i in range(3):\n    for j in range(3):\n        print(i * j)\n");
+    }
+
+    #[test]
+    fn emitted_wat_parses_while_break_continue() {
+        assert_valid_wasm(
+            "i = 0\nwhile i < 10:\n    i = i + 1\n    if i % 2 == 0:\n        continue\n    if i > 7:\n        break\n    print(i)\n",
+        );
     }
 
     #[test]
