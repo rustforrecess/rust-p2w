@@ -336,6 +336,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(expr(ExprKind::Int(n)))
             }
+            Tok::Float(f) => {
+                self.advance();
+                Ok(expr(ExprKind::Float(f)))
+            }
             Tok::Str(s) => {
                 self.advance();
                 Ok(expr(ExprKind::Str(s)))

@@ -59,7 +59,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     let mut module = Module::default();
     module.types.push("(type $INT (struct (field i32)))".into());
     module.types.push("(type $BOOL (struct (field i8)))".into());
-    // NOTE: WASM-GC type canonicalization is structural — keep these three
+    module
+        .types
+        .push("(type $FLOAT (struct (field f64)))".into());
+    // NOTE: WASM-GC type canonicalization is structural — keep these
     // shapes distinct or ref.test misfires (see $BOOL's i8 field).
     module.types.push("(type $STR (array (mut i8)))".into());
     module
@@ -68,6 +71,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .imports
         .push(r#"(import "env" "write_i32" (func $write_i32 (param i32)))"#.into());
+    module
+        .imports
+        .push(r#"(import "env" "write_f64" (func $write_f64 (param f64)))"#.into());
     module
         .globals
         .push("(global $TRUE (ref $BOOL) (struct.new $BOOL (i32.const 1)))".into());
@@ -88,9 +94,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module.funcs.push(f);
     }
     if g.uses_floordiv {
+        module.funcs.push(py_floordiv_helper());
         module.funcs.push(floordiv_helper());
     }
     if g.uses_floormod {
+        module.funcs.push(py_mod_helper());
         module.funcs.push(floormod_helper());
     }
     Ok(module.render())
@@ -146,12 +154,48 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $unbox_f64: any numeric value as f64 (ints/bools convert exactly).
+    let mut b = Body::new();
+    b.push("(if (result f64) (ref.test (ref $FLOAT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))",
+    );
+    b.push_in(
+        1,
+        "(else (f64.convert_i32_s (call $unbox (local.get $r)))))",
+    );
+    fs.push(Func {
+        signature: "(func $unbox_f64 (param $r (ref null eq)) (result f64)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $either_float: arithmetic promotes to float when either side is one.
+    let mut b = Body::new();
+    b.push(
+        "(i32.or (ref.test (ref $FLOAT) (local.get $a)) (ref.test (ref $FLOAT) (local.get $b)))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $either_float (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $truthy: value -> i32 0/1 (non-empty string / nonzero number is true).
     let mut b = Body::new();
     b.push("(if (ref.test (ref $STR) (local.get $r))");
     b.push_in(
         1,
         "(then (return (i32.ne (array.len (ref.cast (ref $STR) (local.get $r))) (i32.const 0))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $FLOAT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (f64.ne (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))) (f64.const 0))))",
     );
     b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
@@ -181,13 +225,19 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $print_value: runtime type dispatch — strings as bytes, bools as
-    // True/False, numbers as digits.
+    // $print_value: runtime type dispatch — strings as bytes, floats via the
+    // host (which formats Python-style), bools as True/False, ints as digits.
     let mut b = Body::new();
     b.push("(if (ref.test (ref $STR) (local.get $r))");
     b.push_in(
         1,
         "(then (return (call $print_str (ref.cast (ref $STR) (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $FLOAT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $write_f64 (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))))",
     );
     b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
@@ -238,9 +288,18 @@ fn runtime_helpers() -> Vec<Func> {
     );
     b.push_in(2, "(local.get $out)");
     b.push_in(1, ")");
+    b.push_in(1, "(else");
     b.push_in(
-        1,
-        "(else (call $box (i32.add (call $unbox (local.get $a)) (call $unbox (local.get $b))))))",
+        2,
+        "(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))",
+    );
+    b.push_in(
+        3,
+        "(then (struct.new $FLOAT (f64.add (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))))",
+    );
+    b.push_in(
+        3,
+        "(else (call $box (i32.add (call $unbox (local.get $a)) (call $unbox (local.get $b))))))))",
     );
     fs.push(Func {
         signature:
@@ -251,6 +310,63 @@ fn runtime_helpers() -> Vec<Func> {
             "(local $sb (ref null $STR))".into(),
             "(local $out (ref null $STR))".into(),
         ],
+        body: b,
+    });
+
+    // $py_sub / $py_mul: float promotion, else i32.
+    for (name, f_instr, i_instr) in [
+        ("$py_sub", "f64.sub", "i32.sub"),
+        ("$py_mul", "f64.mul", "i32.mul"),
+    ] {
+        let mut b = Body::new();
+        b.push("(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))");
+        b.push_in(
+            1,
+            format!("(then (struct.new $FLOAT ({f_instr} (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))))"),
+        );
+        b.push_in(
+            1,
+            format!("(else (call $box ({i_instr} (call $unbox (local.get $a)) (call $unbox (local.get $b))))))"),
+        );
+        fs.push(Func {
+            signature: format!(
+                "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![],
+            body: b,
+        });
+    }
+
+    // $py_div: Python `/` — always float; division by zero traps loudly
+    // (Python raises ZeroDivisionError; silent inf would be a wrong answer).
+    let mut b = Body::new();
+    b.push("(local.set $fb (call $unbox_f64 (local.get $b)))");
+    b.push("(if (f64.eq (local.get $fb) (f64.const 0))");
+    b.push_in(1, "(then unreachable)");
+    b.push(")");
+    b.push("(struct.new $FLOAT (f64.div (call $unbox_f64 (local.get $a)) (local.get $fb)))");
+    fs.push(Func {
+        signature:
+            "(func $py_div (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec!["(local $fb f64)".into()],
+        body: b,
+    });
+
+    // $py_neg: unary minus across int/float.
+    let mut b = Body::new();
+    b.push("(if (result (ref null eq)) (ref.test (ref $FLOAT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (struct.new $FLOAT (f64.neg (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))))",
+    );
+    b.push_in(
+        1,
+        "(else (call $box (i32.sub (i32.const 0) (call $unbox (local.get $r))))))",
+    );
+    fs.push(Func {
+        signature: "(func $py_neg (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
         body: b,
     });
 
@@ -283,7 +399,7 @@ fn runtime_helpers() -> Vec<Func> {
     });
 
     // $py_eq: Python `==` — strings by value, string-vs-number is False,
-    // numbers (and bools, as 1/0) by value.
+    // numbers (ints, bools as 1/0, floats) compared as f64 (exact for i32).
     let mut b = Body::new();
     b.push(
         "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
@@ -298,7 +414,7 @@ fn runtime_helpers() -> Vec<Func> {
     );
     b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
-    b.push("(i32.eq (call $unbox (local.get $a)) (call $unbox (local.get $b)))");
+    b.push("(f64.eq (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))");
     fs.push(Func {
         signature: "(func $py_eq (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
             .into(),
@@ -307,6 +423,65 @@ fn runtime_helpers() -> Vec<Func> {
     });
 
     fs
+}
+
+/// `//` dispatch: floats floor-divide as f64 (zero divisor traps); ints use
+/// the `$i32_floordiv` helper.
+fn py_floordiv_helper() -> Func {
+    let mut b = Body::new();
+    b.push("(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $fb (call $unbox_f64 (local.get $b)))");
+    b.push_in(
+        2,
+        "(if (f64.eq (local.get $fb) (f64.const 0)) (then unreachable))",
+    );
+    b.push_in(
+        2,
+        "(struct.new $FLOAT (f64.floor (f64.div (call $unbox_f64 (local.get $a)) (local.get $fb))))",
+    );
+    b.push_in(1, ")");
+    b.push_in(
+        1,
+        "(else (call $box (call $i32_floordiv (call $unbox (local.get $a)) (call $unbox (local.get $b))))))",
+    );
+    Func {
+        signature:
+            "(func $py_floordiv (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec!["(local $fb f64)".into()],
+        body: b,
+    }
+}
+
+/// `%` dispatch: float modulo follows Python (`a - floor(a/b)*b`, sign of the
+/// divisor; zero divisor traps); ints use the `$i32_floormod` helper.
+fn py_mod_helper() -> Func {
+    let mut b = Body::new();
+    b.push("(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $fa (call $unbox_f64 (local.get $a)))");
+    b.push_in(2, "(local.set $fb (call $unbox_f64 (local.get $b)))");
+    b.push_in(
+        2,
+        "(if (f64.eq (local.get $fb) (f64.const 0)) (then unreachable))",
+    );
+    b.push_in(
+        2,
+        "(struct.new $FLOAT (f64.sub (local.get $fa) (f64.mul (f64.floor (f64.div (local.get $fa) (local.get $fb))) (local.get $fb))))",
+    );
+    b.push_in(1, ")");
+    b.push_in(
+        1,
+        "(else (call $box (call $i32_floormod (call $unbox (local.get $a)) (call $unbox (local.get $b))))))",
+    );
+    Func {
+        signature:
+            "(func $py_mod (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec!["(local $fa f64)".into(), "(local $fb f64)".into()],
+        body: b,
+    }
 }
 
 /// Python floor division: truncating `i32.div_s` adjusted by -1 when the
@@ -595,6 +770,12 @@ impl Gen {
     ) -> Result<()> {
         require_value(start, &cx.vars, "a range start")?;
         require_value(end, &cx.vars, "a range end")?;
+        if [start, end, step].iter().any(|b| const_float(b).is_some()) {
+            return Err(CompileError::at(
+                line,
+                "range() needs whole numbers, not decimals",
+            ));
+        }
 
         // A runtime step would need a sign-aware termination check; until that
         // lands, only constant steps are accepted (so the direction is known).
@@ -686,9 +867,14 @@ impl Gen {
                 )),
             };
         }
+        // Float constants (and negated ones) fold to a $FLOAT literal.
+        if let Some(f) = const_float(e) {
+            return Ok(format!("(struct.new $FLOAT (f64.const {f}))"));
+        }
         match &e.kind {
-            // All integer literals (and negated ones) were folded above.
+            // All numeric literals (and negated ones) were folded above.
             ExprKind::Int(_) => unreachable!("integer literals are folded above"),
+            ExprKind::Float(_) => unreachable!("float literals are folded above"),
             ExprKind::Bool(true) => Ok("(global.get $TRUE)".into()),
             ExprKind::Bool(false) => Ok("(global.get $FALSE)".into()),
             ExprKind::Name(n) => match cx.vars.get(n) {
@@ -696,8 +882,8 @@ impl Gen {
                 None => Err(CompileError::at(e.line, format!("unknown name '{n}'"))),
             },
             ExprKind::Unary(UnOp::Neg, inner) => {
-                let v = self.i32_expr(cx, inner)?;
-                Ok(format!("(call $box (i32.sub (i32.const 0) {v}))"))
+                let v = self.value_expr(cx, inner)?;
+                Ok(format!("(call $py_neg {v})"))
             }
             ExprKind::Unary(UnOp::Not, inner) => {
                 let c = self.cond_i32(cx, inner)?;
@@ -738,45 +924,45 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call $bool (i32.eqz (call $py_eq {lhs} {rhs})))"))
             }
-            ExprKind::Bin(BinOp::Div, _, _) => Err(CompileError::at(
-                e.line,
-                "'/' makes a decimal number in Python, and decimals aren't supported yet — \
-                 use '//' for whole-number division",
-            )),
+            ExprKind::Bin(BinOp::Div, a, b) => {
+                // Python `/` is true division: always a float.
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_div {lhs} {rhs})"))
+            }
+            ExprKind::Bin(BinOp::Sub, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_sub {lhs} {rhs})"))
+            }
+            ExprKind::Bin(BinOp::Mul, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_mul {lhs} {rhs})"))
+            }
             ExprKind::Bin(BinOp::FloorDiv, a, b) => {
                 self.uses_floordiv = true;
-                let lhs = self.i32_expr(cx, a)?;
-                let rhs = self.i32_expr(cx, b)?;
-                Ok(format!("(call $box (call $i32_floordiv {lhs} {rhs}))"))
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_floordiv {lhs} {rhs})"))
             }
             ExprKind::Bin(BinOp::Mod, a, b) => {
                 self.uses_floormod = true;
-                let lhs = self.i32_expr(cx, a)?;
-                let rhs = self.i32_expr(cx, b)?;
-                Ok(format!("(call $box (call $i32_floormod {lhs} {rhs}))"))
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_mod {lhs} {rhs})"))
             }
             ExprKind::Bin(op, a, b) => {
-                let lhs = self.i32_expr(cx, a)?;
-                let rhs = self.i32_expr(cx, b)?;
-                let arith = |instr: &str| format!("(call $box ({instr} {lhs} {rhs}))");
+                // Comparisons run as f64 (exact for every i32).
+                let lhs = self.f64_expr(cx, a)?;
+                let rhs = self.f64_expr(cx, b)?;
                 let cmp = |instr: &str| format!("(call $bool ({instr} {lhs} {rhs}))");
                 Ok(match op {
-                    BinOp::Sub => arith("i32.sub"),
-                    BinOp::Mul => arith("i32.mul"),
-                    BinOp::Lt => cmp("i32.lt_s"),
-                    BinOp::Le => cmp("i32.le_s"),
-                    BinOp::Gt => cmp("i32.gt_s"),
-                    BinOp::Ge => cmp("i32.ge_s"),
-                    BinOp::Add
-                    | BinOp::Eq
-                    | BinOp::Ne
-                    | BinOp::And
-                    | BinOp::Or
-                    | BinOp::Div
-                    | BinOp::FloorDiv
-                    | BinOp::Mod => {
-                        unreachable!("handled above")
-                    }
+                    BinOp::Lt => cmp("f64.lt"),
+                    BinOp::Le => cmp("f64.le"),
+                    BinOp::Gt => cmp("f64.gt"),
+                    BinOp::Ge => cmp("f64.ge"),
+                    _ => unreachable!("handled above"),
                 })
             }
             ExprKind::Str(s) => {
@@ -794,8 +980,8 @@ impl Gen {
         }
     }
 
-    /// Generate WAT producing the raw i32 of `e` — a constant directly, a
-    /// statically boolean expression as 0/1, anything else via `$unbox`.
+    /// Generate WAT producing the raw i32 of `e` — a constant directly,
+    /// anything else via `$unbox`.
     fn i32_expr(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
         if let Some(v) = const_int(e) {
             return match i32::try_from(v) {
@@ -809,6 +995,18 @@ impl Gen {
             };
         }
         Ok(format!("(call $unbox {})", self.value_expr(cx, e)?))
+    }
+
+    /// Generate WAT producing the f64 of `e` — numeric constants directly,
+    /// anything else via `$unbox_f64`.
+    fn f64_expr(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
+        if let Some(v) = const_int(e) {
+            return Ok(format!("(f64.const {v})"));
+        }
+        if let Some(f) = const_float(e) {
+            return Ok(format!("(f64.const {f})"));
+        }
+        Ok(format!("(call $unbox_f64 {})", self.value_expr(cx, e)?))
     }
 
     /// Generate WAT producing an i32 condition (0 = false). Comparisons and
@@ -831,8 +1029,8 @@ impl Gen {
                 Ok(format!("(i32.eqz (call $py_eq {lhs} {rhs}))"))
             }
             ExprKind::Bin(op, a, b) if cmp_instr(*op).is_some() => {
-                let lhs = self.i32_expr(cx, a)?;
-                let rhs = self.i32_expr(cx, b)?;
+                let lhs = self.f64_expr(cx, a)?;
+                let rhs = self.f64_expr(cx, b)?;
                 Ok(format!("({} {lhs} {rhs})", cmp_instr(*op).unwrap()))
             }
             _ => Ok(format!("(call $truthy {})", self.value_expr(cx, e)?)),
@@ -842,10 +1040,10 @@ impl Gen {
 
 fn cmp_instr(op: BinOp) -> Option<&'static str> {
     Some(match op {
-        BinOp::Lt => "i32.lt_s",
-        BinOp::Le => "i32.le_s",
-        BinOp::Gt => "i32.gt_s",
-        BinOp::Ge => "i32.ge_s",
+        BinOp::Lt => "f64.lt",
+        BinOp::Le => "f64.le",
+        BinOp::Gt => "f64.gt",
+        BinOp::Ge => "f64.ge",
         _ => return None,
     })
 }
@@ -859,6 +1057,15 @@ fn const_int(e: &Expr) -> Option<i64> {
     match &e.kind {
         ExprKind::Int(n) => Some(*n),
         ExprKind::Unary(UnOp::Neg, inner) => const_int(inner).map(|v| -v),
+        _ => None,
+    }
+}
+
+/// Constant value of a float literal (handling unary minus), if it is one.
+fn const_float(e: &Expr) -> Option<f64> {
+    match &e.kind {
+        ExprKind::Float(f) => Some(*f),
+        ExprKind::Unary(UnOp::Neg, inner) => const_float(inner).map(|v| -v),
         _ => None,
     }
 }
@@ -879,7 +1086,7 @@ fn require_value(e: &Expr, vars: &Vars, what: &str) -> Result<()> {
 /// misuse traps at run time until real runtime type errors land.
 fn type_of(e: &Expr, vars: &Vars) -> Result<Ty> {
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) => Ok(Ty::Num),
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => Ok(Ty::Num),
         ExprKind::Str(_) => Ok(Ty::Str),
         ExprKind::Unary(op, inner) => {
             let t = type_of(inner, vars)?;
@@ -948,9 +1155,9 @@ mod tests {
     fn print_int_arithmetic() {
         let wat = compile("print(2 + 3 * 4)").unwrap();
         assert!(wat.contains("(export \"_start\")"));
-        // `+` dispatches through $py_add (it might be concatenation);
-        // `*` stays numeric.
-        assert!(wat.contains("(i32.mul (i32.const 3) (i32.const 4))"));
+        // All arithmetic dispatches at runtime: `+` might concatenate,
+        // `*` might promote to float.
+        assert!(wat.contains("(call $py_mul (ref.i31 (i32.const 3)) (ref.i31 (i32.const 4)))"));
         assert!(wat.contains("(call $py_add (ref.i31 (i32.const 2))"));
         assert!(wat.contains("(call $print_value"));
     }
@@ -1024,7 +1231,7 @@ mod tests {
     fn if_else_emits_branches() {
         let wat = compile("x = 3\nif x < 5:\n    print(1)\nelse:\n    print(2)\n").unwrap();
         // Comparison conditions skip the boxed-bool round-trip.
-        assert!(wat.contains("(if (i32.lt_s (call $unbox (local.get $x)) (i32.const 5))"));
+        assert!(wat.contains("(if (f64.lt (call $unbox_f64 (local.get $x)) (f64.const 5))"));
         assert!(wat.contains("(then"));
         assert!(wat.contains("(else"));
     }
@@ -1035,7 +1242,7 @@ mod tests {
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n";
         let wat = compile(src).unwrap();
         // Two conditions compile to two direct comparisons in _start.
-        assert_eq!(wat.matches("(if (i32.lt_s").count(), 2);
+        assert_eq!(wat.matches("(if (f64.lt").count(), 2);
     }
 
     #[test]
@@ -1102,7 +1309,7 @@ mod tests {
     fn while_emits_loop_with_negated_test() {
         let wat = compile("i = 3\nwhile i > 0:\n    i = i - 1\n").unwrap();
         assert!(wat.contains(
-            "(br_if $b0 (i32.eqz (i32.gt_s (call $unbox (local.get $i)) (i32.const 0))))"
+            "(br_if $b0 (i32.eqz (f64.gt (call $unbox_f64 (local.get $i)) (f64.const 0))))"
         ));
         assert!(wat.contains("(br $l0)"));
     }
@@ -1147,8 +1354,12 @@ mod tests {
     #[test]
     fn floordiv_and_mod_call_helpers() {
         let wat = compile("print(-7 // 2)\nprint(-7 % 2)").unwrap();
-        assert!(wat.contains("(call $i32_floordiv (i32.const -7) (i32.const 2))"));
-        assert!(wat.contains("(call $i32_floormod (i32.const -7) (i32.const 2))"));
+        assert!(
+            wat.contains("(call $py_floordiv (ref.i31 (i32.const -7)) (ref.i31 (i32.const 2)))")
+        );
+        assert!(wat.contains("(call $py_mod (ref.i31 (i32.const -7)) (ref.i31 (i32.const 2)))"));
+        // The dispatchers and their int helpers are both emitted.
+        assert!(wat.contains("(func $py_floordiv"));
         assert!(wat.contains("(func $i32_floordiv"));
         assert!(wat.contains("(func $i32_floormod"));
     }
@@ -1161,9 +1372,23 @@ mod tests {
     }
 
     #[test]
-    fn true_division_is_rejected() {
-        let err = compile("print(7 / 2)").unwrap_err();
-        assert!(err.message.contains("//"));
+    fn true_division_is_float() {
+        let wat = compile("print(7 / 2)").unwrap();
+        assert!(wat.contains("(call $py_div (ref.i31 (i32.const 7)) (ref.i31 (i32.const 2)))"));
+        assert!(wat.contains("(type $FLOAT (struct (field f64)))"));
+    }
+
+    #[test]
+    fn float_literals_fold_to_float_structs() {
+        let wat = compile("x = 3.5\nprint(-2.5)").unwrap();
+        assert!(wat.contains("(local.set $x (struct.new $FLOAT (f64.const 3.5)))"));
+        assert!(wat.contains("(struct.new $FLOAT (f64.const -2.5))"));
+    }
+
+    #[test]
+    fn range_rejects_decimals() {
+        let err = compile("for i in range(2.5):\n    print(i)\n").unwrap_err();
+        assert!(err.message.contains("whole numbers"));
     }
 
     #[test]

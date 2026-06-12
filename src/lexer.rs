@@ -11,6 +11,7 @@ use crate::error::CompileError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(i64),
+    Float(f64),
     Str(String),
     Name(String),
 
@@ -267,11 +268,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 i = ni;
             }
             c if c.is_ascii_digit() => {
-                let (n, ni) = lex_number(&chars, i, line)?;
-                out.push(Token {
-                    tok: Tok::Int(n),
-                    line,
-                });
+                let (tok, ni) = lex_number(&chars, i, line)?;
+                out.push(Token { tok, line });
                 i = ni;
             }
             c if c.is_alphabetic() || c == '_' => {
@@ -319,7 +317,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
     Ok(out)
 }
 
-fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(i64, usize), CompileError> {
+fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize), CompileError> {
     let mut i = start;
     let mut digits = String::new();
     while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
@@ -328,16 +326,25 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(i64, usize),
         }
         i += 1;
     }
+    // A '.' makes it a float literal: `3.14`, and Python's `3.` too.
     if i < chars.len() && chars[i] == '.' {
-        return Err(CompileError::at(
-            line,
-            "floating-point numbers aren't supported yet",
-        ));
+        digits.push('.');
+        i += 1;
+        while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
+            if chars[i] != '_' {
+                digits.push(chars[i]);
+            }
+            i += 1;
+        }
+        let f: f64 = digits
+            .parse()
+            .map_err(|_| CompileError::at(line, format!("invalid number '{digits}'")))?;
+        return Ok((Tok::Float(f), i));
     }
     let n: i64 = digits
         .parse()
         .map_err(|_| CompileError::at(line, format!("invalid integer '{digits}'")))?;
-    Ok((n, i))
+    Ok((Tok::Int(n), i))
 }
 
 fn lex_string(chars: &[char], start: usize, line: usize) -> Result<(String, usize), CompileError> {
@@ -469,8 +476,20 @@ mod tests {
     }
 
     #[test]
-    fn float_is_rejected() {
-        assert!(lex("3.14").is_err());
+    fn float_literals_lex() {
+        assert_eq!(
+            toks("x = 2.75"),
+            vec![
+                Tok::Name("x".into()),
+                Tok::Eq,
+                Tok::Float(2.75),
+                Tok::Newline,
+                Tok::Eof
+            ]
+        );
+        // Python's trailing-dot form.
+        assert_eq!(toks("3.")[0], Tok::Float(3.0));
+        assert_eq!(toks("1_000.5")[0], Tok::Float(1000.5));
     }
 
     #[test]

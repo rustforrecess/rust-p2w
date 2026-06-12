@@ -43,6 +43,24 @@ fn run(src: &str) -> String {
             },
         )
         .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "write_f64",
+            |mut caller: Caller<'_, Vec<u8>>, v: f64| {
+                // Python-style: whole floats keep ".0" (repr(2.0) == "2.0");
+                // otherwise Rust's shortest round-trip matches Python's for
+                // everyday values. (Known divergence at extremes: Python
+                // switches to scientific notation around 1e16.)
+                let s = if v.is_finite() && v == v.trunc() {
+                    format!("{v:.1}")
+                } else {
+                    format!("{v}")
+                };
+                caller.data_mut().extend_from_slice(s.as_bytes());
+            },
+        )
+        .unwrap();
 
     let instance = linker
         .instantiate(&mut store, &module)
@@ -152,6 +170,61 @@ fn string_truthiness() {
     );
     assert_output("print(\"\" or \"fallback\")", "fallback\n");
     assert_output("print(\"first\" and \"second\")", "second\n");
+}
+
+// --- floats ---
+
+#[test]
+fn floats_print_python_style() {
+    assert_output("print(3.5)", "3.5\n");
+    assert_output("print(2.0)", "2.0\n"); // whole floats keep .0
+    assert_output("print(-0.25)", "-0.25\n");
+    assert_output("print(0.1 + 0.2)", "0.30000000000000004\n"); // IEEE, like Python
+}
+
+#[test]
+fn true_division_always_returns_float() {
+    assert_output("print(7 / 2)", "3.5\n");
+    assert_output("print(4 / 2)", "2.0\n");
+    assert_output("print(1.0 / 4)", "0.25\n");
+}
+
+#[test]
+fn mixed_arithmetic_promotes_to_float() {
+    assert_output("print(1.5 + 2)", "3.5\n");
+    assert_output("print(2 * 1.5)", "3.0\n");
+    assert_output("print(5 - 0.5)", "4.5\n");
+    assert_output("x = 2.5\nprint(x * 2 - 1)", "4.0\n");
+    assert_output("print(-(1.5))", "-1.5\n");
+}
+
+#[test]
+fn float_floordiv_and_mod_match_python() {
+    assert_output("print(7.5 // 2)", "3.0\n");
+    assert_output("print(-3.5 // 1)", "-4.0\n");
+    assert_output("print(7.5 % 2)", "1.5\n");
+    assert_output("print(-7.5 % 2)", "0.5\n"); // sign of the divisor
+}
+
+#[test]
+fn float_comparisons_and_equality() {
+    assert_output("print(1.5 < 2)", "True\n");
+    assert_output("print(1 == 1.0)", "True\n");
+    assert_output("print(2.0 == 2)", "True\n");
+    assert_output("print(0.1 + 0.2 == 0.3)", "False\n"); // the classic
+    assert_output("x = 98.7\nif x > 98.6:\n    print(\"fever\")\n", "fever\n");
+}
+
+#[test]
+fn float_truthiness() {
+    assert_output(
+        "if 0.0:\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
+        "no\n",
+    );
+    assert_output(
+        "if 0.5:\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
+        "yes\n",
+    );
 }
 
 // --- chained comparisons ---
@@ -312,6 +385,12 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "x = \"hello\"\nprint(x, x + \"!\")",
     "s = \"\"\nfor i in range(4):\n    s = s + \"ab\"\nprint(s)\nprint(s == \"abababab\")",
     "print(\"abc\" == \"abc\", \"abc\" == \"abd\", \"1\" == 1)",
+    "print(7 / 2, 4 / 2, 1.0 / 4)",
+    "print(0.1 + 0.2)\nprint(0.1 + 0.2 == 0.3)",
+    "print(1.5 + 2, 2 * 1.5, 5 - 0.5, -(1.5))",
+    "print(7.5 // 2, -3.5 // 1, 7.5 % 2, -7.5 % 2)",
+    "print(1.5 < 2, 1 == 1.0, 2.0 == 2)",
+    "x = 0.0\nif x:\n    print(\"t\")\nelse:\n    print(\"f\")",
     "if \"\":\n    print(\"y\")\nelse:\n    print(\"n\")\nprint(\"\" or \"fb\", \"a\" and \"b\")",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",

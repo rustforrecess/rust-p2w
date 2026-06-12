@@ -50,13 +50,13 @@ mod tests {
         let src = "print(\"answer:\", 6 * 7)\nprint(100 - 1)";
         let wat = compile_to_wat(src).unwrap();
         assert!(wat.contains("call $write_i32"));
-        assert!(wat.contains("(i32.mul (i32.const 6) (i32.const 7))"));
+        assert!(wat.contains("(call $py_mul (ref.i31 (i32.const 6)) (ref.i31 (i32.const 7)))"));
     }
 
     #[test]
     fn errors_are_friendly() {
-        let err = compile_to_wat("print(3.14)").unwrap_err();
-        assert!(err.contains("floating-point"));
+        let err = compile_to_wat("print(3 $ 4)").unwrap_err();
+        assert!(err.contains("unexpected character"));
         assert!(err.starts_with("line 1:"));
     }
 
