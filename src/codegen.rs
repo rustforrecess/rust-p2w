@@ -153,6 +153,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     for f in runtime_helpers() {
         module.funcs.push(f);
     }
+    for f in raise_helpers() {
+        module.funcs.push(f);
+    }
     if g.uses_floordiv {
         module.funcs.push(py_floordiv_helper());
         module.funcs.push(floordiv_helper());
@@ -162,6 +165,162 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module.funcs.push(floormod_helper());
     }
     Ok(module.render())
+}
+
+/// Emit `write_char` calls spelling out `text` (for runtime messages).
+fn push_text(b: &mut Body, depth: usize, text: &str) {
+    for c in text.bytes() {
+        b.push_in(depth, format!("(call $write_char (i32.const {c}))"));
+    }
+}
+
+/// The error-raising runtime: each $raise_* prints a Python-style message
+/// (on its own line) through write_char, then traps. Bodies end in
+/// `unreachable`, so call sites in value position add their own trailing
+/// `unreachable` to satisfy the validator.
+fn raise_helpers() -> Vec<Func> {
+    let mut fs = Vec::new();
+
+    // $type_name: print the Python type name of a value.
+    let mut b = Body::new();
+    b.push("(if (ref.is_null (local.get $r))");
+    b.push_in(1, "(then");
+    push_text(&mut b, 2, "unassigned");
+    b.push_in(1, "(return))");
+    b.push(")");
+    for (test, name) in [
+        ("(ref.test (ref i31) (local.get $r))", "int"),
+        ("(ref.test (ref $INT) (local.get $r))", "int"),
+        ("(ref.test (ref $BOOL) (local.get $r))", "bool"),
+        ("(ref.test (ref $FLOAT) (local.get $r))", "float"),
+        ("(ref.test (ref $STR) (local.get $r))", "str"),
+        ("(ref.test (ref $LIST) (local.get $r))", "list"),
+        ("(ref.test (ref $DICT) (local.get $r))", "dict"),
+        ("(ref.test (ref $NONE_T) (local.get $r))", "NoneType"),
+    ] {
+        b.push(format!("(if {test}"));
+        b.push_in(1, "(then");
+        push_text(&mut b, 2, name);
+        b.push_in(1, "(return))");
+        b.push(")");
+    }
+    push_text(&mut b, 0, "object");
+    fs.push(Func {
+        signature: "(func $type_name (param $r (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_type_num: numeric operation on a non-number. A null here means
+    // a function local read before assignment — that's a NameError.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    b.push("(if (ref.is_null (local.get $r))");
+    b.push_in(1, "(then");
+    push_text(
+        &mut b,
+        2,
+        "NameError: a variable was used before it was given a value",
+    );
+    b.push_in(2, "(call $write_char (i32.const 10))");
+    b.push_in(2, "unreachable");
+    b.push_in(1, ")");
+    b.push(")");
+    push_text(&mut b, 0, "TypeError: expected a number, got '");
+    b.push("(call $type_name (local.get $r))");
+    push_text(&mut b, 0, "'");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_type_num (param $r (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_index: subscript position out of range.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "IndexError: ");
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(1, "(then");
+    push_text(&mut b, 2, "string");
+    b.push_in(1, ")");
+    b.push_in(1, "(else");
+    push_text(&mut b, 2, "list");
+    b.push_in(1, ")");
+    b.push(")");
+    push_text(&mut b, 0, " index out of range");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_index (param $r (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_key: dict lookup miss; the key prints in repr form.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "KeyError: ");
+    b.push("(call $print_repr (local.get $k))");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_key (param $k (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_zero_div
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "ZeroDivisionError: division by zero");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_zero_div".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // Type-name-bearing raisers that differ only in their message shape.
+    for (fname, before, after) in [
+        (
+            "$raise_no_len",
+            "TypeError: object of type '",
+            "' has no len()",
+        ),
+        (
+            "$raise_not_sub",
+            "TypeError: '",
+            "' object is not subscriptable",
+        ),
+        (
+            "$raise_no_item_assign",
+            "TypeError: '",
+            "' object does not support item assignment",
+        ),
+        (
+            "$raise_no_append",
+            "AttributeError: '",
+            "' object has no attribute 'append'",
+        ),
+    ] {
+        let mut b = Body::new();
+        b.push("(call $write_char (i32.const 10))");
+        push_text(&mut b, 0, before);
+        b.push("(call $type_name (local.get $r))");
+        push_text(&mut b, 0, after);
+        b.push("(call $write_char (i32.const 10))");
+        b.push("unreachable");
+        fs.push(Func {
+            signature: format!("(func {fname} (param $r (ref null eq))"),
+            locals: vec![],
+            body: b,
+        });
+    }
+
+    fs
 }
 
 /// The always-present boxed-value runtime: box/unbox/bool/truthy/print.
@@ -183,20 +342,29 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $unbox: value -> i32 (i31, $BOOL as 0/1, or $INT; traps on null).
+    // $unbox: value -> i32 (i31, $BOOL as 0/1, or $INT). Anything else
+    // raises a friendly TypeError (or NameError for an unassigned local).
     let mut b = Body::new();
-    b.push("(if (result i32) (ref.test (ref i31) (local.get $r))");
-    b.push_in(1, "(then (i31.get_s (ref.cast (ref i31) (local.get $r))))");
-    b.push_in(1, "(else");
-    b.push_in(2, "(if (result i32) (ref.test (ref $BOOL) (local.get $r))");
+    b.push("(if (ref.test (ref i31) (local.get $r))");
     b.push_in(
-        3,
-        "(then (struct.get_u $BOOL 0 (ref.cast (ref $BOOL) (local.get $r))))",
+        1,
+        "(then (return (i31.get_s (ref.cast (ref i31) (local.get $r)))))",
     );
+    b.push(")");
+    b.push("(if (ref.test (ref $BOOL) (local.get $r))");
     b.push_in(
-        3,
-        "(else (struct.get $INT 0 (ref.cast (ref $INT) (local.get $r)))))))",
+        1,
+        "(then (return (struct.get_u $BOOL 0 (ref.cast (ref $BOOL) (local.get $r)))))",
     );
+    b.push(")");
+    b.push("(if (ref.test (ref $INT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (struct.get $INT 0 (ref.cast (ref $INT) (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("(call $raise_type_num (local.get $r))");
+    b.push("unreachable");
     fs.push(Func {
         signature: "(func $unbox (param $r (ref null eq)) (result i32)".into(),
         locals: vec![],
@@ -300,7 +468,8 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (array.len (ref.cast (ref $STR) (local.get $r)))))",
     );
     b.push(")");
-    b.push("unreachable"); // len() of a non-sequence
+    b.push("(call $raise_no_len (local.get $r))");
+    b.push("unreachable");
     fs.push(Func {
         signature: "(func $py_len (param $r (ref null eq)) (result i32)".into(),
         locals: vec![],
@@ -308,9 +477,11 @@ fn runtime_helpers() -> Vec<Func> {
     });
 
     // $py_index: subscript read with Python negative-index normalization;
-    // out of range traps (Python raises IndexError). Strings yield a
-    // one-character string.
+    // out of range raises IndexError. Strings yield a one-character string.
     let mut b = Body::new();
+    b.push("(if (i32.eqz (i32.or (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))) (ref.test (ref $DICT) (local.get $r))))");
+    b.push_in(1, "(then (call $raise_not_sub (local.get $r)))");
+    b.push(")");
     b.push("(local.set $n (call $py_len (local.get $r)))");
     b.push("(if (i32.lt_s (local.get $i) (i32.const 0))");
     b.push_in(
@@ -319,7 +490,7 @@ fn runtime_helpers() -> Vec<Func> {
     );
     b.push(")");
     b.push("(if (i32.or (i32.lt_s (local.get $i) (i32.const 0)) (i32.ge_s (local.get $i) (local.get $n)))");
-    b.push_in(1, "(then unreachable)");
+    b.push_in(1, "(then (call $raise_index (local.get $r)))");
     b.push(")");
     b.push("(if (ref.test (ref $LIST) (local.get $r))");
     b.push_in(
@@ -347,6 +518,9 @@ fn runtime_helpers() -> Vec<Func> {
 
     // $py_set_index: `xs[i] = v` (lists only; same index rules as reads).
     let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $LIST) (local.get $r)))");
+    b.push_in(1, "(then (call $raise_no_item_assign (local.get $r)))");
+    b.push(")");
     b.push("(local.set $n (call $py_len (local.get $r)))");
     b.push("(if (i32.lt_s (local.get $i) (i32.const 0))");
     b.push_in(
@@ -355,7 +529,7 @@ fn runtime_helpers() -> Vec<Func> {
     );
     b.push(")");
     b.push("(if (i32.or (i32.lt_s (local.get $i) (i32.const 0)) (i32.ge_s (local.get $i) (local.get $n)))");
-    b.push_in(1, "(then unreachable)");
+    b.push_in(1, "(then (call $raise_index (local.get $r)))");
     b.push(")");
     b.push("(array.set $ITEMS (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $r))) (local.get $i) (local.get $v))");
     fs.push(Func {
@@ -369,6 +543,9 @@ fn runtime_helpers() -> Vec<Func> {
     // $list_append: amortized growth (double-ish, min 8); returns None like
     // Python's append.
     let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $LIST) (local.get $l)))");
+    b.push_in(1, "(then (call $raise_no_append (local.get $l)))");
+    b.push(")");
     b.push("(local.set $lst (ref.cast (ref $LIST) (local.get $l)))");
     b.push("(local.set $items (struct.get $LIST 1 (local.get $lst)))");
     b.push("(local.set $len (struct.get $LIST 0 (local.get $lst)))");
@@ -432,7 +609,7 @@ fn runtime_helpers() -> Vec<Func> {
     b.push("(local.set $dict (ref.cast (ref $DICT) (local.get $d)))");
     b.push("(local.set $i (call $dict_find (local.get $dict) (local.get $k)))");
     b.push("(if (i32.lt_s (local.get $i) (i32.const 0))");
-    b.push_in(1, "(then unreachable)");
+    b.push_in(1, "(then (call $raise_key (local.get $k)))");
     b.push(")");
     b.push("(array.get $ITEMS (struct.get $DICT 2 (local.get $dict)) (local.get $i))");
     fs.push(Func {
@@ -888,7 +1065,7 @@ fn runtime_helpers() -> Vec<Func> {
     let mut b = Body::new();
     b.push("(local.set $fb (call $unbox_f64 (local.get $b)))");
     b.push("(if (f64.eq (local.get $fb) (f64.const 0))");
-    b.push_in(1, "(then unreachable)");
+    b.push_in(1, "(then (call $raise_zero_div))");
     b.push(")");
     b.push("(struct.new $FLOAT (f64.div (call $unbox_f64 (local.get $a)) (local.get $fb)))");
     fs.push(Func {
@@ -1013,7 +1190,7 @@ fn py_floordiv_helper() -> Func {
     b.push_in(2, "(local.set $fb (call $unbox_f64 (local.get $b)))");
     b.push_in(
         2,
-        "(if (f64.eq (local.get $fb) (f64.const 0)) (then unreachable))",
+        "(if (f64.eq (local.get $fb) (f64.const 0)) (then (call $raise_zero_div)))",
     );
     b.push_in(
         2,
@@ -1043,7 +1220,7 @@ fn py_mod_helper() -> Func {
     b.push_in(2, "(local.set $fb (call $unbox_f64 (local.get $b)))");
     b.push_in(
         2,
-        "(if (f64.eq (local.get $fb) (f64.const 0)) (then unreachable))",
+        "(if (f64.eq (local.get $fb) (f64.const 0)) (then (call $raise_zero_div)))",
     );
     b.push_in(
         2,
@@ -1067,6 +1244,7 @@ fn py_mod_helper() -> Func {
 /// signs differ and the division isn't exact (`-7 // 2` is -4, not -3).
 fn floordiv_helper() -> Func {
     let mut b = Body::new();
+    b.push("(if (i32.eqz (local.get $b)) (then (call $raise_zero_div)))");
     b.push("(local.set $q (i32.div_s (local.get $a) (local.get $b)))");
     b.push("(if (i32.and");
     b.push_in(
@@ -1092,6 +1270,7 @@ fn floordiv_helper() -> Func {
 /// Python modulo: the result takes the sign of the divisor (`-7 % 2` is 1).
 fn floormod_helper() -> Func {
     let mut b = Body::new();
+    b.push("(if (i32.eqz (local.get $b)) (then (call $raise_zero_div)))");
     b.push("(local.set $r (i32.rem_s (local.get $a) (local.get $b)))");
     b.push("(if (i32.and");
     b.push_in(2, "(i32.ne (local.get $r) (i32.const 0))");

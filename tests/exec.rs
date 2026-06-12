@@ -78,6 +78,75 @@ fn assert_output(src: &str, expected: &str) {
     assert_eq!(run(src), expected, "program:\n{src}");
 }
 
+/// Run a program that is expected to raise: returns everything written
+/// before the trap (which includes the runtime's error message).
+fn run_expect_error(src: &str) -> String {
+    let wat = rust_p2w::compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
+    let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("invalid WAT: {e}\n---\n{wat}"));
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config).expect("engine");
+    let module = Module::new(&engine, &wasm[..]).expect("module");
+    let mut store: Store<Vec<u8>> = Store::new(&engine, Vec::new());
+    let mut linker: Linker<Vec<u8>> = Linker::new(&engine);
+    linker
+        .func_wrap(
+            "env",
+            "write_char",
+            |mut caller: Caller<'_, Vec<u8>>, c: i32| {
+                caller.data_mut().push(c as u8);
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "write_i32",
+            |mut caller: Caller<'_, Vec<u8>>, v: i32| {
+                caller
+                    .data_mut()
+                    .extend_from_slice(v.to_string().as_bytes());
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "write_f64",
+            |mut caller: Caller<'_, Vec<u8>>, v: f64| {
+                let s = if v.is_finite() && v == v.trunc() {
+                    format!("{v:.1}")
+                } else {
+                    format!("{v}")
+                };
+                caller.data_mut().extend_from_slice(s.as_bytes());
+            },
+        )
+        .unwrap();
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
+    let start = instance
+        .get_typed_func::<(), i32>(&mut store, "_start")
+        .expect("_start export");
+    let result = start.call(&mut store, ());
+    assert!(
+        result.is_err(),
+        "expected a runtime error, program ran fine"
+    );
+    String::from_utf8(store.into_data()).expect("output is UTF-8")
+}
+
+#[track_caller]
+fn assert_raises(src: &str, message_contains: &str) {
+    let out = run_expect_error(src);
+    assert!(
+        out.contains(message_contains),
+        "expected {message_contains:?} in output, got:\n{out}\nprogram:\n{src}"
+    );
+}
+
 // --- and / or: Python value semantics + short-circuit ---
 
 #[test]
@@ -444,6 +513,85 @@ fn float_truthiness() {
         "if 0.5:\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
         "yes\n",
     );
+}
+
+// --- runtime errors print friendly Python-style messages ---
+
+#[test]
+fn type_errors_name_the_offending_type() {
+    assert_raises(
+        "x = \"a\"\ny = 1\nprint(x - y)",
+        "TypeError: expected a number, got 'str'",
+    );
+    assert_raises(
+        "x = [1]\nprint(x * 2)",
+        "TypeError: expected a number, got 'list'",
+    );
+    assert_raises(
+        "x = None\nprint(x + 1)",
+        "TypeError: expected a number, got 'NoneType'",
+    );
+}
+
+#[test]
+fn index_and_key_errors() {
+    assert_raises(
+        "xs = [1, 2]\nprint(xs[5])",
+        "IndexError: list index out of range",
+    );
+    assert_raises(
+        "s = \"ab\"\nprint(s[9])",
+        "IndexError: string index out of range",
+    );
+    assert_raises(
+        "d = {\"a\": 1}\nprint(d[\"missing\"])",
+        "KeyError: 'missing'",
+    );
+    assert_raises(
+        "x = 5\nprint(x[0])",
+        "TypeError: 'int' object is not subscriptable",
+    );
+    assert_raises(
+        "s = \"ab\"\ns[0] = \"x\"",
+        "TypeError: 'str' object does not support item assignment",
+    );
+}
+
+#[test]
+fn zero_division_errors() {
+    assert_raises(
+        "a = 7\nb = 0\nprint(a // b)",
+        "ZeroDivisionError: division by zero",
+    );
+    assert_raises("a = 7\nb = 0\nprint(a % b)", "ZeroDivisionError");
+    assert_raises("a = 7.5\nb = 0\nprint(a / b)", "ZeroDivisionError");
+}
+
+#[test]
+fn len_and_method_errors() {
+    assert_raises(
+        "x = 5\nprint(len(x))",
+        "TypeError: object of type 'int' has no len()",
+    );
+    assert_raises(
+        "x = 5\nx.append(1)",
+        "AttributeError: 'int' object has no attribute 'append'",
+    );
+}
+
+#[test]
+fn unassigned_function_local_is_a_name_error() {
+    assert_raises(
+        "def f(flag):\n    if flag:\n        x = 1\n    return x\nprint(f(False))",
+        "NameError: a variable was used before it was given a value",
+    );
+}
+
+#[test]
+fn output_before_the_error_is_preserved() {
+    let out = run_expect_error("print(\"step 1\")\nprint(\"step 2\")\nxs = []\nprint(xs[0])");
+    assert!(out.starts_with("step 1\nstep 2\n"));
+    assert!(out.contains("IndexError"));
 }
 
 // --- chained comparisons ---
