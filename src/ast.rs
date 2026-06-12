@@ -32,12 +32,18 @@ pub enum StmtKind {
         elifs: Vec<(Expr, Vec<Stmt>)>,
         else_body: Option<Vec<Stmt>>,
     },
-    /// `for var in range(start, end, step): ...`
+    /// `for var in range(start, end, step): ...` — the counted fast path.
     For {
         var: String,
         start: Expr,
         end: Expr,
         step: Expr,
+        body: Vec<Stmt>,
+    },
+    /// `for var in iterable: ...` over a sequence (list or string).
+    ForEach {
+        var: String,
+        iterable: Expr,
         body: Vec<Stmt>,
     },
     /// `while cond: ...`
@@ -54,6 +60,12 @@ pub enum StmtKind {
     },
     /// `return [expr]` (inside a function; bare return yields None)
     Return(Option<Expr>),
+    /// `target[index] = value`
+    SetIndex {
+        target: Expr,
+        index: Expr,
+        value: Expr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +95,12 @@ pub enum ExprKind {
     Bin(BinOp, Box<Expr>, Box<Expr>),
     /// A call by name, e.g. `print(...)`. Callee is a bare name for now.
     Call(String, Vec<Expr>),
+    /// A list literal, e.g. `[1, 2, 3]`.
+    List(Vec<Expr>),
+    /// Subscript read, e.g. `xs[i]` (lists and strings).
+    Index(Box<Expr>, Box<Expr>),
+    /// A method call, e.g. `xs.append(v)`.
+    MethodCall(Box<Expr>, String, Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

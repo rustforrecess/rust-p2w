@@ -207,6 +207,87 @@ fn function_with_loop_and_early_return() {
     );
 }
 
+// --- lists ---
+
+#[test]
+fn list_literals_print_like_python() {
+    assert_output("print([1, 2, 3])", "[1, 2, 3]\n");
+    assert_output("print([])", "[]\n");
+    // Strings inside lists print with quotes (repr), like Python.
+    assert_output(
+        "print([1, \"a\", True, None, 2.5])",
+        "[1, 'a', True, None, 2.5]\n",
+    );
+    assert_output("print([[1, 2], [3]])", "[[1, 2], [3]]\n");
+}
+
+#[test]
+fn list_indexing_and_negative_indices() {
+    assert_output(
+        "xs = [10, 20, 30]\nprint(xs[0], xs[2], xs[-1], xs[-3])",
+        "10 30 30 10\n",
+    );
+    assert_output("grid = [[1, 2], [3, 4]]\nprint(grid[1][0])", "3\n");
+    assert_output("print(\"hello\"[1], \"hello\"[-1])", "e o\n");
+}
+
+#[test]
+fn list_index_assignment() {
+    assert_output(
+        "xs = [1, 2, 3]\nxs[1] = 99\nxs[-1] = 0\nprint(xs)",
+        "[1, 99, 0]\n",
+    );
+}
+
+#[test]
+fn append_grows_past_initial_capacity() {
+    assert_output(
+        "xs = []\nfor i in range(20):\n    xs.append(i * i)\nprint(len(xs), xs[0], xs[19])",
+        "20 0 361\n",
+    );
+}
+
+#[test]
+fn len_builtin() {
+    assert_output("print(len([1, 2, 3]), len([]), len(\"hello\"))", "3 0 5\n");
+}
+
+#[test]
+fn for_in_list_and_string() {
+    assert_output("for x in [3, 1, 2]:\n    print(x)", "3\n1\n2\n");
+    assert_output("for c in \"abc\":\n    print(c)", "a\nb\nc\n");
+    assert_output(
+        "total = 0\nfor x in [1, 2, 3, 4]:\n    total = total + x\nprint(total)",
+        "10\n",
+    );
+}
+
+#[test]
+fn list_equality_and_concat() {
+    assert_output(
+        "print([1, 2] == [1, 2], [1, 2] == [1, 3], [1] == 1)",
+        "True False False\n",
+    );
+    assert_output("print([[1], \"a\"] == [[1], \"a\"])", "True\n");
+    assert_output("print([1, 2] + [3])", "[1, 2, 3]\n");
+}
+
+#[test]
+fn list_truthiness() {
+    assert_output(
+        "if []:\n    print(\"y\")\nelse:\n    print(\"n\")\nif [0]:\n    print(\"t\")\n",
+        "n\nt\n",
+    );
+}
+
+#[test]
+fn lists_are_references_and_functions_take_them() {
+    assert_output(
+        "def push_twice(xs, v):\n    xs.append(v)\n    xs.append(v)\nys = [1]\npush_twice(ys, 7)\nprint(ys)",
+        "[1, 7, 7]\n",
+    );
+}
+
 // --- strings are values ---
 
 #[test]
@@ -477,6 +558,11 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "bonus = 10\ndef score(p):\n    return p + bonus\nprint(score(5), score(0.5))",
     "def f():\n    x = 1\nprint(f(), None == None, not None)",
     "def is_even(n):\n    if n == 0:\n        return True\n    return is_odd(n - 1)\ndef is_odd(n):\n    if n == 0:\n        return False\n    return is_even(n - 1)\nprint(is_even(8), is_odd(8))",
+    "print([1, \"a\", True, None, 2.5])\nprint([[1, 2], []])",
+    "xs = [10, 20, 30]\nxs[1] = 99\nprint(xs[0], xs[-1], len(xs), xs)",
+    "xs = []\nfor i in range(12):\n    xs.append(i)\nprint(len(xs), xs[-1], xs == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])",
+    "total = 0\nfor x in [2, 4, 6]:\n    total = total + x\nfor c in \"ab\":\n    print(c)\nprint(total, [1] + [2, 3])",
+    "def tail(xs):\n    return xs[-1]\nprint(tail([5, 6, 7]), tail(\"xyz\"))",
     "if \"\":\n    print(\"y\")\nelse:\n    print(\"n\")\nprint(\"\" or \"fb\", \"a\" and \"b\")",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",

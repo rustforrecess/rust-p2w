@@ -145,21 +145,32 @@ impl<'a> Parser<'a> {
                 line,
             });
         }
-        // Assignment: `name = expr`.
-        if let Tok::Name(name) = self.peek().clone() {
-            if *self.peek2() == Tok::Eq {
-                self.advance(); // name
-                self.advance(); // '='
-                let value = self.expr(0)?;
-                self.expect(&Tok::Newline, "a new line")?;
-                return Ok(Stmt {
+        // Assignment or expression statement: parse the expression first,
+        // then decide based on what follows.
+        let e = self.expr(0)?;
+        if matches!(self.peek(), Tok::Eq) {
+            self.advance();
+            let value = self.expr(0)?;
+            self.expect(&Tok::Newline, "a new line")?;
+            return match e.kind {
+                ExprKind::Name(name) => Ok(Stmt {
                     kind: StmtKind::Assign(name, value),
                     line,
-                });
-            }
+                }),
+                ExprKind::Index(target, index) => Ok(Stmt {
+                    kind: StmtKind::SetIndex {
+                        target: *target,
+                        index: *index,
+                        value,
+                    },
+                    line,
+                }),
+                _ => Err(CompileError::at(
+                    line,
+                    "can only assign to a variable or an index like xs[i]",
+                )),
+            };
         }
-        // Expression statement.
-        let e = self.expr(0)?;
         self.expect(&Tok::Newline, "a new line")?;
         Ok(Stmt {
             kind: StmtKind::Expr(e),
@@ -292,33 +303,49 @@ impl<'a> Parser<'a> {
             }
         };
         self.eat_keyword("in")?;
-        self.eat_keyword("range")?;
-        self.expect(&Tok::LParen, "'(' after range")?;
-        let args = self.call_args()?;
-        let int = |n: i64| Expr {
-            kind: ExprKind::Int(n),
-            line,
-        };
-        let (start, end, step) = match args.len() {
-            1 => (int(0), args[0].clone(), int(1)),
-            2 => (args[0].clone(), args[1].clone(), int(1)),
-            3 => (args[0].clone(), args[1].clone(), args[2].clone()),
-            n => {
-                return Err(CompileError::at(
-                    self.line(),
-                    format!("range() takes 1 to 3 arguments, got {n}"),
-                ))
-            }
-        };
+        // `range(...)` is the counted fast path; any other expression
+        // iterates a sequence (list or string).
+        if self.is_keyword("range") && *self.peek2() == Tok::LParen {
+            self.advance(); // range
+            self.advance(); // (
+            let args = self.call_args()?;
+            let int = |n: i64| Expr {
+                kind: ExprKind::Int(n),
+                line,
+            };
+            let (start, end, step) = match args.len() {
+                1 => (int(0), args[0].clone(), int(1)),
+                2 => (args[0].clone(), args[1].clone(), int(1)),
+                3 => (args[0].clone(), args[1].clone(), args[2].clone()),
+                n => {
+                    return Err(CompileError::at(
+                        self.line(),
+                        format!("range() takes 1 to 3 arguments, got {n}"),
+                    ))
+                }
+            };
+            self.expect(&Tok::Colon, "':'")?;
+            self.expect(&Tok::Newline, "a new line")?;
+            let body = self.block()?;
+            return Ok(Stmt {
+                kind: StmtKind::For {
+                    var,
+                    start,
+                    end,
+                    step,
+                    body,
+                },
+                line,
+            });
+        }
+        let iterable = self.expr(0)?;
         self.expect(&Tok::Colon, "':'")?;
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
         Ok(Stmt {
-            kind: StmtKind::For {
+            kind: StmtKind::ForEach {
                 var,
-                start,
-                end,
-                step,
+                iterable,
                 body,
             },
             line,
@@ -407,7 +434,53 @@ impl<'a> Parser<'a> {
                 line,
             });
         }
-        self.primary()
+        let atom = self.primary()?;
+        self.postfix(atom)
+    }
+
+    /// Postfix operators: `xs[i]` subscripts and `xs.method(args)` calls,
+    /// chaining left to right (`grid[0][1]`, `xs.append(v)`).
+    fn postfix(&mut self, mut e: Expr) -> Result<Expr> {
+        loop {
+            match self.peek() {
+                Tok::LBracket => {
+                    let line = self.line();
+                    self.advance();
+                    let index = self.expr(0)?;
+                    self.expect(&Tok::RBracket, "']'")?;
+                    e = Expr {
+                        kind: ExprKind::Index(Box::new(e), Box::new(index)),
+                        line,
+                    };
+                }
+                Tok::Dot => {
+                    let line = self.line();
+                    self.advance();
+                    let method = match self.peek().clone() {
+                        Tok::Name(m) => {
+                            self.advance();
+                            m
+                        }
+                        other => {
+                            return Err(CompileError::at(
+                                self.line(),
+                                format!("expected a method name after '.', found {other:?}"),
+                            ))
+                        }
+                    };
+                    self.expect(
+                        &Tok::LParen,
+                        "'(' (only method calls are supported after '.')",
+                    )?;
+                    let args = self.call_args()?;
+                    e = Expr {
+                        kind: ExprKind::MethodCall(Box::new(e), method, args),
+                        line,
+                    };
+                }
+                _ => return Ok(e),
+            }
+        }
     }
 
     fn primary(&mut self) -> Result<Expr> {
@@ -431,6 +504,25 @@ impl<'a> Parser<'a> {
                 let e = self.expr(0)?;
                 self.expect(&Tok::RParen, "')'")?;
                 Ok(e)
+            }
+            Tok::LBracket => {
+                self.advance();
+                let mut elements = Vec::new();
+                if !matches!(self.peek(), Tok::RBracket) {
+                    loop {
+                        elements.push(self.expr(0)?);
+                        if matches!(self.peek(), Tok::Comma) {
+                            self.advance();
+                            if matches!(self.peek(), Tok::RBracket) {
+                                break; // trailing comma
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RBracket, "']'")?;
+                Ok(expr(ExprKind::List(elements)))
             }
             Tok::Name(name) => {
                 self.advance();
@@ -518,9 +610,10 @@ fn is_comparison(op: BinOp) -> bool {
 /// Whether the expression contains a function call (side effects possible).
 fn contains_call(e: &Expr) -> bool {
     match &e.kind {
-        ExprKind::Call(..) => true,
+        ExprKind::Call(..) | ExprKind::MethodCall(..) => true,
         ExprKind::Unary(_, inner) => contains_call(inner),
-        ExprKind::Bin(_, a, b) => contains_call(a) || contains_call(b),
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => contains_call(a) || contains_call(b),
+        ExprKind::List(elems) => elems.iter().any(contains_call),
         _ => false,
     }
 }

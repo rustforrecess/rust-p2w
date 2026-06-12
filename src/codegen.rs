@@ -103,6 +103,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // must stay the only fieldless struct).
     module.types.push("(type $STR (array (mut i8)))".into());
     module
+        .types
+        .push("(type $ITEMS (array (mut (ref null eq))))".into());
+    // A list is a Vec: logical length + a capacity-sized item array.
+    module
+        .types
+        .push("(type $LIST (struct (field (mut i32)) (field (mut (ref null $ITEMS)))))".into());
+    module
         .imports
         .push(r#"(import "env" "write_char" (func $write_char (param i32)))"#.into());
     module
@@ -249,10 +256,204 @@ fn runtime_helpers() -> Vec<Func> {
     b.push("(if (ref.test (ref $NONE_T) (local.get $r))");
     b.push_in(1, "(then (return (i32.const 0)))"); // None is falsy
     b.push(")");
+    b.push("(if (ref.test (ref $LIST) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (i32.ne (struct.get $LIST 0 (ref.cast (ref $LIST) (local.get $r))) (i32.const 0))))",
+    );
+    b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
     fs.push(Func {
         signature: "(func $truthy (param $r (ref null eq)) (result i32)".into(),
         locals: vec![],
+        body: b,
+    });
+
+    // $py_len: sequence length (lists and strings).
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $LIST) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (struct.get $LIST 0 (ref.cast (ref $LIST) (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (array.len (ref.cast (ref $STR) (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("unreachable"); // len() of a non-sequence
+    fs.push(Func {
+        signature: "(func $py_len (param $r (ref null eq)) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_index: subscript read with Python negative-index normalization;
+    // out of range traps (Python raises IndexError). Strings yield a
+    // one-character string.
+    let mut b = Body::new();
+    b.push("(local.set $n (call $py_len (local.get $r)))");
+    b.push("(if (i32.lt_s (local.get $i) (i32.const 0))");
+    b.push_in(
+        1,
+        "(then (local.set $i (i32.add (local.get $i) (local.get $n))))",
+    );
+    b.push(")");
+    b.push("(if (i32.or (i32.lt_s (local.get $i) (i32.const 0)) (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(1, "(then unreachable)");
+    b.push(")");
+    b.push("(if (ref.test (ref $LIST) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (array.get $ITEMS (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $r))) (local.get $i))))",
+    );
+    b.push(")");
+    b.push("(local.set $c (array.new_default $STR (i32.const 1)))");
+    b.push("(array.set $STR (local.get $c) (i32.const 0) (array.get_u $STR (ref.cast (ref $STR) (local.get $r)) (local.get $i)))");
+    b.push("(local.get $c)");
+    fs.push(Func {
+        signature: "(func $py_index (param $r (ref null eq)) (param $i i32) (result (ref null eq))"
+            .into(),
+        locals: vec!["(local $n i32)".into(), "(local $c (ref null $STR))".into()],
+        body: b,
+    });
+
+    // $py_set_index: `xs[i] = v` (lists only; same index rules as reads).
+    let mut b = Body::new();
+    b.push("(local.set $n (call $py_len (local.get $r)))");
+    b.push("(if (i32.lt_s (local.get $i) (i32.const 0))");
+    b.push_in(
+        1,
+        "(then (local.set $i (i32.add (local.get $i) (local.get $n))))",
+    );
+    b.push(")");
+    b.push("(if (i32.or (i32.lt_s (local.get $i) (i32.const 0)) (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(1, "(then unreachable)");
+    b.push(")");
+    b.push("(array.set $ITEMS (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $r))) (local.get $i) (local.get $v))");
+    fs.push(Func {
+        signature:
+            "(func $py_set_index (param $r (ref null eq)) (param $i i32) (param $v (ref null eq))"
+                .into(),
+        locals: vec!["(local $n i32)".into()],
+        body: b,
+    });
+
+    // $list_append: amortized growth (double-ish, min 8); returns None like
+    // Python's append.
+    let mut b = Body::new();
+    b.push("(local.set $lst (ref.cast (ref $LIST) (local.get $l)))");
+    b.push("(local.set $items (struct.get $LIST 1 (local.get $lst)))");
+    b.push("(local.set $len (struct.get $LIST 0 (local.get $lst)))");
+    b.push("(if (i32.ge_s (local.get $len) (array.len (local.get $items)))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $new (array.new_default $ITEMS (i32.shl (i32.add (array.len (local.get $items)) (i32.const 4)) (i32.const 1))))",
+    );
+    b.push_in(
+        2,
+        "(array.copy $ITEMS $ITEMS (local.get $new) (i32.const 0) (local.get $items) (i32.const 0) (local.get $len))",
+    );
+    b.push_in(2, "(struct.set $LIST 1 (local.get $lst) (local.get $new))");
+    b.push_in(2, "(local.set $items (local.get $new))");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(array.set $ITEMS (local.get $items) (local.get $len) (local.get $v))");
+    b.push("(struct.set $LIST 0 (local.get $lst) (i32.add (local.get $len) (i32.const 1)))");
+    b.push("(global.get $NONE)");
+    fs.push(Func {
+        signature:
+            "(func $list_append (param $l (ref null eq)) (param $v (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $lst (ref null $LIST))".into(),
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $new (ref null $ITEMS))".into(),
+            "(local $len i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $print_repr: element form used inside list printing — strings get
+    // quotes (Python repr), everything else prints as itself.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(call $write_char (i32.const 39))"); // '
+    b.push_in(2, "(call $print_str (ref.cast (ref $STR) (local.get $r)))");
+    b.push_in(2, "(call $write_char (i32.const 39))");
+    b.push_in(2, "(return)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(call $print_value (local.get $r))");
+    fs.push(Func {
+        signature: "(func $print_repr (param $r (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $print_list: `[e1, e2, ...]` with repr elements (nested lists recurse
+    // through $print_value -> $print_list).
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 91))"); // [
+    b.push("(local.set $n (struct.get $LIST 0 (local.get $l)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(2, "(if (i32.gt_s (local.get $i) (i32.const 0))");
+    b.push_in(
+        3,
+        "(then (call $write_char (i32.const 44)) (call $write_char (i32.const 32)))",
+    );
+    b.push_in(2, ")");
+    b.push_in(
+        2,
+        "(call $print_repr (array.get $ITEMS (struct.get $LIST 1 (local.get $l)) (local.get $i)))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(call $write_char (i32.const 93))"); // ]
+    fs.push(Func {
+        signature: "(func $print_list (param $l (ref null $LIST))".into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
+    // $list_eq: element-wise equality (recurses through $py_eq).
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $LIST 0 (local.get $a)))");
+    b.push("(if (i32.ne (local.get $n) (struct.get $LIST 0 (local.get $b)))");
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(2, "(if (i32.eqz (call $py_eq");
+    b.push_in(
+        4,
+        "(array.get $ITEMS (struct.get $LIST 1 (local.get $a)) (local.get $i))",
+    );
+    b.push_in(
+        4,
+        "(array.get $ITEMS (struct.get $LIST 1 (local.get $b)) (local.get $i))))",
+    );
+    b.push_in(3, "(then (return (i32.const 0)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const 1)");
+    fs.push(Func {
+        signature:
+            "(func $list_eq (param $a (ref null $LIST)) (param $b (ref null $LIST)) (result i32)"
+                .into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
     });
 
@@ -298,6 +499,12 @@ fn runtime_helpers() -> Vec<Func> {
     }
     b.push_in(1, "(return))");
     b.push(")");
+    b.push("(if (ref.test (ref $LIST) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $print_list (ref.cast (ref $LIST) (local.get $r)))))",
+    );
+    b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
     b.push_in(1, "(then");
     b.push_in(
@@ -321,9 +528,39 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_add: Python `+` — string concatenation when both sides are
-    // strings, numeric addition otherwise.
+    // $list_concat: `[1] + [2]` makes a new list.
     let mut b = Body::new();
+    b.push("(local.set $na (struct.get $LIST 0 (local.get $a)))");
+    b.push("(local.set $nb (struct.get $LIST 0 (local.get $b)))");
+    b.push(
+        "(local.set $items (array.new_default $ITEMS (i32.add (local.get $na) (local.get $nb))))",
+    );
+    b.push("(array.copy $ITEMS $ITEMS (local.get $items) (i32.const 0) (struct.get $LIST 1 (local.get $a)) (i32.const 0) (local.get $na))");
+    b.push("(array.copy $ITEMS $ITEMS (local.get $items) (local.get $na) (struct.get $LIST 1 (local.get $b)) (i32.const 0) (local.get $nb))");
+    b.push("(struct.new $LIST (i32.add (local.get $na) (local.get $nb)) (local.get $items))");
+    fs.push(Func {
+        signature:
+            "(func $list_concat (param $a (ref null $LIST)) (param $b (ref null $LIST)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $na i32)".into(),
+            "(local $nb i32)".into(),
+            "(local $items (ref null $ITEMS))".into(),
+        ],
+        body: b,
+    });
+
+    // $py_add: Python `+` — list/string concatenation when both sides
+    // match, numeric addition otherwise.
+    let mut b = Body::new();
+    b.push(
+        "(if (i32.and (ref.test (ref $LIST) (local.get $a)) (ref.test (ref $LIST) (local.get $b)))",
+    );
+    b.push_in(
+        1,
+        "(then (return (call $list_concat (ref.cast (ref $LIST) (local.get $a)) (ref.cast (ref $LIST) (local.get $b)))))",
+    );
+    b.push(")");
     b.push("(if (result (ref null eq))");
     b.push_in(
         2,
@@ -465,6 +702,19 @@ fn runtime_helpers() -> Vec<Func> {
         1,
         "(then (return (i32.and (ref.test (ref $NONE_T) (local.get $a)) (ref.test (ref $NONE_T) (local.get $b)))))",
     );
+    b.push(")");
+    b.push(
+        "(if (i32.and (ref.test (ref $LIST) (local.get $a)) (ref.test (ref $LIST) (local.get $b)))",
+    );
+    b.push_in(
+        1,
+        "(then (return (call $list_eq (ref.cast (ref $LIST) (local.get $a)) (ref.cast (ref $LIST) (local.get $b)))))",
+    );
+    b.push(")");
+    b.push(
+        "(if (i32.or (ref.test (ref $LIST) (local.get $a)) (ref.test (ref $LIST) (local.get $b)))",
+    );
+    b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
     b.push(
         "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
@@ -687,7 +937,7 @@ impl Gen {
             }
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::Call(name, args) if name == "print" => self.gen_print(cx, args, out),
-                ExprKind::Call(..) => {
+                ExprKind::Call(..) | ExprKind::MethodCall(..) => {
                     // A bare call: evaluate for its effects, drop the result.
                     let v = self.value_expr(cx, e)?;
                     out.push(format!("(drop {v})"));
@@ -733,6 +983,23 @@ impl Gen {
                 step,
                 body,
             } => self.gen_for(cx, var, start, end, step, body, s.line, out),
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => self.gen_foreach(cx, var, iterable, body, out),
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                self.type_of(cx, value)?;
+                let t = self.value_expr(cx, target)?;
+                let i = self.i32_expr(cx, index)?;
+                let v = self.value_expr(cx, value)?;
+                out.push(format!("(call $py_set_index {t} {i} {v})"));
+                Ok(())
+            }
             StmtKind::While { cond, body } => self.gen_while(cx, cond, body, out),
             StmtKind::Break => match cx.loops.last() {
                 Some((brk, _)) => {
@@ -998,6 +1265,58 @@ impl Gen {
         })
     }
 
+    /// `for var in <sequence>:` — snapshot the iterable, index through it
+    /// with $py_index. Length is re-read each pass (Python's list iterator
+    /// does the same, so appending inside the loop extends it).
+    fn gen_foreach(
+        &mut self,
+        cx: &mut FuncCx,
+        var: &str,
+        iterable: &Expr,
+        body: &[Stmt],
+        out: &mut Body,
+    ) -> Result<()> {
+        self.type_of(cx, iterable)?;
+        let it_wat = self.value_expr(cx, iterable)?;
+        let n = cx.fresh();
+        let it = cx.scratch_local(VAL);
+        let idx = format!(".f{n}");
+        cx.locals.push((idx.clone(), "i32".to_string()));
+        let set_var = if cx.is_top {
+            self.ensure_global(var);
+            format!("(global.set $g_{var} (call $py_index (local.get ${it}) (local.get ${idx})))")
+        } else {
+            format!("(local.set ${var} (call $py_index (local.get ${it}) (local.get ${idx})))")
+        };
+
+        cx.loops.push((format!("$b{n}"), format!("$c{n}")));
+        let mut body_b = Body::new();
+        let r = self.stmts(cx, body, &mut body_b);
+        cx.loops.pop();
+        r?;
+
+        out.push(format!("(local.set ${it} {it_wat})"));
+        out.push(format!("(local.set ${idx} (i32.const 0))"));
+        out.push(format!("(block $b{n}"));
+        out.push_in(1, format!("(loop $l{n}"));
+        out.push_in(
+            2,
+            format!("(br_if $b{n} (i32.ge_s (local.get ${idx}) (call $py_len (local.get ${it}))))"),
+        );
+        out.push_in(2, set_var);
+        out.push_in(2, format!("(block $c{n}"));
+        out.append(body_b, 3);
+        out.push_in(2, ")");
+        out.push_in(
+            2,
+            format!("(local.set ${idx} (i32.add (local.get ${idx}) (i32.const 1)))"),
+        );
+        out.push_in(2, format!("(br $l{n})"));
+        out.push_in(1, ")");
+        out.push(")");
+        Ok(())
+    }
+
     /// Generate WAT producing the boxed `(ref null eq)` value of `e`.
     fn value_expr(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
         // Fold integer constants — this is also where literals are
@@ -1136,12 +1455,52 @@ impl Gen {
                     bytes.join(" ")
                 ))
             }
+            ExprKind::List(elems) => {
+                let mut items = String::new();
+                for el in elems {
+                    items.push(' ');
+                    items.push_str(&self.value_expr(cx, el)?);
+                }
+                let n = elems.len();
+                Ok(format!(
+                    "(struct.new $LIST (i32.const {n}) (array.new_fixed $ITEMS {n}{items}))"
+                ))
+            }
+            ExprKind::Index(obj, idx) => {
+                let o = self.value_expr(cx, obj)?;
+                let i = self.i32_expr(cx, idx)?;
+                Ok(format!("(call $py_index {o} {i})"))
+            }
+            ExprKind::MethodCall(recv, method, args) => {
+                if method == "append" && args.len() == 1 {
+                    let r = self.value_expr(cx, recv)?;
+                    let v = self.value_expr(cx, &args[0])?;
+                    Ok(format!("(call $list_append {r} {v})"))
+                } else {
+                    Err(CompileError::at(
+                        e.line,
+                        format!(
+                            ".{method}({}) isn't supported yet — lists support .append(value)",
+                            if args.is_empty() { "" } else { "..." }
+                        ),
+                    ))
+                }
+            }
             ExprKind::Call(n, args) => {
                 if n == "print" {
                     return Err(CompileError::at(
                         e.line,
                         "print(...) can't be used inside an expression",
                     ));
+                }
+                // User functions first (a `def len` shadows the builtin,
+                // like Python); then the len() builtin.
+                if !self.funcs.contains_key(n.as_str()) && n == "len" {
+                    if args.len() != 1 {
+                        return Err(CompileError::at(e.line, "len() takes exactly one argument"));
+                    }
+                    let v = self.value_expr(cx, &args[0])?;
+                    return Ok(format!("(call $box (call $py_len {v}))"));
                 }
                 let Some(&arity) = self.funcs.get(n) else {
                     return Err(CompileError::at(e.line, format!("unknown function '{n}'")));
@@ -1266,10 +1625,11 @@ fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>)
             StmtKind::Assign(name, _) => {
                 out.insert(name.clone());
             }
-            StmtKind::For { var, body, .. } => {
+            StmtKind::For { var, body, .. } | StmtKind::ForEach { var, body, .. } => {
                 out.insert(var.clone());
                 collect_assigned(body, out);
             }
+            StmtKind::SetIndex { .. } => {}
             StmtKind::While { body, .. } => collect_assigned(body, out),
             StmtKind::If {
                 body,
@@ -1366,7 +1726,30 @@ impl Gen {
                     ))
                 }
             }
-            ExprKind::Call(..) => Ok(Ty::Value),
+            ExprKind::Call(_, args) => {
+                for a in args {
+                    self.type_of(cx, a)?;
+                }
+                Ok(Ty::Value)
+            }
+            ExprKind::List(elems) => {
+                for el in elems {
+                    self.type_of(cx, el)?;
+                }
+                Ok(Ty::Value)
+            }
+            ExprKind::Index(obj, idx) => {
+                self.type_of(cx, obj)?;
+                self.type_of(cx, idx)?;
+                Ok(Ty::Value)
+            }
+            ExprKind::MethodCall(recv, _, args) => {
+                self.type_of(cx, recv)?;
+                for a in args {
+                    self.type_of(cx, a)?;
+                }
+                Ok(Ty::Value)
+            }
         }
     }
 }

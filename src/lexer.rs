@@ -36,6 +36,9 @@ pub enum Tok {
     Colon,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
+    Dot,
     Comma,
 
     // Layout
@@ -248,6 +251,34 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 }
                 out.push(Token {
                     tok: Tok::RParen,
+                    line,
+                });
+                i += 1;
+            }
+            // Brackets suppress newlines exactly like parens (Python allows
+            // multi-line list literals).
+            '[' => {
+                paren_depth += 1;
+                out.push(Token {
+                    tok: Tok::LBracket,
+                    line,
+                });
+                i += 1;
+            }
+            ']' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return Err(CompileError::at(line, "unmatched ']'"));
+                }
+                out.push(Token {
+                    tok: Tok::RBracket,
+                    line,
+                });
+                i += 1;
+            }
+            '.' => {
+                out.push(Token {
+                    tok: Tok::Dot,
                     line,
                 });
                 i += 1;
