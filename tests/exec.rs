@@ -1,12 +1,13 @@
-//! Execution tests: compile to WAT, run the WASM for real (wasmi, with the
-//! same `env.write_char` / `env.write_i32` host imports the browser harness
-//! provides), and compare stdout against what CPython prints.
+//! Execution tests: compile to WAT, run the WASM for real (wasmtime with
+//! WASM-GC enabled, with the same `env.write_char` / `env.write_i32` host
+//! imports the browser harness provides), and compare stdout against what
+//! CPython prints.
 //!
 //! WAT-validation tests can't catch miscompiles that produce well-formed but
 //! wrong code (bitwise `and`, truncating `//`, re-evaluated range bounds…) —
 //! these can.
 
-use wasmi::{Caller, Engine, Linker, Module, Store};
+use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 
 /// Compile and execute `src`, returning everything written via the host
 /// imports, decoded as UTF-8.
@@ -14,7 +15,10 @@ fn run(src: &str) -> String {
     let wat = rust_p2w::compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
     let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("invalid WAT: {e}\n---\n{wat}"));
 
-    let engine = Engine::default();
+    let mut config = Config::new();
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    let engine = Engine::new(&config).expect("engine");
     let module = Module::new(&engine, &wasm[..]).expect("module");
     // Store data is the output byte buffer; write_char sends UTF-8 bytes.
     let mut store: Store<Vec<u8>> = Store::new(&engine, Vec::new());
@@ -42,11 +46,9 @@ fn run(src: &str) -> String {
 
     let instance = linker
         .instantiate(&mut store, &module)
-        .expect("instantiate")
-        .start(&mut store)
-        .expect("start");
+        .expect("instantiate");
     let start = instance
-        .get_typed_func::<(), i32>(&store, "_start")
+        .get_typed_func::<(), i32>(&mut store, "_start")
         .expect("_start export with i32 result");
     let exit = start.call(&mut store, ()).expect("execution trapped");
     assert_eq!(exit, 0, "_start exit code");
@@ -85,6 +87,25 @@ fn truthiness_in_conditions() {
         "if 0 or 0:\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
         "no\n",
     );
+}
+
+// --- booleans are a real type ---
+
+#[test]
+fn booleans_print_as_true_false() {
+    assert_output("print(True)", "True\n");
+    assert_output("print(False)", "False\n");
+    assert_output("print(1 == 1)", "True\n");
+    assert_output("print(1 > 2)", "False\n");
+    assert_output("print(5 > 4 > 3)", "True\n");
+    assert_output("print(not True)", "False\n");
+}
+
+#[test]
+fn booleans_count_as_one_and_zero_in_arithmetic() {
+    assert_output("print(True + 1)", "2\n");
+    assert_output("print(False * 10)", "0\n");
+    assert_output("x = True\nprint(x + x)", "2\n");
 }
 
 // --- chained comparisons ---
@@ -234,11 +255,14 @@ print(\"sum of evens:\", total)
 
 // --- differential testing against real CPython, when available ---
 
-/// Programs that print only ints and strings (the backend prints booleans as
-/// 0/1 and rejects `/`, so those stay out of the differential corpus). All
-/// intermediate values must fit in i32: runtime arithmetic still wraps where
-/// Python promotes to bignum — a known divergence not yet handled.
+/// Programs that print ints, bools, and strings (`/` is still rejected, so it
+/// stays out of the corpus). All intermediate values must fit in i32: runtime
+/// arithmetic still wraps where Python promotes to bignum — a known
+/// divergence not yet handled.
 const DIFFERENTIAL_CORPUS: &[&str] = &[
+    "print(True)\nprint(False)\nprint(1 == 1, 2 < 1)\nprint(5 > 4 > 3)",
+    "print(True + 1, False * 10, not False)",
+    "x = 7\nprint(x and True, 0 or False)",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",
     "print(7 % 2, -7 % 2, 7 % -2, -7 % -2)",

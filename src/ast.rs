@@ -63,6 +63,9 @@ impl PartialEq for Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Int(i64),
+    /// `True` / `False` — a distinct runtime type (prints as True/False),
+    /// numerically equal to 1/0 like Python.
+    Bool(bool),
     Str(String),
     Name(String),
     Unary(UnOp, Box<Expr>),

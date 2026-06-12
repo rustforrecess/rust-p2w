@@ -8,5 +8,5 @@ description = "Rust reimplementation of the p2w Python-subset to WebAssembly (WA
 [dependencies]
 
 [dev-dependencies]
+wasmtime = { version = "44.0.2", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime"] }
 wat = "1"
-wasmi = "0.40"

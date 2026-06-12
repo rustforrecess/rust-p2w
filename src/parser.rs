@@ -349,8 +349,8 @@ impl<'a> Parser<'a> {
             Tok::Name(name) => {
                 self.advance();
                 match name.as_str() {
-                    "True" => Ok(expr(ExprKind::Int(1))),
-                    "False" => Ok(expr(ExprKind::Int(0))),
+                    "True" => Ok(expr(ExprKind::Bool(true))),
+                    "False" => Ok(expr(ExprKind::Bool(false))),
                     _ if matches!(self.peek(), Tok::LParen) => {
                         self.advance();
                         let args = self.call_args()?;
