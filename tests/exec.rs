@@ -108,6 +108,52 @@ fn booleans_count_as_one_and_zero_in_arithmetic() {
     assert_output("x = True\nprint(x + x)", "2\n");
 }
 
+// --- strings are values ---
+
+#[test]
+fn string_variables_and_printing() {
+    assert_output("x = \"hello\"\nprint(x)", "hello\n");
+    assert_output(
+        "s = \"caf\u{e9} \u{1f980}\"\nprint(s)",
+        "caf\u{e9} \u{1f980}\n",
+    );
+    assert_output("x = \"hi\"\nprint(x, 5, x)", "hi 5 hi\n");
+}
+
+#[test]
+fn string_concatenation() {
+    assert_output("print(\"ab\" + \"cd\")", "abcd\n");
+    assert_output("s = \"na\"\nprint(s + s + \" batman\")", "nana batman\n");
+    assert_output(
+        "s = \"\"\nfor i in range(3):\n    s = s + \"ab\"\nprint(s)",
+        "ababab\n",
+    );
+}
+
+#[test]
+fn string_equality_is_by_value() {
+    assert_output("print(\"abc\" == \"abc\")", "True\n");
+    assert_output("print(\"abc\" == \"abd\")", "False\n");
+    assert_output("print(\"abc\" != \"abd\")", "True\n");
+    assert_output("a = \"x\"\nb = \"x\"\nprint(a == b)", "True\n");
+    // String vs number is False, never an error (like Python).
+    assert_output("print(\"1\" == 1)", "False\n");
+}
+
+#[test]
+fn string_truthiness() {
+    assert_output(
+        "if \"\":\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
+        "no\n",
+    );
+    assert_output(
+        "if \"x\":\n    print(\"yes\")\nelse:\n    print(\"no\")\n",
+        "yes\n",
+    );
+    assert_output("print(\"\" or \"fallback\")", "fallback\n");
+    assert_output("print(\"first\" and \"second\")", "second\n");
+}
+
 // --- chained comparisons ---
 
 #[test]
@@ -263,6 +309,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(True)\nprint(False)\nprint(1 == 1, 2 < 1)\nprint(5 > 4 > 3)",
     "print(True + 1, False * 10, not False)",
     "x = 7\nprint(x and True, 0 or False)",
+    "x = \"hello\"\nprint(x, x + \"!\")",
+    "s = \"\"\nfor i in range(4):\n    s = s + \"ab\"\nprint(s)\nprint(s == \"abababab\")",
+    "print(\"abc\" == \"abc\", \"abc\" == \"abd\", \"1\" == 1)",
+    "if \"\":\n    print(\"y\")\nelse:\n    print(\"n\")\nprint(\"\" or \"fb\", \"a\" and \"b\")",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",
     "print(7 % 2, -7 % 2, 7 % -2, -7 % -2)",

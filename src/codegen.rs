@@ -35,10 +35,12 @@ const VAL: &str = "(ref null eq)";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Ty {
-    /// A runtime value (int or bool today; everything dynamic eventually).
-    Value,
-    /// A string literal — compile-time only until strings become values.
+    /// Definitely a number/bool (literals and arithmetic results).
+    Num,
+    /// Definitely a string (literals and concatenations of them).
     Str,
+    /// Unknown until runtime (variables, `==`, `and`/`or`).
+    Value,
 }
 
 type Vars = HashMap<String, Ty>;
@@ -57,6 +59,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     let mut module = Module::default();
     module.types.push("(type $INT (struct (field i32)))".into());
     module.types.push("(type $BOOL (struct (field i8)))".into());
+    // NOTE: WASM-GC type canonicalization is structural — keep these three
+    // shapes distinct or ref.test misfires (see $BOOL's i8 field).
+    module.types.push("(type $STR (array (mut i8)))".into());
     module
         .imports
         .push(r#"(import "env" "write_char" (func $write_char (param i32)))"#.into());
@@ -141,8 +146,14 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $truthy: value -> i32 0/1 (nonzero numeric value is true).
+    // $truthy: value -> i32 0/1 (non-empty string / nonzero number is true).
     let mut b = Body::new();
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (i32.ne (array.len (ref.cast (ref $STR) (local.get $r))) (i32.const 0))))",
+    );
+    b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
     fs.push(Func {
         signature: "(func $truthy (param $r (ref null eq)) (result i32)".into(),
@@ -150,8 +161,35 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $print_value: runtime type dispatch — bools as True/False, ints digits.
+    // $print_str: write a string's bytes through write_char.
     let mut b = Body::new();
+    b.push("(local.set $n (array.len (local.get $s)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(call $write_char (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    fs.push(Func {
+        signature: "(func $print_str (param $s (ref null $STR))".into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
+    // $print_value: runtime type dispatch — strings as bytes, bools as
+    // True/False, numbers as digits.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $print_str (ref.cast (ref $STR) (local.get $r)))))",
+    );
+    b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
     b.push_in(1, "(then");
     b.push_in(
@@ -171,6 +209,99 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(1, "(else (call $write_i32 (call $unbox (local.get $r)))))");
     fs.push(Func {
         signature: "(func $print_value (param $r (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_add: Python `+` — string concatenation when both sides are
+    // strings, numeric addition otherwise.
+    let mut b = Body::new();
+    b.push("(if (result (ref null eq))");
+    b.push_in(
+        2,
+        "(i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
+    );
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $sa (ref.cast (ref $STR) (local.get $a)))");
+    b.push_in(2, "(local.set $sb (ref.cast (ref $STR) (local.get $b)))");
+    b.push_in(
+        2,
+        "(local.set $out (array.new_default $STR (i32.add (array.len (local.get $sa)) (array.len (local.get $sb)))))",
+    );
+    b.push_in(
+        2,
+        "(array.copy $STR $STR (local.get $out) (i32.const 0) (local.get $sa) (i32.const 0) (array.len (local.get $sa)))",
+    );
+    b.push_in(
+        2,
+        "(array.copy $STR $STR (local.get $out) (array.len (local.get $sa)) (local.get $sb) (i32.const 0) (array.len (local.get $sb)))",
+    );
+    b.push_in(2, "(local.get $out)");
+    b.push_in(1, ")");
+    b.push_in(
+        1,
+        "(else (call $box (i32.add (call $unbox (local.get $a)) (call $unbox (local.get $b))))))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $py_add (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $sa (ref null $STR))".into(),
+            "(local $sb (ref null $STR))".into(),
+            "(local $out (ref null $STR))".into(),
+        ],
+        body: b,
+    });
+
+    // $str_eq: byte-wise string equality.
+    let mut b = Body::new();
+    b.push("(local.set $n (array.len (local.get $a)))");
+    b.push("(if (i32.ne (local.get $n) (array.len (local.get $b)))");
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (i32.ne (array.get_u $STR (local.get $a) (local.get $i)) (array.get_u $STR (local.get $b) (local.get $i)))",
+    );
+    b.push_in(3, "(then (return (i32.const 0)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const 1)");
+    fs.push(Func {
+        signature:
+            "(func $str_eq (param $a (ref null $STR)) (param $b (ref null $STR)) (result i32)"
+                .into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
+    // $py_eq: Python `==` — strings by value, string-vs-number is False,
+    // numbers (and bools, as 1/0) by value.
+    let mut b = Body::new();
+    b.push(
+        "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
+    );
+    b.push_in(
+        1,
+        "(then (return (call $str_eq (ref.cast (ref $STR) (local.get $a)) (ref.cast (ref $STR) (local.get $b)))))",
+    );
+    b.push(")");
+    b.push(
+        "(if (i32.or (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
+    );
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push("(i32.eq (call $unbox (local.get $a)) (call $unbox (local.get $b)))");
+    fs.push(Func {
+        signature: "(func $py_eq (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
+            .into(),
         locals: vec![],
         body: b,
     });
@@ -283,15 +414,7 @@ impl Gen {
     fn stmt(&mut self, cx: &mut FuncCx, s: &Stmt, out: &mut Body) -> Result<()> {
         match &s.kind {
             StmtKind::Assign(name, expr) => {
-                let t = type_of(expr, &cx.vars)?;
-                if t != Ty::Value {
-                    return Err(CompileError::at(
-                        s.line,
-                        format!(
-                            "variable '{name}' must be a number for now (string variables aren't supported yet)"
-                        ),
-                    ));
-                }
+                type_of(expr, &cx.vars)?; // surface literal-misuse errors
                 cx.ensure_local(name);
                 let value = self.value_expr(cx, expr)?;
                 out.push(format!("(local.set ${name} {value})"));
@@ -352,23 +475,15 @@ impl Gen {
             if idx > 0 {
                 emit_char(out, b' ');
             }
-            match type_of(arg, &cx.vars)? {
-                Ty::Value => {
-                    let v = self.value_expr(cx, arg)?;
-                    out.push(format!("(call $print_value {v})"));
+            type_of(arg, &cx.vars)?; // surface literal-misuse errors
+            if let ExprKind::Str(s) = &arg.kind {
+                // Literal fast path: no allocation, identical output bytes.
+                for byte in s.bytes() {
+                    emit_char(out, byte);
                 }
-                Ty::Str => {
-                    if let ExprKind::Str(s) = &arg.kind {
-                        for byte in s.bytes() {
-                            emit_char(out, byte);
-                        }
-                    } else {
-                        return Err(CompileError::at(
-                            arg.line,
-                            "only string literals can be printed so far",
-                        ));
-                    }
-                }
+            } else {
+                let v = self.value_expr(cx, arg)?;
+                out.push(format!("(call $print_value {v})"));
             }
         }
         emit_char(out, b'\n');
@@ -384,7 +499,7 @@ impl Gen {
         else_body: &Option<Vec<Stmt>>,
         out: &mut Body,
     ) -> Result<()> {
-        require_value(cond, &cx.vars, "an if-condition")?;
+        type_of(cond, &cx.vars)?; // any value is a condition (strings: non-empty)
         let c = self.cond_i32(cx, cond)?;
         let mut then_b = Body::new();
         self.stmts(cx, body, &mut then_b)?;
@@ -412,7 +527,7 @@ impl Gen {
         else_body: &Option<Vec<Stmt>>,
     ) -> Result<Option<Body>> {
         if let Some(((cond, body), rest)) = elifs.split_first() {
-            require_value(cond, &cx.vars, "an elif-condition")?;
+            type_of(cond, &cx.vars)?;
             let c = self.cond_i32(cx, cond)?;
             let mut then_b = Body::new();
             self.stmts(cx, body, &mut then_b)?;
@@ -446,7 +561,7 @@ impl Gen {
         body: &[Stmt],
         out: &mut Body,
     ) -> Result<()> {
-        require_value(cond, &cx.vars, "a while-condition")?;
+        type_of(cond, &cx.vars)?;
         let c = self.cond_i32(cx, cond)?;
         let n = cx.fresh();
 
@@ -577,11 +692,7 @@ impl Gen {
             ExprKind::Bool(true) => Ok("(global.get $TRUE)".into()),
             ExprKind::Bool(false) => Ok("(global.get $FALSE)".into()),
             ExprKind::Name(n) => match cx.vars.get(n) {
-                Some(Ty::Value) => Ok(format!("(local.get ${n})")),
-                Some(Ty::Str) => Err(CompileError::at(
-                    e.line,
-                    format!("'{n}' is text, not a number"),
-                )),
+                Some(_) => Ok(format!("(local.get ${n})")),
                 None => Err(CompileError::at(e.line, format!("unknown name '{n}'"))),
             },
             ExprKind::Unary(UnOp::Neg, inner) => {
@@ -610,6 +721,23 @@ impl Gen {
                     "(if (result (ref null eq)) (call $truthy (local.tee ${t} {lhs})) (then (local.get ${t})) (else {rhs}))"
                 ))
             }
+            ExprKind::Bin(BinOp::Add, a, b) => {
+                // `+` is concatenation when both sides are strings — runtime
+                // dispatch via $py_add.
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_add {lhs} {rhs})"))
+            }
+            ExprKind::Bin(BinOp::Eq, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $bool (call $py_eq {lhs} {rhs}))"))
+            }
+            ExprKind::Bin(BinOp::Ne, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $bool (i32.eqz (call $py_eq {lhs} {rhs})))"))
+            }
             ExprKind::Bin(BinOp::Div, _, _) => Err(CompileError::at(
                 e.line,
                 "'/' makes a decimal number in Python, and decimals aren't supported yet — \
@@ -633,24 +761,32 @@ impl Gen {
                 let arith = |instr: &str| format!("(call $box ({instr} {lhs} {rhs}))");
                 let cmp = |instr: &str| format!("(call $bool ({instr} {lhs} {rhs}))");
                 Ok(match op {
-                    BinOp::Add => arith("i32.add"),
                     BinOp::Sub => arith("i32.sub"),
                     BinOp::Mul => arith("i32.mul"),
                     BinOp::Lt => cmp("i32.lt_s"),
                     BinOp::Le => cmp("i32.le_s"),
                     BinOp::Gt => cmp("i32.gt_s"),
                     BinOp::Ge => cmp("i32.ge_s"),
-                    BinOp::Eq => cmp("i32.eq"),
-                    BinOp::Ne => cmp("i32.ne"),
-                    BinOp::And | BinOp::Or | BinOp::Div | BinOp::FloorDiv | BinOp::Mod => {
+                    BinOp::Add
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Div
+                    | BinOp::FloorDiv
+                    | BinOp::Mod => {
                         unreachable!("handled above")
                     }
                 })
             }
-            ExprKind::Str(_) => Err(CompileError::at(
-                e.line,
-                "expected a number, found a string",
-            )),
+            ExprKind::Str(s) => {
+                let bytes: Vec<String> = s.bytes().map(|b| format!("(i32.const {b})")).collect();
+                Ok(format!(
+                    "(array.new_fixed $STR {} {})",
+                    bytes.len(),
+                    bytes.join(" ")
+                ))
+            }
             ExprKind::Call(n, _) => Err(CompileError::at(
                 e.line,
                 format!("can't use the result of '{n}(...)' yet"),
@@ -684,6 +820,16 @@ impl Gen {
                 let c = self.cond_i32(cx, inner)?;
                 Ok(format!("(i32.eqz {c})"))
             }
+            ExprKind::Bin(BinOp::Eq, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_eq {lhs} {rhs})"))
+            }
+            ExprKind::Bin(BinOp::Ne, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(i32.eqz (call $py_eq {lhs} {rhs}))"))
+            }
             ExprKind::Bin(op, a, b) if cmp_instr(*op).is_some() => {
                 let lhs = self.i32_expr(cx, a)?;
                 let rhs = self.i32_expr(cx, b)?;
@@ -700,8 +846,6 @@ fn cmp_instr(op: BinOp) -> Option<&'static str> {
         BinOp::Le => "i32.le_s",
         BinOp::Gt => "i32.gt_s",
         BinOp::Ge => "i32.ge_s",
-        BinOp::Eq => "i32.eq",
-        BinOp::Ne => "i32.ne",
         _ => return None,
     })
 }
@@ -721,7 +865,7 @@ fn const_int(e: &Expr) -> Option<i64> {
 
 fn require_value(e: &Expr, vars: &Vars, what: &str) -> Result<()> {
     match type_of(e, vars)? {
-        Ty::Value => Ok(()),
+        Ty::Num | Ty::Value => Ok(()),
         Ty::Str => Err(CompileError::at(
             e.line,
             format!("{what} needs to be a number, not text"),
@@ -729,25 +873,55 @@ fn require_value(e: &Expr, vars: &Vars, what: &str) -> Result<()> {
     }
 }
 
-/// Static type of an expression, given the variables in scope.
+/// Static type of an expression, given the variables in scope. This is a
+/// friendliness pass — it catches *definite* misuse (`5 - "a"`) at compile
+/// time; expressions involving variables are `Value` (unknown) and dynamic
+/// misuse traps at run time until real runtime type errors land.
 fn type_of(e: &Expr, vars: &Vars) -> Result<Ty> {
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) => Ok(Ty::Value),
+        ExprKind::Int(_) | ExprKind::Bool(_) => Ok(Ty::Num),
         ExprKind::Str(_) => Ok(Ty::Str),
-        ExprKind::Unary(_, inner) => match type_of(inner, vars)? {
-            Ty::Value => Ok(Ty::Value),
-            Ty::Str => Err(CompileError::at(
-                e.line,
-                "operator needs a number, not text",
-            )),
-        },
-        ExprKind::Bin(_, a, b) => match (type_of(a, vars)?, type_of(b, vars)?) {
-            (Ty::Value, Ty::Value) => Ok(Ty::Value),
-            _ => Err(CompileError::at(
-                e.line,
-                "this operator needs numbers on both sides",
-            )),
-        },
+        ExprKind::Unary(op, inner) => {
+            let t = type_of(inner, vars)?;
+            match op {
+                UnOp::Not => Ok(Ty::Num), // `not "x"` is a bool
+                UnOp::Neg => match t {
+                    Ty::Str => Err(CompileError::at(
+                        e.line,
+                        "operator needs a number, not text",
+                    )),
+                    _ => Ok(Ty::Num),
+                },
+            }
+        }
+        ExprKind::Bin(op, a, b) => {
+            let (ta, tb) = (type_of(a, vars)?, type_of(b, vars)?);
+            match op {
+                // Equality and and/or accept any mix of types.
+                BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or => Ok(Ty::Value),
+                // `+` concatenates strings or adds numbers — but never across
+                // (only flagged when both sides are statically known).
+                BinOp::Add => match (ta, tb) {
+                    (Ty::Str, Ty::Str) => Ok(Ty::Str),
+                    (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Err(CompileError::at(
+                        e.line,
+                        "can't add text and a number together",
+                    )),
+                    (Ty::Num, Ty::Num) => Ok(Ty::Num),
+                    _ => Ok(Ty::Value),
+                },
+                _ => {
+                    if ta == Ty::Str || tb == Ty::Str {
+                        Err(CompileError::at(
+                            e.line,
+                            "this operator needs numbers on both sides",
+                        ))
+                    } else {
+                        Ok(Ty::Num)
+                    }
+                }
+            }
+        }
         ExprKind::Name(n) => vars.get(n).copied().ok_or_else(|| {
             CompileError::at(
                 e.line,
@@ -774,11 +948,44 @@ mod tests {
     fn print_int_arithmetic() {
         let wat = compile("print(2 + 3 * 4)").unwrap();
         assert!(wat.contains("(export \"_start\")"));
-        // Constant operands feed arithmetic raw; the product is boxed and
-        // unboxed on the way into the addition.
+        // `+` dispatches through $py_add (it might be concatenation);
+        // `*` stays numeric.
         assert!(wat.contains("(i32.mul (i32.const 3) (i32.const 4))"));
-        assert!(wat.contains("(i32.add (i32.const 2)"));
+        assert!(wat.contains("(call $py_add (ref.i31 (i32.const 2))"));
         assert!(wat.contains("(call $print_value"));
+    }
+
+    #[test]
+    fn strings_are_gc_arrays() {
+        let wat = compile("x = \"hi\"\nprint(x)").unwrap();
+        assert!(wat.contains("(type $STR (array (mut i8)))"));
+        assert!(
+            wat.contains("(local.set $x (array.new_fixed $STR 2 (i32.const 104) (i32.const 105)))")
+        );
+        assert!(wat.contains("(call $print_value (local.get $x))"));
+    }
+
+    #[test]
+    fn string_equality_uses_py_eq() {
+        let wat = compile("print(\"a\" == \"b\")").unwrap();
+        assert!(wat.contains("(call $py_eq"));
+        // In a condition, the boxed-bool round-trip is skipped.
+        let wat = compile("if \"a\" == \"b\":\n    print(1)\n").unwrap();
+        assert!(wat.contains("(if (call $py_eq"));
+    }
+
+    #[test]
+    fn literal_type_misuse_is_a_compile_error() {
+        assert!(compile("print(1 + \"a\")")
+            .unwrap_err()
+            .message
+            .contains("can't add text and a number"));
+        assert!(compile("print(\"a\" - 1)")
+            .unwrap_err()
+            .message
+            .contains("numbers on both sides"));
+        assert!(compile("print(\"a\" < \"b\")").is_err()); // lexicographic: later
+        assert!(compile("for i in range(\"x\"):\n    print(i)\n").is_err());
     }
 
     #[test]
