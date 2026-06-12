@@ -594,6 +594,54 @@ fn output_before_the_error_is_preserved() {
     assert!(out.contains("IndexError"));
 }
 
+// --- the in operator ---
+
+#[test]
+fn in_lists_dicts_strings() {
+    assert_output("print(2 in [1, 2, 3], 5 in [1, 2, 3])", "True False\n");
+    assert_output(
+        "d = {\"a\": 1}\nprint(\"a\" in d, \"b\" in d, \"b\" not in d)",
+        "True False True\n",
+    );
+    assert_output(
+        "print(\"cad\" in \"abracadabra\", \"xyz\" in \"abracadabra\", \"\" in \"a\")",
+        "True False True\n",
+    );
+    assert_output("print(None in [None], [1] in [[1], [2]])", "True True\n");
+}
+
+#[test]
+fn not_binds_looser_than_in() {
+    // `not x in xs` is `not (x in xs)`, like Python.
+    assert_output("print(not 5 in [1, 2])", "True\n");
+}
+
+#[test]
+fn the_idiomatic_counter_finally_works() {
+    let src = "\
+counts = {}
+for c in \"abracadabra\":
+    if c in counts:
+        counts[c] = counts[c] + 1
+    else:
+        counts[c] = 1
+print(counts)
+";
+    assert_output(src, "{'a': 5, 'b': 2, 'r': 2, 'c': 1, 'd': 1}\n");
+}
+
+#[test]
+fn in_error_cases() {
+    assert_raises(
+        "print(1 in 5)",
+        "TypeError: argument of type 'int' is not iterable",
+    );
+    assert_raises(
+        "print(1 in \"abc\")",
+        "TypeError: 'in <string>' requires string as left operand, not 'int'",
+    );
+}
+
 // --- chained comparisons ---
 
 #[test]
@@ -771,7 +819,8 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "d = {\"a\": 1, \"b\": 2}\nd[\"a\"] = 10\nd[\"c\"] = 3\nprint(d, len(d), d[\"c\"])",
     "d = {\"x\": 1, \"y\": 2}\nfor k in d:\n    print(k, d[k])\nprint(d == {\"y\": 2, \"x\": 1})",
     "print({})\nprint({1: \"one\", \"two\": [2, 2.5]})",
-    "counts = {}\nfor c in \"abracadabra\":\n    if counts == {}:\n        counts[c] = 0\n    counts[c] = 0\nfor c in \"abracadabra\":\n    counts[c] = counts[c] + 1\nprint(counts)",
+    "counts = {}\nfor c in \"abracadabra\":\n    if c in counts:\n        counts[c] = counts[c] + 1\n    else:\n        counts[c] = 1\nprint(counts)",
+    "print(2 in [1, 2], \"a\" in {\"a\": 1}, \"cad\" in \"abracadabra\", 9 not in [1], not 5 in [1])",
     "if \"\":\n    print(\"y\")\nelse:\n    print(\"n\")\nprint(\"\" or \"fb\", \"a\" and \"b\")",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",

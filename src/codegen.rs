@@ -305,6 +305,16 @@ fn raise_helpers() -> Vec<Func> {
             "AttributeError: '",
             "' object has no attribute 'append'",
         ),
+        (
+            "$raise_not_iter",
+            "TypeError: argument of type '",
+            "' is not iterable",
+        ),
+        (
+            "$raise_in_str",
+            "TypeError: 'in <string>' requires string as left operand, not '",
+            "'",
+        ),
     ] {
         let mut b = Body::new();
         b.push("(call $write_char (i32.const 10))");
@@ -796,6 +806,111 @@ fn runtime_helpers() -> Vec<Func> {
     fs.push(Func {
         signature: "(func $print_dict (param $d (ref null $DICT))".into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
+    // $list_contains: element-wise membership via py_eq.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $LIST 0 (local.get $l)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (call $py_eq (array.get $ITEMS (struct.get $LIST 1 (local.get $l)) (local.get $i)) (local.get $item))",
+    );
+    b.push_in(3, "(then (return (i32.const 1)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const 0)");
+    fs.push(Func {
+        signature:
+            "(func $list_contains (param $l (ref null $LIST)) (param $item (ref null eq)) (result i32)"
+                .into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
+    // $str_contains: naive substring search (empty needle matches).
+    let mut b = Body::new();
+    b.push("(local.set $hl (array.len (local.get $h)))");
+    b.push("(local.set $nl (array.len (local.get $needle)))");
+    b.push("(if (i32.eqz (local.get $nl)) (then (return (i32.const 1))))");
+    b.push("(block $no");
+    b.push_in(1, "(loop $outer");
+    b.push_in(
+        2,
+        "(br_if $no (i32.gt_s (i32.add (local.get $i) (local.get $nl)) (local.get $hl)))",
+    );
+    b.push_in(2, "(local.set $j (i32.const 0))");
+    b.push_in(2, "(block $fail");
+    b.push_in(3, "(loop $inner");
+    b.push_in(
+        4,
+        "(if (i32.ge_s (local.get $j) (local.get $nl)) (then (return (i32.const 1))))",
+    );
+    b.push_in(4, "(br_if $fail (i32.ne");
+    b.push_in(
+        5,
+        "(array.get_u $STR (local.get $h) (i32.add (local.get $i) (local.get $j)))",
+    );
+    b.push_in(5, "(array.get_u $STR (local.get $needle) (local.get $j))))");
+    b.push_in(4, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
+    b.push_in(4, "(br $inner)");
+    b.push_in(3, ")");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $outer)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const 0)");
+    fs.push(Func {
+        signature:
+            "(func $str_contains (param $h (ref null $STR)) (param $needle (ref null $STR)) (result i32)"
+                .into(),
+        locals: vec![
+            "(local $hl i32)".into(),
+            "(local $nl i32)".into(),
+            "(local $i i32)".into(),
+            "(local $j i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $py_in: membership — list elements, dict keys, substrings.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $LIST) (local.get $c))");
+    b.push_in(
+        1,
+        "(then (return (call $list_contains (ref.cast (ref $LIST) (local.get $c)) (local.get $item))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $DICT) (local.get $c))");
+    b.push_in(
+        1,
+        "(then (return (i32.ge_s (call $dict_find (ref.cast (ref $DICT) (local.get $c)) (local.get $item)) (i32.const 0))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $STR) (local.get $c))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(if (i32.eqz (ref.test (ref $STR) (local.get $item)))");
+    b.push_in(3, "(then (call $raise_in_str (local.get $item)))");
+    b.push_in(2, ")");
+    b.push_in(
+        2,
+        "(return (call $str_contains (ref.cast (ref $STR) (local.get $c)) (ref.cast (ref $STR) (local.get $item))))",
+    );
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(call $raise_not_iter (local.get $c))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $py_in (param $item (ref null eq)) (param $c (ref null eq)) (result i32)"
+            .into(),
+        locals: vec![],
         body: b,
     });
 
@@ -1849,6 +1964,18 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call $bool (i32.eqz (call $py_eq {lhs} {rhs})))"))
             }
+            ExprKind::Bin(BinOp::In, a, b) => {
+                let item = self.value_expr(cx, a)?;
+                let cont = self.value_expr(cx, b)?;
+                Ok(format!("(call $bool (call $py_in {item} {cont}))"))
+            }
+            ExprKind::Bin(BinOp::NotIn, a, b) => {
+                let item = self.value_expr(cx, a)?;
+                let cont = self.value_expr(cx, b)?;
+                Ok(format!(
+                    "(call $bool (i32.eqz (call $py_in {item} {cont})))"
+                ))
+            }
             ExprKind::Bin(BinOp::Div, a, b) => {
                 // Python `/` is true division: always a float.
                 let lhs = self.value_expr(cx, a)?;
@@ -2034,6 +2161,16 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(i32.eqz (call $py_eq {lhs} {rhs}))"))
             }
+            ExprKind::Bin(BinOp::In, a, b) => {
+                let item = self.value_expr(cx, a)?;
+                let cont = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_in {item} {cont})"))
+            }
+            ExprKind::Bin(BinOp::NotIn, a, b) => {
+                let item = self.value_expr(cx, a)?;
+                let cont = self.value_expr(cx, b)?;
+                Ok(format!("(i32.eqz (call $py_in {item} {cont}))"))
+            }
             ExprKind::Bin(op, a, b) if cmp_instr(*op).is_some() => {
                 let lhs = self.f64_expr(cx, a)?;
                 let rhs = self.f64_expr(cx, b)?;
@@ -2145,8 +2282,10 @@ impl Gen {
             ExprKind::Bin(op, a, b) => {
                 let (ta, tb) = (self.type_of(cx, a)?, self.type_of(cx, b)?);
                 match op {
-                    // Equality and and/or accept any mix of types.
-                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or => Ok(Ty::Value),
+                    // Equality, membership, and and/or accept any mix.
+                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::In | BinOp::NotIn => {
+                        Ok(Ty::Value)
+                    }
                     // `+` concatenates strings or adds numbers — never across
                     // (only flagged when both sides are statically known).
                     BinOp::Add => match (ta, tb) {

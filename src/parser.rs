@@ -364,6 +364,9 @@ impl<'a> Parser<'a> {
             }
             let op_line = self.line();
             self.advance();
+            if op == BinOp::NotIn {
+                self.advance(); // the `in` of `not in`
+            }
             let rhs = self.expr(r_bp)?;
             if is_comparison(op) {
                 lhs = self.comparison_chain(lhs, op, rhs, op_line)?;
@@ -601,6 +604,12 @@ impl<'a> Parser<'a> {
         let (op, bp) = match self.peek() {
             Tok::Name(n) if n == "or" => (BinOp::Or, 3),
             Tok::Name(n) if n == "and" => (BinOp::And, 4),
+            Tok::Name(n) if n == "in" => (BinOp::In, 7),
+            // `not` in infix position can only start `not in` (two tokens;
+            // expr() eats the second).
+            Tok::Name(n) if n == "not" && matches!(self.peek2(), Tok::Name(m) if m == "in") => {
+                (BinOp::NotIn, 7)
+            }
             Tok::Lt => (BinOp::Lt, 7),
             Tok::Le => (BinOp::Le, 7),
             Tok::Gt => (BinOp::Gt, 7),

@@ -131,4 +131,7 @@ pub enum BinOp {
     // e.g. `2 and 1` is 1, `4 or 2` is 4; the right side is short-circuited)
     And,
     Or,
+    // Membership: `x in seq` / `x not in seq` (lists, dict keys, substrings)
+    In,
+    NotIn,
 }
