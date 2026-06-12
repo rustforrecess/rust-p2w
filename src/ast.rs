@@ -24,6 +24,12 @@ pub enum Stmt {
         step: Expr,
         body: Vec<Stmt>,
     },
+    /// `while cond: ...`
+    While { cond: Expr, body: Vec<Stmt> },
+    /// `break` (inside a loop)
+    Break,
+    /// `continue` (inside a loop)
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq)]

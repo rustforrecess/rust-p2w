@@ -80,6 +80,10 @@ struct Gen {
     scratch: usize,
     uses_floordiv: bool,
     uses_floormod: bool,
+    /// Enclosing loops as `(break_label, continue_label)`, innermost last.
+    /// In a `for`, continue targets the inner `$c` block so the counter
+    /// increment still runs; in a `while`, it targets the loop head (re-test).
+    loops: Vec<(String, String)>,
 }
 
 impl Gen {
@@ -146,7 +150,33 @@ impl Gen {
                 step,
                 body,
             } => self.gen_for(var, start, end, step, body),
+            Stmt::While { cond, body } => self.gen_while(cond, body),
+            Stmt::Break => match self.loops.last() {
+                Some((brk, _)) => Ok(format!("    (br {brk})\n")),
+                None => Err("'break' can only be used inside a loop".into()),
+            },
+            Stmt::Continue => match self.loops.last() {
+                Some((_, cont)) => Ok(format!("    (br {cont})\n")),
+                None => Err("'continue' can only be used inside a loop".into()),
+            },
         }
+    }
+
+    fn gen_while(&mut self, cond: &Expr, body: &[Stmt]) -> Result<String, String> {
+        require_int(cond, &self.vars, "a while-condition")?;
+        let c = self.int_expr(cond)?;
+        let n = self.fresh();
+        self.loops.push((format!("$b{n}"), format!("$l{n}")));
+        let body_wat = self.stmts(body);
+        self.loops.pop();
+        let body_wat = body_wat?;
+        Ok(format!(
+            "    (block $b{n}\n\
+             \x20     (loop $l{n}\n\
+             \x20       (br_if $b{n} (i32.eqz {c}))\n\
+             {body_wat}\
+             \x20       (br $l{n})))\n"
+        ))
     }
 
     fn gen_print(&mut self, args: &[Expr]) -> Result<String, String> {
@@ -254,7 +284,10 @@ impl Gen {
         let ctr = format!(".f{n}");
         self.locals.push(ctr.clone());
         self.ensure_local(var, Ty::Int);
-        let body_wat = self.stmts(body)?;
+        self.loops.push((format!("$b{n}"), format!("$c{n}")));
+        let body_wat = self.stmts(body);
+        self.loops.pop();
+        let body_wat = body_wat?;
 
         Ok(format!(
             "{pre}    (local.set ${ctr} {start_wat})\n\
@@ -262,7 +295,9 @@ impl Gen {
              \x20     (loop $l{n}\n\
              \x20       (br_if $b{n} ({done_cmp} (local.get ${ctr}) {end_operand}))\n\
              \x20       (local.set ${var} (local.get ${ctr}))\n\
+             \x20       (block $c{n}\n\
              {body_wat}\
+             \x20       )\n\
              \x20       (local.set ${ctr} (i32.add (local.get ${ctr}) (i32.const {step_v})))\n\
              \x20       (br $l{n})))\n"
         ))
@@ -494,6 +529,34 @@ mod tests {
     fn non_constant_step_is_rejected() {
         let err = compile("s = 1\nfor i in range(0, 5, s):\n    print(i)\n").unwrap_err();
         assert!(err.contains("step"));
+    }
+
+    #[test]
+    fn while_emits_loop_with_negated_test() {
+        let wat = compile("i = 3\nwhile i > 0:\n    i = i - 1\n").unwrap();
+        assert!(wat.contains("(br_if $b0 (i32.eqz (i32.gt_s (local.get $i) (i32.const 0))))"));
+        assert!(wat.contains("(br $l0)"));
+    }
+
+    #[test]
+    fn break_and_continue_target_the_right_labels() {
+        // In a for-loop, continue must reach the increment (the $c block),
+        // and break must exit the whole loop (the $b block).
+        let wat =
+            compile("for i in range(3):\n    if i == 1:\n        continue\n    break\n").unwrap();
+        assert!(wat.contains("(br $c0)"));
+        assert!(wat.contains("(br $b0)"));
+        // In a while, continue re-tests the condition (the loop head).
+        let wat = compile("i = 0\nwhile i < 3:\n    i = i + 1\n    continue\n").unwrap();
+        assert!(wat.contains("(br $l0)"));
+    }
+
+    #[test]
+    fn break_continue_outside_loop_are_rejected() {
+        assert!(compile("break\n").unwrap_err().contains("inside a loop"));
+        assert!(compile("continue\n").unwrap_err().contains("inside a loop"));
+        // ...including in an if that isn't inside a loop.
+        assert!(compile("if 1:\n    break\n").is_err());
     }
 
     #[test]

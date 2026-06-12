@@ -141,6 +141,49 @@ fn negative_step_counts_down() {
     assert_output("for i in range(10, 0, -3):\n    print(i)", "10\n7\n4\n1\n");
 }
 
+// --- while / break / continue ---
+
+#[test]
+fn while_countdown() {
+    assert_output(
+        "i = 3\nwhile i > 0:\n    print(i)\n    i = i - 1",
+        "3\n2\n1\n",
+    );
+}
+
+#[test]
+fn while_true_with_break() {
+    assert_output(
+        "i = 0\nwhile True:\n    i = i + 1\n    if i == 3:\n        break\nprint(i)",
+        "3\n",
+    );
+}
+
+#[test]
+fn continue_in_for_still_increments() {
+    // If continue skipped the counter increment, this would loop forever.
+    assert_output(
+        "for i in range(5):\n    if i % 2 == 0:\n        continue\n    print(i)",
+        "1\n3\n",
+    );
+}
+
+#[test]
+fn continue_in_while_retests_condition() {
+    assert_output(
+        "i = 0\nwhile i < 5:\n    i = i + 1\n    if i % 2 == 0:\n        continue\n    print(i)",
+        "1\n3\n5\n",
+    );
+}
+
+#[test]
+fn break_exits_only_the_inner_loop() {
+    assert_output(
+        "for i in range(2):\n    for j in range(5):\n        if j == 1:\n            break\n        print(i, j)",
+        "0 0\n1 0\n",
+    );
+}
+
 // --- integer literals ---
 
 #[test]
@@ -205,6 +248,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "x = 5\nif 0 <= x <= 10:\n    print(\"in\")\nelse:\n    print(\"out\")",
     "print(-(-2147483647) - 1)",
     "total = 0\nfor i in range(1, 101):\n    total = total + i\nprint(total)",
+    "i = 3\nwhile i > 0:\n    print(i)\n    i = i - 1",
+    "i = 0\nwhile True:\n    i = i + 1\n    if i == 3:\n        break\nprint(i)",
+    "for i in range(6):\n    if i % 2 == 0:\n        continue\n    if i == 5:\n        break\n    print(i)",
+    "i = 0\nwhile i < 5:\n    i = i + 1\n    if i % 2 == 0:\n        continue\n    print(i)",
 ];
 
 fn find_python() -> Option<&'static str> {

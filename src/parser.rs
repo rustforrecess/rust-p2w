@@ -107,6 +107,19 @@ impl<'a> Parser<'a> {
         if self.is_keyword("for") {
             return self.for_stmt();
         }
+        if self.is_keyword("while") {
+            return self.while_stmt();
+        }
+        if self.is_keyword("break") {
+            self.advance();
+            self.expect(&Tok::Newline, "a new line")?;
+            return Ok(Stmt::Break);
+        }
+        if self.is_keyword("continue") {
+            self.advance();
+            self.expect(&Tok::Newline, "a new line")?;
+            return Ok(Stmt::Continue);
+        }
         // Assignment: `name = expr`.
         if let Tok::Name(name) = self.peek().clone() {
             if *self.peek2() == Tok::Eq {
@@ -156,6 +169,15 @@ impl<'a> Parser<'a> {
             elifs,
             else_body,
         })
+    }
+
+    fn while_stmt(&mut self) -> Result<Stmt, String> {
+        self.eat_keyword("while")?;
+        let cond = self.expr(0)?;
+        self.expect(&Tok::Colon, "':'")?;
+        self.expect(&Tok::Newline, "a new line")?;
+        let body = self.block()?;
+        Ok(Stmt::While { cond, body })
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, String> {
