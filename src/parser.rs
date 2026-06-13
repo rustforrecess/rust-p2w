@@ -355,10 +355,7 @@ impl<'a> Parser<'a> {
     /// Pratt expression parser.
     fn expr(&mut self, min_bp: u8) -> Result<Expr> {
         let mut lhs = self.prefix()?;
-        loop {
-            let Some((op, l_bp, r_bp)) = self.peek_infix() else {
-                break;
-            };
+        while let Some((op, l_bp, r_bp)) = self.peek_infix() {
             if l_bp < min_bp {
                 break;
             }
