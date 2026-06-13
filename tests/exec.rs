@@ -7,22 +7,34 @@
 //! wrong code (bitwise `and`, truncating `//`, re-evaluated range bounds…) —
 //! these can.
 
-use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
+use std::sync::OnceLock;
+use wasmtime::{Caller, Config, Engine, Linker, Module, OptLevel, Store};
 
-/// Compile and execute `src`, returning everything written via the host
-/// imports, decoded as UTF-8.
-fn run(src: &str) -> String {
+/// One shared Engine for the whole suite: Engine is internally refcounted
+/// and Send+Sync (sharing is the documented pattern), and opt-level None
+/// skips Cranelift optimization — these programs run in microseconds, so
+/// compile time dominates the suite.
+fn engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = Config::new();
+        config.wasm_gc(true);
+        config.wasm_function_references(true);
+        config.cranelift_opt_level(OptLevel::None);
+        Engine::new(&config).expect("engine")
+    })
+}
+
+/// Compile and execute `src`; returns everything written via the host
+/// imports plus `_start`'s result (Err = trapped).
+fn execute(src: &str) -> (String, Result<i32, wasmtime::Error>) {
     let wat = rust_p2w::compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
     let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("invalid WAT: {e}\n---\n{wat}"));
 
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    let engine = Engine::new(&config).expect("engine");
-    let module = Module::new(&engine, &wasm[..]).expect("module");
+    let module = Module::new(engine(), &wasm[..]).expect("module");
     // Store data is the output byte buffer; write_char sends UTF-8 bytes.
-    let mut store: Store<Vec<u8>> = Store::new(&engine, Vec::new());
-    let mut linker: Linker<Vec<u8>> = Linker::new(&engine);
+    let mut store: Store<Vec<u8>> = Store::new(engine(), Vec::new());
+    let mut linker: Linker<Vec<u8>> = Linker::new(engine());
     linker
         .func_wrap(
             "env",
@@ -68,9 +80,17 @@ fn run(src: &str) -> String {
     let start = instance
         .get_typed_func::<(), i32>(&mut store, "_start")
         .expect("_start export with i32 result");
-    let exit = start.call(&mut store, ()).expect("execution trapped");
+    let result = start.call(&mut store, ());
+    let out = String::from_utf8(store.into_data()).expect("output is UTF-8");
+    (out, result)
+}
+
+/// Run a program expected to succeed; returns its output.
+fn run(src: &str) -> String {
+    let (out, result) = execute(src);
+    let exit = result.expect("execution trapped");
     assert_eq!(exit, 0, "_start exit code");
-    String::from_utf8(store.into_data()).expect("output is UTF-8")
+    out
 }
 
 #[track_caller]
@@ -81,61 +101,12 @@ fn assert_output(src: &str, expected: &str) {
 /// Run a program that is expected to raise: returns everything written
 /// before the trap (which includes the runtime's error message).
 fn run_expect_error(src: &str) -> String {
-    let wat = rust_p2w::compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
-    let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("invalid WAT: {e}\n---\n{wat}"));
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    let engine = Engine::new(&config).expect("engine");
-    let module = Module::new(&engine, &wasm[..]).expect("module");
-    let mut store: Store<Vec<u8>> = Store::new(&engine, Vec::new());
-    let mut linker: Linker<Vec<u8>> = Linker::new(&engine);
-    linker
-        .func_wrap(
-            "env",
-            "write_char",
-            |mut caller: Caller<'_, Vec<u8>>, c: i32| {
-                caller.data_mut().push(c as u8);
-            },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
-            "write_i32",
-            |mut caller: Caller<'_, Vec<u8>>, v: i32| {
-                caller
-                    .data_mut()
-                    .extend_from_slice(v.to_string().as_bytes());
-            },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
-            "write_f64",
-            |mut caller: Caller<'_, Vec<u8>>, v: f64| {
-                let s = if v.is_finite() && v == v.trunc() {
-                    format!("{v:.1}")
-                } else {
-                    format!("{v}")
-                };
-                caller.data_mut().extend_from_slice(s.as_bytes());
-            },
-        )
-        .unwrap();
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .expect("instantiate");
-    let start = instance
-        .get_typed_func::<(), i32>(&mut store, "_start")
-        .expect("_start export");
-    let result = start.call(&mut store, ());
+    let (out, result) = execute(src);
     assert!(
         result.is_err(),
-        "expected a runtime error, program ran fine"
+        "expected a runtime error, program ran fine:\n{out}"
     );
-    String::from_utf8(store.into_data()).expect("output is UTF-8")
+    out
 }
 
 #[track_caller]

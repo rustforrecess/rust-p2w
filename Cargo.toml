@@ -10,3 +10,9 @@ description = "Rust reimplementation of the p2w Python-subset to WebAssembly (WA
 [dev-dependencies]
 wasmtime = { version = "44.0.2", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime"] }
 wat = "1"
+
+# Tests JIT-compile every program through Cranelift; an unoptimized Cranelift
+# is 10-50x slower, dominating the suite. Optimize dependencies (one-time
+# rebuild) while keeping this crate's own incremental builds fast.
+[profile.dev.package."*"]
+opt-level = 2
