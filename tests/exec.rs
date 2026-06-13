@@ -565,6 +565,73 @@ fn output_before_the_error_is_preserved() {
     assert!(out.contains("IndexError"));
 }
 
+// --- f-strings and conversion builtins ---
+
+#[test]
+fn str_builtin_converts() {
+    assert_output("print(str(42) + \"!\", str(-7), str(0))", "42! -7 0\n");
+    assert_output(
+        "print(str(True), str(False), str(None))",
+        "True False None\n",
+    );
+    assert_output(
+        "print(str(\"already\") + \" a string\")",
+        "already a string\n",
+    );
+    assert_output("print(str(-2147483648))", "-2147483648\n"); // INT_MIN
+    assert_output("print(len(str(12345)))", "5\n");
+}
+
+#[test]
+fn fstrings_interpolate() {
+    assert_output(
+        "name = \"Felicia\"\nprint(f\"Hello, {name}!\")",
+        "Hello, Felicia!\n",
+    );
+    assert_output(
+        "a = 3\nb = 4\nprint(f\"{a} + {b} = {a + b}\")",
+        "3 + 4 = 7\n",
+    );
+    assert_output("print(f\"\")\nprint(f\"plain\")", "\nplain\n");
+    assert_output("print(f\"{{literal braces}}\")", "{literal braces}\n");
+    assert_output(
+        "score = 8\nprint(f\"Score: {score}/10 ({score * 10}%)\")",
+        "Score: 8/10 (80%)\n",
+    );
+    assert_output(
+        "xs = [1, 2]\nprint(f\"first={xs[0]} len={len(xs)}\")",
+        "first=1 len=2\n",
+    );
+}
+
+#[test]
+fn abs_min_max_int_builtins() {
+    assert_output("print(abs(-5), abs(5), abs(-2.5))", "5 5 2.5\n");
+    assert_output(
+        "print(min(3, 7), max(3, 7), min(2, 1.5), max(-1, -2))",
+        "3 7 1.5 -1\n",
+    );
+    // min/max return the original value: int stays int.
+    assert_output("print(min(1, 2.0), max(2.0, 1))", "1 2.0\n");
+    assert_output(
+        "print(int(3.7), int(-3.7), int(5), int(True))",
+        "3 -3 5 1\n",
+    );
+    assert_output("print(abs(-2147483647))", "2147483647\n");
+}
+
+#[test]
+fn fstring_and_str_error_cases() {
+    assert_raises(
+        "print(str(2.5))",
+        "TypeError: str() of 'float' values isn't supported yet",
+    );
+    assert_raises(
+        "print(str([1]))",
+        "TypeError: str() of 'list' values isn't supported yet",
+    );
+}
+
 // --- the in operator ---
 
 #[test]
@@ -792,6 +859,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print({})\nprint({1: \"one\", \"two\": [2, 2.5]})",
     "counts = {}\nfor c in \"abracadabra\":\n    if c in counts:\n        counts[c] = counts[c] + 1\n    else:\n        counts[c] = 1\nprint(counts)",
     "print(2 in [1, 2], \"a\" in {\"a\": 1}, \"cad\" in \"abracadabra\", 9 not in [1], not 5 in [1])",
+    "name = \"sam\"\nscore = 8\nprint(f\"{name}: {score}/10 = {score * 10}%\")",
+    "print(str(42) + str(0) + str(-7), str(True), str(None))",
+    "print(abs(-5), abs(-2.5), min(3, 7), max(3, 7), min(1, 2.0), int(3.7), int(-3.7), int(True))",
+    "for i in range(3):\n    print(f\"line {i}: {i * i}\")",
     "if \"\":\n    print(\"y\")\nelse:\n    print(\"n\")\nprint(\"\" or \"fb\", \"a\" and \"b\")",
     "print(2 and 1)\nprint(0 and 1)\nprint(4 or 2)\nprint(0 or 7)",
     "print(7 // 2, -7 // 2, 7 // -2, -7 // -2)",

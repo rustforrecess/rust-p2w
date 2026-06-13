@@ -502,6 +502,28 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(expr(ExprKind::Str(s)))
             }
+            Tok::FStr(parts) => {
+                self.advance();
+                // Desugar to a str(...) concatenation chain: each literal
+                // part is a Str, each {expr} part re-parses as a real
+                // expression wrapped in str().
+                let mut acc: Option<Expr> = None;
+                for (is_expr, text) in parts {
+                    let piece = if is_expr {
+                        let inner = parse_fragment(&text, line)?;
+                        expr(ExprKind::Call("str".into(), vec![inner]))
+                    } else {
+                        expr(ExprKind::Str(text))
+                    };
+                    acc = Some(match acc {
+                        None => piece,
+                        Some(prev) => {
+                            expr(ExprKind::Bin(BinOp::Add, Box::new(prev), Box::new(piece)))
+                        }
+                    });
+                }
+                Ok(acc.unwrap_or_else(|| expr(ExprKind::Str(String::new()))))
+            }
             Tok::LParen => {
                 self.advance();
                 let e = self.expr(0)?;
@@ -636,6 +658,61 @@ fn is_comparison(op: BinOp) -> bool {
         op,
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
     )
+}
+
+/// Parse one f-string `{...}` fragment as an expression. Errors are
+/// reported at the f-string's line.
+fn parse_fragment(src: &str, line: usize) -> Result<Expr> {
+    let tokens = crate::lexer::lex(src).map_err(|e| CompileError::at(line, e.message))?;
+    let mut p = Parser {
+        toks: &tokens,
+        pos: 0,
+    };
+    let mut e = p.expr(0).map_err(|e| CompileError::at(line, e.message))?;
+    if !matches!(p.peek(), Tok::Newline | Tok::Eof) {
+        return Err(CompileError::at(
+            line,
+            "couldn't parse the expression inside the f-string braces",
+        ));
+    }
+    // The fragment lexed as its own line 1 — re-line every node onto the
+    // f-string's line so codegen errors point at the right place.
+    set_lines(&mut e, line);
+    Ok(e)
+}
+
+fn set_lines(e: &mut Expr, line: usize) {
+    e.line = line;
+    match &mut e.kind {
+        ExprKind::Unary(_, inner) => set_lines(inner, line),
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {
+            set_lines(a, line);
+            set_lines(b, line);
+        }
+        ExprKind::Call(_, args) => {
+            for a in args {
+                set_lines(a, line);
+            }
+        }
+        ExprKind::MethodCall(recv, _, args) => {
+            set_lines(recv, line);
+            for a in args {
+                set_lines(a, line);
+            }
+        }
+        ExprKind::List(elems) => {
+            for el in elems {
+                set_lines(el, line);
+            }
+        }
+        ExprKind::Dict(entries) => {
+            for (k, v) in entries {
+                set_lines(k, line);
+                set_lines(v, line);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether the expression contains a function call (side effects possible).

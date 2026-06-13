@@ -13,6 +13,9 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
+    /// An f-string, split into parts: (is_expression, text). Literal parts
+    /// are ready text; expression parts are raw source the parser re-parses.
+    FStr(Vec<(bool, String)>),
     Name(String),
 
     // Arithmetic
@@ -330,6 +333,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     i += 1;
                 }
                 let name: String = chars[start..i].iter().collect();
+                // f"..." / f'...' is an f-string, not the name `f`.
+                if (name == "f" || name == "F")
+                    && i < chars.len()
+                    && (chars[i] == '"' || chars[i] == '\'')
+                {
+                    let (parts, ni) = lex_fstring(&chars, i, line)?;
+                    out.push(Token {
+                        tok: Tok::FStr(parts),
+                        line,
+                    });
+                    i = ni;
+                    continue;
+                }
                 out.push(Token {
                     tok: Tok::Name(name),
                     line,
@@ -397,6 +413,89 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize),
         .parse()
         .map_err(|_| CompileError::at(line, format!("invalid integer '{digits}'")))?;
     Ok((Tok::Int(n), i))
+}
+
+/// Lex `f"...{expr}..."` into (is_expression, text) parts. `{{`/`}}` are
+/// literal braces; format specs (`{x:...}`) and nested braces are not
+/// supported yet.
+fn lex_fstring(
+    chars: &[char],
+    start: usize,
+    line: usize,
+) -> Result<(Vec<(bool, String)>, usize), CompileError> {
+    let quote = chars[start];
+    let mut i = start + 1;
+    let mut parts: Vec<(bool, String)> = Vec::new();
+    let mut lit = String::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c == quote {
+            if !lit.is_empty() {
+                parts.push((false, lit));
+            }
+            return Ok((parts, i + 1));
+        }
+        if c == '\n' {
+            break;
+        }
+        if c == '{' {
+            if chars.get(i + 1) == Some(&'{') {
+                lit.push('{');
+                i += 2;
+                continue;
+            }
+            if !lit.is_empty() {
+                parts.push((false, std::mem::take(&mut lit)));
+            }
+            let expr_start = i + 1;
+            let mut j = expr_start;
+            while j < chars.len() && chars[j] != '}' && chars[j] != quote && chars[j] != '\n' {
+                if chars[j] == ':' {
+                    return Err(CompileError::at(
+                        line,
+                        "format specifiers like {x:.2f} aren't supported yet",
+                    ));
+                }
+                j += 1;
+            }
+            if j >= chars.len() || chars[j] != '}' {
+                return Err(CompileError::at(line, "missing '}' in f-string"));
+            }
+            let src: String = chars[expr_start..j].iter().collect();
+            if src.trim().is_empty() {
+                return Err(CompileError::at(line, "empty expression in f-string"));
+            }
+            parts.push((true, src));
+            i = j + 1;
+            continue;
+        }
+        if c == '}' {
+            if chars.get(i + 1) == Some(&'}') {
+                lit.push('}');
+                i += 2;
+                continue;
+            }
+            return Err(CompileError::at(line, "single '}' in f-string — use '}}'"));
+        }
+        if c == '\\' && i + 1 < chars.len() {
+            let e = chars[i + 1];
+            lit.push(match e {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '0' => '\0',
+                '\\' => '\\',
+                '\'' => '\'',
+                '"' => '"',
+                other => other,
+            });
+            i += 2;
+            continue;
+        }
+        lit.push(c);
+        i += 1;
+    }
+    Err(CompileError::at(line, "unterminated f-string"))
 }
 
 fn lex_string(chars: &[char], start: usize, line: usize) -> Result<(String, usize), CompileError> {

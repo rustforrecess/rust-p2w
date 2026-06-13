@@ -315,6 +315,11 @@ fn raise_helpers() -> Vec<Func> {
             "TypeError: 'in <string>' requires string as left operand, not '",
             "'",
         ),
+        (
+            "$raise_no_str",
+            "TypeError: str() of '",
+            "' values isn't supported yet",
+        ),
     ] {
         let mut b = Body::new();
         b.push("(call $write_char (i32.const 10))");
@@ -910,6 +915,167 @@ fn runtime_helpers() -> Vec<Func> {
     fs.push(Func {
         signature: "(func $py_in (param $item (ref null eq)) (param $c (ref null eq)) (result i32)"
             .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $i32_to_str: decimal digits as a $STR. Works on the unsigned
+    // magnitude so INT_MIN (whose negation overflows i32) is correct.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (local.get $v))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $s (array.new_default $STR (i32.const 1)))");
+    b.push_in(
+        2,
+        "(array.set $STR (local.get $s) (i32.const 0) (i32.const 48))",
+    );
+    b.push_in(2, "(return (local.get $s))");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.set $neg (i32.lt_s (local.get $v) (i32.const 0)))");
+    b.push("(local.set $mag (select (i32.sub (i32.const 0) (local.get $v)) (local.get $v) (local.get $neg)))");
+    b.push("(local.set $tmp (local.get $mag))");
+    b.push("(block $counted");
+    b.push_in(1, "(loop $count");
+    b.push_in(2, "(br_if $counted (i32.eqz (local.get $tmp)))");
+    b.push_in(
+        2,
+        "(local.set $len (i32.add (local.get $len) (i32.const 1)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $tmp (i32.div_u (local.get $tmp) (i32.const 10)))",
+    );
+    b.push_in(2, "(br $count)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.set $s (array.new_default $STR (i32.add (local.get $len) (local.get $neg))))");
+    b.push("(local.set $i (i32.sub (i32.add (local.get $len) (local.get $neg)) (i32.const 1)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $fill");
+    b.push_in(
+        2,
+        "(array.set $STR (local.get $s) (local.get $i) (i32.add (i32.const 48) (i32.rem_u (local.get $mag) (i32.const 10))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $mag (i32.div_u (local.get $mag) (i32.const 10)))",
+    );
+    b.push_in(2, "(local.set $i (i32.sub (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br_if $done (i32.eqz (local.get $mag)))");
+    b.push_in(2, "(br $fill)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(if (local.get $neg)");
+    b.push_in(
+        1,
+        "(then (array.set $STR (local.get $s) (i32.const 0) (i32.const 45)))",
+    );
+    b.push(")");
+    b.push("(local.get $s)");
+    fs.push(Func {
+        signature: "(func $i32_to_str (param $v i32) (result (ref null $STR))".into(),
+        locals: vec![
+            "(local $neg i32)".into(),
+            "(local $mag i32)".into(),
+            "(local $tmp i32)".into(),
+            "(local $len i32)".into(),
+            "(local $i i32)".into(),
+            "(local $s (ref null $STR))".into(),
+        ],
+        body: b,
+    });
+
+    // $to_str: str(x) — strings pass through; ints/bools/None convert.
+    // Floats and containers raise a friendly not-yet error.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(1, "(then (return (local.get $r)))");
+    b.push(")");
+    b.push("(if (ref.test (ref $BOOL) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(return (if (result (ref null eq)) (struct.get_u $BOOL 0 (ref.cast (ref $BOOL) (local.get $r)))",
+    );
+    b.push_in(
+        3,
+        "(then (array.new_fixed $STR 4 (i32.const 84) (i32.const 114) (i32.const 117) (i32.const 101)))",
+    );
+    b.push_in(
+        3,
+        "(else (array.new_fixed $STR 5 (i32.const 70) (i32.const 97) (i32.const 108) (i32.const 115) (i32.const 101)))))",
+    );
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(if (ref.test (ref $NONE_T) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (array.new_fixed $STR 4 (i32.const 78) (i32.const 111) (i32.const 110) (i32.const 101))))",
+    );
+    b.push(")");
+    b.push("(if (i32.or (ref.test (ref i31) (local.get $r)) (ref.test (ref $INT) (local.get $r)))");
+    b.push_in(
+        1,
+        "(then (return (call $i32_to_str (call $unbox (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("(call $raise_no_str (local.get $r))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $to_str (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_abs: float-aware absolute value.
+    let mut b = Body::new();
+    b.push("(if (result (ref null eq)) (ref.test (ref $FLOAT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (struct.new $FLOAT (f64.abs (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))))",
+    );
+    b.push_in(1, "(else");
+    b.push_in(2, "(local.set $v (call $unbox (local.get $r)))");
+    b.push_in(
+        2,
+        "(call $box (select (i32.sub (i32.const 0) (local.get $v)) (local.get $v) (i32.lt_s (local.get $v) (i32.const 0))))",
+    );
+    b.push_in(1, "))");
+    fs.push(Func {
+        signature: "(func $py_abs (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec!["(local $v i32)".into()],
+        body: b,
+    });
+
+    // min/max return the winning ORIGINAL value (min(1, 2.0) is 1, an int).
+    for (name, cmp) in [("$py_min", "f64.le"), ("$py_max", "f64.ge")] {
+        let mut b = Body::new();
+        b.push(format!(
+            "(if (result (ref null eq)) ({cmp} (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))"
+        ));
+        b.push_in(1, "(then (local.get $a))");
+        b.push_in(1, "(else (local.get $b)))");
+        fs.push(Func {
+            signature: format!(
+                "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![],
+            body: b,
+        });
+    }
+
+    // int(x): floats truncate toward zero; ints/bools pass through unbox.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $FLOAT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $box (i32.trunc_sat_f64_s (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r)))))))",
+    );
+    b.push(")");
+    b.push("(call $box (call $unbox (local.get $r)))");
+    fs.push(Func {
+        signature: "(func $py_int (param $r (ref null eq)) (result (ref null eq))".into(),
         locals: vec![],
         body: b,
     });
@@ -2080,13 +2246,39 @@ impl Gen {
                     ));
                 }
                 // User functions first (a `def len` shadows the builtin,
-                // like Python); then the len() builtin.
-                if !self.funcs.contains_key(n.as_str()) && n == "len" {
-                    if args.len() != 1 {
-                        return Err(CompileError::at(e.line, "len() takes exactly one argument"));
+                // like Python); then the builtins.
+                if !self.funcs.contains_key(n.as_str()) {
+                    let builtin = match n.as_str() {
+                        "len" => Some(("$py_len", 1, true)), // returns raw i32
+                        "str" => Some(("$to_str", 1, false)),
+                        "abs" => Some(("$py_abs", 1, false)),
+                        "int" => Some(("$py_int", 1, false)),
+                        "min" => Some(("$py_min", 2, false)),
+                        "max" => Some(("$py_max", 2, false)),
+                        _ => None,
+                    };
+                    if let Some((helper, arity, boxed_i32)) = builtin {
+                        if args.len() != arity {
+                            return Err(CompileError::at(
+                                e.line,
+                                format!(
+                                    "{n}() takes exactly {arity} argument{}",
+                                    if arity == 1 { "" } else { "s" }
+                                ),
+                            ));
+                        }
+                        let mut wat = format!("(call {helper}");
+                        for a in args {
+                            wat.push(' ');
+                            wat.push_str(&self.value_expr(cx, a)?);
+                        }
+                        wat.push(')');
+                        return Ok(if boxed_i32 {
+                            format!("(call $box {wat})")
+                        } else {
+                            wat
+                        });
                     }
-                    let v = self.value_expr(cx, &args[0])?;
-                    return Ok(format!("(call $box (call $py_len {v}))"));
                 }
                 let Some(&arity) = self.funcs.get(n) else {
                     return Err(CompileError::at(e.line, format!("unknown function '{n}'")));
