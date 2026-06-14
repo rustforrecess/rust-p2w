@@ -1,8 +1,19 @@
-# Classes — design proposal (for review before implementation)
+# Classes — design (implemented)
 
-Status: **proposal, not built.** This ports the reference p2w object model into
-rust-p2w, adapted to the infrastructure we already have. Reviewed and adjusted
-here *before* any codegen, per the "scout the hard thing carefully" plan.
+Status: **v1 implemented** (5 slices, all green vs CPython). This ports the
+reference p2w object model into rust-p2w, adapted to the infrastructure we
+already have. Reviewed and adjusted here *before* codegen, per the "scout the
+hard thing carefully" plan; kept as the record of what shipped.
+
+Shipped, slice by slice: (1) core — `$CLASS`/`$OBJECT`/`$METHOD`/`$MFUNC`
+types, two-pass registration, method codegen + arg-list unpack, construction,
+attr get/set via `$DICT`, `call_ref` dispatch, default `<Name object>` print;
+(2) single inheritance + `super()` (compile-time resolution from the enclosing
+class's base via `$dispatch_from`); (3) `__repr__`/`__str__` in print
+(`$object_display`); (4) operator dunders — `__add__`/`__sub__`/`__mul__`,
+`__eq__` (reflected + identity fallback), `__lt__`/`__le__`/`__gt__`/`__ge__`,
+`__len__`, `__getitem__`; (5) class variables (instance → class namespace
+fallback; reading a method as a value is a clean error).
 
 ## Guiding principle
 
