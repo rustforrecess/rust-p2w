@@ -82,6 +82,9 @@ pub struct Module {
     pub types: Vec<String>,
     pub imports: Vec<String>,
     pub globals: Vec<String>,
+    /// Function names that need `(elem declare func ...)` so `ref.func` on them
+    /// is valid (method dispatch references methods as function references).
+    pub elem_declares: Vec<String>,
     pub funcs: Vec<Func>,
 }
 
@@ -94,6 +97,12 @@ impl Module {
                 out.push_str(entry);
                 out.push('\n');
             }
+        }
+        if !self.elem_declares.is_empty() {
+            out.push_str(INDENT);
+            out.push_str("(elem declare func ");
+            out.push_str(&self.elem_declares.join(" "));
+            out.push_str(")\n");
         }
         for f in &self.funcs {
             f.render(&mut out);
@@ -128,6 +137,7 @@ mod tests {
             types: vec!["(type $t (func))".into()],
             imports: vec!["(import \"env\" \"f\" (func $f))".into()],
             globals: vec![],
+            elem_declares: vec![],
             funcs: vec![Func {
                 signature: "(func $_start (export \"_start\") (result i32)".into(),
                 locals: vec!["(local $x i32)".into()],

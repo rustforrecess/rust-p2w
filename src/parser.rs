@@ -3,7 +3,7 @@
 //! (`if`, `for`, `while`) consume indented blocks delimited by INDENT/DEDENT;
 //! simple statements consume their trailing NEWLINE.
 
-use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Method, Stmt, StmtKind, UnOp};
 use crate::error::CompileError;
 use crate::lexer::{Tok, Token};
 
@@ -116,6 +116,9 @@ impl<'a> Parser<'a> {
         if self.is_keyword("def") {
             return self.def_stmt();
         }
+        if self.is_keyword("class") {
+            return self.class_stmt();
+        }
         if self.is_keyword("return") {
             self.advance();
             let value = if matches!(self.peek(), Tok::Newline) {
@@ -165,9 +168,17 @@ impl<'a> Parser<'a> {
                     },
                     line,
                 }),
+                ExprKind::Attr(obj, attr) => Ok(Stmt {
+                    kind: StmtKind::SetAttr {
+                        obj: *obj,
+                        attr,
+                        value,
+                    },
+                    line,
+                }),
                 _ => Err(CompileError::at(
                     line,
-                    "can only assign to a variable or an index like xs[i]",
+                    "can only assign to a variable, an index like xs[i], or an attribute like obj.x",
                 )),
             };
         }
@@ -270,6 +281,77 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         Ok(Stmt {
             kind: StmtKind::Def { name, params, body },
+            line,
+        })
+    }
+
+    fn class_stmt(&mut self) -> Result<Stmt> {
+        let line = self.line();
+        self.eat_keyword("class")?;
+        let name = match self.peek().clone() {
+            Tok::Name(n) => {
+                self.advance();
+                n
+            }
+            other => {
+                return Err(CompileError::at(
+                    self.line(),
+                    format!("expected a class name after 'class', found {other:?}"),
+                ))
+            }
+        };
+        // Optional single base class: `class Name(Base):`
+        let mut base = None;
+        if matches!(self.peek(), Tok::LParen) {
+            self.advance();
+            if !matches!(self.peek(), Tok::RParen) {
+                match self.peek().clone() {
+                    Tok::Name(b) => {
+                        self.advance();
+                        base = Some(b);
+                    }
+                    other => {
+                        return Err(CompileError::at(
+                            self.line(),
+                            format!("expected a base class name, found {other:?}"),
+                        ))
+                    }
+                }
+                if matches!(self.peek(), Tok::Comma) {
+                    return Err(CompileError::at(
+                        self.line(),
+                        "multiple inheritance isn't supported — one base class only",
+                    ));
+                }
+            }
+            self.expect(&Tok::RParen, "')'")?;
+        }
+        self.expect(&Tok::Colon, "':'")?;
+        self.expect(&Tok::Newline, "a new line")?;
+        // Reuse the normal block parser, then split the body into methods and
+        // class-level variable assignments.
+        let body = self.block()?;
+        let mut methods = Vec::new();
+        let mut class_vars = Vec::new();
+        for stmt in body {
+            match stmt.kind {
+                StmtKind::Def { name, params, body } => methods.push(Method { name, params, body }),
+                StmtKind::Assign(n, v) => class_vars.push((n, v)),
+                _ => {
+                    return Err(CompileError::at(
+                        stmt.line,
+                        "a class body can only contain methods (def) and variable assignments",
+                    ))
+                }
+            }
+        }
+        Ok(Stmt {
+            kind: StmtKind::ClassDef {
+                name,
+                base,
+                methods,
+                class_vars,
+            },
             line,
         })
     }
@@ -456,7 +538,7 @@ impl<'a> Parser<'a> {
                 Tok::Dot => {
                     let line = self.line();
                     self.advance();
-                    let method = match self.peek().clone() {
+                    let name = match self.peek().clone() {
                         Tok::Name(m) => {
                             self.advance();
                             m
@@ -464,19 +546,25 @@ impl<'a> Parser<'a> {
                         other => {
                             return Err(CompileError::at(
                                 self.line(),
-                                format!("expected a method name after '.', found {other:?}"),
+                                format!("expected a name after '.', found {other:?}"),
                             ))
                         }
                     };
-                    self.expect(
-                        &Tok::LParen,
-                        "'(' (only method calls are supported after '.')",
-                    )?;
-                    let args = self.call_args()?;
-                    e = Expr {
-                        kind: ExprKind::MethodCall(Box::new(e), method, args),
-                        line,
-                    };
+                    // `.name(...)` is a method call; bare `.name` is an
+                    // attribute read.
+                    if matches!(self.peek(), Tok::LParen) {
+                        self.advance();
+                        let args = self.call_args()?;
+                        e = Expr {
+                            kind: ExprKind::MethodCall(Box::new(e), name, args),
+                            line,
+                        };
+                    } else {
+                        e = Expr {
+                            kind: ExprKind::Attr(Box::new(e), name),
+                            line,
+                        };
+                    }
                 }
                 _ => return Ok(e),
             }
@@ -722,6 +810,7 @@ fn contains_call(e: &Expr) -> bool {
         ExprKind::Dict(entries) => entries
             .iter()
             .any(|(k, v)| contains_call(k) || contains_call(v)),
+        ExprKind::Attr(inner, _) => contains_call(inner),
         _ => false,
     }
 }

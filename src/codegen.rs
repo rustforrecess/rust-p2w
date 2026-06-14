@@ -52,8 +52,8 @@ const I31_MIN: i64 = -(1 << 30);
 pub fn generate(stmts: &[Stmt]) -> Result<String> {
     let mut g = Gen::default();
 
-    // Pass 1: collect function signatures so calls (including mutual
-    // recursion) resolve regardless of definition order.
+    // Pass 1: collect function and class signatures so calls/construction
+    // (including mutual recursion) resolve regardless of definition order.
     for s in stmts {
         if let StmtKind::Def { name, params, .. } = &s.kind {
             if name == "print" {
@@ -67,27 +67,72 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             }
         }
     }
+    for s in stmts {
+        if let StmtKind::ClassDef { name, base, .. } = &s.kind {
+            if g.funcs.contains_key(name) || g.classes.contains_key(name) {
+                return Err(CompileError::at(
+                    s.line,
+                    format!("'{name}' is defined twice"),
+                ));
+            }
+            if let Some(b) = base {
+                if !g.classes.contains_key(b) {
+                    return Err(CompileError::at(
+                        s.line,
+                        format!("unknown base class '{b}' (define it before '{name}')"),
+                    ));
+                }
+            }
+            g.classes.insert(name.clone(), base.clone());
+        }
+    }
 
-    // Pass 2a: top-level statements become _start; top-level variables are
-    // module globals so functions can read them.
+    // Pass 2a: top-level statements become _start. Classes are built first
+    // (their method tables must exist before any user code constructs an
+    // instance), then top-level variables (which become module globals).
     let mut cx = FuncCx {
         is_top: true,
         ..Default::default()
     };
     let mut body = Body::new();
+    if !g.classes.is_empty() {
+        cx.locals
+            .push((".cd".to_string(), "(ref null $DICT)".to_string()));
+        for s in stmts {
+            if let StmtKind::ClassDef {
+                name,
+                base,
+                methods,
+                ..
+            } = &s.kind
+            {
+                g.gen_class_init(name, base, methods, &mut body);
+            }
+        }
+    }
     for s in stmts {
-        if !matches!(s.kind, StmtKind::Def { .. }) {
+        if !matches!(s.kind, StmtKind::Def { .. } | StmtKind::ClassDef { .. }) {
             g.stmt(&mut cx, s, &mut body)?;
         }
     }
     body.push("(i32.const 0)");
 
-    // Pass 2b: each def becomes its own function (after 2a, so every module
-    // global is known).
+    // Pass 2b: each def and each method becomes its own function (after 2a,
+    // so every module global is known).
     let mut user_funcs = Vec::new();
+    let mut method_names = Vec::new();
     for s in stmts {
-        if let StmtKind::Def { name, params, body } = &s.kind {
-            user_funcs.push(g.gen_def(name, params, body)?);
+        match &s.kind {
+            StmtKind::Def { name, params, body } => {
+                user_funcs.push(g.gen_def(name, params, body)?);
+            }
+            StmtKind::ClassDef { name, methods, .. } => {
+                for m in methods {
+                    user_funcs.push(g.gen_method(name, m, s.line)?);
+                    method_names.push(format!("$m_{name}_{}", m.name));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -114,6 +159,23 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module.types.push(
         "(type $DICT (struct (field (mut i32)) (field (mut (ref null $ITEMS))) (field (mut (ref null $ITEMS)))))".into(),
     );
+    // Classes (boxed object model, ported from reference p2w — see
+    // CLASSES_DESIGN.md). Methods dispatch via $MFUNC function references;
+    // instance attrs and class method tables reuse $DICT.
+    module.types.push(
+        "(type $MFUNC (func (param (ref null eq)) (param (ref null eq)) (result (ref null eq))))"
+            .into(),
+    );
+    module
+        .types
+        .push("(type $METHOD (struct (field (ref $MFUNC))))".into());
+    // $CLASS self-references via $base, so it lives in a singleton rec group.
+    module.types.push(
+        "(rec (type $CLASS (struct (field (ref $STR)) (field (ref null $DICT)) (field (ref null $CLASS)))))".into(),
+    );
+    module
+        .types
+        .push("(type $OBJECT (struct (field (ref $CLASS)) (field (ref null $DICT))))".into());
     module
         .imports
         .push(r#"(import "env" "write_char" (func $write_char (param i32)))"#.into());
@@ -137,6 +199,12 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             "(global $g_{name} (mut (ref null eq)) (ref.null eq))"
         ));
     }
+    for name in g.classes.keys() {
+        module.globals.push(format!(
+            "(global $g_class_{name} (mut (ref null $CLASS)) (ref.null $CLASS))"
+        ));
+    }
+    module.elem_declares = method_names;
 
     module.funcs.push(Func {
         signature: r#"(func $_start (export "_start") (result i32)"#.into(),
@@ -151,6 +219,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module.funcs.push(f);
     }
     for f in runtime_helpers() {
+        module.funcs.push(f);
+    }
+    for f in class_helpers() {
         module.funcs.push(f);
     }
     for f in raise_helpers() {
@@ -204,6 +275,15 @@ fn raise_helpers() -> Vec<Func> {
         b.push_in(1, "(return))");
         b.push(")");
     }
+    // Instances report their class name (e.g. AttributeError messages).
+    b.push("(if (ref.test (ref $OBJECT) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(call $print_str (struct.get $CLASS 0 (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $r)))))",
+    );
+    b.push_in(1, "(return))");
+    b.push(")");
     push_text(&mut b, 0, "object");
     fs.push(Func {
         signature: "(func $type_name (param $r (ref null eq))".into(),
@@ -334,6 +414,39 @@ fn raise_helpers() -> Vec<Func> {
             body: b,
         });
     }
+
+    // $raise_no_attr: attribute miss (read or method) — names the attribute.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "AttributeError: '");
+    b.push("(call $type_name (local.get $obj))");
+    push_text(&mut b, 0, "' object has no attribute '");
+    b.push("(call $print_str (ref.cast (ref null $STR) (local.get $name)))");
+    push_text(&mut b, 0, "'");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_no_attr (param $obj (ref null eq)) (param $name (ref null eq))"
+            .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_arity: a method got the wrong number of arguments.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        0,
+        "TypeError: method called with the wrong number of arguments",
+    );
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_arity".into(),
+        locals: vec![],
+        body: b,
+    });
 
     fs
 }
@@ -1214,6 +1327,19 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (call $print_dict (ref.cast (ref $DICT) (local.get $r)))))",
     );
     b.push(")");
+    // $OBJECT: no __repr__/__str__ wired yet (slice 3) — default `<Name object>`.
+    b.push("(if (ref.test (ref $OBJECT) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(call $write_char (i32.const 60))");
+    b.push_in(
+        2,
+        "(call $print_str (struct.get $CLASS 0 (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $r)))))",
+    );
+    for c in " object>".bytes() {
+        b.push_in(2, format!("(call $write_char (i32.const {c}))"));
+    }
+    b.push_in(1, "(return))");
+    b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
     b.push_in(1, "(then");
     b.push_in(
@@ -1521,6 +1647,150 @@ fn py_mod_helper() -> Func {
     }
 }
 
+/// The class runtime: method resolution up the inheritance chain, dynamic
+/// method dispatch via `call_ref`, instance construction, and attribute
+/// get/set (reusing `$DICT`). Always emitted (cheap; unused if no classes).
+fn class_helpers() -> Vec<Func> {
+    let mut fs = Vec::new();
+
+    // $class_lookup_method: walk class -> base, return the $METHOD (eqref) for
+    // `name`, or null. (Base chain handles single inheritance.)
+    let mut b = Body::new();
+    b.push("(local.set $c (local.get $class))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $walk");
+    b.push_in(2, "(br_if $done (ref.is_null (local.get $c)))");
+    b.push_in(
+        2,
+        "(local.set $methods (struct.get $CLASS 1 (local.get $c)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $idx (call $dict_find (local.get $methods) (local.get $name)))",
+    );
+    b.push_in(2, "(if (i32.ge_s (local.get $idx) (i32.const 0))");
+    b.push_in(
+        3,
+        "(then (return (array.get $ITEMS (struct.get $DICT 2 (local.get $methods)) (local.get $idx)))))",
+    );
+    b.push_in(2, "(local.set $c (struct.get $CLASS 2 (local.get $c)))");
+    b.push_in(2, "(br $walk)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(ref.null eq)");
+    fs.push(Func {
+        signature:
+            "(func $class_lookup_method (param $class (ref null $CLASS)) (param $name (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $c (ref null $CLASS))".into(),
+            "(local $idx i32)".into(),
+            "(local $methods (ref null $DICT))".into(),
+        ],
+        body: b,
+    });
+
+    // $call_method: dynamic dispatch — find the method on the object's class
+    // chain, prepend self, call via call_ref. Missing method -> AttributeError.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push(
+        "(local.set $m (call $class_lookup_method (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name)))",
+    );
+    b.push("(if (i32.eqz (ref.test (ref $METHOD) (local.get $m)))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push(
+        "(call_ref $MFUNC (local.get $obj) (local.get $args) (struct.get $METHOD 0 (ref.cast (ref $METHOD) (local.get $m))))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $call_method (param $obj (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec!["(local $m (ref null eq))".into()],
+        body: b,
+    });
+
+    // $instantiate: Cls(args) -> new instance with empty attrs, then __init__
+    // (if defined) with self prepended.
+    let mut b = Body::new();
+    b.push(
+        "(local.set $obj (struct.new $OBJECT (ref.cast (ref $CLASS) (local.get $class)) (struct.new $DICT (i32.const 0) (array.new_fixed $ITEMS 0) (array.new_fixed $ITEMS 0))))",
+    );
+    b.push(format!(
+        "(local.set $init (call $class_lookup_method (local.get $class) {}))",
+        str_lit("__init__")
+    ));
+    b.push("(if (ref.test (ref $METHOD) (local.get $init))");
+    b.push_in(
+        1,
+        "(then (drop (call_ref $MFUNC (local.get $obj) (local.get $args) (struct.get $METHOD 0 (ref.cast (ref $METHOD) (local.get $init)))))))",
+    );
+    b.push("(local.get $obj)");
+    fs.push(Func {
+        signature:
+            "(func $instantiate (param $class (ref null $CLASS)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $obj (ref null eq))".into(),
+            "(local $init (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
+    // $obj_getattr: instance attribute read (instance dict only in v1).
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push("(local.set $attrs (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) (local.get $obj))))");
+    b.push("(local.set $idx (call $dict_find (local.get $attrs) (local.get $name)))");
+    b.push("(if (i32.lt_s (local.get $idx) (i32.const 0))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push("(array.get $ITEMS (struct.get $DICT 2 (local.get $attrs)) (local.get $idx))");
+    fs.push(Func {
+        signature:
+            "(func $obj_getattr (param $obj (ref null eq)) (param $name (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $idx i32)".into(),
+            "(local $attrs (ref null $DICT))".into(),
+        ],
+        body: b,
+    });
+
+    // $obj_setattr: instance attribute write.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push(
+        "(call $dict_set (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name) (local.get $val))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $obj_setattr (param $obj (ref null eq)) (param $name (ref null eq)) (param $val (ref null eq))"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    fs
+}
+
 /// Python floor division: truncating `i32.div_s` adjusted by -1 when the
 /// signs differ and the division isn't exact (`-7 // 2` is -4, not -3).
 fn floordiv_helper() -> Func {
@@ -1578,6 +1848,9 @@ struct Gen {
     uses_floormod: bool,
     /// User functions: name -> arity (collected before any body compiles).
     funcs: HashMap<String, usize>,
+    /// User classes: name -> base class name (None if no base). Collected in
+    /// pass 1 so `Cls(args)` construction is distinguished from a function call.
+    classes: HashMap<String, Option<String>>,
     /// Top-level Python variables, in definition order — WASM globals named
     /// `$g_<name>` so function bodies can read them.
     globals: Vec<String>,
@@ -1677,6 +1950,18 @@ impl Gen {
                 "functions can only be defined at the top level (not inside \
                  another function, loop, or if)",
             )),
+            StmtKind::ClassDef { .. } => Err(CompileError::at(
+                s.line,
+                "classes can only be defined at the top level (not inside \
+                 another function, loop, or if)",
+            )),
+            StmtKind::SetAttr { obj, attr, value } => {
+                self.type_of(cx, value)?;
+                let o = self.value_expr(cx, obj)?;
+                let v = self.value_expr(cx, value)?;
+                out.push(format!("(call $obj_setattr {o} {} {v})", str_lit(attr)));
+                Ok(())
+            }
             StmtKind::Return(value) => {
                 if cx.is_top {
                     return Err(CompileError::at(
@@ -1989,6 +2274,111 @@ impl Gen {
         })
     }
 
+    /// Build an `$LIST` from argument expressions (the method-call args
+    /// container; same shape as a list literal).
+    fn list_of(&mut self, cx: &mut FuncCx, args: &[Expr]) -> Result<String> {
+        let mut items = String::new();
+        for a in args {
+            items.push(' ');
+            items.push_str(&self.value_expr(cx, a)?);
+        }
+        let n = args.len();
+        Ok(format!(
+            "(struct.new $LIST (i32.const {n}) (array.new_fixed $ITEMS {n}{items}))"
+        ))
+    }
+
+    /// Compile one method into a uniform-signature `$MFUNC` function. The
+    /// instance comes in as the first WASM param (named after the Python
+    /// `self`-parameter); the remaining declared params are unpacked from the
+    /// `$.args` list in the prologue. Dispatched via `call_ref`.
+    fn gen_method(&mut self, class: &str, m: &crate::ast::Method, line: usize) -> Result<Func> {
+        if m.params.is_empty() {
+            return Err(CompileError::at(
+                line,
+                format!("method '{}' needs at least a 'self' parameter", m.name),
+            ));
+        }
+        let self_name = &m.params[0];
+        let rest = &m.params[1..];
+
+        let mut cx = FuncCx::default();
+        for p in &m.params {
+            cx.vars.insert(p.clone(), Ty::Value);
+        }
+        // Non-self params are locals unpacked from the args list.
+        for p in rest {
+            cx.locals.push((p.clone(), VAL.to_string()));
+        }
+        let mut assigned = std::collections::HashSet::new();
+        collect_assigned(&m.body, &mut assigned);
+        let mut local_names: Vec<&String> = assigned.iter().collect();
+        local_names.sort();
+        for a in local_names {
+            if !cx.vars.contains_key(a) {
+                cx.ensure_local(a);
+            }
+        }
+
+        let mut b = Body::new();
+        // Arity check: the args list must hold exactly the non-self params.
+        b.push(format!(
+            "(if (i32.ne (call $py_len (local.get $.args)) (i32.const {})) (then (call $raise_arity)))",
+            rest.len()
+        ));
+        for (i, p) in rest.iter().enumerate() {
+            b.push(format!(
+                "(local.set ${p} (call $py_index (local.get $.args) (i32.const {i})))"
+            ));
+        }
+        self.stmts(&mut cx, &m.body, &mut b)?;
+        b.push("(global.get $NONE)");
+
+        Ok(Func {
+            signature: format!(
+                "(func $m_{class}_{} (type $MFUNC) (param ${self_name} (ref null eq)) (param $.args (ref null eq)) (result (ref null eq))",
+                m.name
+            ),
+            locals: cx
+                .locals
+                .iter()
+                .map(|(n, ty)| format!("(local ${n} {ty})"))
+                .collect(),
+            body: b,
+        })
+    }
+
+    /// Emit the runtime construction of one class's `$CLASS` global into the
+    /// `_start` prologue: build the method table (`$DICT` of name -> `$METHOD`)
+    /// then `global.set`. Runs in source order, so a base class (built
+    /// earlier) is available when a subclass references it.
+    fn gen_class_init(
+        &self,
+        name: &str,
+        base: &Option<String>,
+        methods: &[crate::ast::Method],
+        out: &mut Body,
+    ) {
+        out.push(
+            "(local.set $.cd (struct.new $DICT (i32.const 0) (array.new_fixed $ITEMS 0) (array.new_fixed $ITEMS 0)))",
+        );
+        for m in methods {
+            out.push(format!(
+                "(call $dict_set (local.get $.cd) {} (struct.new $METHOD (ref.func $m_{name}_{})))",
+                str_lit(&m.name),
+                m.name
+            ));
+        }
+        let base_ref = match base {
+            Some(b) => format!("(global.get $g_class_{b})"),
+            None => "(ref.null $CLASS)".to_string(),
+        };
+        out.push(format!(
+            "(global.set $g_class_{name} (struct.new $CLASS {} (local.get $.cd) {base_ref}))",
+            str_lit(name)
+        ));
+    }
+
     /// `for var in <sequence>:` — snapshot the iterable, index through it
     /// with $py_index. Length is re-read each pass (Python's list iterator
     /// does the same, so appending inside the loop extends it).
@@ -2183,14 +2573,7 @@ impl Gen {
                     _ => unreachable!("handled above"),
                 })
             }
-            ExprKind::Str(s) => {
-                let bytes: Vec<String> = s.bytes().map(|b| format!("(i32.const {b})")).collect();
-                Ok(format!(
-                    "(array.new_fixed $STR {} {})",
-                    bytes.len(),
-                    bytes.join(" ")
-                ))
-            }
+            ExprKind::Str(s) => Ok(str_lit(s)),
             ExprKind::List(elems) => {
                 let mut items = String::new();
                 for el in elems {
@@ -2223,18 +2606,23 @@ impl Gen {
                 let k = self.value_expr(cx, key)?;
                 Ok(format!("(call $py_subscript {o} {k})"))
             }
+            ExprKind::Attr(obj, name) => {
+                let o = self.value_expr(cx, obj)?;
+                Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
+            }
             ExprKind::MethodCall(recv, method, args) => {
+                // `.append(v)` is the list fast path; every other method is a
+                // dynamic object dispatch.
                 if method == "append" && args.len() == 1 {
                     let r = self.value_expr(cx, recv)?;
                     let v = self.value_expr(cx, &args[0])?;
                     Ok(format!("(call $list_append {r} {v})"))
                 } else {
-                    Err(CompileError::at(
-                        e.line,
-                        format!(
-                            ".{method}({}) isn't supported yet — lists support .append(value)",
-                            if args.is_empty() { "" } else { "..." }
-                        ),
+                    let r = self.value_expr(cx, recv)?;
+                    let args_list = self.list_of(cx, args)?;
+                    Ok(format!(
+                        "(call $call_method {r} {} {args_list})",
+                        str_lit(method)
                     ))
                 }
             }
@@ -2243,6 +2631,14 @@ impl Gen {
                     return Err(CompileError::at(
                         e.line,
                         "print(...) can't be used inside an expression",
+                    ));
+                }
+                // Class construction: `Cls(args)` builds an instance and runs
+                // __init__ (which validates its own arity at runtime).
+                if self.classes.contains_key(n.as_str()) {
+                    let args_list = self.list_of(cx, args)?;
+                    return Ok(format!(
+                        "(call $instantiate (global.get $g_class_{n}) {args_list})"
                     ));
                 }
                 // User functions first (a `def len` shadows the builtin,
@@ -2387,6 +2783,13 @@ fn emit_char(out: &mut Body, byte: u8) {
     out.push(format!("(call $write_char (i32.const {byte}))"));
 }
 
+/// WAT for a `$STR` literal from Rust bytes (used for attribute/method-name
+/// keys as well as string literals).
+fn str_lit(s: &str) -> String {
+    let bytes: Vec<String> = s.bytes().map(|b| format!("(i32.const {b})")).collect();
+    format!("(array.new_fixed $STR {} {})", bytes.len(), bytes.join(" "))
+}
+
 /// Constant value of an integer literal (handling unary minus), if it is one.
 fn const_int(e: &Expr) -> Option<i64> {
     match &e.kind {
@@ -2526,6 +2929,10 @@ impl Gen {
                 for el in elems {
                     self.type_of(cx, el)?;
                 }
+                Ok(Ty::Value)
+            }
+            ExprKind::Attr(obj, _) => {
+                self.type_of(cx, obj)?;
                 Ok(Ty::Value)
             }
             ExprKind::Dict(entries) => {

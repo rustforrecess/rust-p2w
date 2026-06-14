@@ -825,6 +825,92 @@ print(\"sum of evens:\", total)
     assert_output(src, "sum of evens: 6\n");
 }
 
+// --- classes (slice 1: construction, attrs, methods, dispatch, inheritance) ---
+
+#[test]
+fn class_construction_attrs_and_methods() {
+    assert_output(
+        "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def total(self):\n        return self.x + self.y\np = Point(3, 4)\nprint(p.x, p.y, p.total())",
+        "3 4 7\n",
+    );
+}
+
+#[test]
+fn class_method_mutates_attribute() {
+    assert_output(
+        "class Counter:\n    def __init__(self):\n        self.n = 0\n    def inc(self):\n        self.n = self.n + 1\nc = Counter()\nc.inc()\nc.inc()\nprint(c.n)",
+        "2\n",
+    );
+}
+
+#[test]
+fn class_inheritance_resolves_methods_along_the_chain() {
+    // Dog has no __init__ — construction finds Animal.__init__; speak is
+    // overridden, kind is inherited.
+    assert_output(
+        "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\n    def kind(self):\n        return \"animal\"\nclass Dog(Animal):\n    def speak(self):\n        return self.name + \" barks\"\nd = Dog(\"Rex\")\nprint(d.speak())\nprint(d.kind())",
+        "Rex barks\nanimal\n",
+    );
+}
+
+#[test]
+fn instances_have_reference_semantics() {
+    assert_output(
+        "class Box:\n    def __init__(self, v):\n        self.v = v\ndef bump(box):\n    box.v = box.v + 1\nb = Box(1)\nbump(b)\nbump(b)\nprint(b.v)",
+        "3\n",
+    );
+}
+
+#[test]
+fn instance_without_repr_prints_default() {
+    assert_output(
+        "class Empty:\n    def __init__(self):\n        self.x = 1\ne = Empty()\nprint(e)",
+        "<Empty object>\n",
+    );
+}
+
+#[test]
+fn missing_attribute_raises_attribute_error() {
+    assert_raises(
+        "class A:\n    def __init__(self):\n        self.x = 1\na = A()\nprint(a.y)",
+        "AttributeError",
+    );
+    assert_raises(
+        "class A:\n    def __init__(self):\n        self.x = 1\na = A()\nprint(a.y)",
+        "has no attribute 'y'",
+    );
+}
+
+#[test]
+fn missing_method_raises_attribute_error() {
+    assert_raises(
+        "class A:\n    def __init__(self):\n        self.x = 1\na = A()\nprint(a.nope())",
+        "has no attribute 'nope'",
+    );
+}
+
+#[test]
+fn wrong_method_arity_raises_type_error() {
+    assert_raises(
+        "class A:\n    def __init__(self):\n        self.x = 1\n    def m(self, a):\n        return a\na = A()\nprint(a.m())",
+        "wrong number of arguments",
+    );
+}
+
+#[test]
+fn class_redefinition_is_an_error() {
+    let err = rust_p2w::compile_to_wat("class A:\n    def m(self):\n        return 1\nclass A:\n    def m(self):\n        return 2").unwrap_err();
+    assert!(format!("{err}").contains("defined twice"), "{err}");
+}
+
+#[test]
+fn unknown_base_class_is_an_error() {
+    let err =
+        rust_p2w::compile_to_wat("class Dog(Animal):\n    def speak(self):\n        return 1")
+            .unwrap_err();
+    assert!(format!("{err}").contains("unknown base class"), "{err}");
+}
+
 // --- differential testing against real CPython, when available ---
 
 /// Programs that print ints, bools, and strings (`/` is still rejected, so it
@@ -877,6 +963,13 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "i = 0\nwhile True:\n    i = i + 1\n    if i == 3:\n        break\nprint(i)",
     "for i in range(6):\n    if i % 2 == 0:\n        continue\n    if i == 5:\n        break\n    print(i)",
     "i = 0\nwhile i < 5:\n    i = i + 1\n    if i % 2 == 0:\n        continue\n    print(i)",
+    // --- classes (bare-object printing is excluded: CPython's default repr
+    //     includes a module path and address we don't reproduce) ---
+    "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def total(self):\n        return self.x + self.y\np = Point(3, 4)\nprint(p.x, p.y, p.total())",
+    "class Counter:\n    def __init__(self):\n        self.n = 0\n    def inc(self):\n        self.n = self.n + 1\nc = Counter()\nc.inc()\nc.inc()\nc.inc()\nprint(c.n)",
+    "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\n    def kind(self):\n        return \"animal\"\nclass Dog(Animal):\n    def speak(self):\n        return self.name + \" barks\"\nd = Dog(\"Rex\")\nprint(d.speak(), d.kind(), d.name)",
+    "class Bag:\n    def __init__(self):\n        self.items = []\n    def add(self, x):\n        self.items.append(x)\n    def total(self):\n        t = 0\n        for it in self.items:\n            t = t + it\n        return t\nb = Bag()\nb.add(10)\nb.add(20)\nb.add(5)\nprint(b.items, b.total())",
+    "class Box:\n    def __init__(self, v):\n        self.v = v\ndef bump(box):\n    box.v = box.v + 1\nboxes = [Box(1), Box(2)]\nbump(boxes[0])\nbump(boxes[1])\nprint(boxes[0].v, boxes[1].v)",
 ];
 
 fn find_python() -> Option<&'static str> {

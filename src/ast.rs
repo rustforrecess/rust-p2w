@@ -66,6 +66,28 @@ pub enum StmtKind {
         index: Expr,
         value: Expr,
     },
+    /// `class Name[(Base)]: ...` (top level only). Body splits into methods
+    /// and class-level variable assignments.
+    ClassDef {
+        name: String,
+        base: Option<String>,
+        methods: Vec<Method>,
+        class_vars: Vec<(String, Expr)>,
+    },
+    /// `obj.attr = value`
+    SetAttr {
+        obj: Expr,
+        attr: String,
+        value: Expr,
+    },
+}
+
+/// A method inside a class body. `params[0]` is conventionally `self`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Method {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +125,8 @@ pub enum ExprKind {
     Index(Box<Expr>, Box<Expr>),
     /// A method call, e.g. `xs.append(v)`.
     MethodCall(Box<Expr>, String, Vec<Expr>),
+    /// Attribute read, e.g. `obj.attr` (a `.name` not followed by `(`).
+    Attr(Box<Expr>, String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
