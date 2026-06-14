@@ -945,6 +945,30 @@ fn super_without_a_base_is_an_error() {
 }
 
 #[test]
+fn operator_dunders_drive_arithmetic_and_equality() {
+    assert_output(
+        "class V:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __add__(self, o):\n        return V(self.x + o.x, self.y + o.y)\n    def __eq__(self, o):\n        return self.x == o.x and self.y == o.y\n    def __repr__(self):\n        return \"V(\" + str(self.x) + \", \" + str(self.y) + \")\"\nprint(V(1, 2) + V(3, 4))\nprint(V(1, 2) == V(1, 2))",
+        "V(4, 6)\nTrue\n",
+    );
+}
+
+#[test]
+fn len_and_getitem_dunders() {
+    assert_output(
+        "class Deck:\n    def __init__(self):\n        self.cards = [7, 8, 9]\n    def __len__(self):\n        return len(self.cards)\n    def __getitem__(self, i):\n        return self.cards[i]\nd = Deck()\nprint(len(d))\nprint(d[1])",
+        "3\n8\n",
+    );
+}
+
+#[test]
+fn objects_without_eq_compare_by_identity() {
+    assert_output(
+        "class A:\n    def __init__(self):\n        self.n = 1\na = A()\nb = A()\nprint(a == a, a == b)",
+        "True False\n",
+    );
+}
+
+#[test]
 fn class_redefinition_is_an_error() {
     let err = rust_p2w::compile_to_wat("class A:\n    def m(self):\n        return 1\nclass A:\n    def m(self):\n        return 2").unwrap_err();
     assert!(format!("{err}").contains("defined twice"), "{err}");
@@ -1019,6 +1043,15 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "class Box:\n    def __init__(self, v):\n        self.v = v\ndef bump(box):\n    box.v = box.v + 1\nboxes = [Box(1), Box(2)]\nbump(boxes[0])\nbump(boxes[1])\nprint(boxes[0].v, boxes[1].v)",
     "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\nclass Dog(Animal):\n    def __init__(self, name):\n        super().__init__(name)\n        self.tricks = []\n    def speak(self):\n        return super().speak() + \"; \" + self.name + \" barks\"\n    def learn(self, t):\n        self.tricks.append(t)\nd = Dog(\"Rex\")\nd.learn(\"sit\")\nd.learn(\"roll\")\nprint(d.speak())\nprint(d.tricks)",
     "class Q:\n    def __init__(self, n):\n        self.n = n\n    def __str__(self):\n        return \"str-\" + str(self.n)\n    def __repr__(self):\n        return \"repr-\" + str(self.n)\nq = Q(5)\nprint(q)\nprint([q, Q(6)])\nprint({1: Q(7)})",
+    // operator dunders: arithmetic, ==, repr
+    "class V:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __add__(self, o):\n        return V(self.x + o.x, self.y + o.y)\n    def __sub__(self, o):\n        return V(self.x - o.x, self.y - o.y)\n    def __mul__(self, k):\n        return V(self.x * k, self.y * k)\n    def __eq__(self, o):\n        return self.x == o.x and self.y == o.y\n    def __repr__(self):\n        return \"V(\" + str(self.x) + \", \" + str(self.y) + \")\"\na = V(1, 2)\nb = V(3, 4)\nprint(a + b)\nprint(b - a)\nprint(a * 3)\nprint(a == V(1, 2), a == b)",
+    // ordered comparisons
+    "class T:\n    def __init__(self, c):\n        self.c = c\n    def __lt__(self, o):\n        return self.c < o.c\n    def __le__(self, o):\n        return self.c <= o.c\n    def __gt__(self, o):\n        return self.c > o.c\n    def __ge__(self, o):\n        return self.c >= o.c\na = T(10)\nb = T(20)\nprint(a < b, a > b, a <= T(10), b >= a)",
+    // __len__ and __getitem__
+    "class Deck:\n    def __init__(self):\n        self.cards = [10, 20, 30]\n    def __len__(self):\n        return len(self.cards)\n    def __getitem__(self, i):\n        return self.cards[i]\nd = Deck()\nprint(len(d), d[0], d[2])",
+    // default __eq__ is identity; __eq__ also drives `in`
+    "class A:\n    def __init__(self):\n        self.x = 1\na = A()\nb = A()\nprint(a == a, a == b, a != b)",
+    "class P:\n    def __init__(self, n):\n        self.n = n\n    def __eq__(self, o):\n        return self.n == o.n\nps = [P(1), P(2), P(3)]\nprint(P(2) in ps, P(9) in ps)",
 ];
 
 fn find_python() -> Option<&'static str> {

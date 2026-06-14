@@ -576,8 +576,13 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_len: sequence length (lists, dicts, strings).
+    // $py_len: a custom __len__ first, then sequence length (lists, dicts,
+    // strings). __len__ returns a Python int, unboxed back to i32.
     let mut b = Body::new();
+    b.push(format!(
+        "(if (call $obj_has (local.get $r) {n}) (then (return (call $unbox (call $obj_call0 (local.get $r) {n})))))",
+        n = str_lit("__len__")
+    ));
     b.push("(if (ref.test (ref $LIST) (local.get $r))");
     b.push_in(
         1,
@@ -816,9 +821,14 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_subscript / $py_set_subscript: general `obj[key]` — dicts take the
-    // key as a value; lists/strings unbox it as a position.
+    // $py_subscript / $py_set_subscript: general `obj[key]` — a custom
+    // __getitem__ first, then dicts take the key as a value; lists/strings
+    // unbox it as a position.
     let mut b = Body::new();
+    b.push(format!(
+        "(if (call $obj_has (local.get $r) {n}) (then (return (call $obj_call1 (local.get $r) (local.get $k) {n}))))",
+        n = str_lit("__getitem__")
+    ));
     b.push("(if (ref.test (ref $DICT) (local.get $r))");
     b.push_in(
         1,
@@ -1386,9 +1396,13 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_add: Python `+` — list/string concatenation when both sides
-    // match, numeric addition otherwise.
+    // $py_add: Python `+` — a left operand's __add__ first, then list/string
+    // concatenation when both sides match, numeric addition otherwise.
     let mut b = Body::new();
+    b.push(format!(
+        "(if (call $obj_has (local.get $a) {n}) (then (return (call $obj_call1 (local.get $a) (local.get $b) {n}))))",
+        n = str_lit("__add__")
+    ));
     b.push(
         "(if (i32.and (ref.test (ref $LIST) (local.get $a)) (ref.test (ref $LIST) (local.get $b)))",
     );
@@ -1444,12 +1458,17 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_sub / $py_mul: float promotion, else i32.
-    for (name, f_instr, i_instr) in [
-        ("$py_sub", "f64.sub", "i32.sub"),
-        ("$py_mul", "f64.mul", "i32.mul"),
+    // $py_sub / $py_mul: a left operand's dunder first, then float promotion,
+    // else i32.
+    for (name, f_instr, i_instr, dunder) in [
+        ("$py_sub", "f64.sub", "i32.sub", "__sub__"),
+        ("$py_mul", "f64.mul", "i32.mul", "__mul__"),
     ] {
         let mut b = Body::new();
+        b.push(format!(
+            "(if (call $obj_has (local.get $a) {n}) (then (return (call $obj_call1 (local.get $a) (local.get $b) {n}))))",
+            n = str_lit(dunder)
+        ));
         b.push("(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))");
         b.push_in(
             1,
@@ -1462,6 +1481,32 @@ fn runtime_helpers() -> Vec<Func> {
         fs.push(Func {
             signature: format!(
                 "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![],
+            body: b,
+        });
+    }
+
+    // $py_lt / $py_le / $py_gt / $py_ge: ordered comparison (raw i32 0/1). A
+    // left operand's dunder first (Vector/Fraction etc.); otherwise compare as
+    // f64 (exact for every i32). String comparison is rejected at compile time.
+    for (name, f_instr, dunder) in [
+        ("$py_lt", "f64.lt", "__lt__"),
+        ("$py_le", "f64.le", "__le__"),
+        ("$py_gt", "f64.gt", "__gt__"),
+        ("$py_ge", "f64.ge", "__ge__"),
+    ] {
+        let mut b = Body::new();
+        b.push(format!(
+            "(if (call $obj_has (local.get $a) {n}) (then (return (call $truthy (call $obj_call1 (local.get $a) (local.get $b) {n})))))",
+            n = str_lit(dunder)
+        ));
+        b.push(format!(
+            "({f_instr} (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))"
+        ));
+        fs.push(Func {
+            signature: format!(
+                "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
             ),
             locals: vec![],
             body: b,
@@ -1529,10 +1574,22 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $py_eq: Python `==` — None only equals None; strings by value,
-    // string-vs-number is False; numbers (ints, bools as 1/0, floats)
-    // compared as f64 (exact for i32).
+    // $py_eq: Python `==` — a custom __eq__ (left, then reflected right);
+    // otherwise objects compare by identity. None only equals None; strings
+    // by value, string-vs-number is False; numbers (ints, bools as 1/0,
+    // floats) compared as f64 (exact for i32).
     let mut b = Body::new();
+    b.push(format!(
+        "(if (call $obj_has (local.get $a) {n}) (then (return (call $truthy (call $obj_call1 (local.get $a) (local.get $b) {n})))))",
+        n = str_lit("__eq__")
+    ));
+    b.push(format!(
+        "(if (call $obj_has (local.get $b) {n}) (then (return (call $truthy (call $obj_call1 (local.get $b) (local.get $a) {n})))))",
+        n = str_lit("__eq__")
+    ));
+    b.push("(if (i32.or (ref.test (ref $OBJECT) (local.get $a)) (ref.test (ref $OBJECT) (local.get $b)))");
+    b.push_in(1, "(then (return (ref.eq (local.get $a) (local.get $b))))");
+    b.push(")");
     b.push("(if (i32.or (ref.test (ref $NONE_T) (local.get $a)) (ref.test (ref $NONE_T) (local.get $b)))");
     b.push_in(
         1,
@@ -1829,6 +1886,49 @@ fn class_helpers() -> Vec<Func> {
             "(local $cls (ref null $CLASS))".into(),
             "(local $m (ref null eq))".into(),
         ],
+        body: b,
+    });
+
+    // $obj_has: 1 if `obj` is an instance whose class chain defines `name`.
+    // Non-objects answer 0 — so operator helpers can probe for a dunder
+    // (`__add__`, `__eq__`, …) without first knowing the operand's type.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
+    b.push_in(1, "(then (return (i32.const 0))))");
+    b.push(
+        "(ref.test (ref $METHOD) (call $class_lookup_method (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name)))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $obj_has (param $obj (ref null eq)) (param $name (ref null eq)) (result i32)"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $obj_call1 / $obj_call0: dispatch a method on `obj`'s own class with one
+    // / zero arguments (operator dunders). Callers gate with $obj_has, so the
+    // method is known to exist.
+    let mut b = Body::new();
+    b.push(
+        "(call $dispatch_from (local.get $obj) (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name) (struct.new $LIST (i32.const 1) (array.new_fixed $ITEMS 1 (local.get $arg))))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $obj_call1 (param $obj (ref null eq)) (param $arg (ref null eq)) (param $name (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push(
+        "(call $dispatch_from (local.get $obj) (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name) (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $obj_call0 (param $obj (ref null eq)) (param $name (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![],
         body: b,
     });
 
@@ -2632,17 +2732,12 @@ impl Gen {
                 Ok(format!("(call $py_mod {lhs} {rhs})"))
             }
             ExprKind::Bin(op, a, b) => {
-                // Comparisons run as f64 (exact for every i32).
-                let lhs = self.f64_expr(cx, a)?;
-                let rhs = self.f64_expr(cx, b)?;
-                let cmp = |instr: &str| format!("(call $bool ({instr} {lhs} {rhs}))");
-                Ok(match op {
-                    BinOp::Lt => cmp("f64.lt"),
-                    BinOp::Le => cmp("f64.le"),
-                    BinOp::Gt => cmp("f64.gt"),
-                    BinOp::Ge => cmp("f64.ge"),
-                    _ => unreachable!("handled above"),
-                })
+                // Boxed operands so a custom dunder can run; the helper falls
+                // to an f64 compare (exact for every i32) for plain numbers.
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                let helper = cmp_helper(*op).expect("handled above");
+                Ok(format!("(call $bool (call {helper} {lhs} {rhs}))"))
             }
             ExprKind::Str(s) => Ok(str_lit(s)),
             ExprKind::List(elems) => {
@@ -2823,18 +2918,6 @@ impl Gen {
         Ok(format!("(call $unbox {})", self.value_expr(cx, e)?))
     }
 
-    /// Generate WAT producing the f64 of `e` — numeric constants directly,
-    /// anything else via `$unbox_f64`.
-    fn f64_expr(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
-        if let Some(v) = const_int(e) {
-            return Ok(format!("(f64.const {v})"));
-        }
-        if let Some(f) = const_float(e) {
-            return Ok(format!("(f64.const {f})"));
-        }
-        Ok(format!("(call $unbox_f64 {})", self.value_expr(cx, e)?))
-    }
-
     /// Generate WAT producing an i32 condition (0 = false). Comparisons and
     /// `not` skip the boxed-bool round-trip.
     fn cond_i32(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
@@ -2864,22 +2947,24 @@ impl Gen {
                 let cont = self.value_expr(cx, b)?;
                 Ok(format!("(i32.eqz (call $py_in {item} {cont}))"))
             }
-            ExprKind::Bin(op, a, b) if cmp_instr(*op).is_some() => {
-                let lhs = self.f64_expr(cx, a)?;
-                let rhs = self.f64_expr(cx, b)?;
-                Ok(format!("({} {lhs} {rhs})", cmp_instr(*op).unwrap()))
+            ExprKind::Bin(op, a, b) if cmp_helper(*op).is_some() => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call {} {lhs} {rhs})", cmp_helper(*op).unwrap()))
             }
             _ => Ok(format!("(call $truthy {})", self.value_expr(cx, e)?)),
         }
     }
 }
 
-fn cmp_instr(op: BinOp) -> Option<&'static str> {
+/// The runtime helper for an ordered comparison (object-aware), or `None`
+/// for operators handled elsewhere.
+fn cmp_helper(op: BinOp) -> Option<&'static str> {
     Some(match op {
-        BinOp::Lt => "f64.lt",
-        BinOp::Le => "f64.le",
-        BinOp::Gt => "f64.gt",
-        BinOp::Ge => "f64.ge",
+        BinOp::Lt => "$py_lt",
+        BinOp::Le => "$py_le",
+        BinOp::Gt => "$py_gt",
+        BinOp::Ge => "$py_ge",
         _ => return None,
     })
 }
@@ -3151,8 +3236,9 @@ mod tests {
     #[test]
     fn if_else_emits_branches() {
         let wat = compile("x = 3\nif x < 5:\n    print(1)\nelse:\n    print(2)\n").unwrap();
-        // Comparison conditions skip the boxed-bool round-trip.
-        assert!(wat.contains("(if (f64.lt (call $unbox_f64 (global.get $g_x)) (f64.const 5))"));
+        // Comparison conditions skip the boxed-bool round-trip; the operands
+        // stay boxed so a custom dunder could run.
+        assert!(wat.contains("(if (call $py_lt (global.get $g_x) (ref.i31 (i32.const 5)))"));
         assert!(wat.contains("(then"));
         assert!(wat.contains("(else"));
     }
@@ -3163,7 +3249,7 @@ mod tests {
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n";
         let wat = compile(src).unwrap();
         // Two conditions compile to two direct comparisons in _start.
-        assert_eq!(wat.matches("(if (f64.lt").count(), 2);
+        assert_eq!(wat.matches("(if (call $py_lt").count(), 2);
     }
 
     #[test]
@@ -3230,7 +3316,7 @@ mod tests {
     fn while_emits_loop_with_negated_test() {
         let wat = compile("i = 3\nwhile i > 0:\n    i = i - 1\n").unwrap();
         assert!(wat.contains(
-            "(br_if $b0 (i32.eqz (f64.gt (call $unbox_f64 (global.get $g_i)) (f64.const 0))))"
+            "(br_if $b0 (i32.eqz (call $py_gt (global.get $g_i) (ref.i31 (i32.const 0)))))"
         ));
         assert!(wat.contains("(br $l0)"));
     }
