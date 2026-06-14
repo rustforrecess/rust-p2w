@@ -1204,6 +1204,13 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(2, "(return)");
     b.push_in(1, ")");
     b.push(")");
+    // Instances inside containers use repr() — __repr__ only, never __str__.
+    b.push("(if (ref.test (ref $OBJECT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (call $object_display (local.get $r) (i32.const 0)) (return))",
+    );
+    b.push(")");
     b.push("(call $print_value (local.get $r))");
     fs.push(Func {
         signature: "(func $print_repr (param $r (ref null eq))".into(),
@@ -1327,18 +1334,12 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (call $print_dict (ref.cast (ref $DICT) (local.get $r)))))",
     );
     b.push(")");
-    // $OBJECT: no __repr__/__str__ wired yet (slice 3) — default `<Name object>`.
+    // $OBJECT: print via str()/__repr__ (slice 3), default `<Name object>`.
     b.push("(if (ref.test (ref $OBJECT) (local.get $r))");
-    b.push_in(1, "(then");
-    b.push_in(2, "(call $write_char (i32.const 60))");
     b.push_in(
-        2,
-        "(call $print_str (struct.get $CLASS 0 (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $r)))))",
+        1,
+        "(then (call $object_display (local.get $r) (i32.const 1)) (return))",
     );
-    for c in " object>".bytes() {
-        b.push_in(2, format!("(call $write_char (i32.const {c}))"));
-    }
-    b.push_in(1, "(return))");
     b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
     b.push_in(1, "(then");
@@ -1780,6 +1781,53 @@ fn class_helpers() -> Vec<Func> {
         locals: vec![
             "(local $idx i32)".into(),
             "(local $attrs (ref null $DICT))".into(),
+        ],
+        body: b,
+    });
+
+    // $object_display: print an instance. With $prefer_str, try __str__ then
+    // __repr__ (Python's `str()` / `print`); otherwise __repr__ only (the
+    // `repr()` form used inside containers). Falls back to `<Name object>`.
+    let mut b = Body::new();
+    b.push("(local.set $cls (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))))");
+    b.push("(if (local.get $prefer_str)");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        format!(
+            "(local.set $m (call $class_lookup_method (local.get $cls) {}))",
+            str_lit("__str__")
+        ),
+    );
+    b.push_in(1, "))");
+    b.push("(if (i32.eqz (ref.test (ref $METHOD) (local.get $m)))");
+    b.push_in(
+        1,
+        format!(
+            "(then (local.set $m (call $class_lookup_method (local.get $cls) {})))",
+            str_lit("__repr__")
+        ),
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $METHOD) (local.get $m))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(call $print_str (ref.cast (ref null $STR) (call_ref $MFUNC (local.get $obj) (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)) (struct.get $METHOD 0 (ref.cast (ref $METHOD) (local.get $m))))))",
+    );
+    b.push_in(2, "(return)");
+    b.push_in(1, "))");
+    b.push("(call $write_char (i32.const 60))"); // <
+    b.push("(call $print_str (struct.get $CLASS 0 (local.get $cls)))");
+    for c in " object>".bytes() {
+        b.push(format!("(call $write_char (i32.const {c}))"));
+    }
+    fs.push(Func {
+        signature: "(func $object_display (param $obj (ref null eq)) (param $prefer_str i32)"
+            .into(),
+        locals: vec![
+            "(local $cls (ref null $CLASS))".into(),
+            "(local $m (ref null eq))".into(),
         ],
         body: b,
     });

@@ -862,6 +862,24 @@ fn instances_have_reference_semantics() {
 }
 
 #[test]
+fn print_uses_str_then_repr() {
+    // __str__ wins for print/str(); __repr__ is the fallback and the form
+    // used inside containers.
+    assert_output(
+        "class Q:\n    def __init__(self, n):\n        self.n = n\n    def __str__(self):\n        return \"str-\" + str(self.n)\n    def __repr__(self):\n        return \"repr-\" + str(self.n)\nq = Q(5)\nprint(q)\nprint([q, Q(6)])",
+        "str-5\n[repr-5, repr-6]\n",
+    );
+}
+
+#[test]
+fn repr_only_is_used_by_print_and_containers() {
+    assert_output(
+        "class P:\n    def __init__(self, x):\n        self.x = x\n    def __repr__(self):\n        return \"P(\" + str(self.x) + \")\"\nprint(P(3))\nprint([P(1), P(2)])",
+        "P(3)\n[P(1), P(2)]\n",
+    );
+}
+
+#[test]
 fn instance_without_repr_prints_default() {
     assert_output(
         "class Empty:\n    def __init__(self):\n        self.x = 1\ne = Empty()\nprint(e)",
@@ -1000,6 +1018,7 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "class Bag:\n    def __init__(self):\n        self.items = []\n    def add(self, x):\n        self.items.append(x)\n    def total(self):\n        t = 0\n        for it in self.items:\n            t = t + it\n        return t\nb = Bag()\nb.add(10)\nb.add(20)\nb.add(5)\nprint(b.items, b.total())",
     "class Box:\n    def __init__(self, v):\n        self.v = v\ndef bump(box):\n    box.v = box.v + 1\nboxes = [Box(1), Box(2)]\nbump(boxes[0])\nbump(boxes[1])\nprint(boxes[0].v, boxes[1].v)",
     "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\nclass Dog(Animal):\n    def __init__(self, name):\n        super().__init__(name)\n        self.tricks = []\n    def speak(self):\n        return super().speak() + \"; \" + self.name + \" barks\"\n    def learn(self, t):\n        self.tricks.append(t)\nd = Dog(\"Rex\")\nd.learn(\"sit\")\nd.learn(\"roll\")\nprint(d.speak())\nprint(d.tricks)",
+    "class Q:\n    def __init__(self, n):\n        self.n = n\n    def __str__(self):\n        return \"str-\" + str(self.n)\n    def __repr__(self):\n        return \"repr-\" + str(self.n)\nq = Q(5)\nprint(q)\nprint([q, Q(6)])\nprint({1: Q(7)})",
 ];
 
 fn find_python() -> Option<&'static str> {
