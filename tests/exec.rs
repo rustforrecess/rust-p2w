@@ -898,6 +898,35 @@ fn wrong_method_arity_raises_type_error() {
 }
 
 #[test]
+fn super_init_chains_to_the_base() {
+    assert_output(
+        "class Animal:\n    def __init__(self, name):\n        self.name = name\nclass Dog(Animal):\n    def __init__(self, name):\n        super().__init__(name)\n        self.tricks = []\n    def learn(self, t):\n        self.tricks.append(t)\nd = Dog(\"Rex\")\nd.learn(\"sit\")\nprint(d.name, d.tricks)",
+        "Rex ['sit']\n",
+    );
+}
+
+#[test]
+fn super_method_calls_the_overridden_base_method() {
+    assert_output(
+        "class Animal:\n    def speak(self):\n        return \"some sound\"\nclass Dog(Animal):\n    def speak(self):\n        return super().speak() + \" (woof)\"\nd = Dog()\nprint(d.speak())",
+        "some sound (woof)\n",
+    );
+}
+
+#[test]
+fn super_outside_a_method_is_an_error() {
+    let err = rust_p2w::compile_to_wat("x = super()").unwrap_err();
+    assert!(format!("{err}").contains("super()"), "{err}");
+}
+
+#[test]
+fn super_without_a_base_is_an_error() {
+    let err = rust_p2w::compile_to_wat("class A:\n    def m(self):\n        return super().m()")
+        .unwrap_err();
+    assert!(format!("{err}").contains("base class"), "{err}");
+}
+
+#[test]
 fn class_redefinition_is_an_error() {
     let err = rust_p2w::compile_to_wat("class A:\n    def m(self):\n        return 1\nclass A:\n    def m(self):\n        return 2").unwrap_err();
     assert!(format!("{err}").contains("defined twice"), "{err}");
@@ -970,6 +999,7 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\n    def kind(self):\n        return \"animal\"\nclass Dog(Animal):\n    def speak(self):\n        return self.name + \" barks\"\nd = Dog(\"Rex\")\nprint(d.speak(), d.kind(), d.name)",
     "class Bag:\n    def __init__(self):\n        self.items = []\n    def add(self, x):\n        self.items.append(x)\n    def total(self):\n        t = 0\n        for it in self.items:\n            t = t + it\n        return t\nb = Bag()\nb.add(10)\nb.add(20)\nb.add(5)\nprint(b.items, b.total())",
     "class Box:\n    def __init__(self, v):\n        self.v = v\ndef bump(box):\n    box.v = box.v + 1\nboxes = [Box(1), Box(2)]\nbump(boxes[0])\nbump(boxes[1])\nprint(boxes[0].v, boxes[1].v)",
+    "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\nclass Dog(Animal):\n    def __init__(self, name):\n        super().__init__(name)\n        self.tricks = []\n    def speak(self):\n        return super().speak() + \"; \" + self.name + \" barks\"\n    def learn(self, t):\n        self.tricks.append(t)\nd = Dog(\"Rex\")\nd.learn(\"sit\")\nd.learn(\"roll\")\nprint(d.speak())\nprint(d.tricks)",
 ];
 
 fn find_python() -> Option<&'static str> {

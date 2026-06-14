@@ -1690,17 +1690,12 @@ fn class_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $call_method: dynamic dispatch — find the method on the object's class
-    // chain, prepend self, call via call_ref. Missing method -> AttributeError.
+    // $dispatch_from: look up `name` starting at a given class (not the
+    // object's own), prepend self, call via call_ref. This is how
+    // `super().m(...)` dispatches — from the enclosing class's base. Missing
+    // method -> AttributeError.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
-    b.push_in(
-        1,
-        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
-    );
-    b.push(
-        "(local.set $m (call $class_lookup_method (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name)))",
-    );
+    b.push("(local.set $m (call $class_lookup_method (local.get $class) (local.get $name)))");
     b.push("(if (i32.eqz (ref.test (ref $METHOD) (local.get $m)))");
     b.push_in(
         1,
@@ -1711,9 +1706,28 @@ fn class_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $call_method (param $obj (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $dispatch_from (param $obj (ref null eq)) (param $class (ref null $CLASS)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
                 .into(),
         locals: vec!["(local $m (ref null eq))".into()],
+        body: b,
+    });
+
+    // $call_method: dynamic dispatch — resolve from the object's own class.
+    // Missing method (non-object receiver included) -> AttributeError.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push(
+        "(call $dispatch_from (local.get $obj) (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name) (local.get $args))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $call_method (param $obj (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![],
         body: b,
     });
 
@@ -1884,6 +1898,11 @@ struct FuncCx {
     /// In a `for`, continue targets the inner `$c` block so the counter
     /// increment still runs; in a `while`, it targets the loop head (re-test).
     loops: Vec<(String, String)>,
+    /// Inside a method: the enclosing class name and the `self` parameter
+    /// name, so `super().m(...)` can resolve from the class's base with the
+    /// real `self`. `None` at top level and in plain functions.
+    current_class: Option<String>,
+    self_name: Option<String>,
 }
 
 impl FuncCx {
@@ -2302,7 +2321,11 @@ impl Gen {
         let self_name = &m.params[0];
         let rest = &m.params[1..];
 
-        let mut cx = FuncCx::default();
+        let mut cx = FuncCx {
+            current_class: Some(class.to_string()),
+            self_name: Some(self_name.clone()),
+            ..Default::default()
+        };
         for p in &m.params {
             cx.vars.insert(p.clone(), Ty::Value);
         }
@@ -2611,6 +2634,34 @@ impl Gen {
                 Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
             }
             ExprKind::MethodCall(recv, method, args) => {
+                // `super().m(args)` dispatches from the enclosing class's base
+                // with the current `self` (resolved at compile time — v1 has
+                // no first-class super).
+                if let ExprKind::Call(callee, super_args) = &recv.kind {
+                    if callee == "super" {
+                        if !super_args.is_empty() {
+                            return Err(CompileError::at(
+                                e.line,
+                                "super() takes no arguments in this subset",
+                            ));
+                        }
+                        let class = cx.current_class.as_ref().ok_or_else(|| {
+                            CompileError::at(e.line, "super() can only be used inside a method")
+                        })?;
+                        let base = self.classes.get(class).cloned().flatten().ok_or_else(|| {
+                            CompileError::at(
+                                e.line,
+                                format!("super() needs a base class, but '{class}' has none"),
+                            )
+                        })?;
+                        let self_name = cx.self_name.clone().expect("method has self");
+                        let args_list = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $dispatch_from (local.get ${self_name}) (global.get $g_class_{base}) {} {args_list})",
+                            str_lit(method)
+                        ));
+                    }
+                }
                 // `.append(v)` is the list fast path; every other method is a
                 // dynamic object dispatch.
                 if method == "append" && args.len() == 1 {
@@ -2631,6 +2682,12 @@ impl Gen {
                     return Err(CompileError::at(
                         e.line,
                         "print(...) can't be used inside an expression",
+                    ));
+                }
+                if n == "super" {
+                    return Err(CompileError::at(
+                        e.line,
+                        "super() is only supported as super().method(...) in this subset",
                     ));
                 }
                 // Class construction: `Cls(args)` builds an instance and runs
