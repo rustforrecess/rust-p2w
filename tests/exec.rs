@@ -969,6 +969,24 @@ fn objects_without_eq_compare_by_identity() {
 }
 
 #[test]
+fn class_variables_are_shared_and_shadowed_by_instance_attrs() {
+    // Read falls back to the class; writing creates an instance attr that
+    // shadows it (Python semantics).
+    assert_output(
+        "class C:\n    x = 10\na = C()\nb = C()\nprint(a.x, b.x)\na.x = 99\nprint(a.x, b.x)",
+        "10 10\n99 10\n",
+    );
+}
+
+#[test]
+fn reading_a_method_as_a_value_is_an_error() {
+    assert_raises(
+        "class A:\n    def m(self):\n        return 1\na = A()\nf = a.m",
+        "can't be used as a value",
+    );
+}
+
+#[test]
 fn class_redefinition_is_an_error() {
     let err = rust_p2w::compile_to_wat("class A:\n    def m(self):\n        return 1\nclass A:\n    def m(self):\n        return 2").unwrap_err();
     assert!(format!("{err}").contains("defined twice"), "{err}");
@@ -1052,6 +1070,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // default __eq__ is identity; __eq__ also drives `in`
     "class A:\n    def __init__(self):\n        self.x = 1\na = A()\nb = A()\nprint(a == a, a == b, a != b)",
     "class P:\n    def __init__(self, n):\n        self.n = n\n    def __eq__(self, o):\n        return self.n == o.n\nps = [P(1), P(2), P(3)]\nprint(P(2) in ps, P(9) in ps)",
+    // class variables: shared default, instance read falls back to class
+    "class Dog:\n    species = \"Canis familiaris\"\n    legs = 4\n    def __init__(self, name):\n        self.name = name\nd = Dog(\"Rex\")\ne = Dog(\"Fido\")\nprint(d.name, d.species, d.legs)\nprint(e.species, e.legs)",
+    // class variable inherited through the base, and shadowed per instance
+    "class Base:\n    kind = \"base\"\nclass Sub(Base):\n    def __init__(self):\n        self.n = 1\ns = Sub()\nprint(s.kind)\ns.kind = \"local\"\nt = Sub()\nprint(s.kind, t.kind)",
 ];
 
 fn find_python() -> Option<&'static str> {

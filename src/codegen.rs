@@ -103,10 +103,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                 name,
                 base,
                 methods,
-                ..
+                class_vars,
             } = &s.kind
             {
-                g.gen_class_init(name, base, methods, &mut body);
+                g.gen_class_init(&mut cx, name, base, methods, class_vars, &mut body)?;
             }
         }
     }
@@ -428,6 +428,27 @@ fn raise_helpers() -> Vec<Func> {
     fs.push(Func {
         signature: "(func $raise_no_attr (param $obj (ref null eq)) (param $name (ref null eq))"
             .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_method_value: a method was read as a value (e.g. `f = d.speak`).
+    // Bound methods aren't first-class in this subset.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "TypeError: method '");
+    b.push("(call $print_str (ref.cast (ref null $STR) (local.get $name)))");
+    push_text(
+        &mut b,
+        0,
+        "' can't be used as a value yet (call it with parentheses)",
+    );
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature:
+            "(func $raise_method_value (param $obj (ref null eq)) (param $name (ref null eq))"
+                .into(),
         locals: vec![],
         body: b,
     });
@@ -1816,7 +1837,9 @@ fn class_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $obj_getattr: instance attribute read (instance dict only in v1).
+    // $obj_getattr: attribute read — the instance dict first, then the class
+    // chain (class variables). A class entry that is a $METHOD would be a bound
+    // method, which v1 can't yield as a value -> clean error.
     let mut b = Body::new();
     b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
     b.push_in(
@@ -1825,12 +1848,26 @@ fn class_helpers() -> Vec<Func> {
     );
     b.push("(local.set $attrs (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) (local.get $obj))))");
     b.push("(local.set $idx (call $dict_find (local.get $attrs) (local.get $name)))");
-    b.push("(if (i32.lt_s (local.get $idx) (i32.const 0))");
+    b.push("(if (i32.ge_s (local.get $idx) (i32.const 0))");
+    b.push_in(
+        1,
+        "(then (return (array.get $ITEMS (struct.get $DICT 2 (local.get $attrs)) (local.get $idx)))))",
+    );
+    // Fall back to the class namespace (class variables shared by instances).
+    b.push(
+        "(local.set $m (call $class_lookup_method (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name)))",
+    );
+    b.push("(if (ref.is_null (local.get $m))");
     b.push_in(
         1,
         "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
     );
-    b.push("(array.get $ITEMS (struct.get $DICT 2 (local.get $attrs)) (local.get $idx))");
+    b.push("(if (ref.test (ref $METHOD) (local.get $m))");
+    b.push_in(
+        1,
+        "(then (call $raise_method_value (local.get $obj) (local.get $name))))",
+    );
+    b.push("(local.get $m)");
     fs.push(Func {
         signature:
             "(func $obj_getattr (param $obj (ref null eq)) (param $name (ref null eq)) (result (ref null eq))"
@@ -1838,6 +1875,7 @@ fn class_helpers() -> Vec<Func> {
         locals: vec![
             "(local $idx i32)".into(),
             "(local $attrs (ref null $DICT))".into(),
+            "(local $m (ref null eq))".into(),
         ],
         body: b,
     });
@@ -2520,16 +2558,20 @@ impl Gen {
     }
 
     /// Emit the runtime construction of one class's `$CLASS` global into the
-    /// `_start` prologue: build the method table (`$DICT` of name -> `$METHOD`)
-    /// then `global.set`. Runs in source order, so a base class (built
-    /// earlier) is available when a subclass references it.
+    /// `_start` prologue: build the class namespace (`$DICT` holding methods as
+    /// `$METHOD` and class variables as their values) then `global.set`. Runs
+    /// in source order, so a base class (built earlier) is available when a
+    /// subclass references it. Class-variable initializers are evaluated here,
+    /// in the top-level scope, before the program's other top-level statements.
     fn gen_class_init(
-        &self,
+        &mut self,
+        cx: &mut FuncCx,
         name: &str,
         base: &Option<String>,
         methods: &[crate::ast::Method],
+        class_vars: &[(String, Expr)],
         out: &mut Body,
-    ) {
+    ) -> Result<()> {
         out.push(
             "(local.set $.cd (struct.new $DICT (i32.const 0) (array.new_fixed $ITEMS 0) (array.new_fixed $ITEMS 0)))",
         );
@@ -2540,6 +2582,14 @@ impl Gen {
                 m.name
             ));
         }
+        for (var, expr) in class_vars {
+            self.type_of(cx, expr)?;
+            let value = self.value_expr(cx, expr)?;
+            out.push(format!(
+                "(call $dict_set (local.get $.cd) {} {value})",
+                str_lit(var)
+            ));
+        }
         let base_ref = match base {
             Some(b) => format!("(global.get $g_class_{b})"),
             None => "(ref.null $CLASS)".to_string(),
@@ -2548,6 +2598,7 @@ impl Gen {
             "(global.set $g_class_{name} (struct.new $CLASS {} (local.get $.cd) {base_ref}))",
             str_lit(name)
         ));
+        Ok(())
     }
 
     /// `for var in <sequence>:` — snapshot the iterable, index through it
