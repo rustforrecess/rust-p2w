@@ -934,14 +934,14 @@ fn super_method_calls_the_overridden_base_method() {
 #[test]
 fn super_outside_a_method_is_an_error() {
     let err = rust_p2w::compile_to_wat("x = super()").unwrap_err();
-    assert!(format!("{err}").contains("super()"), "{err}");
+    assert!(err.to_string().contains("super()"), "{err}");
 }
 
 #[test]
 fn super_without_a_base_is_an_error() {
     let err = rust_p2w::compile_to_wat("class A:\n    def m(self):\n        return super().m()")
         .unwrap_err();
-    assert!(format!("{err}").contains("base class"), "{err}");
+    assert!(err.to_string().contains("base class"), "{err}");
 }
 
 #[test]
@@ -989,7 +989,7 @@ fn reading_a_method_as_a_value_is_an_error() {
 #[test]
 fn class_redefinition_is_an_error() {
     let err = rust_p2w::compile_to_wat("class A:\n    def m(self):\n        return 1\nclass A:\n    def m(self):\n        return 2").unwrap_err();
-    assert!(format!("{err}").contains("defined twice"), "{err}");
+    assert!(err.to_string().contains("defined twice"), "{err}");
 }
 
 #[test]
@@ -997,7 +997,7 @@ fn unknown_base_class_is_an_error() {
     let err =
         rust_p2w::compile_to_wat("class Dog(Animal):\n    def speak(self):\n        return 1")
             .unwrap_err();
-    assert!(format!("{err}").contains("unknown base class"), "{err}");
+    assert!(err.to_string().contains("unknown base class"), "{err}");
 }
 
 // --- differential testing against real CPython, when available ---
