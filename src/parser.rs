@@ -176,6 +176,10 @@ impl<'a> Parser<'a> {
                     },
                     line,
                 }),
+                ExprKind::Slice { .. } => Err(CompileError::at(
+                    line,
+                    "slice assignment (xs[a:b] = ...) isn't supported yet",
+                )),
                 _ => Err(CompileError::at(
                     line,
                     "can only assign to a variable, an index like xs[i], or an attribute like obj.x",
@@ -528,12 +532,53 @@ impl<'a> Parser<'a> {
                 Tok::LBracket => {
                     let line = self.line();
                     self.advance();
-                    let index = self.expr(0)?;
-                    self.expect(&Tok::RBracket, "']'")?;
-                    e = Expr {
-                        kind: ExprKind::Index(Box::new(e), Box::new(index)),
-                        line,
+                    // A leading `:` or a missing first operand means a slice;
+                    // otherwise parse the first expression and decide on `:`.
+                    let first = if matches!(self.peek(), Tok::Colon | Tok::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.expr(0)?))
                     };
+                    if matches!(self.peek(), Tok::Colon) {
+                        self.advance(); // first ':'
+                        let stop = if matches!(self.peek(), Tok::Colon | Tok::RBracket) {
+                            None
+                        } else {
+                            Some(Box::new(self.expr(0)?))
+                        };
+                        let step = if matches!(self.peek(), Tok::Colon) {
+                            self.advance(); // second ':'
+                            if matches!(self.peek(), Tok::RBracket) {
+                                None
+                            } else {
+                                Some(Box::new(self.expr(0)?))
+                            }
+                        } else {
+                            None
+                        };
+                        self.expect(&Tok::RBracket, "']'")?;
+                        e = Expr {
+                            kind: ExprKind::Slice {
+                                obj: Box::new(e),
+                                start: first,
+                                stop,
+                                step,
+                            },
+                            line,
+                        };
+                    } else {
+                        let index = first.ok_or_else(|| {
+                            CompileError::at(
+                                line,
+                                "empty subscript: write xs[i] or a slice xs[a:b]",
+                            )
+                        })?;
+                        self.expect(&Tok::RBracket, "']'")?;
+                        e = Expr {
+                            kind: ExprKind::Index(Box::new(e), index),
+                            line,
+                        };
+                    }
                 }
                 Tok::Dot => {
                     let line = self.line();
@@ -811,6 +856,18 @@ fn contains_call(e: &Expr) -> bool {
             .iter()
             .any(|(k, v)| contains_call(k) || contains_call(v)),
         ExprKind::Attr(inner, _) => contains_call(inner),
+        ExprKind::Slice {
+            obj,
+            start,
+            stop,
+            step,
+        } => {
+            contains_call(obj)
+                || [start, stop, step]
+                    .into_iter()
+                    .flatten()
+                    .any(|b| contains_call(b))
+        }
         _ => false,
     }
 }

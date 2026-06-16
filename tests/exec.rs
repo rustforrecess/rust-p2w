@@ -1000,6 +1000,41 @@ fn unknown_base_class_is_an_error() {
     assert!(err.to_string().contains("unknown base class"), "{err}");
 }
 
+// --- slicing ---
+
+#[test]
+fn list_and_string_slices() {
+    assert_output("print([0, 1, 2, 3, 4][1:3])", "[1, 2]\n");
+    assert_output("print(\"abcdef\"[2:])", "cdef\n");
+    assert_output("print([1, 2, 3, 4, 5][::-1])", "[5, 4, 3, 2, 1]\n");
+    assert_output("print(\"hello\"[::-1])", "olleh\n");
+    assert_output("print([0, 1, 2, 3, 4, 5][1:5:2])", "[1, 3]\n");
+}
+
+#[test]
+fn slice_negative_and_out_of_range_bounds() {
+    assert_output("print([1, 2, 3, 4][-2:])", "[3, 4]\n");
+    assert_output("print([1, 2, 3][5:])", "[]\n");
+    assert_output("print([1, 2, 3][3:1])", "[]\n");
+    assert_output("print(\"abc\"[-10:2])", "ab\n");
+}
+
+#[test]
+fn slice_step_zero_raises() {
+    assert_raises("print([1, 2, 3][::0])", "slice step cannot be zero");
+}
+
+#[test]
+fn slice_assignment_is_rejected() {
+    let err = rust_p2w::compile_to_wat("xs = [1, 2, 3]\nxs[0:1] = [9]").unwrap_err();
+    assert!(err.to_string().contains("slice assignment"), "{err}");
+}
+
+#[test]
+fn slicing_a_non_sequence_errors() {
+    assert_raises("x = 5\nprint(x[1:2])", "subscriptable");
+}
+
 // --- differential testing against real CPython, when available ---
 
 /// Programs that print ints, bools, and strings (`/` is still rejected, so it
@@ -1074,6 +1109,14 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "class Dog:\n    species = \"Canis familiaris\"\n    legs = 4\n    def __init__(self, name):\n        self.name = name\nd = Dog(\"Rex\")\ne = Dog(\"Fido\")\nprint(d.name, d.species, d.legs)\nprint(e.species, e.legs)",
     // class variable inherited through the base, and shadowed per instance
     "class Base:\n    kind = \"base\"\nclass Sub(Base):\n    def __init__(self):\n        self.n = 1\ns = Sub()\nprint(s.kind)\ns.kind = \"local\"\nt = Sub()\nprint(s.kind, t.kind)",
+    // list slicing: bounds, steps, negatives, reversal, empties
+    "xs = [0, 1, 2, 3, 4, 5]\nprint(xs[1:4], xs[:3], xs[3:], xs[:])\nprint(xs[::2], xs[::-1], xs[1:5:2])\nprint(xs[-2:], xs[:-2], xs[-3:-1])",
+    "xs = [1, 2, 3]\nprint(xs[5:], xs[1:1], xs[3:1], xs[-10:2], xs[::-2])",
+    "xs = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]\nprint(xs[8:2:-1], xs[::-3], xs[7:0:-2])",
+    // string slicing
+    "s = \"abcdef\"\nprint(s[1:4], s[::-1], s[::2], s[2:], s[:3], s[-2:])\nprint(s[1:5:2] + s[::-1])",
+    // slices compose with other features (function, len, concat)
+    "def mid(xs):\n    return xs[1:-1]\nprint(mid([10, 20, 30, 40]), mid(\"hello\"), len([1,2,3,4][::2]))",
 ];
 
 fn find_python() -> Option<&'static str> {

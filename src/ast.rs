@@ -123,6 +123,14 @@ pub enum ExprKind {
     Dict(Vec<(Expr, Expr)>),
     /// Subscript read, e.g. `xs[i]` (lists and strings).
     Index(Box<Expr>, Box<Expr>),
+    /// Slice read, e.g. `xs[1:3]`, `s[::-1]` (lists and strings). Any of the
+    /// three bounds may be omitted (`None`).
+    Slice {
+        obj: Box<Expr>,
+        start: Option<Box<Expr>>,
+        stop: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+    },
     /// A method call, e.g. `xs.append(v)`.
     MethodCall(Box<Expr>, String, Vec<Expr>),
     /// Attribute read, e.g. `obj.attr` (a `.name` not followed by `(`).

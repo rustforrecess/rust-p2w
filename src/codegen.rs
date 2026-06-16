@@ -453,6 +453,18 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $raise_slice_step: slice step of zero.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "ValueError: slice step cannot be zero");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_slice_step".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $raise_arity: a method got the wrong number of arguments.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
@@ -877,6 +889,157 @@ fn runtime_helpers() -> Vec<Func> {
             "(func $py_set_subscript (param $r (ref null eq)) (param $k (ref null eq)) (param $v (ref null eq))"
                 .into(),
         locals: vec![],
+        body: b,
+    });
+
+    // $slice_adjust: clamp one explicit slice bound into range, Python-style
+    // (negative indices count from the end; out-of-range clamps, never errors).
+    let mut b = Body::new();
+    b.push("(if (i32.lt_s (local.get $i) (i32.const 0))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (i32.lt_s (local.get $i) (local.get $lower)) (then (local.set $i (local.get $lower)))))",
+    );
+    b.push_in(1, "(else");
+    b.push_in(
+        2,
+        "(if (i32.gt_s (local.get $i) (local.get $upper)) (then (local.set $i (local.get $upper))))))",
+    );
+    b.push("(local.get $i)");
+    fs.push(Func {
+        signature:
+            "(func $slice_adjust (param $i i32) (param $n i32) (param $lower i32) (param $upper i32) (result i32)"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_slice: `seq[start:stop:step]` for lists and strings. Bounds arrive
+    // boxed, with $NONE for an omitted one; this mirrors CPython's
+    // PySlice_AdjustIndices (clamping defaults that depend on the step's sign).
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))))");
+    b.push_in(1, "(then (call $raise_not_sub (local.get $r))))");
+    b.push("(local.set $n (call $py_len (local.get $r)))");
+    // step: default 1, zero is a ValueError.
+    b.push("(if (ref.test (ref $NONE_T) (local.get $tv))");
+    b.push_in(1, "(then (local.set $step (i32.const 1)))");
+    b.push_in(1, "(else (local.set $step (call $unbox (local.get $tv)))))");
+    b.push("(if (i32.eqz (local.get $step)) (then (call $raise_slice_step)))");
+    // clamp bounds depend on the step's sign.
+    b.push("(if (i32.lt_s (local.get $step) (i32.const 0))");
+    b.push_in(
+        1,
+        "(then (local.set $lower (i32.const -1)) (local.set $upper (i32.sub (local.get $n) (i32.const 1))))",
+    );
+    b.push_in(
+        1,
+        "(else (local.set $lower (i32.const 0)) (local.set $upper (local.get $n))))",
+    );
+    // start: omitted -> step-dependent default; explicit -> clamp.
+    b.push("(if (ref.test (ref $NONE_T) (local.get $sv))");
+    b.push_in(
+        1,
+        "(then (if (i32.lt_s (local.get $step) (i32.const 0)) (then (local.set $start (local.get $upper))) (else (local.set $start (local.get $lower)))))",
+    );
+    b.push_in(
+        1,
+        "(else (local.set $start (call $slice_adjust (call $unbox (local.get $sv)) (local.get $n) (local.get $lower) (local.get $upper)))))",
+    );
+    // stop: omitted -> step-dependent default; explicit -> clamp.
+    b.push("(if (ref.test (ref $NONE_T) (local.get $ev))");
+    b.push_in(
+        1,
+        "(then (if (i32.lt_s (local.get $step) (i32.const 0)) (then (local.set $stop (local.get $lower))) (else (local.set $stop (local.get $upper)))))",
+    );
+    b.push_in(
+        1,
+        "(else (local.set $stop (call $slice_adjust (call $unbox (local.get $ev)) (local.get $n) (local.get $lower) (local.get $upper)))))",
+    );
+    // count = number of produced elements.
+    b.push("(if (i32.gt_s (local.get $step) (i32.const 0))");
+    b.push_in(
+        1,
+        "(then (if (i32.gt_s (local.get $stop) (local.get $start)) (then (local.set $count (i32.add (i32.div_s (i32.sub (i32.sub (local.get $stop) (local.get $start)) (i32.const 1)) (local.get $step)) (i32.const 1)))) (else (local.set $count (i32.const 0)))))",
+    );
+    b.push_in(
+        1,
+        "(else (if (i32.gt_s (local.get $start) (local.get $stop)) (then (local.set $count (i32.add (i32.div_s (i32.sub (i32.sub (local.get $start) (local.get $stop)) (i32.const 1)) (i32.sub (i32.const 0) (local.get $step))) (i32.const 1)))) (else (local.set $count (i32.const 0))))))",
+    );
+    // materialize: lists copy elements, strings copy bytes.
+    b.push("(if (ref.test (ref $LIST) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $src (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $r))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $items (array.new_default $ITEMS (local.get $count)))",
+    );
+    b.push_in(2, "(local.set $i (local.get $start))");
+    b.push_in(2, "(local.set $j (i32.const 0))");
+    b.push_in(2, "(block $ld (loop $ln");
+    b.push_in(
+        3,
+        "(br_if $ld (i32.ge_s (local.get $j) (local.get $count)))",
+    );
+    b.push_in(
+        3,
+        "(array.set $ITEMS (local.get $items) (local.get $j) (array.get $ITEMS (local.get $src) (local.get $i)))",
+    );
+    b.push_in(
+        3,
+        "(local.set $i (i32.add (local.get $i) (local.get $step)))",
+    );
+    b.push_in(3, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
+    b.push_in(3, "(br $ln)))");
+    b.push_in(
+        2,
+        "(return (struct.new $LIST (local.get $count) (local.get $items)))))",
+    );
+    // string path
+    b.push("(local.set $ssrc (ref.cast (ref $STR) (local.get $r)))");
+    b.push("(local.set $str (array.new_default $STR (local.get $count)))");
+    b.push("(local.set $i (local.get $start))");
+    b.push("(local.set $j (i32.const 0))");
+    b.push("(block $sd (loop $sn");
+    b.push_in(
+        1,
+        "(br_if $sd (i32.ge_s (local.get $j) (local.get $count)))",
+    );
+    b.push_in(
+        1,
+        "(array.set $STR (local.get $str) (local.get $j) (array.get_u $STR (local.get $ssrc) (local.get $i)))",
+    );
+    b.push_in(
+        1,
+        "(local.set $i (i32.add (local.get $i) (local.get $step)))",
+    );
+    b.push_in(1, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
+    b.push_in(1, "(br $sn)))");
+    b.push("(local.get $str)");
+    fs.push(Func {
+        signature:
+            "(func $py_slice (param $r (ref null eq)) (param $sv (ref null eq)) (param $ev (ref null eq)) (param $tv (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $step i32)".into(),
+            "(local $start i32)".into(),
+            "(local $stop i32)".into(),
+            "(local $lower i32)".into(),
+            "(local $upper i32)".into(),
+            "(local $count i32)".into(),
+            "(local $i i32)".into(),
+            "(local $j i32)".into(),
+            "(local $src (ref null $ITEMS))".into(),
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $ssrc (ref null $STR))".into(),
+            "(local $str (ref null $STR))".into(),
+        ],
         body: b,
     });
 
@@ -2823,6 +2986,28 @@ impl Gen {
                 let k = self.value_expr(cx, key)?;
                 Ok(format!("(call $py_subscript {o} {k})"))
             }
+            ExprKind::Slice {
+                obj,
+                start,
+                stop,
+                step,
+            } => {
+                let o = self.value_expr(cx, obj)?;
+                let none = "(global.get $NONE)".to_string();
+                let s = match start {
+                    Some(e) => self.value_expr(cx, e)?,
+                    None => none.clone(),
+                };
+                let st = match stop {
+                    Some(e) => self.value_expr(cx, e)?,
+                    None => none.clone(),
+                };
+                let sp = match step {
+                    Some(e) => self.value_expr(cx, e)?,
+                    None => none,
+                };
+                Ok(format!("(call $py_slice {o} {s} {st} {sp})"))
+            }
             ExprKind::Attr(obj, name) => {
                 let o = self.value_expr(cx, obj)?;
                 Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
@@ -3186,6 +3371,18 @@ impl Gen {
             ExprKind::Index(obj, idx) => {
                 self.type_of(cx, obj)?;
                 self.type_of(cx, idx)?;
+                Ok(Ty::Value)
+            }
+            ExprKind::Slice {
+                obj,
+                start,
+                stop,
+                step,
+            } => {
+                self.type_of(cx, obj)?;
+                for b in [start, stop, step].into_iter().flatten() {
+                    self.type_of(cx, b)?;
+                }
                 Ok(Ty::Value)
             }
             ExprKind::MethodCall(recv, _, args) => {
