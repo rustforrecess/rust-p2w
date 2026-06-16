@@ -135,6 +135,27 @@ pub enum ExprKind {
     MethodCall(Box<Expr>, String, Vec<Expr>),
     /// Attribute read, e.g. `obj.attr` (a `.name` not followed by `(`).
     Attr(Box<Expr>, String),
+    /// `[element for x in it if cond ...]`
+    ListComp {
+        element: Box<Expr>,
+        clauses: Vec<CompClause>,
+    },
+    /// `{key: value for x in it if cond ...}`
+    DictComp {
+        key: Box<Expr>,
+        value: Box<Expr>,
+        clauses: Vec<CompClause>,
+    },
+}
+
+/// One clause of a comprehension: a `for` binding or an `if` filter, in source
+/// order (a comprehension is `element` followed by one or more of these).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompClause {
+    /// `for var in iter` (single-name target only in this subset).
+    For { var: String, iter: Expr },
+    /// `if cond`
+    If(Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

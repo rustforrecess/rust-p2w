@@ -1035,6 +1035,59 @@ fn slicing_a_non_sequence_errors() {
     assert_raises("x = 5\nprint(x[1:2])", "subscriptable");
 }
 
+// --- comprehensions ---
+
+#[test]
+fn list_comprehensions() {
+    assert_output("print([x * x for x in range(5)])", "[0, 1, 4, 9, 16]\n");
+    assert_output(
+        "print([x for x in range(8) if x % 2 == 1])",
+        "[1, 3, 5, 7]\n",
+    );
+    assert_output("print([c for c in \"abc\"])", "['a', 'b', 'c']\n");
+    assert_output(
+        "xs = [10, 20, 30]\nprint([x + 1 for x in xs])",
+        "[11, 21, 31]\n",
+    );
+}
+
+#[test]
+fn nested_comprehensions_and_clauses() {
+    assert_output(
+        "print([x + y for x in range(2) for y in range(3)])",
+        "[0, 1, 2, 1, 2, 3]\n",
+    );
+    assert_output(
+        "print([[y for y in range(x)] for x in range(3)])",
+        "[[], [0], [0, 1]]\n",
+    );
+}
+
+#[test]
+fn dict_comprehension() {
+    assert_output(
+        "print({x: x * x for x in range(4)})",
+        "{0: 0, 1: 1, 2: 4, 3: 9}\n",
+    );
+}
+
+#[test]
+fn comprehension_in_function_does_not_leak() {
+    // Python 3 scopes the loop variable to the comprehension; a fresh name is
+    // undefined afterward.
+    let err = rust_p2w::compile_to_wat(
+        "def f():\n    ys = [i for i in range(3)]\n    return i\nprint(f())",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown name"), "{err}");
+}
+
+#[test]
+fn comprehension_tuple_target_is_rejected() {
+    let err = rust_p2w::compile_to_wat("print([a for a, b in [[1, 2]]])").unwrap_err();
+    assert!(err.to_string().contains("tuple target"), "{err}");
+}
+
 // --- differential testing against real CPython, when available ---
 
 /// Programs that print ints, bools, and strings (`/` is still rejected, so it
@@ -1117,6 +1170,17 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "s = \"abcdef\"\nprint(s[1:4], s[::-1], s[::2], s[2:], s[:3], s[-2:])\nprint(s[1:5:2] + s[::-1])",
     // slices compose with other features (function, len, concat)
     "def mid(xs):\n    return xs[1:-1]\nprint(mid([10, 20, 30, 40]), mid(\"hello\"), len([1,2,3,4][::2]))",
+    // list comprehensions: range, filters, sequences, nesting
+    "print([x * x for x in range(6)])\nprint([x for x in range(10) if x % 2 == 0])",
+    "print([c for c in \"hello\" if c != \"l\"])\nxs = [1, 2, 3, 4, 5]\nprint([x * 10 for x in xs], [x for x in xs if x > 2])",
+    "print([x + y for x in range(3) for y in range(3)])\nprint([[y for y in range(x)] for x in range(4)])",
+    "print([x for x in range(10) if x in [2, 4, 6]])\nprint([x for x in range(20, 0, -5)])",
+    // dict comprehensions
+    "print({x: x * x for x in range(5)})\nprint({c: 1 for c in \"aba\"})",
+    // comprehension inside a function (fresh loop var, doesn't leak)
+    "def squares(n):\n    return [i * i for i in range(n)]\nprint(squares(4), squares(0))",
+    // comprehension composed with len / concat / slice
+    "ns = [x for x in range(8) if x % 3 != 0]\nprint(ns, len(ns), ns[::-1])",
 ];
 
 fn find_python() -> Option<&'static str> {

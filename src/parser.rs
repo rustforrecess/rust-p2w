@@ -3,7 +3,7 @@
 //! (`if`, `for`, `while`) consume indented blocks delimited by INDENT/DEDENT;
 //! simple statements consume their trailing NEWLINE.
 
-use crate::ast::{BinOp, Expr, ExprKind, Method, Stmt, StmtKind, UnOp};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Method, Stmt, StmtKind, UnOp};
 use crate::error::CompileError;
 use crate::lexer::{Tok, Token};
 
@@ -662,41 +662,60 @@ impl<'a> Parser<'a> {
             }
             Tok::LBracket => {
                 self.advance();
-                let mut elements = Vec::new();
-                if !matches!(self.peek(), Tok::RBracket) {
-                    loop {
-                        elements.push(self.expr(0)?);
-                        if matches!(self.peek(), Tok::Comma) {
-                            self.advance();
-                            if matches!(self.peek(), Tok::RBracket) {
-                                break; // trailing comma
-                            }
-                        } else {
-                            break;
-                        }
+                if matches!(self.peek(), Tok::RBracket) {
+                    self.advance();
+                    return Ok(expr(ExprKind::List(Vec::new())));
+                }
+                let first = self.expr(0)?;
+                // `[elem for ...]` is a comprehension; otherwise a list literal.
+                if self.is_keyword("for") {
+                    let clauses = self.comp_clauses()?;
+                    self.expect(&Tok::RBracket, "']'")?;
+                    return Ok(expr(ExprKind::ListComp {
+                        element: Box::new(first),
+                        clauses,
+                    }));
+                }
+                let mut elements = vec![first];
+                while matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    if matches!(self.peek(), Tok::RBracket) {
+                        break; // trailing comma
                     }
+                    elements.push(self.expr(0)?);
                 }
                 self.expect(&Tok::RBracket, "']'")?;
                 Ok(expr(ExprKind::List(elements)))
             }
             Tok::LBrace => {
                 self.advance();
-                let mut entries = Vec::new();
-                if !matches!(self.peek(), Tok::RBrace) {
-                    loop {
-                        let key = self.expr(0)?;
-                        self.expect(&Tok::Colon, "':' between a dict key and its value")?;
-                        let value = self.expr(0)?;
-                        entries.push((key, value));
-                        if matches!(self.peek(), Tok::Comma) {
-                            self.advance();
-                            if matches!(self.peek(), Tok::RBrace) {
-                                break; // trailing comma
-                            }
-                        } else {
-                            break;
-                        }
+                if matches!(self.peek(), Tok::RBrace) {
+                    self.advance();
+                    return Ok(expr(ExprKind::Dict(Vec::new())));
+                }
+                let key = self.expr(0)?;
+                self.expect(&Tok::Colon, "':' between a dict key and its value")?;
+                let value = self.expr(0)?;
+                // `{k: v for ...}` is a dict comprehension.
+                if self.is_keyword("for") {
+                    let clauses = self.comp_clauses()?;
+                    self.expect(&Tok::RBrace, "'}'")?;
+                    return Ok(expr(ExprKind::DictComp {
+                        key: Box::new(key),
+                        value: Box::new(value),
+                        clauses,
+                    }));
+                }
+                let mut entries = vec![(key, value)];
+                while matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    if matches!(self.peek(), Tok::RBrace) {
+                        break; // trailing comma
                     }
+                    let k = self.expr(0)?;
+                    self.expect(&Tok::Colon, "':' between a dict key and its value")?;
+                    let v = self.expr(0)?;
+                    entries.push((k, v));
                 }
                 self.expect(&Tok::RBrace, "'}'")?;
                 Ok(expr(ExprKind::Dict(entries)))
@@ -748,6 +767,44 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::RParen, "')'")?;
         Ok(args)
+    }
+
+    /// The `for x in iter` / `if cond` clauses of a comprehension. The cursor
+    /// is on the first `for`; parsing stops at the closing bracket/brace.
+    fn comp_clauses(&mut self) -> Result<Vec<CompClause>> {
+        let mut clauses = Vec::new();
+        loop {
+            if self.is_keyword("for") {
+                self.advance();
+                let var = match self.peek().clone() {
+                    Tok::Name(n) if !matches!(n.as_str(), "True" | "False" | "None") => {
+                        self.advance();
+                        n
+                    }
+                    other => {
+                        return Err(CompileError::at(
+                            self.line(),
+                            format!("expected a loop variable after 'for', found {other:?}"),
+                        ))
+                    }
+                };
+                if matches!(self.peek(), Tok::Comma) {
+                    return Err(CompileError::at(
+                        self.line(),
+                        "tuple targets in comprehensions (for a, b in …) aren't supported yet",
+                    ));
+                }
+                self.eat_keyword("in")?;
+                let iter = self.expr(0)?;
+                clauses.push(CompClause::For { var, iter });
+            } else if self.is_keyword("if") {
+                self.advance();
+                clauses.push(CompClause::If(self.expr(0)?));
+            } else {
+                break;
+            }
+        }
+        Ok(clauses)
     }
 
     /// Infix operator at the cursor, as `(op, left_bp, right_bp)`. Handles the
@@ -868,6 +925,8 @@ fn contains_call(e: &Expr) -> bool {
                     .flatten()
                     .any(|b| contains_call(b))
         }
+        // Comprehensions evaluate a loop; treat as potentially side-effecting.
+        ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => true,
         _ => false,
     }
 }

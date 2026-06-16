@@ -23,7 +23,7 @@
 //! `FuncCx` holds per-function state (locals, labels, loop stack) — `_start`
 //! is the only function today, but `def` lands as one `FuncCx` per function.
 
-use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::emit::{Body, Func, Module};
 use crate::error::CompileError;
 use std::collections::HashMap;
@@ -2273,7 +2273,11 @@ impl FuncCx {
     fn ensure_local(&mut self, name: &str) {
         if !self.vars.contains_key(name) {
             self.vars.insert(name.to_string(), Ty::Value);
-            self.locals.push((name.to_string(), VAL.to_string()));
+            // A comprehension variable is removed from `vars` (scoping) but its
+            // local declaration stays, so guard against re-declaring it.
+            if !self.locals.iter().any(|(n, _)| n == name) {
+                self.locals.push((name.to_string(), VAL.to_string()));
+            }
         }
     }
 }
@@ -2816,6 +2820,181 @@ impl Gen {
         Ok(())
     }
 
+    /// Recursively emit a comprehension's clauses into a `Body`. The innermost
+    /// level appends to (list) or inserts into (dict) the accumulator `acc`;
+    /// `key` is `Some` for dict comprehensions, `elem` is the element/value.
+    ///
+    /// A `for` target is a function-scoped local restored afterward so a fresh
+    /// name doesn't leak (matching Python 3 for new names; a name that shadows
+    /// an outer *local* still shares that local — a documented divergence).
+    fn comp_loop(
+        &mut self,
+        cx: &mut FuncCx,
+        clauses: &[CompClause],
+        acc: &str,
+        key: Option<&Expr>,
+        elem: &Expr,
+    ) -> Result<Body> {
+        let Some((clause, rest)) = clauses.split_first() else {
+            let mut b = Body::new();
+            match key {
+                Some(k) => {
+                    let kw = self.value_expr(cx, k)?;
+                    let vw = self.value_expr(cx, elem)?;
+                    b.push(format!("(call $dict_set (local.get ${acc}) {kw} {vw})"));
+                }
+                None => {
+                    let ew = self.value_expr(cx, elem)?;
+                    b.push(format!(
+                        "(drop (call $list_append (local.get ${acc}) {ew}))"
+                    ));
+                }
+            }
+            return Ok(b);
+        };
+        match clause {
+            CompClause::If(cond) => {
+                let c = self.cond_i32(cx, cond)?;
+                let inner = self.comp_loop(cx, rest, acc, key, elem)?;
+                let mut b = Body::new();
+                b.push(format!("(if {c}"));
+                b.push_in(1, "(then");
+                b.append(inner, 2);
+                b.push_in(1, "))");
+                Ok(b)
+            }
+            CompClause::For { var, iter } => {
+                // `range(...)` becomes a counted i32 loop; any other iterable
+                // is indexed through $py_index (like the for statement).
+                let prev = cx.vars.get(var).copied();
+                cx.ensure_local(var);
+                let result = self.comp_for(cx, var, iter, rest, acc, key, elem);
+                match prev {
+                    Some(t) => {
+                        cx.vars.insert(var.clone(), t);
+                    }
+                    None => {
+                        cx.vars.remove(var);
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    /// One `for` clause of a comprehension (the binding is already registered).
+    #[allow(clippy::too_many_arguments)]
+    fn comp_for(
+        &mut self,
+        cx: &mut FuncCx,
+        var: &str,
+        iter: &Expr,
+        rest: &[CompClause],
+        acc: &str,
+        key: Option<&Expr>,
+        elem: &Expr,
+    ) -> Result<Body> {
+        if let ExprKind::Call(name, args) = &iter.kind {
+            if name == "range" && (1..=3).contains(&args.len()) && !self.funcs.contains_key("range")
+            {
+                return self.comp_range_for(cx, var, args, rest, acc, key, elem, iter.line);
+            }
+        }
+        self.type_of(cx, iter)?;
+        let it_wat = self.value_expr(cx, iter)?;
+        let it = cx.scratch_local(VAL);
+        let idx = cx.scratch_local("i32");
+        let n = cx.fresh();
+        let inner = self.comp_loop(cx, rest, acc, key, elem)?;
+        let mut b = Body::new();
+        b.push(format!("(local.set ${it} {it_wat})"));
+        b.push(format!("(local.set ${idx} (i32.const 0))"));
+        b.push(format!("(block $b{n}"));
+        b.push_in(1, format!("(loop $l{n}"));
+        b.push_in(
+            2,
+            format!("(br_if $b{n} (i32.ge_s (local.get ${idx}) (call $py_len (local.get ${it}))))"),
+        );
+        b.push_in(
+            2,
+            format!("(local.set ${var} (call $py_index (local.get ${it}) (local.get ${idx})))"),
+        );
+        b.append(inner, 2);
+        b.push_in(
+            2,
+            format!("(local.set ${idx} (i32.add (local.get ${idx}) (i32.const 1)))"),
+        );
+        b.push_in(2, format!("(br $l{n})"));
+        b.push_in(1, ")");
+        b.push(")");
+        Ok(b)
+    }
+
+    /// A comprehension `for v in range(...)` clause: a counted i32 loop binding
+    /// the boxed counter, mirroring the for-statement's range fast path.
+    #[allow(clippy::too_many_arguments)]
+    fn comp_range_for(
+        &mut self,
+        cx: &mut FuncCx,
+        var: &str,
+        args: &[Expr],
+        rest: &[CompClause],
+        acc: &str,
+        key: Option<&Expr>,
+        elem: &Expr,
+        line: usize,
+    ) -> Result<Body> {
+        let (start_wat, end_expr, step_v): (String, &Expr, i32) = match args.len() {
+            1 => ("(i32.const 0)".to_string(), &args[0], 1),
+            2 => (self.i32_expr(cx, &args[0])?, &args[1], 1),
+            _ => {
+                let sv = const_int(&args[2]).ok_or_else(|| {
+                    CompileError::at(line, "the range() step must be a plain number")
+                })?;
+                if sv == 0 {
+                    return Err(CompileError::at(line, "range() step can't be zero"));
+                }
+                let sv = i32::try_from(sv)
+                    .map_err(|_| CompileError::at(line, "range() step is too big"))?;
+                (self.i32_expr(cx, &args[0])?, &args[1], sv)
+            }
+        };
+        if const_float(end_expr).is_some() {
+            return Err(CompileError::at(
+                line,
+                "range() needs whole numbers, not decimals",
+            ));
+        }
+        let end_wat = self.i32_expr(cx, end_expr)?;
+        let ctr = cx.scratch_local("i32");
+        let endloc = cx.scratch_local("i32");
+        let n = cx.fresh();
+        let done_cmp = if step_v > 0 { "i32.ge_s" } else { "i32.le_s" };
+        let inner = self.comp_loop(cx, rest, acc, key, elem)?;
+        let mut b = Body::new();
+        b.push(format!("(local.set ${endloc} {end_wat})"));
+        b.push(format!("(local.set ${ctr} {start_wat})"));
+        b.push(format!("(block $b{n}"));
+        b.push_in(1, format!("(loop $l{n}"));
+        b.push_in(
+            2,
+            format!("(br_if $b{n} ({done_cmp} (local.get ${ctr}) (local.get ${endloc})))"),
+        );
+        b.push_in(
+            2,
+            format!("(local.set ${var} (call $box (local.get ${ctr})))"),
+        );
+        b.append(inner, 2);
+        b.push_in(
+            2,
+            format!("(local.set ${ctr} (i32.add (local.get ${ctr}) (i32.const {step_v})))"),
+        );
+        b.push_in(2, format!("(br $l{n})"));
+        b.push_in(1, ")");
+        b.push(")");
+        Ok(b)
+    }
+
     /// Generate WAT producing the boxed `(ref null eq)` value of `e`.
     fn value_expr(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
         // Fold integer constants — this is also where literals are
@@ -3011,6 +3190,38 @@ impl Gen {
             ExprKind::Attr(obj, name) => {
                 let o = self.value_expr(cx, obj)?;
                 Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
+            }
+            ExprKind::ListComp { element, clauses } => {
+                let acc = cx.scratch_local(VAL);
+                let inner = self.comp_loop(cx, clauses, &acc, None, element)?;
+                let mut body = Body::new();
+                body.push(format!(
+                    "(local.set ${acc} (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))"
+                ));
+                body.append(inner, 0);
+                let mut s = String::new();
+                body.render(0, &mut s);
+                Ok(format!(
+                    "(block (result (ref null eq))\n{s}(local.get ${acc}))"
+                ))
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                clauses,
+            } => {
+                let acc = cx.scratch_local(VAL);
+                let inner = self.comp_loop(cx, clauses, &acc, Some(key), value)?;
+                let mut body = Body::new();
+                body.push(format!(
+                    "(local.set ${acc} (struct.new $DICT (i32.const 0) (array.new_fixed $ITEMS 0) (array.new_fixed $ITEMS 0)))"
+                ));
+                body.append(inner, 0);
+                let mut s = String::new();
+                body.render(0, &mut s);
+                Ok(format!(
+                    "(block (result (ref null eq))\n{s}(local.get ${acc}))"
+                ))
             }
             ExprKind::MethodCall(recv, method, args) => {
                 // `super().m(args)` dispatches from the enclosing class's base
@@ -3385,6 +3596,9 @@ impl Gen {
                 }
                 Ok(Ty::Value)
             }
+            // Comprehensions bind their own variables, which aren't in scope
+            // here — checking happens during codegen where they're bound.
+            ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => Ok(Ty::Value),
             ExprKind::MethodCall(recv, _, args) => {
                 self.type_of(cx, recv)?;
                 for a in args {
