@@ -80,6 +80,9 @@ pub enum StmtKind {
         attr: String,
         value: Expr,
     },
+    /// Tuple-unpacking assignment, e.g. `a, b = pair` or `a, b = b, a`. Each
+    /// target is a `Name`, `Index`, or `Attr`; `value` is any iterable.
+    UnpackAssign { targets: Vec<Expr>, value: Expr },
 }
 
 /// A method inside a class body. `params[0]` is conventionally `self`.
@@ -119,6 +122,8 @@ pub enum ExprKind {
     Call(String, Vec<Expr>),
     /// A list literal, e.g. `[1, 2, 3]`.
     List(Vec<Expr>),
+    /// A tuple, e.g. `(1, 2)`, `(1,)`, `()`, or a bare `1, 2`. Immutable.
+    Tuple(Vec<Expr>),
     /// A dict literal, e.g. `{"a": 1}` (insertion-ordered, like Python).
     Dict(Vec<(Expr, Expr)>),
     /// Subscript read, e.g. `xs[i]` (lists and strings).

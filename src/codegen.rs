@@ -154,6 +154,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .types
         .push("(type $LIST (struct (field (mut i32)) (field (mut (ref null $ITEMS)))))".into());
+    // A tuple is immutable: non-mut fields make it a structurally distinct type
+    // from $LIST, so ref.test never confuses the two.
+    module
+        .types
+        .push("(type $TUPLE (struct (field i32) (field (ref null $ITEMS))))".into());
     // A dict is an insertion-ordered association: parallel key/value arrays
     // with linear-scan lookup (classroom-sized; order matches Python).
     module.types.push(
@@ -266,6 +271,7 @@ fn raise_helpers() -> Vec<Func> {
         ("(ref.test (ref $FLOAT) (local.get $r))", "float"),
         ("(ref.test (ref $STR) (local.get $r))", "str"),
         ("(ref.test (ref $LIST) (local.get $r))", "list"),
+        ("(ref.test (ref $TUPLE) (local.get $r))", "tuple"),
         ("(ref.test (ref $DICT) (local.get $r))", "dict"),
         ("(ref.test (ref $NONE_T) (local.get $r))", "NoneType"),
     ] {
@@ -453,6 +459,18 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $raise_unpack: tuple-unpacking length mismatch.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "ValueError: wrong number of values to unpack");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_unpack".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $raise_slice_step: slice step of zero.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
@@ -602,6 +620,12 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (i32.ne (struct.get $DICT 0 (ref.cast (ref $DICT) (local.get $r))) (i32.const 0))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $TUPLE) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (i32.ne (struct.get $TUPLE 0 (ref.cast (ref $TUPLE) (local.get $r))) (i32.const 0))))",
+    );
+    b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
     fs.push(Func {
         signature: "(func $truthy (param $r (ref null eq)) (result i32)".into(),
@@ -634,6 +658,12 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (array.len (ref.cast (ref $STR) (local.get $r)))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $TUPLE) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (struct.get $TUPLE 0 (ref.cast (ref $TUPLE) (local.get $r)))))",
+    );
+    b.push(")");
     b.push("(call $raise_no_len (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
@@ -645,7 +675,7 @@ fn runtime_helpers() -> Vec<Func> {
     // $py_index: subscript read with Python negative-index normalization;
     // out of range raises IndexError. Strings yield a one-character string.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (i32.or (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))) (ref.test (ref $DICT) (local.get $r))))");
+    b.push("(if (i32.eqz (i32.or (i32.or (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))) (ref.test (ref $DICT) (local.get $r))) (ref.test (ref $TUPLE) (local.get $r))))");
     b.push_in(1, "(then (call $raise_not_sub (local.get $r)))");
     b.push(")");
     b.push("(local.set $n (call $py_len (local.get $r)))");
@@ -662,6 +692,12 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(
         1,
         "(then (return (array.get $ITEMS (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $r))) (local.get $i))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $TUPLE) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (array.get $ITEMS (struct.get $TUPLE 1 (ref.cast (ref $TUPLE) (local.get $r))) (local.get $i))))",
     );
     b.push(")");
     // Positional access on a dict yields its i-th KEY — this is what makes
@@ -1146,6 +1182,31 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $tuple_contains: element-wise membership via py_eq (like list_contains).
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $TUPLE 0 (local.get $l)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (call $py_eq (array.get $ITEMS (struct.get $TUPLE 1 (local.get $l)) (local.get $i)) (local.get $item))",
+    );
+    b.push_in(3, "(then (return (i32.const 1)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const 0)");
+    fs.push(Func {
+        signature:
+            "(func $tuple_contains (param $l (ref null $TUPLE)) (param $item (ref null eq)) (result i32)"
+                .into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
     // $str_contains: naive substring search (empty needle matches).
     let mut b = Body::new();
     b.push("(local.set $hl (array.len (local.get $h)))");
@@ -1198,6 +1259,12 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(
         1,
         "(then (return (call $list_contains (ref.cast (ref $LIST) (local.get $c)) (local.get $item))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $TUPLE) (local.get $c))");
+    b.push_in(
+        1,
+        "(then (return (call $tuple_contains (ref.cast (ref $TUPLE) (local.get $c)) (local.get $item))))",
     );
     b.push(")");
     b.push("(if (ref.test (ref $DICT) (local.get $c))");
@@ -1441,6 +1508,37 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $print_tuple: `(e1, e2)` with repr elements; a 1-tuple keeps the trailing
+    // comma (`(x,)`) like Python.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 40))"); // (
+    b.push("(local.set $n (struct.get $TUPLE 0 (local.get $l)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(2, "(if (i32.gt_s (local.get $i) (i32.const 0))");
+    b.push_in(
+        3,
+        "(then (call $write_char (i32.const 44)) (call $write_char (i32.const 32)))",
+    );
+    b.push_in(2, ")");
+    b.push_in(
+        2,
+        "(call $print_repr (array.get $ITEMS (struct.get $TUPLE 1 (local.get $l)) (local.get $i)))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    // Singleton tuple: trailing comma.
+    b.push("(if (i32.eq (local.get $n) (i32.const 1)) (then (call $write_char (i32.const 44))))");
+    b.push("(call $write_char (i32.const 41))"); // )
+    fs.push(Func {
+        signature: "(func $print_tuple (param $l (ref null $TUPLE))".into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
     // $list_eq: element-wise equality (recurses through $py_eq).
     let mut b = Body::new();
     b.push("(local.set $n (struct.get $LIST 0 (local.get $a)))");
@@ -1469,6 +1567,39 @@ fn runtime_helpers() -> Vec<Func> {
     fs.push(Func {
         signature:
             "(func $list_eq (param $a (ref null $LIST)) (param $b (ref null $LIST)) (result i32)"
+                .into(),
+        locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
+        body: b,
+    });
+
+    // $tuple_eq: element-wise equality (recurses through $py_eq), like list_eq.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $TUPLE 0 (local.get $a)))");
+    b.push("(if (i32.ne (local.get $n) (struct.get $TUPLE 0 (local.get $b)))");
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(2, "(if (i32.eqz (call $py_eq");
+    b.push_in(
+        4,
+        "(array.get $ITEMS (struct.get $TUPLE 1 (local.get $a)) (local.get $i))",
+    );
+    b.push_in(
+        4,
+        "(array.get $ITEMS (struct.get $TUPLE 1 (local.get $b)) (local.get $i))))",
+    );
+    b.push_in(3, "(then (return (i32.const 0)))");
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.const 1)");
+    fs.push(Func {
+        signature:
+            "(func $tuple_eq (param $a (ref null $TUPLE)) (param $b (ref null $TUPLE)) (result i32)"
                 .into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
@@ -1520,6 +1651,12 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(
         1,
         "(then (return (call $print_list (ref.cast (ref $LIST) (local.get $r)))))",
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $TUPLE) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $print_tuple (ref.cast (ref $TUPLE) (local.get $r)))))",
     );
     b.push(")");
     b.push("(if (ref.test (ref $DICT) (local.get $r))");
@@ -1790,6 +1927,19 @@ fn runtime_helpers() -> Vec<Func> {
     b.push(")");
     b.push(
         "(if (i32.or (ref.test (ref $LIST) (local.get $a)) (ref.test (ref $LIST) (local.get $b)))",
+    );
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push(
+        "(if (i32.and (ref.test (ref $TUPLE) (local.get $a)) (ref.test (ref $TUPLE) (local.get $b)))",
+    );
+    b.push_in(
+        1,
+        "(then (return (call $tuple_eq (ref.cast (ref $TUPLE) (local.get $a)) (ref.cast (ref $TUPLE) (local.get $b)))))",
+    );
+    b.push(")");
+    b.push(
+        "(if (i32.or (ref.test (ref $TUPLE) (local.get $a)) (ref.test (ref $TUPLE) (local.get $b)))",
     );
     b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
@@ -2334,6 +2484,22 @@ impl Gen {
                 out.push(format!("(call $obj_setattr {o} {} {v})", str_lit(attr)));
                 Ok(())
             }
+            StmtKind::UnpackAssign { targets, value } => {
+                self.type_of(cx, value)?;
+                let v = self.value_expr(cx, value)?;
+                let tmp = cx.scratch_local(VAL);
+                out.push(format!("(local.set ${tmp} {v})"));
+                let n = targets.len();
+                // Length must match exactly (Python's unpack semantics).
+                out.push(format!(
+                    "(if (i32.ne (call $py_len (local.get ${tmp})) (i32.const {n})) (then (call $raise_unpack)))"
+                ));
+                for (i, target) in targets.iter().enumerate() {
+                    let elem = format!("(call $py_index (local.get ${tmp}) (i32.const {i}))");
+                    self.assign_target(cx, target, &elem, out)?;
+                }
+                Ok(())
+            }
             StmtKind::Return(value) => {
                 if cx.is_top {
                     return Err(CompileError::at(
@@ -2820,6 +2986,42 @@ impl Gen {
         Ok(())
     }
 
+    /// Emit an assignment of an already-built value expression to one target
+    /// (a `Name`, `Index`, or `Attr`). Used by tuple unpacking, where each
+    /// target receives one element of the right-hand side.
+    fn assign_target(
+        &mut self,
+        cx: &mut FuncCx,
+        target: &Expr,
+        value_wat: &str,
+        out: &mut Body,
+    ) -> Result<()> {
+        match &target.kind {
+            ExprKind::Name(name) => {
+                if cx.is_top {
+                    self.ensure_global(name);
+                    out.push(format!("(global.set $g_{name} {value_wat})"));
+                } else {
+                    out.push(format!("(local.set ${name} {value_wat})"));
+                }
+            }
+            ExprKind::Index(t, idx) => {
+                let tw = self.value_expr(cx, t)?;
+                let kw = self.value_expr(cx, idx)?;
+                out.push(format!("(call $py_set_subscript {tw} {kw} {value_wat})"));
+            }
+            ExprKind::Attr(obj, attr) => {
+                let ow = self.value_expr(cx, obj)?;
+                out.push(format!(
+                    "(call $obj_setattr {ow} {} {value_wat})",
+                    str_lit(attr)
+                ));
+            }
+            _ => return Err(CompileError::at(target.line, "invalid unpacking target")),
+        }
+        Ok(())
+    }
+
     /// Recursively emit a comprehension's clauses into a `Body`. The innermost
     /// level appends to (list) or inserts into (dict) the accumulator `acc`;
     /// `key` is `Some` for dict comprehensions, `elem` is the element/value.
@@ -3144,6 +3346,21 @@ impl Gen {
                     "(struct.new $LIST (i32.const {n}) (array.new_fixed $ITEMS {n}{items}))"
                 ))
             }
+            ExprKind::Tuple(elems) => {
+                let mut items = String::new();
+                for el in elems {
+                    items.push(' ');
+                    items.push_str(&self.value_expr(cx, el)?);
+                }
+                let n = elems.len();
+                if n == 0 {
+                    Ok("(struct.new $TUPLE (i32.const 0) (array.new_fixed $ITEMS 0))".to_string())
+                } else {
+                    Ok(format!(
+                        "(struct.new $TUPLE (i32.const {n}) (array.new_fixed $ITEMS {n}{items}))"
+                    ))
+                }
+            }
             ExprKind::Dict(entries) => {
                 // Known divergence: duplicate literal keys keep the FIRST
                 // entry here (Python keeps the last) — rare enough to defer.
@@ -3457,6 +3674,13 @@ fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>)
                 out.insert(var.clone());
                 collect_assigned(body, out);
             }
+            StmtKind::UnpackAssign { targets, .. } => {
+                for t in targets {
+                    if let ExprKind::Name(n) = &t.kind {
+                        out.insert(n.clone());
+                    }
+                }
+            }
             StmtKind::SetIndex { .. } => {}
             StmtKind::While { body, .. } => collect_assigned(body, out),
             StmtKind::If {
@@ -3562,7 +3786,7 @@ impl Gen {
                 }
                 Ok(Ty::Value)
             }
-            ExprKind::List(elems) => {
+            ExprKind::List(elems) | ExprKind::Tuple(elems) => {
                 for el in elems {
                     self.type_of(cx, el)?;
                 }

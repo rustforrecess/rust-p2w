@@ -1035,6 +1035,43 @@ fn slicing_a_non_sequence_errors() {
     assert_raises("x = 5\nprint(x[1:2])", "subscriptable");
 }
 
+// --- tuples and unpacking ---
+
+#[test]
+fn tuples_print_distinctly_from_lists() {
+    assert_output("print((1, 2, 3))", "(1, 2, 3)\n");
+    assert_output("print([1, 2, 3])", "[1, 2, 3]\n");
+    assert_output("print((1,))", "(1,)\n"); // singleton keeps the comma
+    assert_output("print(())", "()\n");
+    assert_output("print((1, 2) == (1, 2), (1, 2) == [1, 2])", "True False\n");
+}
+
+#[test]
+fn tuple_indexing_and_len() {
+    assert_output("t = (10, 20, 30)\nprint(t[1], t[-1], len(t))", "20 30 3\n");
+}
+
+#[test]
+fn unpacking_and_swap() {
+    assert_output("a, b = 1, 2\nprint(a, b)", "1 2\n");
+    assert_output("a, b = 1, 2\na, b = b, a\nprint(a, b)", "2 1\n");
+    assert_output("x, y, z = [7, 8, 9]\nprint(x + y + z)", "24\n");
+}
+
+#[test]
+fn unpacking_length_mismatch_raises() {
+    assert_raises("a, b = [1, 2, 3]", "values to unpack");
+    assert_raises("a, b, c = (1, 2)", "values to unpack");
+}
+
+#[test]
+fn for_loop_tuple_target() {
+    assert_output(
+        "for i, c in [(0, \"a\"), (1, \"b\")]:\n    print(i, c)",
+        "0 a\n1 b\n",
+    );
+}
+
 // --- augmented assignment ---
 
 #[test]
@@ -1202,6 +1239,18 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "xs = [1, 2, 3]\nxs[0] += 10\nxs[-1] *= 2\nprint(xs)\ns = \"a\"\ns += \"bc\"\nprint(s)",
     "counts = {}\nfor c in \"abracadabra\":\n    if c in counts:\n        counts[c] += 1\n    else:\n        counts[c] = 1\nprint(counts)",
     "class C:\n    def __init__(self):\n        self.n = 0\n    def add(self, k):\n        self.n += k\nc = C()\nc.add(5)\nc.add(3)\nprint(c.n)",
+    // tuples: literals, indexing, len, singleton/empty, equality, membership
+    "t = (1, 2, 3)\nprint(t, t[0], t[-1], len(t))\nprint((1,), (), (1, 2))",
+    "print((1, 2) == (1, 2), (1, 2) == (1, 3), (1,) == [1])\nprint(2 in (1, 2, 3), 5 in (1, 2, 3))",
+    // unpacking assignment, swap, from a list, to index/attr targets
+    "a, b = 10, 20\nprint(a, b)\na, b = b, a\nprint(a, b)\nx, y, z = [1, 2, 3]\nprint(x, y, z)",
+    "xs = [0, 0]\nxs[0], xs[1] = 5, 6\nprint(xs)",
+    "class P:\n    def __init__(self):\n        self.x = 0\n        self.y = 0\np = P()\np.x, p.y = 3, 4\nprint(p.x, p.y)",
+    // for-loop tuple targets + tuple element comprehension
+    "for k, v in [(1, \"a\"), (2, \"b\")]:\n    print(k, v)\nprint([(x, x * x) for x in range(4)])",
+    "total = 0\nfor a, b in [(1, 2), (3, 4), (5, 6)]:\n    total += a + b\nprint(total)",
+    // returning a tuple, then unpacking it
+    "def minmax(xs):\n    lo = xs[0]\n    hi = xs[0]\n    for v in xs:\n        if v < lo:\n            lo = v\n        if v > hi:\n            hi = v\n    return lo, hi\nlow, high = minmax([4, 1, 8, 3])\nprint(low, high)",
 ];
 
 fn find_python() -> Option<&'static str> {

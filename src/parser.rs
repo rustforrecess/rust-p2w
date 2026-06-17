@@ -13,6 +13,7 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        next_tmp: 0,
     };
     p.program()
 }
@@ -20,6 +21,10 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>> {
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
+    /// Counter for compiler-introduced temporaries (e.g. desugaring a
+    /// tuple-target `for` loop). The `.u` prefix can't collide with a Python
+    /// name.
+    next_tmp: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -124,7 +129,7 @@ impl<'a> Parser<'a> {
             let value = if matches!(self.peek(), Tok::Newline) {
                 None
             } else {
-                Some(self.expr(0)?)
+                Some(self.expr_list()?)
             };
             self.expect(&Tok::Newline, "a new line")?;
             return Ok(Stmt {
@@ -149,8 +154,9 @@ impl<'a> Parser<'a> {
             });
         }
         // Assignment or expression statement: parse the expression first,
-        // then decide based on what follows.
-        let e = self.expr(0)?;
+        // then decide based on what follows. `expr_list` makes a bare comma
+        // list (`a, b` / `1, 2`) into a tuple.
+        let e = self.expr_list()?;
         // Augmented assignment `target OP= rhs` desugars to `target = target OP
         // rhs` (the target is read once textually; a side-effecting index is
         // re-evaluated — a documented v1 simplification).
@@ -209,7 +215,7 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.peek(), Tok::Eq) {
             self.advance();
-            let value = self.expr(0)?;
+            let value = self.expr_list()?;
             self.expect(&Tok::Newline, "a new line")?;
             return match e.kind {
                 ExprKind::Name(name) => Ok(Stmt {
@@ -232,6 +238,24 @@ impl<'a> Parser<'a> {
                     },
                     line,
                 }),
+                // `a, b = ...` unpacks; each target must be assignable.
+                ExprKind::Tuple(targets) => {
+                    for t in &targets {
+                        if !matches!(
+                            t.kind,
+                            ExprKind::Name(_) | ExprKind::Index(..) | ExprKind::Attr(..)
+                        ) {
+                            return Err(CompileError::at(
+                                line,
+                                "unpacking targets must be variables, indices, or attributes",
+                            ));
+                        }
+                    }
+                    Ok(Stmt {
+                        kind: StmtKind::UnpackAssign { targets, value },
+                        line,
+                    })
+                }
                 ExprKind::Slice { .. } => Err(CompileError::at(
                     line,
                     "slice assignment (xs[a:b] = ...) isn't supported yet",
@@ -432,22 +456,18 @@ impl<'a> Parser<'a> {
     fn for_stmt(&mut self) -> Result<Stmt> {
         let line = self.line();
         self.eat_keyword("for")?;
-        let var = match self.peek().clone() {
-            Tok::Name(n) => {
-                self.advance();
-                n
-            }
-            other => {
-                return Err(CompileError::at(
-                    self.line(),
-                    format!("expected a loop variable, found {other:?}"),
-                ))
-            }
-        };
+        // One or more comma-separated loop variables (`for k, v in ...`).
+        let mut targets = vec![self.for_target_name()?];
+        while matches!(self.peek(), Tok::Comma) {
+            self.advance();
+            targets.push(self.for_target_name()?);
+        }
+        let var = targets[0].clone();
         self.eat_keyword("in")?;
         // `range(...)` is the counted fast path; any other expression
-        // iterates a sequence (list or string).
-        if self.is_keyword("range") && *self.peek2() == Tok::LParen {
+        // iterates a sequence (list or string). A tuple target never uses the
+        // range path (you can't unpack an int).
+        if targets.len() == 1 && self.is_keyword("range") && *self.peek2() == Tok::LParen {
             self.advance(); // range
             self.advance(); // (
             let args = self.call_args()?;
@@ -483,13 +503,91 @@ impl<'a> Parser<'a> {
         let iterable = self.expr(0)?;
         self.expect(&Tok::Colon, "':'")?;
         self.expect(&Tok::Newline, "a new line")?;
-        let body = self.block()?;
+        let mut body = self.block()?;
+        // A tuple target desugars to a single hidden loop variable plus an
+        // unpacking assignment at the top of the body: `for k, v in it:` ->
+        // `for .u in it: (k, v) = .u; <body>`.
+        if targets.len() > 1 {
+            let tmp = self.fresh_tmp();
+            let unpack = Stmt {
+                kind: StmtKind::UnpackAssign {
+                    targets: targets
+                        .into_iter()
+                        .map(|n| Expr {
+                            kind: ExprKind::Name(n),
+                            line,
+                        })
+                        .collect(),
+                    value: Expr {
+                        kind: ExprKind::Name(tmp.clone()),
+                        line,
+                    },
+                },
+                line,
+            };
+            body.insert(0, unpack);
+            return Ok(Stmt {
+                kind: StmtKind::ForEach {
+                    var: tmp,
+                    iterable,
+                    body,
+                },
+                line,
+            });
+        }
         Ok(Stmt {
             kind: StmtKind::ForEach {
                 var,
                 iterable,
                 body,
             },
+            line,
+        })
+    }
+
+    /// A single `for` loop variable name (rejecting keywords like `in`).
+    fn for_target_name(&mut self) -> Result<String> {
+        match self.peek().clone() {
+            Tok::Name(n) if !matches!(n.as_str(), "in" | "True" | "False" | "None") => {
+                self.advance();
+                Ok(n)
+            }
+            other => Err(CompileError::at(
+                self.line(),
+                format!("expected a loop variable, found {other:?}"),
+            )),
+        }
+    }
+
+    fn fresh_tmp(&mut self) -> String {
+        let n = self.next_tmp;
+        self.next_tmp += 1;
+        format!(".u{n}")
+    }
+
+    /// Parse one expression, or a comma-separated list as a `Tuple` (a bare
+    /// `a, b` / `1, 2,`). A single expression with no comma passes through
+    /// unwrapped. Stops at tokens that can't start an expression (so a trailing
+    /// comma before `=`, newline, `:`, or `)` is handled).
+    fn expr_list(&mut self) -> Result<Expr> {
+        let line = self.line();
+        let first = self.expr(0)?;
+        if !matches!(self.peek(), Tok::Comma) {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while matches!(self.peek(), Tok::Comma) {
+            self.advance();
+            if matches!(
+                self.peek(),
+                Tok::Newline | Tok::Eq | Tok::Colon | Tok::RParen | Tok::Eof
+            ) {
+                break; // trailing comma
+            }
+            items.push(self.expr(0)?);
+        }
+        Ok(Expr {
+            kind: ExprKind::Tuple(items),
             line,
         })
     }
@@ -712,9 +810,27 @@ impl<'a> Parser<'a> {
             }
             Tok::LParen => {
                 self.advance();
-                let e = self.expr(0)?;
+                // `()` is the empty tuple.
+                if matches!(self.peek(), Tok::RParen) {
+                    self.advance();
+                    return Ok(expr(ExprKind::Tuple(Vec::new())));
+                }
+                let first = self.expr(0)?;
+                // A comma makes it a tuple; otherwise it's a grouping paren.
+                if matches!(self.peek(), Tok::Comma) {
+                    let mut items = vec![first];
+                    while matches!(self.peek(), Tok::Comma) {
+                        self.advance();
+                        if matches!(self.peek(), Tok::RParen) {
+                            break; // trailing comma (incl. the `(x,)` singleton)
+                        }
+                        items.push(self.expr(0)?);
+                    }
+                    self.expect(&Tok::RParen, "')'")?;
+                    return Ok(expr(ExprKind::Tuple(items)));
+                }
                 self.expect(&Tok::RParen, "')'")?;
-                Ok(e)
+                Ok(first)
             }
             Tok::LBracket => {
                 self.advance();
@@ -910,6 +1026,7 @@ fn parse_fragment(src: &str, line: usize) -> Result<Expr> {
     let mut p = Parser {
         toks: &tokens,
         pos: 0,
+        next_tmp: 0,
     };
     let mut e = p.expr(0).map_err(|e| CompileError::at(line, e.message))?;
     if !matches!(p.peek(), Tok::Newline | Tok::Eof) {
@@ -943,7 +1060,7 @@ fn set_lines(e: &mut Expr, line: usize) {
                 set_lines(a, line);
             }
         }
-        ExprKind::List(elems) => {
+        ExprKind::List(elems) | ExprKind::Tuple(elems) => {
             for el in elems {
                 set_lines(el, line);
             }
@@ -964,7 +1081,7 @@ fn contains_call(e: &Expr) -> bool {
         ExprKind::Call(..) | ExprKind::MethodCall(..) => true,
         ExprKind::Unary(_, inner) => contains_call(inner),
         ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => contains_call(a) || contains_call(b),
-        ExprKind::List(elems) => elems.iter().any(contains_call),
+        ExprKind::List(elems) | ExprKind::Tuple(elems) => elems.iter().any(contains_call),
         ExprKind::Dict(entries) => entries
             .iter()
             .any(|(k, v)| contains_call(k) || contains_call(v)),
