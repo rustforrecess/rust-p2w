@@ -2798,6 +2798,141 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $str_replace: replace every non-overlapping occurrence of `old` with
+    // `new` (count, then build to the exact length). Empty `old` returns the
+    // original (lenient).
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $oldc (ref.cast (ref $STR) (local.get $old)))");
+    b.push("(local.set $newc (ref.cast (ref $STR) (local.get $new)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $ol (array.len (local.get $oldc)))");
+    b.push("(local.set $nl (array.len (local.get $newc)))");
+    b.push("(if (i32.eqz (local.get $ol)) (then (return (local.get $ss))))");
+    b.push("(block $cd (loop $cl");
+    b.push_in(
+        2,
+        "(br_if $cd (i32.gt_s (i32.add (local.get $i) (local.get $ol)) (local.get $n)))",
+    );
+    b.push_in(
+        2,
+        "(if (call $str_match_at (local.get $ss) (local.get $i) (local.get $oldc) (local.get $ol))",
+    );
+    b.push_in(
+        3,
+        "(then (local.set $cnt (i32.add (local.get $cnt) (i32.const 1))) (local.set $i (i32.add (local.get $i) (local.get $ol))))",
+    );
+    b.push_in(
+        3,
+        "(else (local.set $i (i32.add (local.get $i) (i32.const 1)))))",
+    );
+    b.push_in(2, "(br $cl)))");
+    b.push(
+        "(local.set $total (i32.add (local.get $n) (i32.mul (local.get $cnt) (i32.sub (local.get $nl) (local.get $ol)))))",
+    );
+    b.push("(local.set $out (array.new_default $STR (local.get $total)))");
+    b.push("(local.set $i (i32.const 0))");
+    b.push("(local.set $pos (i32.const 0))");
+    b.push("(block $bd (loop $bl");
+    b.push_in(2, "(br_if $bd (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(2, "(local.set $mt (i32.const 0))");
+    b.push_in(
+        2,
+        "(if (i32.le_s (i32.add (local.get $i) (local.get $ol)) (local.get $n))",
+    );
+    b.push_in(
+        3,
+        "(then (local.set $mt (call $str_match_at (local.get $ss) (local.get $i) (local.get $oldc) (local.get $ol)))))",
+    );
+    b.push_in(2, "(if (local.get $mt)");
+    b.push_in(3, "(then");
+    b.push_in(
+        4,
+        "(array.copy $STR $STR (local.get $out) (local.get $pos) (local.get $newc) (i32.const 0) (local.get $nl))",
+    );
+    b.push_in(
+        4,
+        "(local.set $pos (i32.add (local.get $pos) (local.get $nl)))",
+    );
+    b.push_in(
+        4,
+        "(local.set $i (i32.add (local.get $i) (local.get $ol))))",
+    );
+    b.push_in(3, "(else");
+    b.push_in(
+        4,
+        "(array.set $STR (local.get $out) (local.get $pos) (array.get_u $STR (local.get $ss) (local.get $i)))",
+    );
+    b.push_in(
+        4,
+        "(local.set $pos (i32.add (local.get $pos) (i32.const 1)))",
+    );
+    b.push_in(4, "(local.set $i (i32.add (local.get $i) (i32.const 1)))))");
+    b.push_in(2, "(br $bl)))");
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $str_replace (param $s (ref null eq)) (param $old (ref null eq)) (param $new (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $oldc (ref null $STR))".into(),
+            "(local $newc (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $ol i32)".into(),
+            "(local $nl i32)".into(),
+            "(local $i i32)".into(),
+            "(local $cnt i32)".into(),
+            "(local $total i32)".into(),
+            "(local $out (ref null $STR))".into(),
+            "(local $pos i32)".into(),
+            "(local $mt i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $str_starts / $str_ends: prefix / suffix test, returning a bool value.
+    for (fname, at_start) in [("$str_starts", true), ("$str_ends", false)] {
+        let mut b = Body::new();
+        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+        b.push_in(
+            1,
+            "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+        );
+        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+        b.push("(local.set $pc (ref.cast (ref $STR) (local.get $p)))");
+        b.push("(local.set $n (array.len (local.get $ss)))");
+        b.push("(local.set $pl (array.len (local.get $pc)))");
+        b.push(
+            "(if (i32.gt_s (local.get $pl) (local.get $n)) (then (return (global.get $FALSE))))",
+        );
+        let at = if at_start {
+            "(i32.const 0)".to_string()
+        } else {
+            "(i32.sub (local.get $n) (local.get $pl))".to_string()
+        };
+        b.push(format!(
+            "(call $bool (call $str_match_at (local.get $ss) {at} (local.get $pc) (local.get $pl)))"
+        ));
+        fs.push(Func {
+            signature: format!(
+                "(func {fname} (param $s (ref null eq)) (param $p (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![
+                "(local $ss (ref null $STR))".into(),
+                "(local $pc (ref null $STR))".into(),
+                "(local $n i32)".into(),
+                "(local $pl i32)".into(),
+            ],
+            body: b,
+        });
+    }
+
     fs
 }
 
@@ -4423,6 +4558,30 @@ impl Gen {
                         let argl = self.list_of(cx, args)?;
                         return Ok(format!(
                             "(call $str_join {r} {it} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "replace" if args.len() == 2 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let old = self.value_expr(cx, &args[0])?;
+                        let new = self.value_expr(cx, &args[1])?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $str_replace {r} {old} {new} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "startswith" | "endswith" if args.len() == 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let p = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        let helper = if method == "startswith" {
+                            "$str_starts"
+                        } else {
+                            "$str_ends"
+                        };
+                        return Ok(format!(
+                            "(call {helper} {r} {p} {} {argl})",
                             str_lit(method)
                         ));
                     }

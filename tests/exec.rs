@@ -1260,6 +1260,17 @@ fn string_strip_case_join() {
 }
 
 #[test]
+fn string_replace_and_affix_tests() {
+    assert_output("print(\"a.b.c\".replace(\".\", \"/\"))", "a/b/c\n");
+    assert_output("print(\"aaaa\".replace(\"aa\", \"b\"))", "bb\n");
+    assert_output(
+        "print(\"file.py\".endswith(\".py\"), \"file.py\".startswith(\"file\"))",
+        "True True\n",
+    );
+    assert_output("print(\"hi\".startswith(\"hello\"))", "False\n");
+}
+
+#[test]
 fn string_method_name_falls_back_to_class_method() {
     // A class defining `upper` still dispatches there (not the string helper).
     assert_output(
@@ -1449,6 +1460,9 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // power operator (** binds tighter than unary minus, right-associative)
     "print(2 ** 10, 3 ** 0, 5 ** 1)\nprint(2 ** -1, 2.0 ** 3, 10 ** -2)\nprint(-2 ** 2, (-2) ** 2, 2 ** 3 ** 2)",
     "n = 5\nprint(n ** 2 + 1)\nb = 2\nb **= 5\nprint(b)\nprint([i ** 2 for i in range(5)])",
+    // string replace / startswith / endswith
+    "print(\"a-b-c\".replace(\"-\", \"+\"))\nprint(\"hello\".replace(\"l\", \"LL\"))\nprint(\"aaa\".replace(\"a\", \"\"))",
+    "print(\"hello.py\".endswith(\".py\"), \"hello.py\".startswith(\"he\"), \"x\".startswith(\"xy\"))",
 ];
 
 fn find_python() -> Option<&'static str> {
