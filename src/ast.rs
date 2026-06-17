@@ -157,8 +157,8 @@ pub enum ExprKind {
 /// order (a comprehension is `element` followed by one or more of these).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompClause {
-    /// `for var in iter` (single-name target only in this subset).
-    For { var: String, iter: Expr },
+    /// `for v in iter` or `for a, b in iter` (one or more name targets).
+    For { vars: Vec<String>, iter: Expr },
     /// `if cond`
     If(Expr),
 }

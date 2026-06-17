@@ -1035,6 +1035,53 @@ fn slicing_a_non_sequence_errors() {
     assert_raises("x = 5\nprint(x[1:2])", "subscriptable");
 }
 
+// --- iterable builtins (range value, enumerate, zip, dict views, sum, sorted) ---
+
+#[test]
+fn range_as_a_value() {
+    assert_output("print(sum(range(5)))", "10\n");
+    assert_output(
+        "r = range(1, 4)\nprint(len(r))\nfor x in r:\n    print(x)",
+        "3\n1\n2\n3\n",
+    );
+    assert_output("print(sorted(range(5, 0, -1)))", "[1, 2, 3, 4, 5]\n");
+}
+
+#[test]
+fn enumerate_and_zip() {
+    assert_output(
+        "for i, c in enumerate(\"ab\"):\n    print(i, c)",
+        "0 a\n1 b\n",
+    );
+    assert_output(
+        "for i, x in enumerate([9, 8], 1):\n    print(i, x)",
+        "1 9\n2 8\n",
+    );
+    assert_output(
+        "print([a + b for a, b in zip([1, 2, 3], [10, 20])])",
+        "[11, 22]\n",
+    );
+}
+
+#[test]
+fn dict_views() {
+    assert_output(
+        "d = {\"x\": 1, \"y\": 2}\nfor k, v in d.items():\n    print(k, v)",
+        "x 1\ny 2\n",
+    );
+    assert_output(
+        "d = {\"a\": 3, \"b\": 1}\nprint(sorted(d.values()))",
+        "[1, 3]\n",
+    );
+}
+
+#[test]
+fn sum_and_sorted() {
+    assert_output("print(sum([10, 20, 30]))", "60\n");
+    assert_output("print(sorted([5, 2, 8, 1]))", "[1, 2, 5, 8]\n");
+    assert_output("print(sorted(\"ceab\"))", "['a', 'b', 'c', 'e']\n");
+}
+
 // --- tuples and unpacking ---
 
 #[test]
@@ -1136,9 +1183,12 @@ fn comprehension_in_function_does_not_leak() {
 }
 
 #[test]
-fn comprehension_tuple_target_is_rejected() {
-    let err = rust_p2w::compile_to_wat("print([a for a, b in [[1, 2]]])").unwrap_err();
-    assert!(err.to_string().contains("tuple target"), "{err}");
+fn comprehension_tuple_target() {
+    assert_output("print([a + b for a, b in [(1, 2), (3, 4)]])", "[3, 7]\n");
+    assert_output(
+        "print([a * b for a, b in zip([1, 2, 3], [4, 5, 6])])",
+        "[4, 10, 18]\n",
+    );
 }
 
 // --- differential testing against real CPython, when available ---
@@ -1251,6 +1301,19 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "total = 0\nfor a, b in [(1, 2), (3, 4), (5, 6)]:\n    total += a + b\nprint(total)",
     // returning a tuple, then unpacking it
     "def minmax(xs):\n    lo = xs[0]\n    hi = xs[0]\n    for v in xs:\n        if v < lo:\n            lo = v\n        if v > hi:\n            hi = v\n    return lo, hi\nlow, high = minmax([4, 1, 8, 3])\nprint(low, high)",
+    // range as a value: iterate, sum, len, membership
+    "r = range(3)\nfor x in r:\n    print(x)\nprint(sum(range(5)), len(range(10)), 2 in range(5), 9 in range(5))\nprint(sum(range(1, 101)))",
+    // enumerate (default and custom start)
+    "for i, c in enumerate(\"abc\"):\n    print(i, c)\nfor i, x in enumerate([10, 20], 1):\n    print(i, x)",
+    // zip (stops at the shorter input)
+    "for a, b in zip([1, 2, 3], \"ab\"):\n    print(a, b)\nprint([a + b for a, b in zip([1, 2], [10, 20])])",
+    // dict views: iterate keys / values / items
+    "d = {\"a\": 1, \"b\": 2, \"c\": 3}\nfor k in d.keys():\n    print(k)\nfor v in d.values():\n    print(v)\nfor k, v in d.items():\n    print(k, v)\nprint(sorted(d.keys()))",
+    // sum and sorted
+    "print(sum([1, 2, 3, 4]), sum([1.5, 2.5]))\nprint(sorted([3, 1, 2]), sorted([3, 1.5, 2]))\nprint(sorted(\"dcba\"), sorted([\"banana\", \"apple\", \"cherry\"]))",
+    // tuple-target comprehensions over items()/zip
+    "d = {\"a\": 1, \"b\": 2}\nprint({v: k for k, v in d.items()})\nprint([k for k, v in d.items() if v > 1])",
+    "print([a * b for a, b in zip([1, 2, 3], [4, 5, 6])])",
 ];
 
 fn find_python() -> Option<&'static str> {

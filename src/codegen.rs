@@ -1977,6 +1977,332 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $range_list: materialize `range(start, end, step)` as a list (the value
+    // form; the for-statement and comprehensions use a counted loop instead).
+    let mut b = Body::new();
+    b.push("(local.set $lst (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))");
+    // A zero step would loop forever; yield an empty range instead of hanging.
+    b.push("(if (i32.eqz (local.get $step)) (then (return (local.get $lst))))");
+    b.push("(local.set $i (local.get $start))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(
+        2,
+        "(br_if $done (if (result i32) (i32.gt_s (local.get $step) (i32.const 0)) (then (i32.ge_s (local.get $i) (local.get $end))) (else (i32.le_s (local.get $i) (local.get $end)))))",
+    );
+    b.push_in(
+        2,
+        "(drop (call $list_append (local.get $lst) (call $box (local.get $i))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $i (i32.add (local.get $i) (local.get $step)))",
+    );
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.get $lst)");
+    fs.push(Func {
+        signature:
+            "(func $range_list (param $start i32) (param $end i32) (param $step i32) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $lst (ref null eq))".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $enumerate: list of (index, element) tuples, index counting from $start.
+    let mut b = Body::new();
+    b.push("(local.set $lst (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))");
+    b.push("(local.set $n (call $py_len (local.get $seq)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $tup (array.new_default $ITEMS (i32.const 2)))",
+    );
+    b.push_in(
+        2,
+        "(array.set $ITEMS (local.get $tup) (i32.const 0) (call $box (i32.add (local.get $start) (local.get $i))))",
+    );
+    b.push_in(
+        2,
+        "(array.set $ITEMS (local.get $tup) (i32.const 1) (call $py_index (local.get $seq) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(drop (call $list_append (local.get $lst) (struct.new $TUPLE (i32.const 2) (local.get $tup))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.get $lst)");
+    fs.push(Func {
+        signature:
+            "(func $enumerate (param $seq (ref null eq)) (param $start i32) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $lst (ref null eq))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $tup (ref null $ITEMS))".into(),
+        ],
+        body: b,
+    });
+
+    // $zip2: list of (a[i], b[i]) tuples up to the shorter length.
+    let mut b = Body::new();
+    b.push("(local.set $lst (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))");
+    b.push("(local.set $na (call $py_len (local.get $a)))");
+    b.push("(local.set $nb (call $py_len (local.get $b)))");
+    b.push("(local.set $n (select (local.get $na) (local.get $nb) (i32.lt_s (local.get $na) (local.get $nb))))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $tup (array.new_default $ITEMS (i32.const 2)))",
+    );
+    b.push_in(
+        2,
+        "(array.set $ITEMS (local.get $tup) (i32.const 0) (call $py_index (local.get $a) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(array.set $ITEMS (local.get $tup) (i32.const 1) (call $py_index (local.get $b) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(drop (call $list_append (local.get $lst) (struct.new $TUPLE (i32.const 2) (local.get $tup))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.get $lst)");
+    fs.push(Func {
+        signature:
+            "(func $zip2 (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $lst (ref null eq))".into(),
+            "(local $na i32)".into(),
+            "(local $nb i32)".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $tup (ref null $ITEMS))".into(),
+        ],
+        body: b,
+    });
+
+    // $dict_view: dict.keys()/.values()/.items() (which = 0/1/2) as a list. A
+    // non-dict receiver falls back to ordinary method dispatch, so a user class
+    // may define methods with these names.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $DICT) (local.get $d)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $d) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $dd (ref.cast (ref $DICT) (local.get $d)))");
+    b.push("(local.set $n (struct.get $DICT 0 (local.get $dd)))");
+    b.push("(local.set $items (array.new_default $ITEMS (local.get $n)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(2, "(if (i32.eq (local.get $which) (i32.const 0))");
+    b.push_in(
+        3,
+        "(then (array.set $ITEMS (local.get $items) (local.get $i) (array.get $ITEMS (struct.get $DICT 1 (local.get $dd)) (local.get $i)))))",
+    );
+    b.push_in(2, "(if (i32.eq (local.get $which) (i32.const 1))");
+    b.push_in(
+        3,
+        "(then (array.set $ITEMS (local.get $items) (local.get $i) (array.get $ITEMS (struct.get $DICT 2 (local.get $dd)) (local.get $i)))))",
+    );
+    b.push_in(2, "(if (i32.eq (local.get $which) (i32.const 2))");
+    b.push_in(3, "(then");
+    b.push_in(
+        4,
+        "(local.set $tup (array.new_default $ITEMS (i32.const 2)))",
+    );
+    b.push_in(
+        4,
+        "(array.set $ITEMS (local.get $tup) (i32.const 0) (array.get $ITEMS (struct.get $DICT 1 (local.get $dd)) (local.get $i)))",
+    );
+    b.push_in(
+        4,
+        "(array.set $ITEMS (local.get $tup) (i32.const 1) (array.get $ITEMS (struct.get $DICT 2 (local.get $dd)) (local.get $i)))",
+    );
+    b.push_in(
+        4,
+        "(array.set $ITEMS (local.get $items) (local.get $i) (struct.new $TUPLE (i32.const 2) (local.get $tup)))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(struct.new $LIST (local.get $n) (local.get $items))");
+    fs.push(Func {
+        signature:
+            "(func $dict_view (param $d (ref null eq)) (param $which i32) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $dd (ref null $DICT))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $tup (ref null $ITEMS))".into(),
+        ],
+        body: b,
+    });
+
+    // $py_sum: numeric sum of an iterable, starting from 0 (via $py_add).
+    let mut b = Body::new();
+    b.push("(local.set $acc (call $box (i32.const 0)))");
+    b.push("(local.set $n (call $py_len (local.get $seq)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $acc (call $py_add (local.get $acc) (call $py_index (local.get $seq) (local.get $i))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.get $acc)");
+    fs.push(Func {
+        signature: "(func $py_sum (param $seq (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $acc (ref null eq))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $str_lt: lexicographic byte comparison, `a < b` (shorter is smaller when
+    // it's a prefix). Supports sorting strings.
+    let mut b = Body::new();
+    b.push("(local.set $la (array.len (local.get $a)))");
+    b.push("(local.set $lb (array.len (local.get $b)))");
+    b.push("(local.set $m (select (local.get $la) (local.get $lb) (i32.lt_s (local.get $la) (local.get $lb))))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $m)))");
+    b.push_in(
+        2,
+        "(local.set $ca (array.get_u $STR (local.get $a) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $cb (array.get_u $STR (local.get $b) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(if (i32.lt_u (local.get $ca) (local.get $cb)) (then (return (i32.const 1))))",
+    );
+    b.push_in(
+        2,
+        "(if (i32.gt_u (local.get $ca) (local.get $cb)) (then (return (i32.const 0))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(i32.lt_s (local.get $la) (local.get $lb))");
+    fs.push(Func {
+        signature:
+            "(func $str_lt (param $a (ref null $STR)) (param $b (ref null $STR)) (result i32)"
+                .into(),
+        locals: vec![
+            "(local $la i32)".into(),
+            "(local $lb i32)".into(),
+            "(local $m i32)".into(),
+            "(local $i i32)".into(),
+            "(local $ca i32)".into(),
+            "(local $cb i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $sort_lt: `a < b` for sorting — lexicographic for two strings, numeric
+    // otherwise.
+    let mut b = Body::new();
+    b.push(
+        "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
+    );
+    b.push_in(
+        1,
+        "(then (return (call $str_lt (ref.cast (ref $STR) (local.get $a)) (ref.cast (ref $STR) (local.get $b))))))",
+    );
+    b.push("(f64.lt (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))");
+    fs.push(Func {
+        signature: "(func $sort_lt (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
+            .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_sorted: a new sorted list (insertion sort; classroom-sized inputs).
+    let mut b = Body::new();
+    b.push("(local.set $n (call $py_len (local.get $seq)))");
+    b.push("(local.set $items (array.new_default $ITEMS (local.get $n)))");
+    b.push("(local.set $i (i32.const 0))");
+    b.push("(block $cd (loop $cl");
+    b.push_in(1, "(br_if $cd (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(array.set $ITEMS (local.get $items) (local.get $i) (call $py_index (local.get $seq) (local.get $i)))",
+    );
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $cl)))");
+    // insertion sort
+    b.push("(local.set $i (i32.const 1))");
+    b.push("(block $od (loop $ol");
+    b.push_in(1, "(br_if $od (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(local.set $key (array.get $ITEMS (local.get $items) (local.get $i)))",
+    );
+    b.push_in(1, "(local.set $j (i32.sub (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(block $id (loop $il");
+    b.push_in(2, "(br_if $id (i32.lt_s (local.get $j) (i32.const 0)))");
+    b.push_in(
+        2,
+        "(br_if $id (i32.eqz (call $sort_lt (local.get $key) (array.get $ITEMS (local.get $items) (local.get $j)))))",
+    );
+    b.push_in(
+        2,
+        "(array.set $ITEMS (local.get $items) (i32.add (local.get $j) (i32.const 1)) (array.get $ITEMS (local.get $items) (local.get $j)))",
+    );
+    b.push_in(2, "(local.set $j (i32.sub (local.get $j) (i32.const 1)))");
+    b.push_in(2, "(br $il)))");
+    b.push_in(
+        1,
+        "(array.set $ITEMS (local.get $items) (i32.add (local.get $j) (i32.const 1)) (local.get $key))",
+    );
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $ol)))");
+    b.push("(struct.new $LIST (local.get $n) (local.get $items))");
+    fs.push(Func {
+        signature: "(func $py_sorted (param $seq (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $j i32)".into(),
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $key (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
     fs
 }
 
@@ -3065,18 +3391,25 @@ impl Gen {
                 b.push_in(1, "))");
                 Ok(b)
             }
-            CompClause::For { var, iter } => {
-                // `range(...)` becomes a counted i32 loop; any other iterable
-                // is indexed through $py_index (like the for statement).
-                let prev = cx.vars.get(var).copied();
-                cx.ensure_local(var);
-                let result = self.comp_for(cx, var, iter, rest, acc, key, elem);
-                match prev {
-                    Some(t) => {
-                        cx.vars.insert(var.clone(), t);
-                    }
-                    None => {
-                        cx.vars.remove(var);
+            CompClause::For { vars, iter } => {
+                // Target names are function-scoped; save and restore so they
+                // don't leak past the comprehension.
+                let prev: Vec<(String, Option<Ty>)> = vars
+                    .iter()
+                    .map(|v| (v.clone(), cx.vars.get(v).copied()))
+                    .collect();
+                for v in vars {
+                    cx.ensure_local(v);
+                }
+                let result = self.comp_for_clause(cx, vars, iter, rest, acc, key, elem);
+                for (v, t) in prev {
+                    match t {
+                        Some(t) => {
+                            cx.vars.insert(v, t);
+                        }
+                        None => {
+                            cx.vars.remove(&v);
+                        }
                     }
                 }
                 result
@@ -3084,30 +3417,62 @@ impl Gen {
         }
     }
 
-    /// One `for` clause of a comprehension (the binding is already registered).
+    /// A `for` clause: bind one hidden loop variable, then (for a tuple target)
+    /// unpack it into the named targets before the rest of the comprehension.
     #[allow(clippy::too_many_arguments)]
-    fn comp_for(
+    fn comp_for_clause(
         &mut self,
         cx: &mut FuncCx,
-        var: &str,
+        vars: &[String],
         iter: &Expr,
         rest: &[CompClause],
         acc: &str,
         key: Option<&Expr>,
         elem: &Expr,
     ) -> Result<Body> {
-        if let ExprKind::Call(name, args) = &iter.kind {
-            if name == "range" && (1..=3).contains(&args.len()) && !self.funcs.contains_key("range")
-            {
-                return self.comp_range_for(cx, var, args, rest, acc, key, elem, iter.line);
+        let single = vars.len() == 1;
+        let loopvar = if single {
+            vars[0].clone()
+        } else {
+            cx.scratch_local(VAL)
+        };
+        let mut inner = self.comp_loop(cx, rest, acc, key, elem)?;
+        if !single {
+            let mut unpacked = Body::new();
+            unpacked.push(format!(
+                "(if (i32.ne (call $py_len (local.get ${loopvar})) (i32.const {})) (then (call $raise_unpack)))",
+                vars.len()
+            ));
+            for (i, v) in vars.iter().enumerate() {
+                unpacked.push(format!(
+                    "(local.set ${v} (call $py_index (local.get ${loopvar}) (i32.const {i})))"
+                ));
+            }
+            unpacked.append(inner, 0);
+            inner = unpacked;
+        }
+        // `range(...)` over a single target is a counted i32 loop.
+        if single {
+            if let ExprKind::Call(name, args) = &iter.kind {
+                if name == "range"
+                    && (1..=3).contains(&args.len())
+                    && !self.funcs.contains_key("range")
+                {
+                    return self.comp_range_for(cx, &loopvar, args, inner, iter.line);
+                }
             }
         }
+        self.comp_for(cx, &loopvar, iter, inner)
+    }
+
+    /// Build a sequence-iterating comprehension loop around `inner`, binding
+    /// `var` to each element via $py_index.
+    fn comp_for(&mut self, cx: &mut FuncCx, var: &str, iter: &Expr, inner: Body) -> Result<Body> {
         self.type_of(cx, iter)?;
         let it_wat = self.value_expr(cx, iter)?;
         let it = cx.scratch_local(VAL);
         let idx = cx.scratch_local("i32");
         let n = cx.fresh();
-        let inner = self.comp_loop(cx, rest, acc, key, elem)?;
         let mut b = Body::new();
         b.push(format!("(local.set ${it} {it_wat})"));
         b.push(format!("(local.set ${idx} (i32.const 0))"));
@@ -3132,18 +3497,14 @@ impl Gen {
         Ok(b)
     }
 
-    /// A comprehension `for v in range(...)` clause: a counted i32 loop binding
-    /// the boxed counter, mirroring the for-statement's range fast path.
-    #[allow(clippy::too_many_arguments)]
+    /// Build a counted `range(...)` comprehension loop around `inner`, binding
+    /// `var` to the boxed counter (the for-statement's range fast path).
     fn comp_range_for(
         &mut self,
         cx: &mut FuncCx,
         var: &str,
         args: &[Expr],
-        rest: &[CompClause],
-        acc: &str,
-        key: Option<&Expr>,
-        elem: &Expr,
+        inner: Body,
         line: usize,
     ) -> Result<Body> {
         let (start_wat, end_expr, step_v): (String, &Expr, i32) = match args.len() {
@@ -3172,7 +3533,6 @@ impl Gen {
         let endloc = cx.scratch_local("i32");
         let n = cx.fresh();
         let done_cmp = if step_v > 0 { "i32.ge_s" } else { "i32.le_s" };
-        let inner = self.comp_loop(cx, rest, acc, key, elem)?;
         let mut b = Body::new();
         b.push(format!("(local.set ${endloc} {end_wat})"));
         b.push(format!("(local.set ${ctr} {start_wat})"));
@@ -3469,6 +3829,23 @@ impl Gen {
                         ));
                     }
                 }
+                // dict.keys()/.values()/.items() — $dict_view falls back to
+                // method dispatch for a non-dict, so a class may reuse the names.
+                if args.is_empty() {
+                    if let Some(which) = match method.as_str() {
+                        "keys" => Some(0),
+                        "values" => Some(1),
+                        "items" => Some(2),
+                        _ => None,
+                    } {
+                        let r = self.value_expr(cx, recv)?;
+                        let empty = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $dict_view {r} (i32.const {which}) {} {empty})",
+                            str_lit(method)
+                        ));
+                    }
+                }
                 // `.append(v)` is the list fast path; every other method is a
                 // dynamic object dispatch.
                 if method == "append" && args.len() == 1 {
@@ -3505,8 +3882,62 @@ impl Gen {
                         "(call $instantiate (global.get $g_class_{n}) {args_list})"
                     ));
                 }
+                // Builtins with custom arity/codegen (user defs shadow them).
+                if !self.funcs.contains_key(n.as_str()) {
+                    match n.as_str() {
+                        // `range(...)` as a value materializes a list (the for
+                        // statement and comprehensions use a counted loop).
+                        "range" => {
+                            let one = "(i32.const 1)".to_string();
+                            let zero = "(i32.const 0)".to_string();
+                            let (start, end, step) = match args.len() {
+                                1 => (zero, self.i32_expr(cx, &args[0])?, one),
+                                2 => (
+                                    self.i32_expr(cx, &args[0])?,
+                                    self.i32_expr(cx, &args[1])?,
+                                    one,
+                                ),
+                                3 => (
+                                    self.i32_expr(cx, &args[0])?,
+                                    self.i32_expr(cx, &args[1])?,
+                                    self.i32_expr(cx, &args[2])?,
+                                ),
+                                k => {
+                                    return Err(CompileError::at(
+                                        e.line,
+                                        format!("range() takes 1 to 3 arguments, got {k}"),
+                                    ))
+                                }
+                            };
+                            return Ok(format!("(call $range_list {start} {end} {step})"));
+                        }
+                        "enumerate" if (1..=2).contains(&args.len()) => {
+                            let seq = self.value_expr(cx, &args[0])?;
+                            let start = if args.len() == 2 {
+                                self.i32_expr(cx, &args[1])?
+                            } else {
+                                "(i32.const 0)".to_string()
+                            };
+                            return Ok(format!("(call $enumerate {seq} {start})"));
+                        }
+                        "zip" if args.len() == 2 => {
+                            let a = self.value_expr(cx, &args[0])?;
+                            let b = self.value_expr(cx, &args[1])?;
+                            return Ok(format!("(call $zip2 {a} {b})"));
+                        }
+                        "sum" if args.len() == 1 => {
+                            let seq = self.value_expr(cx, &args[0])?;
+                            return Ok(format!("(call $py_sum {seq})"));
+                        }
+                        "sorted" if args.len() == 1 => {
+                            let seq = self.value_expr(cx, &args[0])?;
+                            return Ok(format!("(call $py_sorted {seq})"));
+                        }
+                        _ => {}
+                    }
+                }
                 // User functions first (a `def len` shadows the builtin,
-                // like Python); then the builtins.
+                // like Python); then the fixed-arity builtins.
                 if !self.funcs.contains_key(n.as_str()) {
                     let builtin = match n.as_str() {
                         "len" => Some(("$py_len", 1, true)), // returns raw i32

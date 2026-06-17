@@ -948,27 +948,14 @@ impl<'a> Parser<'a> {
         loop {
             if self.is_keyword("for") {
                 self.advance();
-                let var = match self.peek().clone() {
-                    Tok::Name(n) if !matches!(n.as_str(), "True" | "False" | "None") => {
-                        self.advance();
-                        n
-                    }
-                    other => {
-                        return Err(CompileError::at(
-                            self.line(),
-                            format!("expected a loop variable after 'for', found {other:?}"),
-                        ))
-                    }
-                };
-                if matches!(self.peek(), Tok::Comma) {
-                    return Err(CompileError::at(
-                        self.line(),
-                        "tuple targets in comprehensions (for a, b in …) aren't supported yet",
-                    ));
+                let mut vars = vec![self.for_target_name()?];
+                while matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                    vars.push(self.for_target_name()?);
                 }
                 self.eat_keyword("in")?;
                 let iter = self.expr(0)?;
-                clauses.push(CompClause::For { var, iter });
+                clauses.push(CompClause::For { vars, iter });
             } else if self.is_keyword("if") {
                 self.advance();
                 clauses.push(CompClause::If(self.expr(0)?));
