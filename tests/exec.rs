@@ -1035,6 +1035,22 @@ fn slicing_a_non_sequence_errors() {
     assert_raises("x = 5\nprint(x[1:2])", "subscriptable");
 }
 
+// --- augmented assignment ---
+
+#[test]
+fn augmented_assignment_forms() {
+    assert_output("x = 10\nx += 5\nprint(x)", "15\n");
+    assert_output("x = 10\nx -= 3\nx *= 2\nprint(x)", "14\n");
+    assert_output("xs = [1, 2, 3]\nxs[1] += 100\nprint(xs)", "[1, 102, 3]\n");
+    assert_output("s = \"go\"\ns += \"!\"\nprint(s)", "go!\n");
+}
+
+#[test]
+fn augmented_assignment_to_non_target_is_an_error() {
+    let err = rust_p2w::compile_to_wat("5 += 1").unwrap_err();
+    assert!(err.to_string().contains("can only use +="), "{err}");
+}
+
 // --- comprehensions ---
 
 #[test]
@@ -1181,6 +1197,11 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "def squares(n):\n    return [i * i for i in range(n)]\nprint(squares(4), squares(0))",
     // comprehension composed with len / concat / slice
     "ns = [x for x in range(8) if x % 3 != 0]\nprint(ns, len(ns), ns[::-1])",
+    // augmented assignment on variables, indices, attributes
+    "x = 5\nx += 3\nx *= 2\nx -= 1\nprint(x)\nn = 17\nn //= 5\nn %= 2\nprint(n)\ny = 10.0\ny /= 4\nprint(y)",
+    "xs = [1, 2, 3]\nxs[0] += 10\nxs[-1] *= 2\nprint(xs)\ns = \"a\"\ns += \"bc\"\nprint(s)",
+    "counts = {}\nfor c in \"abracadabra\":\n    if c in counts:\n        counts[c] += 1\n    else:\n        counts[c] = 1\nprint(counts)",
+    "class C:\n    def __init__(self):\n        self.n = 0\n    def add(self, k):\n        self.n += k\nc = C()\nc.add(5)\nc.add(3)\nprint(c.n)",
 ];
 
 fn find_python() -> Option<&'static str> {

@@ -151,6 +151,62 @@ impl<'a> Parser<'a> {
         // Assignment or expression statement: parse the expression first,
         // then decide based on what follows.
         let e = self.expr(0)?;
+        // Augmented assignment `target OP= rhs` desugars to `target = target OP
+        // rhs` (the target is read once textually; a side-effecting index is
+        // re-evaluated — a documented v1 simplification).
+        if let Tok::AugAssign(op) = self.peek().clone() {
+            self.advance();
+            let rhs = self.expr(0)?;
+            self.expect(&Tok::Newline, "a new line")?;
+            let combined = |read: Expr, rhs: Expr| Expr {
+                kind: ExprKind::Bin(op, Box::new(read), Box::new(rhs)),
+                line,
+            };
+            return match e.kind {
+                ExprKind::Name(name) => {
+                    let read = Expr {
+                        kind: ExprKind::Name(name.clone()),
+                        line,
+                    };
+                    Ok(Stmt {
+                        kind: StmtKind::Assign(name, combined(read, rhs)),
+                        line,
+                    })
+                }
+                ExprKind::Index(target, index) => {
+                    let read = Expr {
+                        kind: ExprKind::Index(target.clone(), index.clone()),
+                        line,
+                    };
+                    Ok(Stmt {
+                        kind: StmtKind::SetIndex {
+                            target: *target,
+                            index: *index,
+                            value: combined(read, rhs),
+                        },
+                        line,
+                    })
+                }
+                ExprKind::Attr(obj, attr) => {
+                    let read = Expr {
+                        kind: ExprKind::Attr(obj.clone(), attr.clone()),
+                        line,
+                    };
+                    Ok(Stmt {
+                        kind: StmtKind::SetAttr {
+                            obj: *obj,
+                            attr,
+                            value: combined(read, rhs),
+                        },
+                        line,
+                    })
+                }
+                _ => Err(CompileError::at(
+                    line,
+                    "can only use += on a variable, an index like xs[i], or an attribute",
+                )),
+            };
+        }
         if matches!(self.peek(), Tok::Eq) {
             self.advance();
             let value = self.expr(0)?;

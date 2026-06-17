@@ -6,6 +6,7 @@
 //! (the CPython approach). Blank and comment-only lines don't affect
 //! indentation.
 
+use crate::ast::BinOp;
 use crate::error::CompileError;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +37,8 @@ pub enum Tok {
 
     // Punctuation
     Eq,
+    /// Augmented assignment: `+=`, `-=`, `*=`, `/=`, `//=`, `%=`.
+    AugAssign(BinOp),
     Colon,
     LParen,
     RParen,
@@ -151,47 +154,46 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 }
             }
             '+' => {
-                out.push(Token {
-                    tok: Tok::Plus,
-                    line,
-                });
-                i += 1;
+                let (tok, w) = aug_or(&chars, i, Tok::Plus, BinOp::Add);
+                out.push(Token { tok, line });
+                i += w;
             }
             '-' => {
-                out.push(Token {
-                    tok: Tok::Minus,
-                    line,
-                });
-                i += 1;
+                let (tok, w) = aug_or(&chars, i, Tok::Minus, BinOp::Sub);
+                out.push(Token { tok, line });
+                i += w;
             }
             '*' => {
-                out.push(Token {
-                    tok: Tok::Star,
-                    line,
-                });
-                i += 1;
+                let (tok, w) = aug_or(&chars, i, Tok::Star, BinOp::Mul);
+                out.push(Token { tok, line });
+                i += w;
             }
             '/' => {
                 if i + 1 < chars.len() && chars[i + 1] == '/' {
-                    out.push(Token {
-                        tok: Tok::SlashSlash,
-                        line,
-                    });
-                    i += 2;
+                    // `//=` (3 chars) before `//`.
+                    if i + 2 < chars.len() && chars[i + 2] == '=' {
+                        out.push(Token {
+                            tok: Tok::AugAssign(BinOp::FloorDiv),
+                            line,
+                        });
+                        i += 3;
+                    } else {
+                        out.push(Token {
+                            tok: Tok::SlashSlash,
+                            line,
+                        });
+                        i += 2;
+                    }
                 } else {
-                    out.push(Token {
-                        tok: Tok::Slash,
-                        line,
-                    });
-                    i += 1;
+                    let (tok, w) = aug_or(&chars, i, Tok::Slash, BinOp::Div);
+                    out.push(Token { tok, line });
+                    i += w;
                 }
             }
             '%' => {
-                out.push(Token {
-                    tok: Tok::Percent,
-                    line,
-                });
-                i += 1;
+                let (tok, w) = aug_or(&chars, i, Tok::Percent, BinOp::Mod);
+                out.push(Token { tok, line });
+                i += w;
             }
             '<' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
@@ -383,6 +385,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
         line,
     });
     Ok(out)
+}
+
+/// A single-char operator at `i`: `AugAssign(op)` (width 2) if followed by
+/// `=`, otherwise `plain` (width 1).
+fn aug_or(chars: &[char], i: usize, plain: Tok, op: BinOp) -> (Tok, usize) {
+    if i + 1 < chars.len() && chars[i + 1] == '=' {
+        (Tok::AugAssign(op), 2)
+    } else {
+        (plain, 1)
+    }
 }
 
 fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize), CompileError> {
