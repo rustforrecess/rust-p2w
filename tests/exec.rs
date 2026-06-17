@@ -1219,6 +1219,51 @@ fn comprehension_tuple_target() {
     );
 }
 
+// --- float() ---
+
+#[test]
+fn float_builtin() {
+    assert_output("print(float(\"3.5\"))", "3.5\n");
+    assert_output("print(float(\"-2\"))", "-2.0\n");
+    assert_output("print(float(5), float(2.5))", "5.0 2.5\n");
+    assert_output("print(float(\"1.5e2\"))", "150.0\n");
+}
+
+#[test]
+fn float_of_bad_string_raises() {
+    assert_raises(
+        "print(float(\"1.2.3\"))",
+        "could not convert string to float",
+    );
+    assert_raises("print(float(\"abc\"))", "could not convert string to float");
+}
+
+// --- dict .get/.pop and list .pop ---
+
+#[test]
+fn dict_get_and_pop() {
+    assert_output(
+        "d = {\"a\": 1}\nprint(d.get(\"a\"), d.get(\"x\"), d.get(\"x\", 0))",
+        "1 None 0\n",
+    );
+    assert_output(
+        "d = {\"a\": 1, \"b\": 2}\nprint(d.pop(\"a\"))\nprint(d)",
+        "1\n{'b': 2}\n",
+    );
+    assert_output("d = {}\nprint(d.pop(\"x\", -1))", "-1\n");
+}
+
+#[test]
+fn dict_pop_missing_without_default_raises() {
+    assert_raises("d = {}\nd.pop(\"x\")", "KeyError");
+}
+
+#[test]
+fn list_pop() {
+    assert_output("xs = [1, 2, 3]\nprint(xs.pop())\nprint(xs)", "3\n[1, 2]\n");
+    assert_output("xs = [1, 2, 3]\nprint(xs.pop(0))\nprint(xs)", "1\n[2, 3]\n");
+}
+
 // --- power operator ---
 
 #[test]
@@ -1463,6 +1508,12 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // string replace / startswith / endswith
     "print(\"a-b-c\".replace(\"-\", \"+\"))\nprint(\"hello\".replace(\"l\", \"LL\"))\nprint(\"aaa\".replace(\"a\", \"\"))",
     "print(\"hello.py\".endswith(\".py\"), \"hello.py\".startswith(\"he\"), \"x\".startswith(\"xy\"))",
+    // float() — strings (exactly-representable values) and numbers
+    "print(float(\"2.5\"), float(\"-0.25\"), float(\"100\"), float(\"3.0\"))",
+    "print(float(\"1e3\"), float(\"2.5e2\"), float(\"1.25e2\"))\nprint(float(5), float(True), float(2.5))",
+    // dict .get / .pop and list .pop
+    "d = {\"a\": 1, \"b\": 2}\nprint(d.get(\"a\"), d.get(\"z\"), d.get(\"z\", -1))\nprint(d.pop(\"a\"), d)\nprint(d.pop(\"z\", 99))",
+    "xs = [10, 20, 30, 40]\nprint(xs.pop(), xs)\nprint(xs.pop(0), xs)",
 ];
 
 fn find_python() -> Option<&'static str> {

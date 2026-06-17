@@ -483,6 +483,24 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $raise_float_parse: float() of a string that isn't a valid number.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        0,
+        "ValueError: could not convert string to float: '",
+    );
+    b.push("(call $print_str (local.get $s))");
+    push_text(&mut b, 0, "'");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_float_parse (param $s (ref null $STR))".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $raise_unpack: tuple-unpacking length mismatch.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
@@ -2933,6 +2951,244 @@ fn runtime_helpers() -> Vec<Func> {
         });
     }
 
+    // $dict_remove_at / $list_remove_at: drop the entry at `idx`, shifting the
+    // tail down (array.copy handles the overlap) and decrementing the count.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $DICT 0 (local.get $d)))");
+    b.push(
+        "(array.copy $ITEMS $ITEMS (struct.get $DICT 1 (local.get $d)) (local.get $idx) (struct.get $DICT 1 (local.get $d)) (i32.add (local.get $idx) (i32.const 1)) (i32.sub (i32.sub (local.get $n) (local.get $idx)) (i32.const 1)))",
+    );
+    b.push(
+        "(array.copy $ITEMS $ITEMS (struct.get $DICT 2 (local.get $d)) (local.get $idx) (struct.get $DICT 2 (local.get $d)) (i32.add (local.get $idx) (i32.const 1)) (i32.sub (i32.sub (local.get $n) (local.get $idx)) (i32.const 1)))",
+    );
+    b.push("(struct.set $DICT 0 (local.get $d) (i32.sub (local.get $n) (i32.const 1)))");
+    fs.push(Func {
+        signature: "(func $dict_remove_at (param $d (ref null $DICT)) (param $idx i32)".into(),
+        locals: vec!["(local $n i32)".into()],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $LIST 0 (local.get $l)))");
+    b.push(
+        "(array.copy $ITEMS $ITEMS (struct.get $LIST 1 (local.get $l)) (local.get $idx) (struct.get $LIST 1 (local.get $l)) (i32.add (local.get $idx) (i32.const 1)) (i32.sub (i32.sub (local.get $n) (local.get $idx)) (i32.const 1)))",
+    );
+    b.push("(struct.set $LIST 0 (local.get $l) (i32.sub (local.get $n) (i32.const 1)))");
+    fs.push(Func {
+        signature: "(func $list_remove_at (param $l (ref null $LIST)) (param $idx i32)".into(),
+        locals: vec!["(local $n i32)".into()],
+        body: b,
+    });
+
+    // $dict_get: dict.get(key[, default]) -> value or default (never raises).
+    // Non-dict receiver falls back to method dispatch.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $DICT) (local.get $d)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $d) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $dd (ref.cast (ref $DICT) (local.get $d)))");
+    b.push("(local.set $idx (call $dict_find (local.get $dd) (local.get $key)))");
+    b.push(
+        "(if (i32.ge_s (local.get $idx) (i32.const 0)) (then (return (array.get $ITEMS (struct.get $DICT 2 (local.get $dd)) (local.get $idx)))))",
+    );
+    b.push("(local.get $default)");
+    fs.push(Func {
+        signature:
+            "(func $dict_get_default (param $d (ref null eq)) (param $key (ref null eq)) (param $default (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $dd (ref null $DICT))".into(),
+            "(local $idx i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $py_pop: dict.pop(key[, default]) and list.pop([index]). `nargs` is the
+    // Python argument count. Non-dict/non-list falls back to method dispatch.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $DICT) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $dd (ref.cast (ref $DICT) (local.get $r)))");
+    b.push_in(
+        2,
+        "(if (i32.lt_s (local.get $nargs) (i32.const 1)) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $idx (call $dict_find (local.get $dd) (local.get $arg)))",
+    );
+    b.push_in(2, "(if (i32.ge_s (local.get $idx) (i32.const 0))");
+    b.push_in(3, "(then");
+    b.push_in(
+        4,
+        "(local.set $val (array.get $ITEMS (struct.get $DICT 2 (local.get $dd)) (local.get $idx)))",
+    );
+    b.push_in(4, "(call $dict_remove_at (local.get $dd) (local.get $idx))");
+    b.push_in(4, "(return (local.get $val))))");
+    b.push_in(
+        2,
+        "(if (i32.ge_s (local.get $nargs) (i32.const 2)) (then (return (local.get $default))))",
+    );
+    b.push_in(2, "(call $raise_key (local.get $arg))");
+    b.push_in(2, "(unreachable)))");
+    b.push("(if (ref.test (ref $LIST) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $ll (ref.cast (ref $LIST) (local.get $r)))");
+    b.push_in(2, "(local.set $n (struct.get $LIST 0 (local.get $ll)))");
+    b.push_in(
+        2,
+        "(local.set $li (if (result i32) (i32.ge_s (local.get $nargs) (i32.const 1)) (then (call $unbox (local.get $arg))) (else (i32.sub (local.get $n) (i32.const 1)))))",
+    );
+    b.push_in(
+        2,
+        "(if (i32.lt_s (local.get $li) (i32.const 0)) (then (local.set $li (i32.add (local.get $li) (local.get $n)))))",
+    );
+    b.push_in(
+        2,
+        "(if (i32.or (i32.lt_s (local.get $li) (i32.const 0)) (i32.ge_s (local.get $li) (local.get $n))) (then (call $raise_index (local.get $r)) (unreachable)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $val (array.get $ITEMS (struct.get $LIST 1 (local.get $ll)) (local.get $li)))",
+    );
+    b.push_in(2, "(call $list_remove_at (local.get $ll) (local.get $li))");
+    b.push_in(2, "(return (local.get $val))))");
+    b.push("(call $call_method (local.get $r) (local.get $name) (local.get $args))");
+    fs.push(Func {
+        signature:
+            "(func $py_pop (param $r (ref null eq)) (param $arg (ref null eq)) (param $default (ref null eq)) (param $nargs i32) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $dd (ref null $DICT))".into(),
+            "(local $ll (ref null $LIST))".into(),
+            "(local $idx i32)".into(),
+            "(local $li i32)".into(),
+            "(local $n i32)".into(),
+            "(local $val (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
+    // $str_to_float / $py_float: float(x) — parse a string (sign, digits, an
+    // optional fraction, an optional exponent) or convert a number to f64.
+    let mut b = Body::new();
+    b.push("(local.set $n (array.len (local.get $s)))");
+    b.push("(local.set $sign (f64.const 1))");
+    b.push("(local.set $acc (f64.const 0))");
+    // leading spaces
+    b.push("(block $l1 (loop $l1n (br_if $l1 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l1 (i32.eqz (call $is_space (array.get_u $STR (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l1n)))");
+    // sign
+    b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then");
+    b.push_in(
+        1,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(1, "(if (i32.eq (local.get $c) (i32.const 45)) (then (local.set $sign (f64.const -1)) (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
+    b.push_in(1, "(if (i32.eq (local.get $c) (i32.const 43)) (then (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
+    b.push("))");
+    // integer part
+    b.push("(block $l2 (loop $l2n");
+    b.push_in(1, "(br_if $l2 (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(1, "(br_if $l2 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
+    b.push_in(1, "(local.set $acc (f64.add (f64.mul (local.get $acc) (f64.const 10)) (f64.convert_i32_s (i32.sub (local.get $c) (i32.const 48)))))");
+    b.push_in(1, "(local.set $seen (i32.const 1))");
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $l2n)))");
+    // fraction (peek without reading past the end)
+    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (array.get_u $STR (local.get $s) (local.get $i))) (else (i32.const 0))))");
+    b.push("(if (i32.eq (local.get $c) (i32.const 46)) (then");
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(local.set $scale (f64.const 0.1))");
+    b.push_in(1, "(block $l3 (loop $l3n");
+    b.push_in(2, "(br_if $l3 (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(2, "(br_if $l3 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
+    b.push_in(2, "(local.set $acc (f64.add (local.get $acc) (f64.mul (f64.convert_i32_s (i32.sub (local.get $c) (i32.const 48))) (local.get $scale))))");
+    b.push_in(
+        2,
+        "(local.set $scale (f64.mul (local.get $scale) (f64.const 0.1)))",
+    );
+    b.push_in(2, "(local.set $seen (i32.const 1))");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $l3n)))");
+    b.push("))");
+    b.push("(if (i32.eqz (local.get $seen)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
+    // exponent (peek without reading past the end)
+    b.push("(local.set $esign (i32.const 1))");
+    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (array.get_u $STR (local.get $s) (local.get $i))) (else (i32.const 0))))");
+    b.push("(if (i32.or (i32.eq (local.get $c) (i32.const 101)) (i32.eq (local.get $c) (i32.const 69))) (then");
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(if (i32.lt_s (local.get $i) (local.get $n)) (then");
+    b.push_in(
+        2,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 45)) (then (local.set $esign (i32.const -1)) (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
+    b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 43)) (then (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
+    b.push_in(1, "))");
+    b.push_in(1, "(local.set $edig (i32.const 0))");
+    b.push_in(1, "(block $l4 (loop $l4n");
+    b.push_in(2, "(br_if $l4 (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(2, "(br_if $l4 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
+    b.push_in(2, "(local.set $exp (i32.add (i32.mul (local.get $exp) (i32.const 10)) (i32.sub (local.get $c) (i32.const 48))))");
+    b.push_in(2, "(local.set $edig (i32.const 1))");
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $l4n)))");
+    b.push_in(1, "(if (i32.eqz (local.get $edig)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
+    b.push_in(1, "(block $l5 (loop $l5n");
+    b.push_in(2, "(br_if $l5 (i32.le_s (local.get $exp) (i32.const 0)))");
+    b.push_in(2, "(if (i32.gt_s (local.get $esign) (i32.const 0)) (then (local.set $acc (f64.mul (local.get $acc) (f64.const 10)))) (else (local.set $acc (f64.mul (local.get $acc) (f64.const 0.1)))))");
+    b.push_in(
+        2,
+        "(local.set $exp (i32.sub (local.get $exp) (i32.const 1)))",
+    );
+    b.push_in(2, "(br $l5n)))");
+    b.push("))");
+    // trailing spaces
+    b.push("(block $l6 (loop $l6n (br_if $l6 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l6 (i32.eqz (call $is_space (array.get_u $STR (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l6n)))");
+    b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
+    b.push("(struct.new $FLOAT (f64.mul (local.get $sign) (local.get $acc)))");
+    fs.push(Func {
+        signature: "(func $str_to_float (param $s (ref null $STR)) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $c i32)".into(),
+            "(local $sign f64)".into(),
+            "(local $acc f64)".into(),
+            "(local $scale f64)".into(),
+            "(local $seen i32)".into(),
+            "(local $exp i32)".into(),
+            "(local $esign i32)".into(),
+            "(local $edig i32)".into(),
+        ],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $str_to_float (ref.cast (ref $STR) (local.get $r))))))",
+    );
+    b.push("(struct.new $FLOAT (call $unbox_f64 (local.get $r)))");
+    fs.push(Func {
+        signature: "(func $py_float (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
     fs
 }
 
@@ -4585,6 +4841,41 @@ impl Gen {
                             str_lit(method)
                         ));
                     }
+                    // dict.get(key[, default]) — never raises.
+                    "get" if (1..=2).contains(&args.len()) => {
+                        let r = self.value_expr(cx, recv)?;
+                        let key = self.value_expr(cx, &args[0])?;
+                        let default = if args.len() == 2 {
+                            self.value_expr(cx, &args[1])?
+                        } else {
+                            "(global.get $NONE)".to_string()
+                        };
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $dict_get_default {r} {key} {default} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    // dict.pop(key[, default]) and list.pop([index]).
+                    "pop" if args.len() <= 2 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let arg = if !args.is_empty() {
+                            self.value_expr(cx, &args[0])?
+                        } else {
+                            "(global.get $NONE)".to_string()
+                        };
+                        let default = if args.len() == 2 {
+                            self.value_expr(cx, &args[1])?
+                        } else {
+                            "(global.get $NONE)".to_string()
+                        };
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $py_pop {r} {arg} {default} (i32.const {}) {} {argl})",
+                            args.len(),
+                            str_lit(method)
+                        ));
+                    }
                     _ => {}
                 }
                 // dict.keys()/.values()/.items() — $dict_view falls back to
@@ -4712,6 +5003,7 @@ impl Gen {
                     let builtin = match n.as_str() {
                         "len" => Some(("$py_len", 1, true)), // returns raw i32
                         "str" => Some(("$to_str", 1, false)),
+                        "float" => Some(("$py_float", 1, false)),
                         "abs" => Some(("$py_abs", 1, false)),
                         "int" => Some(("$py_int", 1, false)),
                         "min" => Some(("$py_min", 2, false)),
