@@ -240,6 +240,12 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module.funcs.push(py_mod_helper());
         module.funcs.push(floormod_helper());
     }
+    if g.uses_input {
+        module
+            .imports
+            .push(r#"(import "env" "read_char" (func $read_char (result i32)))"#.into());
+        module.funcs.push(read_line_helper());
+    }
     Ok(module.render())
 }
 
@@ -455,6 +461,24 @@ fn raise_helpers() -> Vec<Func> {
         signature:
             "(func $raise_method_value (param $obj (ref null eq)) (param $name (ref null eq))"
                 .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_int_parse: int() of a string that isn't a valid integer.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        0,
+        "ValueError: invalid literal for int() with base 10: '",
+    );
+    b.push("(call $print_str (local.get $s))");
+    push_text(&mut b, 0, "'");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_int_parse (param $s (ref null $STR))".into(),
         locals: vec![],
         body: b,
     });
@@ -1439,7 +1463,8 @@ fn runtime_helpers() -> Vec<Func> {
         });
     }
 
-    // int(x): floats truncate toward zero; ints/bools pass through unbox.
+    // int(x): floats truncate toward zero; a string is parsed (so
+    // int(input()) works); ints/bools pass through unbox.
     let mut b = Body::new();
     b.push("(if (ref.test (ref $FLOAT) (local.get $r))");
     b.push_in(
@@ -1447,10 +1472,102 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (call $box (i32.trunc_sat_f64_s (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r)))))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $str_to_int (ref.cast (ref $STR) (local.get $r)))))",
+    );
+    b.push(")");
     b.push("(call $box (call $unbox (local.get $r)))");
     fs.push(Func {
         signature: "(func $py_int (param $r (ref null eq)) (result (ref null eq))".into(),
         locals: vec![],
+        body: b,
+    });
+
+    // $str_to_int: parse a decimal int from a string (surrounding spaces and an
+    // optional sign allowed); anything else is a ValueError. Used by int() and
+    // int(input()). Wraps on i32 overflow (the compiler's int range).
+    let mut b = Body::new();
+    b.push("(local.set $n (array.len (local.get $s)))");
+    // skip leading spaces/tabs
+    b.push("(block $sl (loop $sln");
+    b.push_in(2, "(br_if $sl (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(br_if $sl (i32.and (i32.ne (local.get $c) (i32.const 32)) (i32.ne (local.get $c) (i32.const 9))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $sln)))");
+    // optional sign
+    b.push("(local.set $sign (i32.const 1))");
+    b.push("(if (i32.lt_s (local.get $i) (local.get $n))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 45))");
+    b.push_in(
+        3,
+        "(then (local.set $sign (i32.const -1)) (local.set $i (i32.add (local.get $i) (i32.const 1)))))",
+    );
+    b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 43))");
+    b.push_in(
+        3,
+        "(then (local.set $i (i32.add (local.get $i) (i32.const 1)))))",
+    );
+    b.push_in(1, "))");
+    // digits
+    b.push("(local.set $start (local.get $i))");
+    b.push("(block $dl (loop $dln");
+    b.push_in(2, "(br_if $dl (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(br_if $dl (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 10)) (i32.sub (local.get $c) (i32.const 48))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $dln)))");
+    // at least one digit required
+    b.push("(if (i32.eq (local.get $i) (local.get $start)) (then (call $raise_int_parse (local.get $s))))");
+    // skip trailing spaces/tabs
+    b.push("(block $tl (loop $tln");
+    b.push_in(2, "(br_if $tl (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(br_if $tl (i32.and (i32.ne (local.get $c) (i32.const 32)) (i32.ne (local.get $c) (i32.const 9))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $tln)))");
+    // any leftover char is junk
+    b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_int_parse (local.get $s))))");
+    b.push("(call $box (i32.mul (local.get $sign) (local.get $acc)))");
+    fs.push(Func {
+        signature: "(func $str_to_int (param $s (ref null $STR)) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $c i32)".into(),
+            "(local $sign i32)".into(),
+            "(local $start i32)".into(),
+            "(local $acc i32)".into(),
+        ],
         body: b,
     });
 
@@ -2630,6 +2747,66 @@ fn class_helpers() -> Vec<Func> {
     fs
 }
 
+/// `$read_line`: read bytes from the `env.read_char` host import until a
+/// newline or EOF (-1), returning a `$STR` with the newline stripped (a stray
+/// `\r` is dropped, so `\r\n` input works). Emitted only when `input()` is used.
+fn read_line_helper() -> Func {
+    let mut b = Body::new();
+    b.push("(local.set $cap (i32.const 16))");
+    b.push("(local.set $buf (array.new_default $STR (local.get $cap)))");
+    b.push("(local.set $len (i32.const 0))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(local.set $c (call $read_char))");
+    b.push_in(2, "(br_if $done (i32.lt_s (local.get $c) (i32.const 0)))"); // EOF
+    b.push_in(2, "(br_if $done (i32.eq (local.get $c) (i32.const 10)))"); // \n
+    b.push_in(2, "(if (i32.ne (local.get $c) (i32.const 13))"); // skip \r
+    b.push_in(3, "(then");
+    // grow if needed (double capacity, copy)
+    b.push_in(4, "(if (i32.ge_s (local.get $len) (local.get $cap))");
+    b.push_in(5, "(then");
+    b.push_in(
+        6,
+        "(local.set $cap (i32.mul (local.get $cap) (i32.const 2)))",
+    );
+    b.push_in(
+        6,
+        "(local.set $new (array.new_default $STR (local.get $cap)))",
+    );
+    b.push_in(
+        6,
+        "(array.copy $STR $STR (local.get $new) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $len))",
+    );
+    b.push_in(6, "(local.set $buf (local.get $new))))");
+    b.push_in(
+        4,
+        "(array.set $STR (local.get $buf) (local.get $len) (local.get $c))",
+    );
+    b.push_in(
+        4,
+        "(local.set $len (i32.add (local.get $len) (i32.const 1)))))",
+    );
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    // Trim to exactly $len.
+    b.push("(local.set $out (array.new_default $STR (local.get $len)))");
+    b.push("(array.copy $STR $STR (local.get $out) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $len))");
+    b.push("(local.get $out)");
+    Func {
+        signature: "(func $read_line (result (ref null eq))".into(),
+        locals: vec![
+            "(local $cap i32)".into(),
+            "(local $len i32)".into(),
+            "(local $c i32)".into(),
+            "(local $buf (ref null $STR))".into(),
+            "(local $new (ref null $STR))".into(),
+            "(local $out (ref null $STR))".into(),
+        ],
+        body: b,
+    }
+}
+
 /// Python floor division: truncating `i32.div_s` adjusted by -1 when the
 /// signs differ and the division isn't exact (`-7 // 2` is -4, not -3).
 fn floordiv_helper() -> Func {
@@ -2685,6 +2862,10 @@ fn floormod_helper() -> Func {
 struct Gen {
     uses_floordiv: bool,
     uses_floormod: bool,
+    /// Set when `input()` is used, so the `env.read_char` import and the
+    /// `$read_line` helper are only emitted (and only required of the host)
+    /// when a program actually reads input.
+    uses_input: bool,
     /// User functions: name -> arity (collected before any body compiles).
     funcs: HashMap<String, usize>,
     /// User classes: name -> base class name (None if no base). Collected in
@@ -3932,6 +4113,18 @@ impl Gen {
                         "sorted" if args.len() == 1 => {
                             let seq = self.value_expr(cx, &args[0])?;
                             return Ok(format!("(call $py_sorted {seq})"));
+                        }
+                        // input([prompt]) -> a line from stdin (newline
+                        // stripped); a prompt is printed first.
+                        "input" if args.len() <= 1 => {
+                            self.uses_input = true;
+                            if args.len() == 1 {
+                                let p = self.value_expr(cx, &args[0])?;
+                                return Ok(format!(
+                                    "(block (result (ref null eq)) (call $print_str (ref.cast (ref null $STR) (call $to_str {p}))) (call $read_line))"
+                                ));
+                            }
+                            return Ok("(call $read_line)".to_string());
                         }
                         _ => {}
                     }

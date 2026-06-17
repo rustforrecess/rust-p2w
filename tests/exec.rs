@@ -25,53 +25,74 @@ fn engine() -> &'static Engine {
     })
 }
 
-/// Compile and execute `src`; returns everything written via the host
-/// imports plus `_start`'s result (Err = trapped).
+/// Host I/O state: the output buffer plus a stdin byte buffer with a cursor
+/// (so `env.read_char` can serve `input()`).
+struct Io {
+    out: Vec<u8>,
+    input: Vec<u8>,
+    pos: usize,
+}
+
+/// Compile and execute `src` with no stdin.
 fn execute(src: &str) -> (String, Result<i32, wasmtime::Error>) {
+    execute_io(src, "")
+}
+
+/// Compile and execute `src`, feeding `stdin` to `input()`; returns everything
+/// written via the host imports plus `_start`'s result (Err = trapped).
+fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) {
     let wat = rust_p2w::compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
     let wasm = wat::parse_str(&wat).unwrap_or_else(|e| panic!("invalid WAT: {e}\n---\n{wat}"));
 
     let module = Module::new(engine(), &wasm[..]).expect("module");
-    // Store data is the output byte buffer; write_char sends UTF-8 bytes.
-    let mut store: Store<Vec<u8>> = Store::new(engine(), Vec::new());
-    let mut linker: Linker<Vec<u8>> = Linker::new(engine());
+    let mut store: Store<Io> = Store::new(
+        engine(),
+        Io {
+            out: Vec::new(),
+            input: stdin.as_bytes().to_vec(),
+            pos: 0,
+        },
+    );
+    let mut linker: Linker<Io> = Linker::new(engine());
     linker
-        .func_wrap(
-            "env",
-            "write_char",
-            |mut caller: Caller<'_, Vec<u8>>, c: i32| {
-                caller.data_mut().push(c as u8);
-            },
-        )
+        .func_wrap("env", "write_char", |mut caller: Caller<'_, Io>, c: i32| {
+            caller.data_mut().out.push(c as u8);
+        })
         .unwrap();
     linker
-        .func_wrap(
-            "env",
-            "write_i32",
-            |mut caller: Caller<'_, Vec<u8>>, v: i32| {
-                caller
-                    .data_mut()
-                    .extend_from_slice(v.to_string().as_bytes());
-            },
-        )
+        .func_wrap("env", "write_i32", |mut caller: Caller<'_, Io>, v: i32| {
+            caller
+                .data_mut()
+                .out
+                .extend_from_slice(v.to_string().as_bytes());
+        })
         .unwrap();
     linker
-        .func_wrap(
-            "env",
-            "write_f64",
-            |mut caller: Caller<'_, Vec<u8>>, v: f64| {
-                // Python-style: whole floats keep ".0" (repr(2.0) == "2.0");
-                // otherwise Rust's shortest round-trip matches Python's for
-                // everyday values. (Known divergence at extremes: Python
-                // switches to scientific notation around 1e16.)
-                let s = if v.is_finite() && v == v.trunc() {
-                    format!("{v:.1}")
-                } else {
-                    format!("{v}")
-                };
-                caller.data_mut().extend_from_slice(s.as_bytes());
-            },
-        )
+        .func_wrap("env", "write_f64", |mut caller: Caller<'_, Io>, v: f64| {
+            // Python-style: whole floats keep ".0" (repr(2.0) == "2.0");
+            // otherwise Rust's shortest round-trip matches Python's for
+            // everyday values. (Known divergence at extremes: Python
+            // switches to scientific notation around 1e16.)
+            let s = if v.is_finite() && v == v.trunc() {
+                format!("{v:.1}")
+            } else {
+                format!("{v}")
+            };
+            caller.data_mut().out.extend_from_slice(s.as_bytes());
+        })
+        .unwrap();
+    // read_char: next stdin byte, or -1 at EOF (matches the browser harness).
+    linker
+        .func_wrap("env", "read_char", |mut caller: Caller<'_, Io>| -> i32 {
+            let d = caller.data_mut();
+            if d.pos < d.input.len() {
+                let b = d.input[d.pos];
+                d.pos += 1;
+                b as i32
+            } else {
+                -1
+            }
+        })
         .unwrap();
 
     let instance = linker
@@ -81,7 +102,7 @@ fn execute(src: &str) -> (String, Result<i32, wasmtime::Error>) {
         .get_typed_func::<(), i32>(&mut store, "_start")
         .expect("_start export with i32 result");
     let result = start.call(&mut store, ());
-    let out = String::from_utf8(store.into_data()).expect("output is UTF-8");
+    let out = String::from_utf8(store.into_data().out).expect("output is UTF-8");
     (out, result)
 }
 
@@ -96,6 +117,13 @@ fn run(src: &str) -> String {
 #[track_caller]
 fn assert_output(src: &str, expected: &str) {
     assert_eq!(run(src), expected, "program:\n{src}");
+}
+
+#[track_caller]
+fn assert_io(src: &str, stdin: &str, expected: &str) {
+    let (out, result) = execute_io(src, stdin);
+    assert_eq!(result.expect("execution trapped"), 0, "_start exit code");
+    assert_eq!(out, expected, "program:\n{src}");
 }
 
 /// Run a program that is expected to raise: returns everything written
@@ -1191,6 +1219,55 @@ fn comprehension_tuple_target() {
     );
 }
 
+// --- input() / stdin ---
+
+#[test]
+fn input_reads_a_line() {
+    assert_io(
+        "name = input()\nprint(\"Hello, \" + name + \"!\")",
+        "World\n",
+        "Hello, World!\n",
+    );
+}
+
+#[test]
+fn int_of_input_and_str_parsing() {
+    assert_io("n = int(input())\nprint(n * n)", "7\n", "49\n");
+    assert_io("print(int(\"  -42  \"))", "", "-42\n");
+}
+
+#[test]
+fn int_of_bad_string_raises() {
+    assert_raises("print(int(\"12x\"))", "invalid literal for int");
+}
+
+#[test]
+fn input_loop_sums_n_numbers() {
+    assert_io(
+        "total = 0\nfor i in range(int(input())):\n    total += int(input())\nprint(total)",
+        "3\n10\n20\n30\n",
+        "60\n",
+    );
+}
+
+#[test]
+fn input_prompt_is_printed() {
+    assert_io("x = input(\"name? \")\nprint(x)", "Sam\n", "name? Sam\n");
+}
+
+#[test]
+fn no_input_means_no_read_char_import() {
+    // A program that never calls input() must not import read_char (so existing
+    // hosts that don't provide it keep working).
+    let wat = rust_p2w::compile_to_wat("print(1)").unwrap();
+    assert!(
+        !wat.contains("read_char"),
+        "read_char imported without input()"
+    );
+    let wat = rust_p2w::compile_to_wat("x = input()\nprint(x)").unwrap();
+    assert!(wat.contains("read_char"), "read_char missing with input()");
+}
+
 // --- differential testing against real CPython, when available ---
 
 /// Programs that print ints, bools, and strings (`/` is still rejected, so it
@@ -1350,5 +1427,58 @@ fn differential_against_cpython() {
             .expect("python output is UTF-8")
             .replace("\r\n", "\n");
         assert_eq!(run(src), expected, "differs from CPython for:\n{src}");
+    }
+}
+
+/// `(program, stdin)` pairs exercising `input()` / `int(input())`.
+const STDIN_CORPUS: &[(&str, &str)] = &[
+    ("print(\"Hello, \" + input() + \"!\")", "World\n"),
+    ("n = int(input())\nprint(n * n)", "9\n"),
+    ("print(input()[::-1])", "stressed\n"),
+    (
+        "total = 0\nfor i in range(int(input())):\n    total += int(input())\nprint(total)",
+        "4\n1\n2\n3\n4\n",
+    ),
+    (
+        "names = [input() for i in range(int(input()))]\nprint(sorted(names))",
+        "3\ncharlie\nalice\nbob\n",
+    ),
+    ("print(int(input()) + int(input()))", "40\n2\n"),
+];
+
+#[test]
+fn differential_stdin_against_cpython() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Some(python) = find_python() else {
+        eprintln!("skipping: no python on PATH");
+        return;
+    };
+    for (src, stdin) in STDIN_CORPUS {
+        let mut child = Command::new(python)
+            .args(["-c", src])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn python");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("run python");
+        assert!(
+            out.status.success(),
+            "CPython rejected:\n{src}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected = String::from_utf8(out.stdout)
+            .expect("python output is UTF-8")
+            .replace("\r\n", "\n");
+        let (got, result) = execute_io(src, stdin);
+        assert_eq!(result.expect("trapped"), 0);
+        assert_eq!(got, expected, "differs from CPython for:\n{src}");
     }
 }
