@@ -178,6 +178,7 @@ pub enum BinOp {
     Div,
     FloorDiv,
     Mod,
+    Pow,
     // Comparison (yield 0/1)
     Lt,
     Le,

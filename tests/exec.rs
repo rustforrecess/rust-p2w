@@ -1219,6 +1219,24 @@ fn comprehension_tuple_target() {
     );
 }
 
+// --- power operator ---
+
+#[test]
+fn power_operator() {
+    assert_output("print(2 ** 10)", "1024\n");
+    assert_output("print(3 ** 0, 2 ** 1)", "1 2\n");
+    assert_output("print(2 ** -1)", "0.5\n");
+    assert_output("print(2.0 ** 3)", "8.0\n");
+}
+
+#[test]
+fn power_precedence_and_associativity() {
+    assert_output("print(-2 ** 2)", "-4\n"); // -(2 ** 2)
+    assert_output("print((-2) ** 2)", "4\n");
+    assert_output("print(2 ** 3 ** 2)", "512\n"); // right-assoc
+    assert_output("print(2 * 3 ** 2)", "18\n"); // ** tighter than *
+}
+
 // --- string methods ---
 
 #[test]
@@ -1428,6 +1446,9 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(\"-\".join([\"a\", \"b\", \"c\"]), \",\".join([str(i) for i in range(4)]))",
     "print(\"\".split(), \"\".split(\",\"))\nwords = \"the quick brown fox\".split()\nprint(len(words), words[0], words[-1])",
     "print(sum([int(x) for x in \"1 2 3 4\".split()]))",
+    // power operator (** binds tighter than unary minus, right-associative)
+    "print(2 ** 10, 3 ** 0, 5 ** 1)\nprint(2 ** -1, 2.0 ** 3, 10 ** -2)\nprint(-2 ** 2, (-2) ** 2, 2 ** 3 ** 2)",
+    "n = 5\nprint(n ** 2 + 1)\nb = 2\nb **= 5\nprint(b)\nprint([i ** 2 for i in range(5)])",
 ];
 
 fn find_python() -> Option<&'static str> {

@@ -1722,6 +1722,77 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $py_pow: `a ** b` with an integer exponent (a float/fractional exponent
+    // isn't supported — unbox traps). Non-negative exponent on an int base
+    // stays int (wrapping i32); a float base or negative exponent goes through
+    // f64. `0 ** negative` is a ZeroDivisionError.
+    let mut b = Body::new();
+    b.push("(local.set $e (call $unbox (local.get $b)))");
+    b.push("(if (i32.lt_s (local.get $e) (i32.const 0))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $base (call $unbox_f64 (local.get $a)))");
+    b.push_in(
+        2,
+        "(if (f64.eq (local.get $base) (f64.const 0)) (then (call $raise_zero_div)))",
+    );
+    b.push_in(2, "(local.set $facc (f64.const 1))");
+    b.push_in(2, "(local.set $i (i32.const 0))");
+    b.push_in(2, "(block $d (loop $l");
+    b.push_in(
+        3,
+        "(br_if $d (i32.ge_s (local.get $i) (i32.sub (i32.const 0) (local.get $e))))",
+    );
+    b.push_in(
+        3,
+        "(local.set $facc (f64.mul (local.get $facc) (local.get $base)))",
+    );
+    b.push_in(3, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(3, "(br $l)))");
+    b.push_in(
+        2,
+        "(return (struct.new $FLOAT (f64.div (f64.const 1) (local.get $facc))))))",
+    );
+    // non-negative exponent, float base
+    b.push("(if (ref.test (ref $FLOAT) (local.get $a))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $base (call $unbox_f64 (local.get $a)))");
+    b.push_in(2, "(local.set $facc (f64.const 1))");
+    b.push_in(2, "(local.set $i (i32.const 0))");
+    b.push_in(2, "(block $d2 (loop $l2");
+    b.push_in(3, "(br_if $d2 (i32.ge_s (local.get $i) (local.get $e)))");
+    b.push_in(
+        3,
+        "(local.set $facc (f64.mul (local.get $facc) (local.get $base)))",
+    );
+    b.push_in(3, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(3, "(br $l2)))");
+    b.push_in(2, "(return (struct.new $FLOAT (local.get $facc)))))");
+    // non-negative exponent, integer base
+    b.push("(local.set $acc (i32.const 1))");
+    b.push("(local.set $i (i32.const 0))");
+    b.push("(block $d3 (loop $l3");
+    b.push_in(1, "(br_if $d3 (i32.ge_s (local.get $i) (local.get $e)))");
+    b.push_in(
+        1,
+        "(local.set $acc (i32.mul (local.get $acc) (call $unbox (local.get $a))))",
+    );
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $l3)))");
+    b.push("(call $box (local.get $acc))");
+    fs.push(Func {
+        signature:
+            "(func $py_pow (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $e i32)".into(),
+            "(local $i i32)".into(),
+            "(local $acc i32)".into(),
+            "(local $facc f64)".into(),
+            "(local $base f64)".into(),
+        ],
+        body: b,
+    });
+
     // $print_str: write a string's bytes through write_char.
     let mut b = Body::new();
     b.push("(local.set $n (array.len (local.get $s)))");
@@ -4161,6 +4232,11 @@ impl Gen {
                 let lhs = self.value_expr(cx, a)?;
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call $py_mul {lhs} {rhs})"))
+            }
+            ExprKind::Bin(BinOp::Pow, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_pow {lhs} {rhs})"))
             }
             ExprKind::Bin(BinOp::FloorDiv, a, b) => {
                 self.uses_floordiv = true;

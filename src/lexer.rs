@@ -23,6 +23,7 @@ pub enum Tok {
     Plus,
     Minus,
     Star,
+    DoubleStar,
     Slash,
     SlashSlash,
     Percent,
@@ -164,9 +165,26 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 i += w;
             }
             '*' => {
-                let (tok, w) = aug_or(&chars, i, Tok::Star, BinOp::Mul);
-                out.push(Token { tok, line });
-                i += w;
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    // `**=` (3 chars) before `**`.
+                    if i + 2 < chars.len() && chars[i + 2] == '=' {
+                        out.push(Token {
+                            tok: Tok::AugAssign(BinOp::Pow),
+                            line,
+                        });
+                        i += 3;
+                    } else {
+                        out.push(Token {
+                            tok: Tok::DoubleStar,
+                            line,
+                        });
+                        i += 2;
+                    }
+                } else {
+                    let (tok, w) = aug_or(&chars, i, Tok::Star, BinOp::Mul);
+                    out.push(Token { tok, line });
+                    i += w;
+                }
             }
             '/' => {
                 if i + 1 < chars.len() && chars[i + 1] == '/' {

@@ -990,14 +990,18 @@ impl<'a> Parser<'a> {
             Tok::Slash => (BinOp::Div, 20),
             Tok::SlashSlash => (BinOp::FloorDiv, 20),
             Tok::Percent => (BinOp::Mod, 20),
+            // `**` is right-associative and binds tighter than unary minus, so
+            // `2 ** 3 ** 2` is `2 ** (3 ** 2)` and `-2 ** 2` is `-(2 ** 2)`.
+            Tok::DoubleStar => return Some((BinOp::Pow, 30, 29)),
             _ => return None,
         };
         Some((op, bp, bp + 1)) // left-associative
     }
 }
 
-/// Unary prefix binding power — higher than every binary operator.
-const PREFIX_BP: u8 = 100;
+/// Unary prefix binding power — tighter than `*`/`/`/`%` but looser than `**`
+/// (so `-2 ** 2` is `-(2 ** 2)`, matching Python).
+const PREFIX_BP: u8 = 25;
 
 fn is_comparison(op: BinOp) -> bool {
     matches!(
