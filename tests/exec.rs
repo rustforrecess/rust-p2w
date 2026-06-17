@@ -1219,6 +1219,37 @@ fn comprehension_tuple_target() {
     );
 }
 
+// --- string methods ---
+
+#[test]
+fn string_split() {
+    assert_output("print(\"a b c\".split())", "['a', 'b', 'c']\n");
+    assert_output("print(\"  x   y \".split())", "['x', 'y']\n");
+    assert_output("print(\"a,b,,c\".split(\",\"))", "['a', 'b', '', 'c']\n");
+    assert_output("print(\"\".split())", "[]\n");
+    assert_output("print(\"\".split(\",\"))", "['']\n");
+}
+
+#[test]
+fn string_strip_case_join() {
+    assert_output("print(\"  hi  \".strip())", "hi\n");
+    assert_output(
+        "print(\"MixEd\".upper(), \"MixEd\".lower())",
+        "MIXED mixed\n",
+    );
+    assert_output("print(\"-\".join([\"a\", \"b\", \"c\"]))", "a-b-c\n");
+    assert_output("print(\"\".join([\"a\", \"b\"]))", "ab\n");
+}
+
+#[test]
+fn string_method_name_falls_back_to_class_method() {
+    // A class defining `upper` still dispatches there (not the string helper).
+    assert_output(
+        "class Shout:\n    def __init__(self, s):\n        self.s = s\n    def upper(self):\n        return self.s + \"!!!\"\nprint(Shout(\"hi\").upper())",
+        "hi!!!\n",
+    );
+}
+
 // --- input() / stdin ---
 
 #[test]
@@ -1391,6 +1422,12 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // tuple-target comprehensions over items()/zip
     "d = {\"a\": 1, \"b\": 2}\nprint({v: k for k, v in d.items()})\nprint([k for k, v in d.items() if v > 1])",
     "print([a * b for a, b in zip([1, 2, 3], [4, 5, 6])])",
+    // string methods: split, strip, upper/lower, join
+    "print(\"hello world\".split())\nprint(\"a,b,,c\".split(\",\"))\nprint(\"a b c\".split(\" \"))",
+    "print(\"  trim me  \".strip(), \"Hello\".upper(), \"Hello\".lower())",
+    "print(\"-\".join([\"a\", \"b\", \"c\"]), \",\".join([str(i) for i in range(4)]))",
+    "print(\"\".split(), \"\".split(\",\"))\nwords = \"the quick brown fox\".split()\nprint(len(words), words[0], words[-1])",
+    "print(sum([int(x) for x in \"1 2 3 4\".split()]))",
 ];
 
 fn find_python() -> Option<&'static str> {
@@ -1444,6 +1481,12 @@ const STDIN_CORPUS: &[(&str, &str)] = &[
         "3\ncharlie\nalice\nbob\n",
     ),
     ("print(int(input()) + int(input()))", "40\n2\n"),
+    // the classic "two ints on one line", now possible via split()
+    ("a, b = input().split()\nprint(int(a) + int(b))", "20 22\n"),
+    (
+        "print(sum([int(x) for x in input().split()]))",
+        "5 10 15 20\n",
+    ),
 ];
 
 #[test]

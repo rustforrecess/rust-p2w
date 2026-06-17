@@ -2420,6 +2420,313 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $is_space: ASCII whitespace test (space, tab, newline, carriage return).
+    let mut b = Body::new();
+    b.push("(i32.or (i32.or (i32.eq (local.get $c) (i32.const 32)) (i32.eq (local.get $c) (i32.const 9))) (i32.or (i32.eq (local.get $c) (i32.const 10)) (i32.eq (local.get $c) (i32.const 13))))");
+    fs.push(Func {
+        signature: "(func $is_space (param $c i32) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $str_sub: a fresh $STR copy of s[start .. start+len].
+    let mut b = Body::new();
+    b.push("(local.set $out (array.new_default $STR (local.get $len)))");
+    b.push("(array.copy $STR $STR (local.get $out) (i32.const 0) (local.get $s) (local.get $start) (local.get $len))");
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $str_sub (param $s (ref null $STR)) (param $start i32) (param $len i32) (result (ref null $STR))"
+                .into(),
+        locals: vec!["(local $out (ref null $STR))".into()],
+        body: b,
+    });
+
+    // $str_match_at: do the `sl` bytes of `sep` occur in `h` starting at `at`?
+    let mut b = Body::new();
+    b.push("(block $done (loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $j) (local.get $sl)))");
+    b.push_in(
+        2,
+        "(if (i32.ne (array.get_u $STR (local.get $h) (i32.add (local.get $at) (local.get $j))) (array.get_u $STR (local.get $sep) (local.get $j))) (then (return (i32.const 0))))",
+    );
+    b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
+    b.push_in(2, "(br $next)))");
+    b.push("(i32.const 1)");
+    fs.push(Func {
+        signature:
+            "(func $str_match_at (param $h (ref null $STR)) (param $at i32) (param $sep (ref null $STR)) (param $sl i32) (result i32)"
+                .into(),
+        locals: vec!["(local $j i32)".into()],
+        body: b,
+    });
+
+    // $str_upper / $str_lower: ASCII case shift. Non-strings fall back to method
+    // dispatch (so a class may define these names).
+    for (name, lo, hi, delta) in [("$str_upper", 97, 122, -32), ("$str_lower", 65, 90, 32)] {
+        let mut b = Body::new();
+        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+        b.push_in(
+            1,
+            "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+        );
+        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+        b.push("(local.set $n (array.len (local.get $ss)))");
+        b.push("(local.set $out (array.new_default $STR (local.get $n)))");
+        b.push("(block $done (loop $next");
+        b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+        b.push_in(
+            2,
+            "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+        );
+        b.push_in(
+            2,
+            format!("(if (i32.and (i32.ge_u (local.get $c) (i32.const {lo})) (i32.le_u (local.get $c) (i32.const {hi}))) (then (local.set $c (i32.add (local.get $c) (i32.const {delta})))))"),
+        );
+        b.push_in(
+            2,
+            "(array.set $STR (local.get $out) (local.get $i) (local.get $c))",
+        );
+        b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(2, "(br $next)))");
+        b.push("(local.get $out)");
+        fs.push(Func {
+            signature: format!(
+                "(func {name} (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![
+                "(local $ss (ref null $STR))".into(),
+                "(local $n i32)".into(),
+                "(local $i i32)".into(),
+                "(local $c i32)".into(),
+                "(local $out (ref null $STR))".into(),
+            ],
+            body: b,
+        });
+    }
+
+    // $str_strip: drop leading/trailing ASCII whitespace.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $start (i32.const 0))");
+    b.push("(block $ld (loop $ln");
+    b.push_in(
+        2,
+        "(br_if $ld (i32.ge_s (local.get $start) (local.get $n)))",
+    );
+    b.push_in(
+        2,
+        "(br_if $ld (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (local.get $start)))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $start (i32.add (local.get $start) (i32.const 1)))",
+    );
+    b.push_in(2, "(br $ln)))");
+    b.push("(local.set $end (local.get $n))");
+    b.push("(block $td (loop $tn");
+    b.push_in(
+        2,
+        "(br_if $td (i32.le_s (local.get $end) (local.get $start)))",
+    );
+    b.push_in(
+        2,
+        "(br_if $td (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (i32.sub (local.get $end) (i32.const 1))))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $end (i32.sub (local.get $end) (i32.const 1)))",
+    );
+    b.push_in(2, "(br $tn)))");
+    b.push("(call $str_sub (local.get $ss) (local.get $start) (i32.sub (local.get $end) (local.get $start)))");
+    fs.push(Func {
+        signature:
+            "(func $str_strip (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $start i32)".into(),
+            "(local $end i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $str_split: `sep` None -> split on whitespace runs (no empty tokens);
+    // otherwise split on each occurrence of the separator string (Python
+    // semantics, empty tokens kept).
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $lst (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))");
+    b.push("(if (ref.test (ref $NONE_T) (local.get $sep))");
+    b.push_in(1, "(then");
+    // whitespace split
+    b.push_in(2, "(block $wd (loop $wn");
+    b.push_in(3, "(block $sk (loop $skn");
+    b.push_in(4, "(br_if $sk (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        4,
+        "(br_if $sk (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (local.get $i)))))",
+    );
+    b.push_in(4, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(4, "(br $skn)))");
+    b.push_in(3, "(br_if $wd (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(3, "(local.set $start (local.get $i))");
+    b.push_in(3, "(block $tk (loop $tkn");
+    b.push_in(4, "(br_if $tk (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        4,
+        "(br_if $tk (call $is_space (array.get_u $STR (local.get $ss) (local.get $i))))",
+    );
+    b.push_in(4, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(4, "(br $tkn)))");
+    b.push_in(
+        3,
+        "(drop (call $list_append (local.get $lst) (call $str_sub (local.get $ss) (local.get $start) (i32.sub (local.get $i) (local.get $start)))))",
+    );
+    b.push_in(3, "(br $wn)))");
+    b.push_in(1, ")");
+    b.push_in(1, "(else");
+    // separator split
+    b.push_in(
+        2,
+        "(local.set $sepc (ref.cast (ref $STR) (local.get $sep)))",
+    );
+    b.push_in(2, "(local.set $sl (array.len (local.get $sepc)))");
+    b.push_in(2, "(if (i32.eqz (local.get $sl))");
+    b.push_in(
+        3,
+        "(then (drop (call $list_append (local.get $lst) (local.get $ss))) (return (local.get $lst))))",
+    );
+    b.push_in(2, "(local.set $start (i32.const 0))");
+    b.push_in(2, "(block $pd (loop $pn");
+    b.push_in(
+        3,
+        "(br_if $pd (i32.gt_s (i32.add (local.get $i) (local.get $sl)) (local.get $n)))",
+    );
+    b.push_in(
+        3,
+        "(if (call $str_match_at (local.get $ss) (local.get $i) (local.get $sepc) (local.get $sl))",
+    );
+    b.push_in(4, "(then");
+    b.push_in(
+        5,
+        "(drop (call $list_append (local.get $lst) (call $str_sub (local.get $ss) (local.get $start) (i32.sub (local.get $i) (local.get $start)))))",
+    );
+    b.push_in(5, "(local.set $i (i32.add (local.get $i) (local.get $sl)))");
+    b.push_in(5, "(local.set $start (local.get $i)))");
+    b.push_in(
+        4,
+        "(else (local.set $i (i32.add (local.get $i) (i32.const 1)))))",
+    );
+    b.push_in(3, "(br $pn)))");
+    b.push_in(
+        2,
+        "(drop (call $list_append (local.get $lst) (call $str_sub (local.get $ss) (local.get $start) (i32.sub (local.get $n) (local.get $start)))))",
+    );
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.get $lst)");
+    fs.push(Func {
+        signature:
+            "(func $str_split (param $s (ref null eq)) (param $sep (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $start i32)".into(),
+            "(local $lst (ref null eq))".into(),
+            "(local $sepc (ref null $STR))".into(),
+            "(local $sl i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $str_join: join the (string) elements of an iterable with `sep`.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $sep)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $sep) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $sepc (ref.cast (ref $STR) (local.get $sep)))");
+    b.push("(local.set $sl (array.len (local.get $sepc)))");
+    b.push("(local.set $cnt (call $py_len (local.get $it)))");
+    // total length = sum(len(elem)) + sl*(cnt-1)
+    b.push("(block $ld (loop $ln");
+    b.push_in(2, "(br_if $ld (i32.ge_s (local.get $i) (local.get $cnt)))");
+    b.push_in(
+        2,
+        "(local.set $total (i32.add (local.get $total) (array.len (ref.cast (ref $STR) (call $py_index (local.get $it) (local.get $i))))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $ln)))");
+    b.push(
+        "(if (i32.gt_s (local.get $cnt) (i32.const 0)) (then (local.set $total (i32.add (local.get $total) (i32.mul (local.get $sl) (i32.sub (local.get $cnt) (i32.const 1)))))))",
+    );
+    // build
+    b.push("(local.set $out (array.new_default $STR (local.get $total)))");
+    b.push("(local.set $i (i32.const 0))");
+    b.push("(local.set $pos (i32.const 0))");
+    b.push("(block $bd (loop $bn");
+    b.push_in(2, "(br_if $bd (i32.ge_s (local.get $i) (local.get $cnt)))");
+    b.push_in(2, "(if (i32.gt_s (local.get $i) (i32.const 0))");
+    b.push_in(3, "(then");
+    b.push_in(
+        4,
+        "(array.copy $STR $STR (local.get $out) (local.get $pos) (local.get $sepc) (i32.const 0) (local.get $sl))",
+    );
+    b.push_in(
+        4,
+        "(local.set $pos (i32.add (local.get $pos) (local.get $sl)))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $elem (ref.cast (ref $STR) (call $py_index (local.get $it) (local.get $i))))",
+    );
+    b.push_in(2, "(local.set $el (array.len (local.get $elem)))");
+    b.push_in(
+        2,
+        "(array.copy $STR $STR (local.get $out) (local.get $pos) (local.get $elem) (i32.const 0) (local.get $el))",
+    );
+    b.push_in(
+        2,
+        "(local.set $pos (i32.add (local.get $pos) (local.get $el)))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $bn)))");
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $str_join (param $sep (ref null eq)) (param $it (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $sepc (ref null $STR))".into(),
+            "(local $sl i32)".into(),
+            "(local $cnt i32)".into(),
+            "(local $i i32)".into(),
+            "(local $total i32)".into(),
+            "(local $out (ref null $STR))".into(),
+            "(local $pos i32)".into(),
+            "(local $elem (ref null $STR))".into(),
+            "(local $el i32)".into(),
+        ],
+        body: b,
+    });
+
     fs
 }
 
@@ -4009,6 +4316,41 @@ impl Gen {
                             str_lit(method)
                         ));
                     }
+                }
+                // String methods. Each helper falls back to method dispatch for
+                // a non-string receiver, so a class may reuse these names.
+                match method.as_str() {
+                    "upper" | "lower" | "strip" if args.is_empty() => {
+                        let r = self.value_expr(cx, recv)?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $str_{method} {r} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "split" if args.len() <= 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let sep = if args.len() == 1 {
+                            self.value_expr(cx, &args[0])?
+                        } else {
+                            "(global.get $NONE)".to_string()
+                        };
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $str_split {r} {sep} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "join" if args.len() == 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let it = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $str_join {r} {it} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    _ => {}
                 }
                 // dict.keys()/.values()/.items() — $dict_view falls back to
                 // method dispatch for a non-dict, so a class may reuse the names.
