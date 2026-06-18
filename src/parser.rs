@@ -928,36 +928,69 @@ impl<'a> Parser<'a> {
             }
             Tok::LBrace => {
                 self.advance();
+                // `{}` is an empty dict (an empty set is `set()`).
                 if matches!(self.peek(), Tok::RBrace) {
                     self.advance();
                     return Ok(expr(ExprKind::Dict(Vec::new())));
                 }
-                let key = self.expr(0)?;
-                self.expect(&Tok::Colon, "':' between a dict key and its value")?;
-                let value = self.expr(0)?;
-                // `{k: v for ...}` is a dict comprehension.
+                let first = self.expr(0)?;
+                // A `:` after the first element means a dict; otherwise a set.
+                if matches!(self.peek(), Tok::Colon) {
+                    self.advance();
+                    let value = self.expr(0)?;
+                    if self.is_keyword("for") {
+                        let clauses = self.comp_clauses()?;
+                        self.expect(&Tok::RBrace, "'}'")?;
+                        return Ok(expr(ExprKind::DictComp {
+                            key: Box::new(first),
+                            value: Box::new(value),
+                            clauses,
+                        }));
+                    }
+                    let mut entries = vec![(first, value)];
+                    while matches!(self.peek(), Tok::Comma) {
+                        self.advance();
+                        if matches!(self.peek(), Tok::RBrace) {
+                            break; // trailing comma
+                        }
+                        let k = self.expr(0)?;
+                        self.expect(&Tok::Colon, "':' between a dict key and its value")?;
+                        let v = self.expr(0)?;
+                        entries.push((k, v));
+                    }
+                    self.expect(&Tok::RBrace, "'}'")?;
+                    return Ok(expr(ExprKind::Dict(entries)));
+                }
+                // Set literal / comprehension — desugared to `set([...])` /
+                // `set(<listcomp>)` so codegen reuses the set() builtin.
+                let set_of = |arg: Expr| Expr {
+                    kind: ExprKind::Call("set".into(), vec![arg]),
+                    line,
+                };
                 if self.is_keyword("for") {
                     let clauses = self.comp_clauses()?;
                     self.expect(&Tok::RBrace, "'}'")?;
-                    return Ok(expr(ExprKind::DictComp {
-                        key: Box::new(key),
-                        value: Box::new(value),
-                        clauses,
+                    return Ok(set_of(Expr {
+                        kind: ExprKind::ListComp {
+                            element: Box::new(first),
+                            clauses,
+                        },
+                        line,
                     }));
                 }
-                let mut entries = vec![(key, value)];
+                let mut elements = vec![first];
                 while matches!(self.peek(), Tok::Comma) {
                     self.advance();
                     if matches!(self.peek(), Tok::RBrace) {
                         break; // trailing comma
                     }
-                    let k = self.expr(0)?;
-                    self.expect(&Tok::Colon, "':' between a dict key and its value")?;
-                    let v = self.expr(0)?;
-                    entries.push((k, v));
+                    elements.push(self.expr(0)?);
                 }
                 self.expect(&Tok::RBrace, "'}'")?;
-                Ok(expr(ExprKind::Dict(entries)))
+                Ok(set_of(Expr {
+                    kind: ExprKind::List(elements),
+                    line,
+                }))
             }
             Tok::Name(name) => {
                 self.advance();

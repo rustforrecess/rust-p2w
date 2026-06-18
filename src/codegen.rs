@@ -182,6 +182,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .types
         .push("(type $TUPLE (struct (field i32) (field (ref null $ITEMS))))".into());
+    // A set: count + element array. The trailing i8 marker makes it
+    // structurally distinct from $LIST (count + items). Insertion-ordered (a
+    // documented divergence from CPython's hash order).
+    module.types.push(
+        "(type $SET (struct (field (mut i32)) (field (mut (ref null $ITEMS))) (field (mut i8))))"
+            .into(),
+    );
     // A dict is an insertion-ordered association: parallel key/value arrays
     // with linear-scan lookup (classroom-sized; order matches Python).
     module.types.push(
@@ -301,6 +308,7 @@ fn raise_helpers() -> Vec<Func> {
         ("(ref.test (ref $STR) (local.get $r))", "str"),
         ("(ref.test (ref $LIST) (local.get $r))", "list"),
         ("(ref.test (ref $TUPLE) (local.get $r))", "tuple"),
+        ("(ref.test (ref $SET) (local.get $r))", "set"),
         ("(ref.test (ref $DICT) (local.get $r))", "dict"),
         ("(ref.test (ref $NONE_T) (local.get $r))", "NoneType"),
     ] {
@@ -703,6 +711,12 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (i32.ne (struct.get $TUPLE 0 (ref.cast (ref $TUPLE) (local.get $r))) (i32.const 0))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $SET) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (i32.ne (struct.get $SET 0 (ref.cast (ref $SET) (local.get $r))) (i32.const 0))))",
+    );
+    b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
     fs.push(Func {
         signature: "(func $truthy (param $r (ref null eq)) (result i32)".into(),
@@ -741,6 +755,12 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (struct.get $TUPLE 0 (ref.cast (ref $TUPLE) (local.get $r)))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $SET) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (struct.get $SET 0 (ref.cast (ref $SET) (local.get $r)))))",
+    );
+    b.push(")");
     b.push("(call $raise_no_len (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
@@ -752,7 +772,7 @@ fn runtime_helpers() -> Vec<Func> {
     // $py_index: subscript read with Python negative-index normalization;
     // out of range raises IndexError. Strings yield a one-character string.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (i32.or (i32.or (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))) (ref.test (ref $DICT) (local.get $r))) (ref.test (ref $TUPLE) (local.get $r))))");
+    b.push("(if (i32.eqz (i32.or (i32.or (i32.or (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))) (ref.test (ref $DICT) (local.get $r))) (ref.test (ref $TUPLE) (local.get $r))) (ref.test (ref $SET) (local.get $r))))");
     b.push_in(1, "(then (call $raise_not_sub (local.get $r)))");
     b.push(")");
     b.push("(local.set $n (call $py_len (local.get $r)))");
@@ -775,6 +795,14 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(
         1,
         "(then (return (array.get $ITEMS (struct.get $TUPLE 1 (ref.cast (ref $TUPLE) (local.get $r))) (local.get $i))))",
+    );
+    b.push(")");
+    // Positional access on a set yields its i-th element (insertion order) —
+    // used by `for x in s` iteration. Direct `s[i]` is blocked in py_subscript.
+    b.push("(if (ref.test (ref $SET) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (array.get $ITEMS (struct.get $SET 1 (ref.cast (ref $SET) (local.get $r))) (local.get $i))))",
     );
     b.push(")");
     // Positional access on a dict yields its i-th KEY — this is what makes
@@ -857,6 +885,184 @@ fn runtime_helpers() -> Vec<Func> {
         ],
         body: b,
     });
+
+    // $set_find: index of an element (by py_eq), or -1.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $SET 0 (local.get $s)))");
+    b.push("(block $done (loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (call $py_eq (array.get $ITEMS (struct.get $SET 1 (local.get $s)) (local.get $i)) (local.get $v)) (then (return (local.get $i))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)))");
+    b.push("(i32.const -1)");
+    fs.push(Func {
+        signature:
+            "(func $set_find (param $s (ref null $SET)) (param $v (ref null eq)) (result i32)"
+                .into(),
+        locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
+        body: b,
+    });
+
+    // $set_insert: add an element if absent (amortized growth, like list).
+    let mut b = Body::new();
+    b.push("(if (i32.ge_s (call $set_find (local.get $s) (local.get $v)) (i32.const 0)) (then (return)))");
+    b.push("(local.set $items (struct.get $SET 1 (local.get $s)))");
+    b.push("(local.set $len (struct.get $SET 0 (local.get $s)))");
+    b.push("(if (i32.ge_s (local.get $len) (array.len (local.get $items)))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $new (array.new_default $ITEMS (i32.shl (i32.add (array.len (local.get $items)) (i32.const 4)) (i32.const 1))))",
+    );
+    b.push_in(
+        2,
+        "(array.copy $ITEMS $ITEMS (local.get $new) (i32.const 0) (local.get $items) (i32.const 0) (local.get $len))",
+    );
+    b.push_in(2, "(struct.set $SET 1 (local.get $s) (local.get $new))");
+    b.push_in(2, "(local.set $items (local.get $new))");
+    b.push_in(1, "))");
+    b.push("(array.set $ITEMS (local.get $items) (local.get $len) (local.get $v))");
+    b.push("(struct.set $SET 0 (local.get $s) (i32.add (local.get $len) (i32.const 1)))");
+    fs.push(Func {
+        signature: "(func $set_insert (param $s (ref null $SET)) (param $v (ref null eq))".into(),
+        locals: vec![
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $new (ref null $ITEMS))".into(),
+            "(local $len i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $set_remove_at: drop element at idx (shift tail down, count--).
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $SET 0 (local.get $s)))");
+    b.push(
+        "(array.copy $ITEMS $ITEMS (struct.get $SET 1 (local.get $s)) (local.get $idx) (struct.get $SET 1 (local.get $s)) (i32.add (local.get $idx) (i32.const 1)) (i32.sub (i32.sub (local.get $n) (local.get $idx)) (i32.const 1)))",
+    );
+    b.push("(struct.set $SET 0 (local.get $s) (i32.sub (local.get $n) (i32.const 1)))");
+    fs.push(Func {
+        signature: "(func $set_remove_at (param $s (ref null $SET)) (param $idx i32)".into(),
+        locals: vec!["(local $n i32)".into()],
+        body: b,
+    });
+
+    // $py_set: build a set from an iterable (set() / set literal / set comp).
+    let mut b = Body::new();
+    b.push(
+        "(local.set $s (struct.new $SET (i32.const 0) (array.new_fixed $ITEMS 0) (i32.const 0)))",
+    );
+    b.push("(if (ref.is_null (local.get $it)) (then (return (local.get $s))))");
+    b.push("(local.set $n (call $py_len (local.get $it)))");
+    b.push("(block $done (loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(call $set_insert (local.get $s) (call $py_index (local.get $it) (local.get $i)))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)))");
+    b.push("(local.get $s)");
+    fs.push(Func {
+        signature: "(func $py_set (param $it (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $s (ref null $SET))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $set_eq: same size and every element of `a` is in `b`.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $SET 0 (local.get $a)))");
+    b.push("(if (i32.ne (local.get $n) (struct.get $SET 0 (local.get $b))) (then (return (i32.const 0))))");
+    b.push("(block $done (loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (i32.lt_s (call $set_find (local.get $b) (array.get $ITEMS (struct.get $SET 1 (local.get $a)) (local.get $i))) (i32.const 0)) (then (return (i32.const 0))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)))");
+    b.push("(i32.const 1)");
+    fs.push(Func {
+        signature:
+            "(func $set_eq (param $a (ref null $SET)) (param $b (ref null $SET)) (result i32)"
+                .into(),
+        locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
+        body: b,
+    });
+
+    // $print_set: `{e1, e2}` (insertion order); empty prints `set()`.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $SET 0 (local.get $s)))");
+    b.push("(if (i32.eqz (local.get $n))");
+    b.push_in(1, "(then");
+    for c in "set()".bytes() {
+        b.push_in(2, format!("(call $write_char (i32.const {c}))"));
+    }
+    b.push_in(2, "(return)))");
+    b.push("(call $write_char (i32.const 123))"); // {
+    b.push("(block $done (loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(if (i32.gt_s (local.get $i) (i32.const 0)) (then (call $write_char (i32.const 44)) (call $write_char (i32.const 32))))",
+    );
+    b.push_in(
+        2,
+        "(call $print_repr (array.get $ITEMS (struct.get $SET 1 (local.get $s)) (local.get $i)))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)))");
+    b.push("(call $write_char (i32.const 125))"); // }
+    fs.push(Func {
+        signature: "(func $print_set (param $s (ref null $SET))".into(),
+        locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
+        body: b,
+    });
+
+    // $set_add / $set_discard / $set_remove: the methods (fall back to dispatch
+    // for non-set receivers). add returns None; remove raises KeyError if
+    // absent; discard is a no-op if absent.
+    for (fname, mode) in [("$set_add", 0), ("$set_discard", 1), ("$set_remove", 2)] {
+        let mut b = Body::new();
+        b.push("(if (i32.eqz (ref.test (ref $SET) (local.get $r)))");
+        b.push_in(
+            1,
+            "(then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))",
+        );
+        b.push("(local.set $ss (ref.cast (ref $SET) (local.get $r)))");
+        if mode == 0 {
+            b.push("(call $set_insert (local.get $ss) (local.get $v))");
+            b.push("(global.get $NONE)");
+        } else {
+            b.push("(local.set $idx (call $set_find (local.get $ss) (local.get $v)))");
+            b.push("(if (i32.ge_s (local.get $idx) (i32.const 0))");
+            b.push_in(
+                1,
+                "(then (call $set_remove_at (local.get $ss) (local.get $idx)))",
+            );
+            if mode == 2 {
+                b.push_in(1, "(else (call $raise_key (local.get $v)) (unreachable))");
+            }
+            b.push(")");
+            b.push("(global.get $NONE)");
+        }
+        fs.push(Func {
+            signature: format!(
+                "(func {fname} (param $r (ref null eq)) (param $v (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![
+                "(local $ss (ref null $SET))".into(),
+                "(local $idx i32)".into(),
+            ],
+            body: b,
+        });
+    }
 
     // $dict_find: index of a key (by py_eq), or -1.
     let mut b = Body::new();
@@ -981,6 +1187,8 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (call $dict_get (local.get $r) (local.get $k))))",
     );
     b.push(")");
+    // Sets aren't subscriptable (even though iteration uses $py_index).
+    b.push("(if (ref.test (ref $SET) (local.get $r)) (then (call $raise_not_sub (local.get $r)) (unreachable)))");
     b.push("(call $py_index (local.get $r) (call $unbox (local.get $k)))");
     fs.push(Func {
         signature:
@@ -1344,6 +1552,11 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (call $tuple_contains (ref.cast (ref $TUPLE) (local.get $c)) (local.get $item))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $SET) (local.get $c))");
+    b.push_in(
+        1,
+        "(then (return (i32.ge_s (call $set_find (ref.cast (ref $SET) (local.get $c)) (local.get $item)) (i32.const 0)))))",
+    );
     b.push("(if (ref.test (ref $DICT) (local.get $c))");
     b.push_in(
         1,
@@ -1970,6 +2183,12 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (call $print_tuple (ref.cast (ref $TUPLE) (local.get $r)))))",
     );
     b.push(")");
+    b.push("(if (ref.test (ref $SET) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (call $print_set (ref.cast (ref $SET) (local.get $r)))))",
+    );
+    b.push(")");
     b.push("(if (ref.test (ref $DICT) (local.get $r))");
     b.push_in(
         1,
@@ -2251,6 +2470,19 @@ fn runtime_helpers() -> Vec<Func> {
     b.push(")");
     b.push(
         "(if (i32.or (ref.test (ref $TUPLE) (local.get $a)) (ref.test (ref $TUPLE) (local.get $b)))",
+    );
+    b.push_in(1, "(then (return (i32.const 0)))");
+    b.push(")");
+    b.push(
+        "(if (i32.and (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b)))",
+    );
+    b.push_in(
+        1,
+        "(then (return (call $set_eq (ref.cast (ref $SET) (local.get $a)) (ref.cast (ref $SET) (local.get $b)))))",
+    );
+    b.push(")");
+    b.push(
+        "(if (i32.or (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b)))",
     );
     b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
@@ -5163,6 +5395,21 @@ impl Gen {
                             str_lit(method)
                         ));
                     }
+                    // set methods: add / discard / remove.
+                    "add" | "discard" | "remove" if args.len() == 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let v = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        let helper = match method.as_str() {
+                            "add" => "$set_add",
+                            "discard" => "$set_discard",
+                            _ => "$set_remove",
+                        };
+                        return Ok(format!(
+                            "(call {helper} {r} {v} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
                     "isdigit" | "isalpha" if args.is_empty() => {
                         let r = self.value_expr(cx, recv)?;
                         let argl = self.list_of(cx, args)?;
@@ -5358,6 +5605,16 @@ impl Gen {
                         "all" if args.len() == 1 => {
                             let seq = self.value_expr(cx, &args[0])?;
                             return Ok(format!("(call $py_all {seq})"));
+                        }
+                        // set() / set(iterable) (also the desugar target of set
+                        // literals and set comprehensions).
+                        "set" if args.len() <= 1 => {
+                            let it = if args.len() == 1 {
+                                self.value_expr(cx, &args[0])?
+                            } else {
+                                "(ref.null eq)".to_string()
+                            };
+                            return Ok(format!("(call $py_set {it})"));
                         }
                         // min/max: one iterable, or several positional args.
                         "min" | "max" if !args.is_empty() => {

@@ -1252,6 +1252,39 @@ fn default_arguments_arity_errors() {
     assert!(err.to_string().contains("too many positional"), "{err}");
 }
 
+// --- sets ---
+
+#[test]
+fn set_basics() {
+    // Insertion order is deterministic here (our sets iterate in insertion
+    // order — a documented divergence from CPython's hash order).
+    assert_output("print(set([1, 2, 3]))", "{1, 2, 3}\n");
+    assert_output("print(set())", "set()\n");
+    assert_output("print(len({1, 1, 2}))", "2\n");
+    assert_output("print(3 in {1, 2, 3}, 9 in {1, 2, 3})", "True False\n");
+}
+
+#[test]
+fn set_empty_is_falsy() {
+    assert_output(
+        "if set():\n    print(\"y\")\nelse:\n    print(\"n\")",
+        "n\n",
+    );
+}
+
+#[test]
+fn set_add_discard_remove() {
+    assert_output(
+        "s = set()\ns.add(5)\ns.add(5)\ns.add(7)\nprint(sorted(s))",
+        "[5, 7]\n",
+    );
+    assert_output(
+        "s = set([1, 2, 3])\ns.discard(2)\ns.discard(9)\nprint(sorted(s))",
+        "[1, 3]\n",
+    );
+    assert_raises("s = set([1])\ns.remove(2)", "KeyError");
+}
+
 // --- keyword arguments ---
 
 #[test]
@@ -1685,6 +1718,12 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // keyword arguments (order-independent; can skip a middle default)
     "def rect(w, h=1, label=\"r\"):\n    return label + str(w * h)\nprint(rect(5), rect(5, 2), rect(5, label=\"x\"))\nprint(rect(w=4, h=3), rect(h=3, w=4))",
     "def f(a, b, c):\n    return a * 100 + b * 10 + c\nprint(f(1, c=3, b=2), f(c=3, a=1, b=2))",
+    // sets — only order-independent operations (CPython set order is hash-based)
+    "print(len(set([3, 1, 2, 1, 3])))\ns = set([1, 2, 3])\nprint(2 in s, 5 in s)",
+    "print(set([1, 2]) == set([2, 1]), set([1]) == set([1, 2]))\nprint(sorted(set([3, 1, 2, 1])))",
+    "seen = set()\nfor x in [1, 2, 2, 3, 1]:\n    seen.add(x)\nprint(len(seen), sorted(seen))",
+    "print(sorted({x % 3 for x in range(10)}))\nprint(sorted(set(\"mississippi\")))",
+    "print(len({1, 1, 2, 3, 3}), sorted({c for c in \"hello\"}))",
 ];
 
 fn find_python() -> Option<&'static str> {
