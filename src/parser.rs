@@ -329,6 +329,7 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::LParen, "'(' after the function name")?;
         let mut params = Vec::new();
+        let mut defaults: Vec<Expr> = Vec::new();
         if !matches!(self.peek(), Tok::RParen) {
             loop {
                 match self.peek().clone() {
@@ -341,6 +342,16 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         params.push(p);
+                        // Optional default value (`= expr`).
+                        if matches!(self.peek(), Tok::Eq) {
+                            self.advance();
+                            defaults.push(self.expr(0)?);
+                        } else if !defaults.is_empty() {
+                            return Err(CompileError::at(
+                                self.line(),
+                                "a parameter without a default can't follow one with a default",
+                            ));
+                        }
                     }
                     other => {
                         return Err(CompileError::at(
@@ -364,7 +375,12 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
         Ok(Stmt {
-            kind: StmtKind::Def { name, params, body },
+            kind: StmtKind::Def {
+                name,
+                params,
+                defaults,
+                body,
+            },
             line,
         })
     }
@@ -419,7 +435,20 @@ impl<'a> Parser<'a> {
         let mut class_vars = Vec::new();
         for stmt in body {
             match stmt.kind {
-                StmtKind::Def { name, params, body } => methods.push(Method { name, params, body }),
+                StmtKind::Def {
+                    name,
+                    params,
+                    defaults,
+                    body,
+                } => {
+                    if !defaults.is_empty() {
+                        return Err(CompileError::at(
+                            stmt.line,
+                            "default arguments aren't supported in methods yet",
+                        ));
+                    }
+                    methods.push(Method { name, params, body })
+                }
                 StmtKind::Assign(n, v) => class_vars.push((n, v)),
                 _ => {
                     return Err(CompileError::at(

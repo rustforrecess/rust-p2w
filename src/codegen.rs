@@ -55,7 +55,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // Pass 1: collect function and class signatures so calls/construction
     // (including mutual recursion) resolve regardless of definition order.
     for s in stmts {
-        if let StmtKind::Def { name, params, .. } = &s.kind {
+        if let StmtKind::Def {
+            name,
+            params,
+            defaults,
+            ..
+        } = &s.kind
+        {
             if name == "print" {
                 return Err(CompileError::at(s.line, "can't redefine print"));
             }
@@ -65,6 +71,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                     format!("function '{name}' is defined twice"),
                 ));
             }
+            g.func_defaults.insert(name.clone(), defaults.clone());
         }
     }
     for s in stmts {
@@ -123,7 +130,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     let mut method_names = Vec::new();
     for s in stmts {
         match &s.kind {
-            StmtKind::Def { name, params, body } => {
+            StmtKind::Def {
+                name, params, body, ..
+            } => {
                 user_funcs.push(g.gen_def(name, params, body)?);
             }
             StmtKind::ClassDef { name, methods, .. } => {
@@ -2393,6 +2402,34 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $py_any / $py_all: truthiness reductions over an iterable. `any` returns
+    // TRUE on the first truthy element (else FALSE); `all` returns FALSE on the
+    // first falsy element (else TRUE).
+    for (fname, any, hit, miss) in [
+        ("$py_any", true, "$TRUE", "$FALSE"),
+        ("$py_all", false, "$FALSE", "$TRUE"),
+    ] {
+        let truthy = "(call $truthy (call $py_index (local.get $seq) (local.get $i)))";
+        let cond = if any {
+            truthy.to_string()
+        } else {
+            format!("(i32.eqz {truthy})")
+        };
+        let mut b = Body::new();
+        b.push("(local.set $n (call $py_len (local.get $seq)))");
+        b.push("(block $done (loop $next");
+        b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+        b.push_in(2, format!("(if {cond} (then (return (global.get {hit}))))"));
+        b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(2, "(br $next)))");
+        b.push(format!("(global.get {miss})"));
+        fs.push(Func {
+            signature: format!("(func {fname} (param $seq (ref null eq)) (result (ref null eq))"),
+            locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
+            body: b,
+        });
+    }
+
     // $str_lt: lexicographic byte comparison, `a < b` (shorter is smaller when
     // it's a prefix). Supports sorting strings.
     let mut b = Body::new();
@@ -3635,8 +3672,12 @@ struct Gen {
     /// `$read_line` helper are only emitted (and only required of the host)
     /// when a program actually reads input.
     uses_input: bool,
-    /// User functions: name -> arity (collected before any body compiles).
+    /// User functions: name -> total parameter count (collected before any
+    /// body compiles).
     funcs: HashMap<String, usize>,
+    /// Default-value expressions for the trailing parameters of each function
+    /// (evaluated at the call site to fill omitted arguments).
+    func_defaults: HashMap<String, Vec<Expr>>,
     /// User classes: name -> base class name (None if no base). Collected in
     /// pass 1 so `Cls(args)` construction is distinguished from a function call.
     classes: HashMap<String, Option<String>>,
@@ -4982,6 +5023,14 @@ impl Gen {
                             let seq = self.value_expr(cx, &args[0])?;
                             return Ok(format!("(call $py_sorted {seq})"));
                         }
+                        "any" if args.len() == 1 => {
+                            let seq = self.value_expr(cx, &args[0])?;
+                            return Ok(format!("(call $py_any {seq})"));
+                        }
+                        "all" if args.len() == 1 => {
+                            let seq = self.value_expr(cx, &args[0])?;
+                            return Ok(format!("(call $py_all {seq})"));
+                        }
                         // input([prompt]) -> a line from stdin (newline
                         // stripped); a prompt is printed first.
                         "input" if args.len() <= 1 => {
@@ -5033,15 +5082,24 @@ impl Gen {
                         });
                     }
                 }
-                let Some(&arity) = self.funcs.get(n) else {
+                let Some(&total) = self.funcs.get(n) else {
                     return Err(CompileError::at(e.line, format!("unknown function '{n}'")));
                 };
-                if args.len() != arity {
+                // Clone the trailing default expressions so we can evaluate
+                // them at the call site without holding a borrow on self.
+                let defaults = self.func_defaults.get(n).cloned().unwrap_or_default();
+                let required = total - defaults.len();
+                if args.len() < required || args.len() > total {
+                    let want = if required == total {
+                        format!("{total}")
+                    } else {
+                        format!("{required} to {total}")
+                    };
                     return Err(CompileError::at(
                         e.line,
                         format!(
-                            "{n}() takes {arity} argument{} but {} {} given",
-                            if arity == 1 { "" } else { "s" },
+                            "{n}() takes {want} argument{} but {} {} given",
+                            if total == 1 { "" } else { "s" },
                             args.len(),
                             if args.len() == 1 { "was" } else { "were" }
                         ),
@@ -5051,6 +5109,12 @@ impl Gen {
                 for a in args {
                     wat.push(' ');
                     wat.push_str(&self.value_expr(cx, a)?);
+                }
+                // Fill omitted trailing parameters with their defaults.
+                for i in args.len()..total {
+                    wat.push(' ');
+                    let d = defaults[i - required].clone();
+                    wat.push_str(&self.value_expr(cx, &d)?);
                 }
                 wat.push(')');
                 Ok(wat)

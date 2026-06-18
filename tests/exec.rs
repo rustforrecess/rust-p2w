@@ -1219,6 +1219,36 @@ fn comprehension_tuple_target() {
     );
 }
 
+// --- any() / all() and default arguments ---
+
+#[test]
+fn any_and_all() {
+    assert_output("print(any([0, 1, 0]), all([1, 1]))", "True True\n");
+    assert_output("print(any([0, 0]), all([1, 0]))", "False False\n");
+    assert_output("print(any([]), all([]))", "False True\n");
+}
+
+#[test]
+fn default_arguments() {
+    assert_output(
+        "def f(a, b=10):\n    return a + b\nprint(f(5), f(5, 1))",
+        "15 6\n",
+    );
+    assert_output(
+        "def g(x, y=2, z=3):\n    return x * 100 + y * 10 + z\nprint(g(1), g(1, 5), g(1, 5, 9))",
+        "123 153 159\n",
+    );
+}
+
+#[test]
+fn default_arguments_arity_errors() {
+    let err = rust_p2w::compile_to_wat("def f(a, b=1):\n    return a\nprint(f())").unwrap_err();
+    assert!(err.to_string().contains("takes 1 to 2 argument"), "{err}");
+    let err =
+        rust_p2w::compile_to_wat("def f(a, b=1):\n    return a\nprint(f(1, 2, 3))").unwrap_err();
+    assert!(err.to_string().contains("argument"), "{err}");
+}
+
 // --- float() ---
 
 #[test]
@@ -1514,6 +1544,12 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // dict .get / .pop and list .pop
     "d = {\"a\": 1, \"b\": 2}\nprint(d.get(\"a\"), d.get(\"z\"), d.get(\"z\", -1))\nprint(d.pop(\"a\"), d)\nprint(d.pop(\"z\", 99))",
     "xs = [10, 20, 30, 40]\nprint(xs.pop(), xs)\nprint(xs.pop(0), xs)",
+    // any() / all()
+    "print(any([0, 0, 1]), any([0, 0]), all([1, 1, 1]), all([1, 0]))\nprint(any([]), all([]))",
+    "print(any([x > 2 for x in [1, 2, 3]]), all([x > 0 for x in [1, 2, 3]]))",
+    // default arguments
+    "def greet(name, greeting=\"Hello\"):\n    return greeting + \", \" + name + \"!\"\nprint(greet(\"Sam\"))\nprint(greet(\"Sam\", \"Hi\"))",
+    "def f(a, b=1, c=2):\n    return a + b + c\nprint(f(10), f(10, 20), f(10, 20, 30))",
 ];
 
 fn find_python() -> Option<&'static str> {

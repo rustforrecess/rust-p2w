@@ -52,10 +52,13 @@ pub enum StmtKind {
     Break,
     /// `continue` (inside a loop)
     Continue,
-    /// `def name(params): ...` (top level only)
+    /// `def name(params): ...` (top level only). `defaults` holds the default
+    /// expressions for the trailing parameters (so `params[params.len() -
+    /// defaults.len() ..]` each have one).
     Def {
         name: String,
         params: Vec<String>,
+        defaults: Vec<Expr>,
         body: Vec<Stmt>,
     },
     /// `return [expr]` (inside a function; bare return yields None)
