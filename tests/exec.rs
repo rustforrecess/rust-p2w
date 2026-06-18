@@ -1249,6 +1249,30 @@ fn default_arguments_arity_errors() {
     assert!(err.to_string().contains("argument"), "{err}");
 }
 
+// --- math module ---
+
+#[test]
+fn math_module() {
+    assert_output("import math\nprint(math.sqrt(9.0))", "3.0\n");
+    assert_output(
+        "import math\nprint(math.floor(2.9), math.ceil(2.1))",
+        "2 3\n",
+    );
+    assert_output(
+        "import math\nprint(math.trunc(-4.8), math.fabs(-3.0))",
+        "-4 3.0\n",
+    );
+    assert_output("import math\nprint(math.pi)", "3.141592653589793\n");
+}
+
+#[test]
+fn math_errors() {
+    let err = rust_p2w::compile_to_wat("import os").unwrap_err();
+    assert!(err.to_string().contains("isn't available"), "{err}");
+    let err = rust_p2w::compile_to_wat("import math\nprint(math.nope(1))").unwrap_err();
+    assert!(err.to_string().contains("no function"), "{err}");
+}
+
 // --- min/max iterable, bool, round ---
 
 #[test]
@@ -1583,6 +1607,9 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(min([3, 1, 2]), max([3, 1, 2]), min(5, 2, 8), max(5, 2, 8))\nprint(min(\"banana\", \"apple\"), max([1.5, 2, 0.5]))",
     "print(bool(0), bool(1), bool(\"\"), bool(\"x\"), bool([]), bool([1]))",
     "print(round(2.5), round(3.5), round(2.4), round(-2.5), round(0.5))",
+    // math module (sqrt is correctly-rounded in both WASM and CPython)
+    "import math\nprint(math.sqrt(16), math.sqrt(2))\nprint(math.floor(3.7), math.ceil(3.2), math.trunc(-3.7))\nprint(math.fabs(-5.5))",
+    "import math\nprint(round(math.pi, 5), round(math.e, 5), int(math.sqrt(144)))",
 ];
 
 fn find_python() -> Option<&'static str> {

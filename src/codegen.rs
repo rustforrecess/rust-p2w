@@ -93,6 +93,19 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             g.classes.insert(name.clone(), base.clone());
         }
     }
+    for s in stmts {
+        if let StmtKind::Import(names) = &s.kind {
+            for m in names {
+                if m != "math" {
+                    return Err(CompileError::at(
+                        s.line,
+                        format!("module '{m}' isn't available (only 'math' for now)"),
+                    ));
+                }
+                g.imported.insert(m.clone());
+            }
+        }
+    }
 
     // Pass 2a: top-level statements become _start. Classes are built first
     // (their method tables must exist before any user code constructs an
@@ -3766,9 +3779,22 @@ struct Gen {
     /// Top-level Python variables, in definition order — WASM globals named
     /// `$g_<name>` so function bodies can read them.
     globals: Vec<String>,
+    /// Imported module names (only `math` is supported), so `math.sqrt(...)`
+    /// and `math.pi` resolve to built-in operations.
+    imported: std::collections::HashSet<String>,
 }
 
 impl Gen {
+    /// Whether `e` is a bare reference to an imported module (not shadowed by a
+    /// variable), e.g. the `math` in `math.sqrt(x)`.
+    fn is_module_ref(&self, cx: &FuncCx, e: &Expr) -> bool {
+        if let ExprKind::Name(m) = &e.kind {
+            self.imported.contains(m) && !cx.vars.contains_key(m) && !self.is_global(m)
+        } else {
+            false
+        }
+    }
+
     fn ensure_global(&mut self, name: &str) {
         if !self.globals.iter().any(|g| g == name) {
             self.globals.push(name.to_string());
@@ -3883,6 +3909,8 @@ impl Gen {
                 out.push(format!("(call $obj_setattr {o} {} {v})", str_lit(attr)));
                 Ok(())
             }
+            // Imports are recorded in pass 1; nothing to emit here.
+            StmtKind::Import(_) => Ok(()),
             StmtKind::UnpackAssign { targets, value } => {
                 self.type_of(cx, value)?;
                 let v = self.value_expr(cx, value)?;
@@ -4209,6 +4237,38 @@ impl Gen {
                 .collect(),
             body: b,
         })
+    }
+
+    /// `math.<fn>(args)`. sqrt/fabs return a float; floor/ceil/trunc return an
+    /// int (Python's behavior). WASM has native f64 ops for all of these.
+    fn gen_math_call(
+        &mut self,
+        cx: &mut FuncCx,
+        method: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<String> {
+        if args.len() != 1 {
+            return Err(CompileError::at(
+                line,
+                format!("math.{method}() takes one argument"),
+            ));
+        }
+        let x = self.value_expr(cx, &args[0])?;
+        let float = |op: &str| format!("(struct.new $FLOAT ({op} (call $unbox_f64 {x})))");
+        let to_int =
+            |op: &str| format!("(call $box (i32.trunc_sat_f64_s ({op} (call $unbox_f64 {x}))))");
+        match method {
+            "sqrt" => Ok(float("f64.sqrt")),
+            "fabs" => Ok(float("f64.abs")),
+            "floor" => Ok(to_int("f64.floor")),
+            "ceil" => Ok(to_int("f64.ceil")),
+            "trunc" => Ok(to_int("f64.trunc")),
+            _ => Err(CompileError::at(
+                line,
+                format!("math has no function '{method}'"),
+            )),
+        }
     }
 
     /// Build an `$LIST` from argument expressions (the method-call args
@@ -4843,6 +4903,18 @@ impl Gen {
                 Ok(format!("(call $py_slice {o} {s} {st} {sp})"))
             }
             ExprKind::Attr(obj, name) => {
+                // `math.pi` / `math.e` / `math.tau` — module constants.
+                if self.is_module_ref(cx, obj) {
+                    return match name.as_str() {
+                        "pi" => Ok("(struct.new $FLOAT (f64.const 3.141592653589793))".into()),
+                        "e" => Ok("(struct.new $FLOAT (f64.const 2.718281828459045))".into()),
+                        "tau" => Ok("(struct.new $FLOAT (f64.const 6.283185307179586))".into()),
+                        _ => Err(CompileError::at(
+                            e.line,
+                            format!("math has no attribute '{name}'"),
+                        )),
+                    };
+                }
                 let o = self.value_expr(cx, obj)?;
                 Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
             }
@@ -4906,6 +4978,10 @@ impl Gen {
                             str_lit(method)
                         ));
                     }
+                }
+                // `math.fn(...)` — a module function, not a value method.
+                if self.is_module_ref(cx, recv) {
+                    return self.gen_math_call(cx, method, args, e.line);
                 }
                 // String methods. Each helper falls back to method dispatch for
                 // a non-string receiver, so a class may reuse these names.
@@ -5449,7 +5525,10 @@ impl Gen {
                 Ok(Ty::Value)
             }
             ExprKind::Attr(obj, _) => {
-                self.type_of(cx, obj)?;
+                // A module attribute (`math.pi`) isn't a value-attr read.
+                if !self.is_module_ref(cx, obj) {
+                    self.type_of(cx, obj)?;
+                }
                 Ok(Ty::Value)
             }
             ExprKind::Dict(entries) => {
@@ -5480,7 +5559,10 @@ impl Gen {
             // here — checking happens during codegen where they're bound.
             ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => Ok(Ty::Value),
             ExprKind::MethodCall(recv, _, args) => {
-                self.type_of(cx, recv)?;
+                // A module receiver (`math`) isn't a value — don't type it.
+                if !self.is_module_ref(cx, recv) {
+                    self.type_of(cx, recv)?;
+                }
                 for a in args {
                     self.type_of(cx, a)?;
                 }

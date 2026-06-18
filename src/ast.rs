@@ -86,6 +86,8 @@ pub enum StmtKind {
     /// Tuple-unpacking assignment, e.g. `a, b = pair` or `a, b = b, a`. Each
     /// target is a `Name`, `Index`, or `Attr`; `value` is any iterable.
     UnpackAssign { targets: Vec<Expr>, value: Expr },
+    /// `import name[, name]*` (only `math` is supported for now).
+    Import(Vec<String>),
 }
 
 /// A method inside a class body. `params[0]` is conventionally `self`.

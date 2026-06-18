@@ -124,6 +124,34 @@ impl<'a> Parser<'a> {
         if self.is_keyword("class") {
             return self.class_stmt();
         }
+        if self.is_keyword("import") {
+            self.advance();
+            let mut names = Vec::new();
+            loop {
+                match self.peek().clone() {
+                    Tok::Name(m) => {
+                        self.advance();
+                        names.push(m);
+                    }
+                    other => {
+                        return Err(CompileError::at(
+                            self.line(),
+                            format!("expected a module name after 'import', found {other:?}"),
+                        ))
+                    }
+                }
+                if matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Tok::Newline, "a new line")?;
+            return Ok(Stmt {
+                kind: StmtKind::Import(names),
+                line,
+            });
+        }
         if self.is_keyword("return") {
             self.advance();
             let value = if matches!(self.peek(), Tok::Newline) {
