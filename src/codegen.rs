@@ -492,6 +492,18 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $raise_empty: min()/max() of an empty sequence.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "ValueError: arg is an empty sequence");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_empty".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $raise_float_parse: float() of a string that isn't a valid number.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
@@ -1474,21 +1486,91 @@ fn runtime_helpers() -> Vec<Func> {
     });
 
     // min/max return the winning ORIGINAL value (min(1, 2.0) is 1, an int).
-    for (name, cmp) in [("$py_min", "f64.le"), ("$py_max", "f64.ge")] {
+    // min/max reduce over an iterable (callers wrap multiple positional args in
+    // a list). Comparison via $sort_lt (lexicographic for strings, else
+    // numeric). Empty input is a ValueError. The winner keeps its original
+    // value/type (so min(1, 2.0) is the int 1).
+    for (name, take_when) in [
+        // min: take element when element < acc.
+        (
+            "$py_min",
+            "(call $sort_lt (local.get $el) (local.get $acc))",
+        ),
+        // max: take element when acc < element.
+        (
+            "$py_max",
+            "(call $sort_lt (local.get $acc) (local.get $el))",
+        ),
+    ] {
         let mut b = Body::new();
-        b.push(format!(
-            "(if (result (ref null eq)) ({cmp} (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))"
-        ));
-        b.push_in(1, "(then (local.get $a))");
-        b.push_in(1, "(else (local.get $b)))");
+        b.push("(local.set $n (call $py_len (local.get $seq)))");
+        b.push("(if (i32.eqz (local.get $n)) (then (call $raise_empty) (unreachable)))");
+        b.push("(local.set $acc (call $py_index (local.get $seq) (i32.const 0)))");
+        b.push("(local.set $i (i32.const 1))");
+        b.push("(block $d (loop $l");
+        b.push_in(2, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+        b.push_in(
+            2,
+            "(local.set $el (call $py_index (local.get $seq) (local.get $i)))",
+        );
+        b.push_in(
+            2,
+            format!("(if {take_when} (then (local.set $acc (local.get $el))))"),
+        );
+        b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(2, "(br $l)))");
+        b.push("(local.get $acc)");
         fs.push(Func {
-            signature: format!(
-                "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
-            ),
-            locals: vec![],
+            signature: format!("(func {name} (param $seq (ref null eq)) (result (ref null eq))"),
+            locals: vec![
+                "(local $n i32)".into(),
+                "(local $i i32)".into(),
+                "(local $acc (ref null eq))".into(),
+                "(local $el (ref null eq))".into(),
+            ],
             body: b,
         });
     }
+
+    // $py_bool: truthiness as a bool value.
+    let mut b = Body::new();
+    b.push("(call $bool (call $truthy (local.get $r)))");
+    fs.push(Func {
+        signature: "(func $py_bool (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_round1: round to the nearest integer, ties to even (f64.nearest is
+    // exactly Python's round()). $py_round2: round to n decimal places (float).
+    let mut b = Body::new();
+    b.push("(call $box (i32.trunc_sat_f64_s (f64.nearest (call $unbox_f64 (local.get $r)))))");
+    fs.push(Func {
+        signature: "(func $py_round1 (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(local.set $x (call $unbox_f64 (local.get $r)))");
+    b.push("(local.set $scale (f64.const 1))");
+    b.push("(if (i32.ge_s (local.get $n) (i32.const 0))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $i (i32.const 0))");
+    b.push_in(2, "(block $d (loop $l (br_if $d (i32.ge_s (local.get $i) (local.get $n))) (local.set $scale (f64.mul (local.get $scale) (f64.const 10))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l))))");
+    b.push_in(1, "(else");
+    b.push_in(2, "(local.set $i (i32.const 0))");
+    b.push_in(2, "(block $d2 (loop $l2 (br_if $d2 (i32.ge_s (local.get $i) (i32.sub (i32.const 0) (local.get $n)))) (local.set $scale (f64.mul (local.get $scale) (f64.const 0.1))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l2))))");
+    b.push(")");
+    b.push("(struct.new $FLOAT (f64.div (f64.nearest (f64.mul (local.get $x) (local.get $scale))) (local.get $scale)))");
+    fs.push(Func {
+        signature: "(func $py_round2 (param $r (ref null eq)) (param $n i32) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $x f64)".into(),
+            "(local $scale f64)".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
 
     // int(x): floats truncate toward zero; a string is parsed (so
     // int(input()) works); ints/bools pass through unbox.
@@ -5031,6 +5113,24 @@ impl Gen {
                             let seq = self.value_expr(cx, &args[0])?;
                             return Ok(format!("(call $py_all {seq})"));
                         }
+                        // min/max: one iterable, or several positional args.
+                        "min" | "max" if !args.is_empty() => {
+                            let seq = if args.len() == 1 {
+                                self.value_expr(cx, &args[0])?
+                            } else {
+                                self.list_of(cx, args)?
+                            };
+                            let h = if n == "min" { "$py_min" } else { "$py_max" };
+                            return Ok(format!("(call {h} {seq})"));
+                        }
+                        "round" if (1..=2).contains(&args.len()) => {
+                            let x = self.value_expr(cx, &args[0])?;
+                            if args.len() == 2 {
+                                let nd = self.i32_expr(cx, &args[1])?;
+                                return Ok(format!("(call $py_round2 {x} {nd})"));
+                            }
+                            return Ok(format!("(call $py_round1 {x})"));
+                        }
                         // input([prompt]) -> a line from stdin (newline
                         // stripped); a prompt is printed first.
                         "input" if args.len() <= 1 => {
@@ -5055,8 +5155,7 @@ impl Gen {
                         "float" => Some(("$py_float", 1, false)),
                         "abs" => Some(("$py_abs", 1, false)),
                         "int" => Some(("$py_int", 1, false)),
-                        "min" => Some(("$py_min", 2, false)),
-                        "max" => Some(("$py_max", 2, false)),
+                        "bool" => Some(("$py_bool", 1, false)),
                         _ => None,
                     };
                     if let Some((helper, arity, boxed_i32)) = builtin {

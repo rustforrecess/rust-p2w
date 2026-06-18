@@ -1249,6 +1249,35 @@ fn default_arguments_arity_errors() {
     assert!(err.to_string().contains("argument"), "{err}");
 }
 
+// --- min/max iterable, bool, round ---
+
+#[test]
+fn min_max_over_iterable_and_args() {
+    assert_output("print(min([4, 2, 7, 1]), max([4, 2, 7, 1]))", "1 7\n");
+    assert_output("print(min(3, 9, 1), max(3, 9, 1))", "1 9\n");
+    assert_output("print(min(\"cat\", \"ant\"))", "ant\n");
+}
+
+#[test]
+fn min_of_empty_raises() {
+    assert_raises("print(min([]))", "empty sequence");
+}
+
+#[test]
+fn bool_builtin() {
+    assert_output(
+        "print(bool(0), bool(3), bool(\"\"), bool([1]))",
+        "False True False True\n",
+    );
+}
+
+#[test]
+fn round_builtin() {
+    assert_output("print(round(2.5), round(3.5), round(-0.5))", "2 4 0\n"); // ties to even
+    assert_output("print(round(2.7), round(2.4))", "3 2\n");
+    assert_output("print(round(3.14159, 2))", "3.14\n");
+}
+
 // --- float() ---
 
 #[test]
@@ -1550,6 +1579,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // default arguments
     "def greet(name, greeting=\"Hello\"):\n    return greeting + \", \" + name + \"!\"\nprint(greet(\"Sam\"))\nprint(greet(\"Sam\", \"Hi\"))",
     "def f(a, b=1, c=2):\n    return a + b + c\nprint(f(10), f(10, 20), f(10, 20, 30))",
+    // min/max over an iterable or several args; bool(); round() to int
+    "print(min([3, 1, 2]), max([3, 1, 2]), min(5, 2, 8), max(5, 2, 8))\nprint(min(\"banana\", \"apple\"), max([1.5, 2, 0.5]))",
+    "print(bool(0), bool(1), bool(\"\"), bool(\"x\"), bool([]), bool([1]))",
+    "print(round(2.5), round(3.5), round(2.4), round(-2.5), round(0.5))",
 ];
 
 fn find_python() -> Option<&'static str> {
