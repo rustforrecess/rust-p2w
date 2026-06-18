@@ -3083,6 +3083,130 @@ fn runtime_helpers() -> Vec<Func> {
         });
     }
 
+    // $str_count: count non-overlapping occurrences of `sub`. $str_find:
+    // index of the first occurrence, or -1. Both fall back to method dispatch
+    // for a non-string receiver.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $subc (ref.cast (ref $STR) (local.get $sub)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $sl (array.len (local.get $subc)))");
+    b.push("(if (i32.eqz (local.get $sl)) (then (return (call $box (i32.add (local.get $n) (i32.const 1))))))");
+    b.push("(block $cd (loop $cl");
+    b.push_in(
+        2,
+        "(br_if $cd (i32.gt_s (i32.add (local.get $i) (local.get $sl)) (local.get $n)))",
+    );
+    b.push_in(
+        2,
+        "(if (call $str_match_at (local.get $ss) (local.get $i) (local.get $subc) (local.get $sl))",
+    );
+    b.push_in(
+        3,
+        "(then (local.set $cnt (i32.add (local.get $cnt) (i32.const 1))) (local.set $i (i32.add (local.get $i) (local.get $sl))))",
+    );
+    b.push_in(
+        3,
+        "(else (local.set $i (i32.add (local.get $i) (i32.const 1)))))",
+    );
+    b.push_in(2, "(br $cl)))");
+    b.push("(call $box (local.get $cnt))");
+    fs.push(Func {
+        signature:
+            "(func $str_count (param $s (ref null eq)) (param $sub (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $subc (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $sl i32)".into(),
+            "(local $i i32)".into(),
+            "(local $cnt i32)".into(),
+        ],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push_in(
+        1,
+        "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+    );
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $subc (ref.cast (ref $STR) (local.get $sub)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $sl (array.len (local.get $subc)))");
+    b.push("(block $fd (loop $fl");
+    b.push_in(
+        2,
+        "(br_if $fd (i32.gt_s (i32.add (local.get $i) (local.get $sl)) (local.get $n)))",
+    );
+    b.push_in(
+        2,
+        "(if (call $str_match_at (local.get $ss) (local.get $i) (local.get $subc) (local.get $sl)) (then (return (call $box (local.get $i)))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $fl)))");
+    b.push("(call $box (i32.const -1))");
+    fs.push(Func {
+        signature:
+            "(func $str_find (param $s (ref null eq)) (param $sub (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $subc (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $sl i32)".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $str_isdigit / $str_isalpha: non-empty and every char in the class.
+    for (fname, lo1, hi1, lo2, hi2) in [
+        ("$str_isdigit", 48, 57, 48, 57),
+        ("$str_isalpha", 65, 90, 97, 122),
+    ] {
+        let mut b = Body::new();
+        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+        b.push_in(
+            1,
+            "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
+        );
+        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+        b.push("(local.set $n (array.len (local.get $ss)))");
+        b.push("(if (i32.eqz (local.get $n)) (then (return (global.get $FALSE))))");
+        b.push("(block $d (loop $l");
+        b.push_in(2, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+        b.push_in(
+            2,
+            "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+        );
+        b.push_in(
+            2,
+            format!("(if (i32.eqz (i32.or (i32.and (i32.ge_u (local.get $c) (i32.const {lo1})) (i32.le_u (local.get $c) (i32.const {hi1}))) (i32.and (i32.ge_u (local.get $c) (i32.const {lo2})) (i32.le_u (local.get $c) (i32.const {hi2}))))) (then (return (global.get $FALSE))))"),
+        );
+        b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(2, "(br $l)))");
+        b.push("(global.get $TRUE)");
+        fs.push(Func {
+            signature: format!(
+                "(func {fname} (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![
+                "(local $ss (ref null $STR))".into(),
+                "(local $n i32)".into(),
+                "(local $i i32)".into(),
+                "(local $c i32)".into(),
+            ],
+            body: b,
+        });
+    }
+
     // $dict_remove_at / $list_remove_at: drop the entry at `idx`, shifting the
     // tail down (array.copy handles the overlap) and decrementing the count.
     let mut b = Body::new();
@@ -5015,6 +5139,30 @@ impl Gen {
                             "(call $str_join {r} {it} {} {argl})",
                             str_lit(method)
                         ));
+                    }
+                    "count" | "find" if args.len() == 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let sub = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        let helper = if method == "count" {
+                            "$str_count"
+                        } else {
+                            "$str_find"
+                        };
+                        return Ok(format!(
+                            "(call {helper} {r} {sub} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "isdigit" | "isalpha" if args.is_empty() => {
+                        let r = self.value_expr(cx, recv)?;
+                        let argl = self.list_of(cx, args)?;
+                        let helper = if method == "isdigit" {
+                            "$str_isdigit"
+                        } else {
+                            "$str_isalpha"
+                        };
+                        return Ok(format!("(call {helper} {r} {} {argl})", str_lit(method)));
                     }
                     "replace" if args.len() == 2 => {
                         let r = self.value_expr(cx, recv)?;

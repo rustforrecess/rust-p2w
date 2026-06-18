@@ -1402,6 +1402,22 @@ fn string_strip_case_join() {
 }
 
 #[test]
+fn string_count_find_classify() {
+    assert_output(
+        "print(\"banana\".count(\"a\"), \"banana\".count(\"na\"))",
+        "3 2\n",
+    );
+    assert_output(
+        "print(\"hello\".find(\"ll\"), \"hello\".find(\"x\"))",
+        "2 -1\n",
+    );
+    assert_output(
+        "print(\"42\".isdigit(), \"4a\".isdigit(), \"abc\".isalpha())",
+        "True False True\n",
+    );
+}
+
+#[test]
 fn string_replace_and_affix_tests() {
     assert_output("print(\"a.b.c\".replace(\".\", \"/\"))", "a/b/c\n");
     assert_output("print(\"aaaa\".replace(\"aa\", \"b\"))", "bb\n");
@@ -1628,6 +1644,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(sum(x * x for x in range(5)))\nprint(any(x > 3 for x in [1, 2, 3, 4]), all(x > 0 for x in [1, 2, 3]))",
     "print(max(len(w) for w in [\"a\", \"bbb\", \"cc\"]))\nprint(sorted(x % 3 for x in range(6)))",
     "words = [\"hi\", \"world\"]\nprint(\" \".join(w.upper() for w in words))",
+    // string count / find / isdigit / isalpha
+    "print(\"abracadabra\".count(\"a\"), \"abracadabra\".count(\"bra\"), \"xyz\".count(\"q\"))",
+    "print(\"hello world\".find(\"world\"), \"hello\".find(\"z\"))",
+    "print(\"123\".isdigit(), \"12a\".isdigit(), \"abc\".isalpha(), \"ab1\".isalpha(), \"\".isdigit())",
 ];
 
 fn find_python() -> Option<&'static str> {
