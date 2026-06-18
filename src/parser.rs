@@ -873,6 +873,16 @@ impl<'a> Parser<'a> {
                     return Ok(expr(ExprKind::Tuple(Vec::new())));
                 }
                 let first = self.expr(0)?;
+                // `(x for x in xs)` is a (parenthesized) generator expression,
+                // treated as an eager list here.
+                if self.is_keyword("for") {
+                    let clauses = self.comp_clauses()?;
+                    self.expect(&Tok::RParen, "')'")?;
+                    return Ok(expr(ExprKind::ListComp {
+                        element: Box::new(first),
+                        clauses,
+                    }));
+                }
                 // A comma makes it a tuple; otherwise it's a grouping paren.
                 if matches!(self.peek(), Tok::Comma) {
                     let mut items = vec![first];
@@ -977,7 +987,22 @@ impl<'a> Parser<'a> {
             return Ok(args);
         }
         loop {
-            args.push(self.expr(0)?);
+            let line = self.line();
+            let e = self.expr(0)?;
+            // A bare generator expression as the sole argument, e.g.
+            // `sum(x * x for x in xs)`, is treated as an (eager) list.
+            if args.is_empty() && self.is_keyword("for") {
+                let clauses = self.comp_clauses()?;
+                self.expect(&Tok::RParen, "')'")?;
+                return Ok(vec![Expr {
+                    kind: ExprKind::ListComp {
+                        element: Box::new(e),
+                        clauses,
+                    },
+                    line,
+                }]);
+            }
+            args.push(e);
             match self.peek() {
                 Tok::Comma => {
                     self.advance();

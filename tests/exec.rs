@@ -1249,6 +1249,20 @@ fn default_arguments_arity_errors() {
     assert!(err.to_string().contains("argument"), "{err}");
 }
 
+// --- generator expressions ---
+
+#[test]
+fn generator_expression_call_args() {
+    assert_output("print(sum(x * x for x in range(4)))", "14\n");
+    assert_output("print(max(x % 5 for x in [7, 12, 3]))", "3\n");
+    assert_output("print(\",\".join(str(i) for i in range(3)))", "0,1,2\n");
+}
+
+#[test]
+fn parenthesized_generator_expression() {
+    assert_output("g = (x + 1 for x in [10, 20])\nprint(sum(g))", "32\n");
+}
+
 // --- math module ---
 
 #[test]
@@ -1610,6 +1624,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     // math module (sqrt is correctly-rounded in both WASM and CPython)
     "import math\nprint(math.sqrt(16), math.sqrt(2))\nprint(math.floor(3.7), math.ceil(3.2), math.trunc(-3.7))\nprint(math.fabs(-5.5))",
     "import math\nprint(round(math.pi, 5), round(math.e, 5), int(math.sqrt(144)))",
+    // generator expressions as sole call arguments (materialized as lists)
+    "print(sum(x * x for x in range(5)))\nprint(any(x > 3 for x in [1, 2, 3, 4]), all(x > 0 for x in [1, 2, 3]))",
+    "print(max(len(w) for w in [\"a\", \"bbb\", \"cc\"]))\nprint(sorted(x % 3 for x in range(6)))",
+    "words = [\"hi\", \"world\"]\nprint(\" \".join(w.upper() for w in words))",
 ];
 
 fn find_python() -> Option<&'static str> {
