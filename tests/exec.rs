@@ -1243,10 +1243,44 @@ fn default_arguments() {
 #[test]
 fn default_arguments_arity_errors() {
     let err = rust_p2w::compile_to_wat("def f(a, b=1):\n    return a\nprint(f())").unwrap_err();
-    assert!(err.to_string().contains("takes 1 to 2 argument"), "{err}");
+    assert!(
+        err.to_string().contains("missing a required argument"),
+        "{err}"
+    );
     let err =
         rust_p2w::compile_to_wat("def f(a, b=1):\n    return a\nprint(f(1, 2, 3))").unwrap_err();
-    assert!(err.to_string().contains("argument"), "{err}");
+    assert!(err.to_string().contains("too many positional"), "{err}");
+}
+
+// --- keyword arguments ---
+
+#[test]
+fn keyword_arguments() {
+    assert_output(
+        "def f(a, b=2, c=3):\n    return a * 100 + b * 10 + c\nprint(f(1), f(1, c=9), f(c=9, a=1))",
+        "123 129 129\n",
+    );
+}
+
+#[test]
+fn keyword_argument_errors() {
+    let err = rust_p2w::compile_to_wat("def f(a):\n    return a\nprint(f(b=1))").unwrap_err();
+    assert!(
+        err.to_string().contains("unexpected keyword argument"),
+        "{err}"
+    );
+    let err = rust_p2w::compile_to_wat("def f(a, b):\n    return a\nprint(f(1, a=2))").unwrap_err();
+    assert!(err.to_string().contains("multiple values"), "{err}");
+    let err = rust_p2w::compile_to_wat("def f(a, b):\n    return a\nprint(f(b=2))").unwrap_err();
+    assert!(
+        err.to_string().contains("missing a required argument"),
+        "{err}"
+    );
+    let err = rust_p2w::compile_to_wat("def f(a, b):\n    return a\nprint(f(a=1, 2))").unwrap_err();
+    assert!(
+        err.to_string().contains("positional argument can't follow"),
+        "{err}"
+    );
 }
 
 // --- generator expressions ---
@@ -1648,6 +1682,9 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(\"abracadabra\".count(\"a\"), \"abracadabra\".count(\"bra\"), \"xyz\".count(\"q\"))",
     "print(\"hello world\".find(\"world\"), \"hello\".find(\"z\"))",
     "print(\"123\".isdigit(), \"12a\".isdigit(), \"abc\".isalpha(), \"ab1\".isalpha(), \"\".isdigit())",
+    // keyword arguments (order-independent; can skip a middle default)
+    "def rect(w, h=1, label=\"r\"):\n    return label + str(w * h)\nprint(rect(5), rect(5, 2), rect(5, label=\"x\"))\nprint(rect(w=4, h=3), rect(h=3, w=4))",
+    "def f(a, b, c):\n    return a * 100 + b * 10 + c\nprint(f(1, c=3, b=2), f(c=3, a=1, b=2))",
 ];
 
 fn find_python() -> Option<&'static str> {

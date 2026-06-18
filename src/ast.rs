@@ -124,7 +124,10 @@ pub enum ExprKind {
     Unary(UnOp, Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     /// A call by name, e.g. `print(...)`. Callee is a bare name for now.
+    /// Keyword arguments appear in the arg list as `Kwarg` entries.
     Call(String, Vec<Expr>),
+    /// A keyword argument `name=value`, only valid inside a call's arg list.
+    Kwarg(String, Box<Expr>),
     /// A list literal, e.g. `[1, 2, 3]`.
     List(Vec<Expr>),
     /// A tuple, e.g. `(1, 2)`, `(1,)`, `()`, or a bare `1, 2`. Immutable.

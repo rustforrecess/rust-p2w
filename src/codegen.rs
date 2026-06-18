@@ -72,6 +72,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                 ));
             }
             g.func_defaults.insert(name.clone(), defaults.clone());
+            g.func_params.insert(name.clone(), params.clone());
         }
     }
     for s in stmts {
@@ -3897,6 +3898,8 @@ struct Gen {
     /// Default-value expressions for the trailing parameters of each function
     /// (evaluated at the call site to fill omitted arguments).
     func_defaults: HashMap<String, Vec<Expr>>,
+    /// Parameter names of each function, for binding keyword arguments.
+    func_params: HashMap<String, Vec<String>>,
     /// User classes: name -> base class name (None if no base). Collected in
     /// pass 1 so `Cls(args)` construction is distinguished from a function call.
     classes: HashMap<String, Option<String>>,
@@ -5075,6 +5078,12 @@ impl Gen {
                 ))
             }
             ExprKind::MethodCall(recv, method, args) => {
+                if args.iter().any(|a| matches!(a.kind, ExprKind::Kwarg(..))) {
+                    return Err(CompileError::at(
+                        e.line,
+                        "keyword arguments aren't supported in method calls yet",
+                    ));
+                }
                 // `super().m(args)` dispatches from the enclosing class's base
                 // with the current `self` (resolved at compile time — v1 has
                 // no first-class super).
@@ -5257,6 +5266,10 @@ impl Gen {
                     ))
                 }
             }
+            ExprKind::Kwarg(..) => Err(CompileError::at(
+                e.line,
+                "keyword arguments can only appear in a function call",
+            )),
             ExprKind::Call(n, args) => {
                 if n == "print" {
                     return Err(CompileError::at(
@@ -5268,6 +5281,15 @@ impl Gen {
                     return Err(CompileError::at(
                         e.line,
                         "super() is only supported as super().method(...) in this subset",
+                    ));
+                }
+                // Keyword arguments are bound only for user functions (below).
+                if args.iter().any(|a| matches!(a.kind, ExprKind::Kwarg(..)))
+                    && !self.funcs.contains_key(n.as_str())
+                {
+                    return Err(CompileError::at(
+                        e.line,
+                        format!("keyword arguments aren't supported for '{n}'"),
                     ));
                 }
                 // Class construction: `Cls(args)` builds an instance and runs
@@ -5408,36 +5430,60 @@ impl Gen {
                 let Some(&total) = self.funcs.get(n) else {
                     return Err(CompileError::at(e.line, format!("unknown function '{n}'")));
                 };
-                // Clone the trailing default expressions so we can evaluate
-                // them at the call site without holding a borrow on self.
+                // Clone params/defaults so we can evaluate at the call site
+                // without holding a borrow on self.
+                let params = self.func_params.get(n).cloned().unwrap_or_default();
                 let defaults = self.func_defaults.get(n).cloned().unwrap_or_default();
                 let required = total - defaults.len();
-                if args.len() < required || args.len() > total {
-                    let want = if required == total {
-                        format!("{total}")
-                    } else {
-                        format!("{required} to {total}")
-                    };
-                    return Err(CompileError::at(
-                        e.line,
-                        format!(
-                            "{n}() takes {want} argument{} but {} {} given",
-                            if total == 1 { "" } else { "s" },
-                            args.len(),
-                            if args.len() == 1 { "was" } else { "were" }
-                        ),
-                    ));
-                }
-                let mut wat = format!("(call $f_{n}");
+
+                // Bind each parameter slot from positional args, then keyword
+                // args, then defaults (in parameter order for the WASM call).
+                let mut slots: Vec<Option<Expr>> = vec![None; total];
+                let mut npos = 0usize;
                 for a in args {
-                    wat.push(' ');
-                    wat.push_str(&self.value_expr(cx, a)?);
+                    if let ExprKind::Kwarg(k, v) = &a.kind {
+                        let Some(j) = params.iter().position(|p| p == k) else {
+                            return Err(CompileError::at(
+                                e.line,
+                                format!("{n}() got an unexpected keyword argument '{k}'"),
+                            ));
+                        };
+                        if slots[j].is_some() {
+                            return Err(CompileError::at(
+                                e.line,
+                                format!("{n}() got multiple values for argument '{k}'"),
+                            ));
+                        }
+                        slots[j] = Some((**v).clone());
+                    } else {
+                        if npos >= total {
+                            return Err(CompileError::at(
+                                e.line,
+                                format!("{n}() got too many positional arguments"),
+                            ));
+                        }
+                        slots[npos] = Some(a.clone());
+                        npos += 1;
+                    }
                 }
-                // Fill omitted trailing parameters with their defaults.
-                for i in args.len()..total {
+
+                let mut wat = format!("(call $f_{n}");
+                for (j, slot) in slots.into_iter().enumerate() {
+                    let bound = match slot {
+                        Some(ex) => ex,
+                        None if j >= required => defaults[j - required].clone(),
+                        None => {
+                            return Err(CompileError::at(
+                                e.line,
+                                format!(
+                                    "{n}() is missing a required argument '{}'",
+                                    params.get(j).map(|s| s.as_str()).unwrap_or("?")
+                                ),
+                            ))
+                        }
+                    };
                     wat.push(' ');
-                    let d = defaults[i - required].clone();
-                    wat.push_str(&self.value_expr(cx, &d)?);
+                    wat.push_str(&self.value_expr(cx, &bound)?);
                 }
                 wat.push(')');
                 Ok(wat)
@@ -5664,6 +5710,10 @@ impl Gen {
                 for a in args {
                     self.type_of(cx, a)?;
                 }
+                Ok(Ty::Value)
+            }
+            ExprKind::Kwarg(_, v) => {
+                self.type_of(cx, v)?;
                 Ok(Ty::Value)
             }
             ExprKind::List(elems) | ExprKind::Tuple(elems) => {
@@ -6003,7 +6053,7 @@ mod tests {
     fn def_error_cases() {
         // Arity mismatch is a compile error.
         let err = compile("def f(a):\n    return a\nprint(f(1, 2))\n").unwrap_err();
-        assert!(err.message.contains("takes 1 argument"));
+        assert!(err.message.contains("too many positional arguments"));
         // return at top level.
         assert!(compile("return 1\n")
             .unwrap_err()

@@ -986,8 +986,42 @@ impl<'a> Parser<'a> {
             self.advance();
             return Ok(args);
         }
+        let mut seen_kwarg = false;
         loop {
             let line = self.line();
+            // `name=value` is a keyword argument (but `name==value` is not).
+            if let (Tok::Name(k), Tok::Eq) = (self.peek().clone(), self.peek2().clone()) {
+                self.advance(); // name
+                self.advance(); // =
+                let value = self.expr(0)?;
+                args.push(Expr {
+                    kind: ExprKind::Kwarg(k, Box::new(value)),
+                    line,
+                });
+                seen_kwarg = true;
+                match self.peek() {
+                    Tok::Comma => {
+                        self.advance();
+                        if matches!(self.peek(), Tok::RParen) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Tok::RParen => break,
+                    other => {
+                        return Err(CompileError::at(
+                            self.line(),
+                            format!("expected ',' or ')' in call, found {other:?}"),
+                        ));
+                    }
+                }
+            }
+            if seen_kwarg {
+                return Err(CompileError::at(
+                    self.line(),
+                    "positional argument can't follow a keyword argument",
+                ));
+            }
             let e = self.expr(0)?;
             // A bare generator expression as the sole argument, e.g.
             // `sum(x * x for x in xs)`, is treated as an (eager) list.
@@ -1127,6 +1161,7 @@ fn set_lines(e: &mut Expr, line: usize) {
                 set_lines(a, line);
             }
         }
+        ExprKind::Kwarg(_, v) => set_lines(v, line),
         ExprKind::MethodCall(recv, _, args) => {
             set_lines(recv, line);
             for a in args {
@@ -1159,6 +1194,7 @@ fn contains_call(e: &Expr) -> bool {
             .iter()
             .any(|(k, v)| contains_call(k) || contains_call(v)),
         ExprKind::Attr(inner, _) => contains_call(inner),
+        ExprKind::Kwarg(_, v) => contains_call(v),
         ExprKind::Slice {
             obj,
             start,
