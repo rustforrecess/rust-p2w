@@ -9,6 +9,7 @@
 //! file for full attribution.
 
 mod ast;
+mod blockly;
 mod codegen;
 mod emit;
 mod error;
@@ -16,6 +17,7 @@ mod lexer;
 mod parser;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+pub use blockly::to_blockly_xml;
 pub use error::CompileError;
 
 /// Compile Python (the supported subset) to WebAssembly text (WAT).
