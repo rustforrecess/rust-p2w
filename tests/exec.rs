@@ -1286,6 +1286,28 @@ fn str_of_float_still_unsupported() {
     assert_raises("print(str([1.5]))", "str()"); // float element
 }
 
+// --- set operations ---
+
+#[test]
+fn set_operations() {
+    assert_output("print(sorted({1, 2, 3} | {3, 4, 5}))", "[1, 2, 3, 4, 5]\n");
+    assert_output("print(sorted({1, 2, 3} & {2, 3, 4}))", "[2, 3]\n");
+    assert_output("print(sorted({1, 2, 3} - {2}))", "[1, 3]\n");
+    assert_output("print(sorted({1, 2, 3} ^ {3, 4}))", "[1, 2, 4]\n");
+}
+
+#[test]
+fn set_op_augmented_and_precedence() {
+    assert_output("s = {1}\ns |= {2, 3}\nprint(sorted(s))", "[1, 2, 3]\n");
+    // & binds tighter than |
+    assert_output("print(sorted({1, 2} | {3} & {3, 9}))", "[1, 2, 3]\n");
+}
+
+#[test]
+fn set_op_on_non_set_is_an_error() {
+    assert_raises("print(1 | 2)", "set operation");
+}
+
 // --- f-string format specs ---
 
 #[test]
@@ -1785,6 +1807,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "seen = set()\nfor x in [1, 2, 2, 3, 1]:\n    seen.add(x)\nprint(len(seen), sorted(seen))",
     "print(sorted({x % 3 for x in range(10)}))\nprint(sorted(set(\"mississippi\")))",
     "print(len({1, 1, 2, 3, 3}), sorted({c for c in \"hello\"}))",
+    // set operations: union | / intersection & / difference - / sym-diff ^
+    "a = set([1, 2, 3, 4])\nb = set([3, 4, 5, 6])\nprint(sorted(a | b), sorted(a & b))\nprint(sorted(a - b), sorted(b - a), sorted(a ^ b))",
+    "s = {1, 2}\ns |= {2, 3, 4}\nprint(sorted(s))\nprint(sorted({1, 2, 3} - {2} | {5}))",
+    "print(sorted({1, 2, 3, 4} & {2, 4, 6}), sorted({1, 2} | {3} & {3, 4}))",
     // f-string format specs: precision, width, alignment, zero-pad
     "print(f\"{3.14159:.2f}\", f\"{3.14159:.4f}\")\nprint(f\"pi is about {3.14159:.3f}\")",
     "print(f\"[{42:5}]\", f\"[{42:<5}]\", f\"[{42:^5}]\", f\"[{7:03}]\")",

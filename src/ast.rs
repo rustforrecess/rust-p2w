@@ -187,6 +187,10 @@ pub enum BinOp {
     FloorDiv,
     Mod,
     Pow,
+    // Set operations (union / intersection / symmetric difference).
+    BitOr,
+    BitAnd,
+    BitXor,
     // Comparison (yield 0/1)
     Lt,
     Le,

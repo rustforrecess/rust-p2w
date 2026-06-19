@@ -29,6 +29,9 @@ pub enum Tok {
     Slash,
     SlashSlash,
     Percent,
+    Pipe,
+    Amp,
+    Caret,
 
     // Comparison
     Lt,
@@ -212,6 +215,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
             }
             '%' => {
                 let (tok, w) = aug_or(&chars, i, Tok::Percent, BinOp::Mod);
+                out.push(Token { tok, line });
+                i += w;
+            }
+            '|' => {
+                let (tok, w) = aug_or(&chars, i, Tok::Pipe, BinOp::BitOr);
+                out.push(Token { tok, line });
+                i += w;
+            }
+            '&' => {
+                let (tok, w) = aug_or(&chars, i, Tok::Amp, BinOp::BitAnd);
+                out.push(Token { tok, line });
+                i += w;
+            }
+            '^' => {
+                let (tok, w) = aug_or(&chars, i, Tok::Caret, BinOp::BitXor);
                 out.push(Token { tok, line });
                 i += w;
             }

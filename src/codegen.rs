@@ -514,6 +514,22 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $raise_setop: a set operator (|, &, ^, set - set) on a non-set.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        0,
+        "TypeError: unsupported operand type for a set operation (both sides must be sets)",
+    );
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_setop".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $raise_empty: min()/max() of an empty sequence.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
@@ -993,6 +1009,109 @@ fn runtime_helpers() -> Vec<Func> {
             "(func $set_eq (param $a (ref null $SET)) (param $b (ref null $SET)) (result i32)"
                 .into(),
         locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
+        body: b,
+    });
+
+    // $py_setop: union (0) / intersection (1) / symmetric difference (2) /
+    // difference (3). Both operands must be sets.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (i32.and (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b)))) (then (call $raise_setop) (unreachable)))");
+    b.push("(local.set $sa (ref.cast (ref $SET) (local.get $a)))");
+    b.push("(local.set $sb (ref.cast (ref $SET) (local.get $b)))");
+    b.push(
+        "(local.set $out (struct.new $SET (i32.const 0) (array.new_fixed $ITEMS 0) (i32.const 0)))",
+    );
+    // Union: every element of a, then of b.
+    b.push("(if (i32.eq (local.get $mode) (i32.const 0)) (then");
+    b.push_in(1, "(local.set $i (i32.const 0))");
+    b.push_in(1, "(block $ud (loop $ul");
+    b.push_in(
+        2,
+        "(br_if $ud (i32.ge_s (local.get $i) (struct.get $SET 0 (local.get $sa))))",
+    );
+    b.push_in(2, "(call $set_insert (local.get $out) (array.get $ITEMS (struct.get $SET 1 (local.get $sa)) (local.get $i)))");
+    b.push_in(
+        2,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $ul)))",
+    );
+    b.push_in(1, "(local.set $i (i32.const 0))");
+    b.push_in(1, "(block $ud2 (loop $ul2");
+    b.push_in(
+        2,
+        "(br_if $ud2 (i32.ge_s (local.get $i) (struct.get $SET 0 (local.get $sb))))",
+    );
+    b.push_in(2, "(call $set_insert (local.get $out) (array.get $ITEMS (struct.get $SET 1 (local.get $sb)) (local.get $i)))");
+    b.push_in(
+        2,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $ul2)))",
+    );
+    b.push("))");
+    // Intersection (1) / difference (3): elements of a that are / aren't in b.
+    b.push("(if (i32.or (i32.eq (local.get $mode) (i32.const 1)) (i32.eq (local.get $mode) (i32.const 3))) (then");
+    b.push_in(1, "(local.set $i (i32.const 0))");
+    b.push_in(1, "(block $id (loop $il");
+    b.push_in(
+        2,
+        "(br_if $id (i32.ge_s (local.get $i) (struct.get $SET 0 (local.get $sa))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $e (array.get $ITEMS (struct.get $SET 1 (local.get $sa)) (local.get $i)))",
+    );
+    b.push_in(2, "(local.set $found (i32.ge_s (call $set_find (local.get $sb) (local.get $e)) (i32.const 0)))");
+    // keep when (intersection & found) or (difference & !found)
+    b.push_in(2, "(if (i32.or (i32.and (i32.eq (local.get $mode) (i32.const 1)) (local.get $found)) (i32.and (i32.eq (local.get $mode) (i32.const 3)) (i32.eqz (local.get $found)))) (then (call $set_insert (local.get $out) (local.get $e))))");
+    b.push_in(
+        2,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $il)))",
+    );
+    b.push("))");
+    // Symmetric difference (2): (a - b) then (b - a).
+    b.push("(if (i32.eq (local.get $mode) (i32.const 2)) (then");
+    b.push_in(1, "(local.set $i (i32.const 0))");
+    b.push_in(1, "(block $xd (loop $xl");
+    b.push_in(
+        2,
+        "(br_if $xd (i32.ge_s (local.get $i) (struct.get $SET 0 (local.get $sa))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $e (array.get $ITEMS (struct.get $SET 1 (local.get $sa)) (local.get $i)))",
+    );
+    b.push_in(2, "(if (i32.lt_s (call $set_find (local.get $sb) (local.get $e)) (i32.const 0)) (then (call $set_insert (local.get $out) (local.get $e))))");
+    b.push_in(
+        2,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $xl)))",
+    );
+    b.push_in(1, "(local.set $i (i32.const 0))");
+    b.push_in(1, "(block $xd2 (loop $xl2");
+    b.push_in(
+        2,
+        "(br_if $xd2 (i32.ge_s (local.get $i) (struct.get $SET 0 (local.get $sb))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $e (array.get $ITEMS (struct.get $SET 1 (local.get $sb)) (local.get $i)))",
+    );
+    b.push_in(2, "(if (i32.lt_s (call $set_find (local.get $sa) (local.get $e)) (i32.const 0)) (then (call $set_insert (local.get $out) (local.get $e))))");
+    b.push_in(
+        2,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $xl2)))",
+    );
+    b.push("))");
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $py_setop (param $a (ref null eq)) (param $b (ref null eq)) (param $mode i32) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $sa (ref null $SET))".into(),
+            "(local $sb (ref null $SET))".into(),
+            "(local $out (ref null $SET))".into(),
+            "(local $i i32)".into(),
+            "(local $e (ref null eq))".into(),
+            "(local $found i32)".into(),
+        ],
         body: b,
     });
 
@@ -2578,6 +2697,10 @@ fn runtime_helpers() -> Vec<Func> {
         ("$py_mul", "f64.mul", "i32.mul", "__mul__"),
     ] {
         let mut b = Body::new();
+        // `set - set` is set difference (mode 3); other `-` is numeric.
+        if name == "$py_sub" {
+            b.push("(if (i32.and (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b))) (then (return (call $py_setop (local.get $a) (local.get $b) (i32.const 3)))))");
+        }
         b.push(format!(
             "(if (call $obj_has (local.get $a) {n}) (then (return (call $obj_call1 (local.get $a) (local.get $b) {n}))))",
             n = str_lit(dunder)
@@ -5399,6 +5522,18 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call $py_pow {lhs} {rhs})"))
             }
+            // Set operators: union / intersection / symmetric difference
+            // (modes 0/1/2). Both operands must be sets.
+            ExprKind::Bin(op @ (BinOp::BitOr | BinOp::BitXor | BinOp::BitAnd), a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                let mode = match op {
+                    BinOp::BitOr => 0,
+                    BinOp::BitAnd => 1,
+                    _ => 2,
+                };
+                Ok(format!("(call $py_setop {lhs} {rhs} (i32.const {mode}))"))
+            }
             ExprKind::Bin(BinOp::FloorDiv, a, b) => {
                 self.uses_floordiv = true;
                 let lhs = self.value_expr(cx, a)?;
@@ -6264,10 +6399,17 @@ impl Gen {
             ExprKind::Bin(op, a, b) => {
                 let (ta, tb) = (self.type_of(cx, a)?, self.type_of(cx, b)?);
                 match op {
-                    // Equality, membership, and and/or accept any mix.
-                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::In | BinOp::NotIn => {
-                        Ok(Ty::Value)
-                    }
+                    // Equality, membership, and/or, and set operators accept any
+                    // mix (the result isn't a plain number).
+                    BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::In
+                    | BinOp::NotIn
+                    | BinOp::BitOr
+                    | BinOp::BitAnd
+                    | BinOp::BitXor => Ok(Ty::Value),
                     // `+` concatenates strings or adds numbers — never across
                     // (only flagged when both sides are statically known).
                     BinOp::Add => match (ta, tb) {

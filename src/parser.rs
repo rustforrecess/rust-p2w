@@ -1147,8 +1147,13 @@ impl<'a> Parser<'a> {
             Tok::Ge => (BinOp::Ge, 7),
             Tok::EqEq => (BinOp::Eq, 7),
             Tok::BangEq => (BinOp::Ne, 7),
-            Tok::Plus => (BinOp::Add, 10),
-            Tok::Minus => (BinOp::Sub, 10),
+            // Set operators sit between comparisons and `+`/`-` (Python's
+            // order: `|` looser than `^` looser than `&`).
+            Tok::Pipe => (BinOp::BitOr, 8),
+            Tok::Caret => (BinOp::BitXor, 9),
+            Tok::Amp => (BinOp::BitAnd, 10),
+            Tok::Plus => (BinOp::Add, 12),
+            Tok::Minus => (BinOp::Sub, 12),
             Tok::Star => (BinOp::Mul, 20),
             Tok::Slash => (BinOp::Div, 20),
             Tok::SlashSlash => (BinOp::FloorDiv, 20),
