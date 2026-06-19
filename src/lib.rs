@@ -17,7 +17,7 @@ mod lexer;
 mod parser;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
-pub use blockly::to_blockly_xml;
+pub use blockly::to_blockly_json;
 pub use error::CompileError;
 
 /// Compile Python (the supported subset) to WebAssembly text (WAT).
