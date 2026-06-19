@@ -1286,6 +1286,17 @@ fn str_of_float_still_unsupported() {
     assert_raises("print(str([1.5]))", "str()"); // float element
 }
 
+// --- more string methods ---
+
+#[test]
+fn string_case_strip_zfill() {
+    assert_output("print(\"hello WORLD\".capitalize())", "Hello world\n");
+    assert_output("print(\"a nice day\".title())", "A Nice Day\n");
+    assert_output("print(\"[\" + \"  x  \".lstrip() + \"]\")", "[x  ]\n");
+    assert_output("print(\"[\" + \"  x  \".rstrip() + \"]\")", "[  x]\n");
+    assert_output("print(\"42\".zfill(5), \"-3\".zfill(4))", "00042 -003\n");
+}
+
 // --- str.format() ---
 
 #[test]
@@ -1898,6 +1909,9 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(\"abracadabra\".count(\"a\"), \"abracadabra\".count(\"bra\"), \"xyz\".count(\"q\"))",
     "print(\"hello world\".find(\"world\"), \"hello\".find(\"z\"))",
     "print(\"123\".isdigit(), \"12a\".isdigit(), \"abc\".isalpha(), \"ab1\".isalpha(), \"\".isdigit())",
+    // capitalize / title / lstrip / rstrip / zfill
+    "print(\"hello world\".capitalize(), \"hello world\".title())\nprint(\"the QUICK fox\".title())",
+    "print(\"  hi  \".lstrip() + \"|\", \"|\" + \"  hi  \".rstrip())\nprint(\"5\".zfill(3), \"-5\".zfill(3), \"+7\".zfill(4))",
     // keyword arguments (order-independent; can skip a middle default)
     "def rect(w, h=1, label=\"r\"):\n    return label + str(w * h)\nprint(rect(5), rect(5, 2), rect(5, label=\"x\"))\nprint(rect(w=4, h=3), rect(h=3, w=4))",
     "def f(a, b, c):\n    return a * 100 + b * 10 + c\nprint(f(1, c=3, b=2), f(c=3, a=1, b=2))",

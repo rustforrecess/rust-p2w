@@ -4148,6 +4148,168 @@ fn runtime_helpers() -> Vec<Func> {
         });
     }
 
+    // $str_capitalize: first char upper, the rest lower.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $out (array.new_default $STR (local.get $n)))");
+    b.push("(block $d (loop $l");
+    b.push_in(1, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+    );
+    b.push_in(1, "(if (i32.eqz (local.get $i))");
+    b.push_in(2, "(then (if (i32.and (i32.ge_u (local.get $c) (i32.const 97)) (i32.le_u (local.get $c) (i32.const 122))) (then (local.set $c (i32.sub (local.get $c) (i32.const 32))))))");
+    b.push_in(2, "(else (if (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))) (then (local.set $c (i32.add (local.get $c) (i32.const 32)))))))");
+    b.push_in(
+        1,
+        "(array.set $STR (local.get $out) (local.get $i) (local.get $c))",
+    );
+    b.push_in(
+        1,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
+    );
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $str_capitalize (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $c i32)".into(),
+            "(local $out (ref null $STR))".into(),
+        ],
+        body: b,
+    });
+
+    // $str_title: first letter of each word upper, the rest lower.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $out (array.new_default $STR (local.get $n)))");
+    b.push("(block $d (loop $l");
+    b.push_in(1, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+    );
+    b.push_in(1, "(local.set $al (i32.or (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))) (i32.and (i32.ge_u (local.get $c) (i32.const 97)) (i32.le_u (local.get $c) (i32.const 122)))))");
+    b.push_in(1, "(if (local.get $al)");
+    b.push_in(2, "(then (if (i32.eqz (local.get $prev))");
+    b.push_in(3, "(then (if (i32.and (i32.ge_u (local.get $c) (i32.const 97)) (i32.le_u (local.get $c) (i32.const 122))) (then (local.set $c (i32.sub (local.get $c) (i32.const 32))))))");
+    b.push_in(3, "(else (if (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))) (then (local.set $c (i32.add (local.get $c) (i32.const 32)))))))))");
+    b.push_in(
+        1,
+        "(array.set $STR (local.get $out) (local.get $i) (local.get $c))",
+    );
+    b.push_in(1, "(local.set $prev (local.get $al))");
+    b.push_in(
+        1,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
+    );
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $str_title (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $c i32)".into(),
+            "(local $al i32)".into(),
+            "(local $prev i32)".into(),
+            "(local $out (ref null $STR))".into(),
+        ],
+        body: b,
+    });
+
+    // $str_lstrip / $str_rstrip: one-sided whitespace trim.
+    for (fname, left) in [("$str_lstrip", true), ("$str_rstrip", false)] {
+        let mut b = Body::new();
+        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+        b.push("(local.set $n (array.len (local.get $ss)))");
+        b.push("(local.set $start (i32.const 0))");
+        b.push("(local.set $end (local.get $n))");
+        if left {
+            b.push("(block $d (loop $l");
+            b.push_in(
+                1,
+                "(br_if $d (i32.ge_s (local.get $start) (local.get $end)))",
+            );
+            b.push_in(1, "(br_if $d (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (local.get $start)))))");
+            b.push_in(
+                1,
+                "(local.set $start (i32.add (local.get $start) (i32.const 1))) (br $l)))",
+            );
+        } else {
+            b.push("(block $d (loop $l");
+            b.push_in(
+                1,
+                "(br_if $d (i32.le_s (local.get $end) (local.get $start)))",
+            );
+            b.push_in(1, "(br_if $d (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (i32.sub (local.get $end) (i32.const 1))))))");
+            b.push_in(
+                1,
+                "(local.set $end (i32.sub (local.get $end) (i32.const 1))) (br $l)))",
+            );
+        }
+        b.push("(call $str_sub (local.get $ss) (local.get $start) (i32.sub (local.get $end) (local.get $start)))");
+        fs.push(Func {
+            signature: format!(
+                "(func {fname} (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            ),
+            locals: vec![
+                "(local $ss (ref null $STR))".into(),
+                "(local $n i32)".into(),
+                "(local $start i32)".into(),
+                "(local $end i32)".into(),
+            ],
+            body: b,
+        });
+    }
+
+    // $str_zfill: pad with leading zeros to `width`, keeping a leading sign.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $w (call $unbox (local.get $wv)))");
+    b.push("(if (i32.ge_s (local.get $n) (local.get $w)) (then (return (local.get $ss))))");
+    b.push("(local.set $out (array.new_default $STR (local.get $w)))");
+    b.push("(array.fill $STR (local.get $out) (i32.const 0) (i32.const 48) (local.get $w))");
+    // a leading + or - stays in front, zeros after it
+    b.push("(local.set $c (if (result i32) (i32.gt_s (local.get $n) (i32.const 0)) (then (array.get_u $STR (local.get $ss) (i32.const 0))) (else (i32.const 0))))");
+    b.push("(if (i32.or (i32.eq (local.get $c) (i32.const 43)) (i32.eq (local.get $c) (i32.const 45)))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(array.set $STR (local.get $out) (i32.const 0) (local.get $c))",
+    );
+    b.push_in(2, "(array.copy $STR $STR (local.get $out) (i32.add (i32.sub (local.get $w) (local.get $n)) (i32.const 1)) (local.get $ss) (i32.const 1) (i32.sub (local.get $n) (i32.const 1))))");
+    b.push_in(1, "(else");
+    b.push_in(2, "(array.copy $STR $STR (local.get $out) (i32.sub (local.get $w) (local.get $n)) (local.get $ss) (i32.const 0) (local.get $n))))");
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $str_zfill (param $s (ref null eq)) (param $wv (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $w i32)".into(),
+            "(local $c i32)".into(),
+            "(local $out (ref null $STR))".into(),
+        ],
+        body: b,
+    });
+
     // $dict_remove_at / $list_remove_at: drop the entry at `idx`, shifting the
     // tail down (array.copy handles the overlap) and decrementing the count.
     let mut b = Body::new();
@@ -6161,11 +6323,22 @@ impl Gen {
                 // String methods. Each helper falls back to method dispatch for
                 // a non-string receiver, so a class may reuse these names.
                 match method.as_str() {
-                    "upper" | "lower" | "strip" if args.is_empty() => {
+                    "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "capitalize" | "title"
+                        if args.is_empty() =>
+                    {
                         let r = self.value_expr(cx, recv)?;
                         let argl = self.list_of(cx, args)?;
                         return Ok(format!(
                             "(call $str_{method} {r} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "zfill" if args.len() == 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let w = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $str_zfill {r} {w} {} {argl})",
                             str_lit(method)
                         ));
                     }
