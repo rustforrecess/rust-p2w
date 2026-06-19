@@ -1286,6 +1286,38 @@ fn str_of_float_still_unsupported() {
     assert_raises("print(str([1.5]))", "str()"); // float element
 }
 
+// --- dict and set methods ---
+
+#[test]
+fn dict_update_clear_setdefault() {
+    assert_output(
+        "d = {\"a\": 1}\nd.update({\"a\": 9, \"b\": 2})\nprint(d)",
+        "{'a': 9, 'b': 2}\n",
+    );
+    assert_output(
+        "d = {}\nprint(d.setdefault(\"x\", 5), d.setdefault(\"x\", 7))",
+        "5 5\n",
+    );
+    assert_output(
+        "d = {\"a\": 1, \"b\": 2}\nd.clear()\nprint(d, len(d))",
+        "{} 0\n",
+    );
+}
+
+#[test]
+fn set_algebra_methods() {
+    assert_output("print(sorted({1, 2, 3}.union({3, 4})))", "[1, 2, 3, 4]\n");
+    assert_output(
+        "print(sorted({1, 2, 3}.intersection([2, 3, 4])))",
+        "[2, 3]\n",
+    );
+    assert_output("print(sorted({1, 2, 3}.difference({2})))", "[1, 3]\n");
+    assert_output(
+        "print({1, 2}.issubset({1, 2, 3}), {1, 2, 3}.issuperset({1, 2}), {1, 5}.issubset({1, 2}))",
+        "True True False\n",
+    );
+}
+
 // --- list methods ---
 
 #[test]
@@ -1860,6 +1892,11 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print([1, 2, 2, 3, 2].count(2), [\"a\", \"b\", \"c\"].index(\"b\"))\nprint((1, 2, 3).count(2), (5, 6, 7).index(7))",
     "words = [\"banana\", \"apple\", \"cherry\"]\nwords.sort()\nprint(words)\nnums = [5, 3, 8, 1]\nnums.sort()\nprint(nums, nums.index(8))",
     "print(\"banana\".count(\"a\"), \"banana\".find(\"na\"), \"banana\".index(\"ana\"))",
+    // set methods (accept iterables) + subset/superset
+    "a = {1, 2, 3}\nb = {2, 3, 4}\nprint(sorted(a.union(b)), sorted(a.intersection(b)))\nprint(sorted(a.difference(b)), sorted(a.symmetric_difference(b)))",
+    "print({1, 2, 3}.issubset({1, 2, 3, 4}), {1, 2, 3}.issuperset({1, 2}), {1, 2}.issubset({1, 2, 3}))\nprint(sorted({1, 2}.union([3, 4, 2])))",
+    // dict methods
+    "d = {\"a\": 1}\nd.update({\"b\": 2, \"a\": 10})\nprint(d)\nd.setdefault(\"c\", 3)\nd.setdefault(\"a\", 99)\nprint(d, d.setdefault(\"a\"))\nd.clear()\nprint(d, len(d))",
     // f-string format specs: precision, width, alignment, zero-pad
     "print(f\"{3.14159:.2f}\", f\"{3.14159:.4f}\")\nprint(f\"pi is about {3.14159:.3f}\")",
     "print(f\"[{42:5}]\", f\"[{42:<5}]\", f\"[{42:^5}]\", f\"[{7:03}]\")",

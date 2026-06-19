@@ -1127,6 +1127,98 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $set_method: set.union/intersection/symmetric_difference/difference
+    // (modes 0/1/2/3 — like the operators but accepting any iterable) and
+    // issubset/issuperset (modes 4/5 -> bool). Non-set falls back to dispatch.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $SET) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(if (i32.lt_s (local.get $mode) (i32.const 4)) (then (return (call $py_setop (local.get $r) (call $py_set (local.get $o)) (local.get $mode)))))");
+    b.push("(local.set $rs (ref.cast (ref $SET) (local.get $r)))");
+    b.push("(local.set $os (ref.cast (ref $SET) (call $py_set (local.get $o))))");
+    // mode 5 = issuperset (swap roles); else issubset. Either way every element
+    // of $rs must then be in $os.
+    b.push("(if (i32.eq (local.get $mode) (i32.const 5)) (then (local.set $tmp (local.get $rs)) (local.set $rs (local.get $os)) (local.set $os (local.get $tmp))))");
+    b.push("(local.set $n (struct.get $SET 0 (local.get $rs)))");
+    b.push("(block $d (loop $l");
+    b.push_in(1, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(1, "(if (i32.lt_s (call $set_find (local.get $os) (array.get $ITEMS (struct.get $SET 1 (local.get $rs)) (local.get $i))) (i32.const 0)) (then (return (global.get $FALSE))))");
+    b.push_in(
+        1,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
+    );
+    b.push("(global.get $TRUE)");
+    fs.push(Func {
+        signature:
+            "(func $set_method (param $r (ref null eq)) (param $o (ref null eq)) (param $mode i32) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $rs (ref null $SET))".into(),
+            "(local $os (ref null $SET))".into(),
+            "(local $tmp (ref null $SET))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $dict_update: merge another dict's entries (overwriting).
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $DICT) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $od (ref.cast (ref $DICT) (local.get $o)))");
+    b.push("(local.set $n (struct.get $DICT 0 (local.get $od)))");
+    b.push("(block $d (loop $l");
+    b.push_in(1, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(1, "(call $dict_set (local.get $r) (array.get $ITEMS (struct.get $DICT 1 (local.get $od)) (local.get $i)) (array.get $ITEMS (struct.get $DICT 2 (local.get $od)) (local.get $i)))");
+    b.push_in(
+        1,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
+    );
+    b.push("(global.get $NONE)");
+    fs.push(Func {
+        signature:
+            "(func $dict_update (param $r (ref null eq)) (param $o (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $od (ref null $DICT))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $dict_clear: empty the dict in place.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $DICT) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(struct.set $DICT 0 (ref.cast (ref $DICT) (local.get $r)) (i32.const 0))");
+    b.push("(global.get $NONE)");
+    fs.push(Func {
+        signature:
+            "(func $dict_clear (param $r (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $dict_setdefault: return d[key] if present, else insert key=default and
+    // return default.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $DICT) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $dd (ref.cast (ref $DICT) (local.get $r)))");
+    b.push("(local.set $idx (call $dict_find (local.get $dd) (local.get $key)))");
+    b.push("(if (i32.ge_s (local.get $idx) (i32.const 0)) (then (return (array.get $ITEMS (struct.get $DICT 2 (local.get $dd)) (local.get $idx)))))");
+    b.push("(call $dict_set (local.get $r) (local.get $key) (local.get $default))");
+    b.push("(local.get $default)");
+    fs.push(Func {
+        signature:
+            "(func $dict_setdefault (param $r (ref null eq)) (param $key (ref null eq)) (param $default (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $dd (ref null $DICT))".into(),
+            "(local $idx i32)".into(),
+        ],
+        body: b,
+    });
+
     // $print_set: `{e1, e2}` (insertion order); empty prints `set()`.
     let mut b = Body::new();
     b.push("(local.set $n (struct.get $SET 0 (local.get $s)))");
@@ -6018,6 +6110,60 @@ impl Gen {
                         let argl = self.list_of(cx, args)?;
                         return Ok(format!(
                             "(call $list_insert {r} {iv} {x} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    // set algebra methods (accept any iterable).
+                    "union"
+                    | "intersection"
+                    | "difference"
+                    | "symmetric_difference"
+                    | "issubset"
+                    | "issuperset"
+                        if args.len() == 1 =>
+                    {
+                        let r = self.value_expr(cx, recv)?;
+                        let o = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        let mode = match method.as_str() {
+                            "union" => 0,
+                            "intersection" => 1,
+                            "symmetric_difference" => 2,
+                            "difference" => 3,
+                            "issubset" => 4,
+                            _ => 5,
+                        };
+                        return Ok(format!(
+                            "(call $set_method {r} {o} (i32.const {mode}) {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    // dict methods.
+                    "update" if args.len() == 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let o = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $dict_update {r} {o} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "clear" if args.is_empty() => {
+                        let r = self.value_expr(cx, recv)?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!("(call $dict_clear {r} {} {argl})", str_lit(method)));
+                    }
+                    "setdefault" if (1..=2).contains(&args.len()) => {
+                        let r = self.value_expr(cx, recv)?;
+                        let key = self.value_expr(cx, &args[0])?;
+                        let default = if args.len() == 2 {
+                            self.value_expr(cx, &args[1])?
+                        } else {
+                            "(global.get $NONE)".to_string()
+                        };
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $dict_setdefault {r} {key} {default} {} {argl})",
                             str_lit(method)
                         ));
                     }
