@@ -514,6 +514,18 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $raise_not_found: .index() of a value that isn't present.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "ValueError: value is not in the sequence");
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_not_found".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $raise_setop: a set operator (|, &, ^, set - set) on a non-set.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
@@ -3259,6 +3271,225 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $list_sort: in-place insertion sort (matches sorted()'s comparison).
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $LIST) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ll (ref.cast (ref $LIST) (local.get $r)))");
+    b.push("(local.set $items (struct.get $LIST 1 (local.get $ll)))");
+    b.push("(local.set $n (struct.get $LIST 0 (local.get $ll)))");
+    b.push("(local.set $i (i32.const 1))");
+    b.push("(block $od (loop $ol");
+    b.push_in(1, "(br_if $od (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(local.set $key (array.get $ITEMS (local.get $items) (local.get $i)))",
+    );
+    b.push_in(1, "(local.set $j (i32.sub (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(block $id (loop $il");
+    b.push_in(2, "(br_if $id (i32.lt_s (local.get $j) (i32.const 0)))");
+    b.push_in(2, "(br_if $id (i32.eqz (call $sort_lt (local.get $key) (array.get $ITEMS (local.get $items) (local.get $j)))))");
+    b.push_in(2, "(array.set $ITEMS (local.get $items) (i32.add (local.get $j) (i32.const 1)) (array.get $ITEMS (local.get $items) (local.get $j)))");
+    b.push_in(
+        2,
+        "(local.set $j (i32.sub (local.get $j) (i32.const 1))) (br $il)))",
+    );
+    b.push_in(1, "(array.set $ITEMS (local.get $items) (i32.add (local.get $j) (i32.const 1)) (local.get $key))");
+    b.push_in(
+        1,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $ol)))",
+    );
+    b.push("(global.get $NONE)");
+    fs.push(Func {
+        signature:
+            "(func $list_sort (param $r (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ll (ref null $LIST))".into(),
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $j i32)".into(),
+            "(local $key (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
+    // $list_reverse: reverse in place.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $LIST) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ll (ref.cast (ref $LIST) (local.get $r)))");
+    b.push("(local.set $items (struct.get $LIST 1 (local.get $ll)))");
+    b.push("(local.set $lo (i32.const 0))");
+    b.push("(local.set $hi (i32.sub (struct.get $LIST 0 (local.get $ll)) (i32.const 1)))");
+    b.push("(block $d (loop $l");
+    b.push_in(1, "(br_if $d (i32.ge_s (local.get $lo) (local.get $hi)))");
+    b.push_in(
+        1,
+        "(local.set $key (array.get $ITEMS (local.get $items) (local.get $lo)))",
+    );
+    b.push_in(1, "(array.set $ITEMS (local.get $items) (local.get $lo) (array.get $ITEMS (local.get $items) (local.get $hi)))");
+    b.push_in(
+        1,
+        "(array.set $ITEMS (local.get $items) (local.get $hi) (local.get $key))",
+    );
+    b.push_in(1, "(local.set $lo (i32.add (local.get $lo) (i32.const 1)))");
+    b.push_in(
+        1,
+        "(local.set $hi (i32.sub (local.get $hi) (i32.const 1))) (br $l)))",
+    );
+    b.push("(global.get $NONE)");
+    fs.push(Func {
+        signature:
+            "(func $list_reverse (param $r (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ll (ref null $LIST))".into(),
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $lo i32)".into(),
+            "(local $hi i32)".into(),
+            "(local $key (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
+    // $list_extend: append every element of an iterable.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $LIST) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $n (call $py_len (local.get $it)))");
+    b.push("(block $d (loop $l");
+    b.push_in(1, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(drop (call $list_append (local.get $r) (call $py_index (local.get $it) (local.get $i))))",
+    );
+    b.push_in(
+        1,
+        "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
+    );
+    b.push("(global.get $NONE)");
+    fs.push(Func {
+        signature:
+            "(func $list_extend (param $r (ref null eq)) (param $it (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
+        body: b,
+    });
+
+    // $list_insert: insert before index `iv` (clamped like Python).
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $LIST) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ll (ref.cast (ref $LIST) (local.get $r)))");
+    b.push("(local.set $n (struct.get $LIST 0 (local.get $ll)))");
+    b.push("(local.set $idx (call $unbox (local.get $iv)))");
+    b.push("(if (i32.lt_s (local.get $idx) (i32.const 0)) (then (local.set $idx (i32.add (local.get $idx) (local.get $n))) (if (i32.lt_s (local.get $idx) (i32.const 0)) (then (local.set $idx (i32.const 0))))))");
+    b.push(
+        "(if (i32.gt_s (local.get $idx) (local.get $n)) (then (local.set $idx (local.get $n))))",
+    );
+    // grow if full
+    b.push("(local.set $items (struct.get $LIST 1 (local.get $ll)))");
+    b.push("(if (i32.ge_s (local.get $n) (array.len (local.get $items)))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $new (array.new_default $ITEMS (i32.shl (i32.add (array.len (local.get $items)) (i32.const 4)) (i32.const 1))))");
+    b.push_in(2, "(array.copy $ITEMS $ITEMS (local.get $new) (i32.const 0) (local.get $items) (i32.const 0) (local.get $n))");
+    b.push_in(2, "(struct.set $LIST 1 (local.get $ll) (local.get $new))");
+    b.push_in(2, "(local.set $items (local.get $new))))");
+    // shift [idx..n) right by one, then place
+    b.push("(array.copy $ITEMS $ITEMS (local.get $items) (i32.add (local.get $idx) (i32.const 1)) (local.get $items) (local.get $idx) (i32.sub (local.get $n) (local.get $idx)))");
+    b.push("(array.set $ITEMS (local.get $items) (local.get $idx) (local.get $x))");
+    b.push("(struct.set $LIST 0 (local.get $ll) (i32.add (local.get $n) (i32.const 1)))");
+    b.push("(global.get $NONE)");
+    fs.push(Func {
+        signature:
+            "(func $list_insert (param $r (ref null eq)) (param $iv (ref null eq)) (param $x (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ll (ref null $LIST))".into(),
+            "(local $items (ref null $ITEMS))".into(),
+            "(local $new (ref null $ITEMS))".into(),
+            "(local $n i32)".into(),
+            "(local $idx i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $py_count: element count (list/tuple) or substring count (str); else
+    // method dispatch.
+    let mut b = Body::new();
+    for (tycheck, ty) in [("$LIST", "$LIST"), ("$TUPLE", "$TUPLE")] {
+        let _ = tycheck;
+        b.push(format!("(if (ref.test (ref {ty}) (local.get $r))"));
+        b.push_in(1, "(then");
+        b.push_in(
+            2,
+            format!("(local.set $n (struct.get {ty} 0 (ref.cast (ref {ty}) (local.get $r))))"),
+        );
+        b.push_in(
+            2,
+            "(local.set $i (i32.const 0)) (local.set $cnt (i32.const 0))",
+        );
+        b.push_in(2, "(block $d (loop $l");
+        b.push_in(3, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+        b.push_in(3, format!("(if (call $py_eq (array.get $ITEMS (struct.get {ty} 1 (ref.cast (ref {ty}) (local.get $r))) (local.get $i)) (local.get $v)) (then (local.set $cnt (i32.add (local.get $cnt) (i32.const 1)))))"));
+        b.push_in(
+            3,
+            "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
+        );
+        b.push_in(2, "(return (call $box (local.get $cnt)))");
+        b.push_in(1, "))");
+    }
+    b.push("(call $str_count (local.get $r) (local.get $v) (local.get $name) (local.get $args))");
+    fs.push(Func {
+        signature:
+            "(func $py_count (param $r (ref null eq)) (param $v (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $cnt i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $py_index_of: first index of an element (list/tuple) or substring (str);
+    // ValueError if absent; else method dispatch.
+    let mut b = Body::new();
+    for ty in ["$LIST", "$TUPLE"] {
+        b.push(format!("(if (ref.test (ref {ty}) (local.get $r))"));
+        b.push_in(1, "(then");
+        b.push_in(
+            2,
+            format!("(local.set $n (struct.get {ty} 0 (ref.cast (ref {ty}) (local.get $r))))"),
+        );
+        b.push_in(2, "(local.set $i (i32.const 0))");
+        b.push_in(2, "(block $d (loop $l");
+        b.push_in(3, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
+        b.push_in(3, format!("(if (call $py_eq (array.get $ITEMS (struct.get {ty} 1 (ref.cast (ref {ty}) (local.get $r))) (local.get $i)) (local.get $v)) (then (return (call $box (local.get $i)))))"));
+        b.push_in(
+            3,
+            "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
+        );
+        b.push_in(2, "(call $raise_not_found) (unreachable)");
+        b.push_in(1, "))");
+    }
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $res (call $str_find (local.get $r) (local.get $v) (local.get $name) (local.get $args)))");
+    b.push_in(2, "(if (i32.lt_s (call $unbox (local.get $res)) (i32.const 0)) (then (call $raise_not_found) (unreachable)))");
+    b.push_in(2, "(return (local.get $res))");
+    b.push_in(1, "))");
+    b.push("(call $call_method (local.get $r) (local.get $name) (local.get $args))");
+    fs.push(Func {
+        signature:
+            "(func $py_index_of (param $r (ref null eq)) (param $v (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $res (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
     // $is_space: ASCII whitespace test (space, tab, newline, carriage return).
     let mut b = Body::new();
     b.push("(i32.or (i32.or (i32.eq (local.get $c) (i32.const 32)) (i32.eq (local.get $c) (i32.const 9))) (i32.or (i32.eq (local.get $c) (i32.const 10)) (i32.eq (local.get $c) (i32.const 13))))");
@@ -5744,17 +5975,49 @@ impl Gen {
                             str_lit(method)
                         ));
                     }
-                    "count" | "find" if args.len() == 1 => {
+                    // count: element (list/tuple) or substring (str); find:
+                    // substring (str); index: element/substring with ValueError.
+                    "count" | "find" | "index" if args.len() == 1 => {
                         let r = self.value_expr(cx, recv)?;
                         let sub = self.value_expr(cx, &args[0])?;
                         let argl = self.list_of(cx, args)?;
-                        let helper = if method == "count" {
-                            "$str_count"
-                        } else {
-                            "$str_find"
+                        let helper = match method.as_str() {
+                            "count" => "$py_count",
+                            "find" => "$str_find",
+                            _ => "$py_index_of",
                         };
                         return Ok(format!(
                             "(call {helper} {r} {sub} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    // in-place list methods.
+                    "sort" | "reverse" if args.is_empty() => {
+                        let r = self.value_expr(cx, recv)?;
+                        let argl = self.list_of(cx, args)?;
+                        let helper = if method == "sort" {
+                            "$list_sort"
+                        } else {
+                            "$list_reverse"
+                        };
+                        return Ok(format!("(call {helper} {r} {} {argl})", str_lit(method)));
+                    }
+                    "extend" if args.len() == 1 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let it = self.value_expr(cx, &args[0])?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $list_extend {r} {it} {} {argl})",
+                            str_lit(method)
+                        ));
+                    }
+                    "insert" if args.len() == 2 => {
+                        let r = self.value_expr(cx, recv)?;
+                        let iv = self.value_expr(cx, &args[0])?;
+                        let x = self.value_expr(cx, &args[1])?;
+                        let argl = self.list_of(cx, args)?;
+                        return Ok(format!(
+                            "(call $list_insert {r} {iv} {x} {} {argl})",
                             str_lit(method)
                         ));
                     }

@@ -1286,6 +1286,50 @@ fn str_of_float_still_unsupported() {
     assert_raises("print(str([1.5]))", "str()"); // float element
 }
 
+// --- list methods ---
+
+#[test]
+fn list_sort_reverse() {
+    assert_output("xs = [3, 1, 2]\nxs.sort()\nprint(xs)", "[1, 2, 3]\n");
+    assert_output("xs = [1, 2, 3]\nxs.reverse()\nprint(xs)", "[3, 2, 1]\n");
+    assert_output(
+        "w = [\"pear\", \"apple\", \"fig\"]\nw.sort()\nprint(w)",
+        "['apple', 'fig', 'pear']\n",
+    );
+}
+
+#[test]
+fn list_insert_extend() {
+    assert_output(
+        "xs = [1, 2, 3]\nxs.insert(1, 99)\nprint(xs)",
+        "[1, 99, 2, 3]\n",
+    );
+    assert_output(
+        "xs = [1]\nxs.insert(0, 0)\nxs.insert(99, 5)\nprint(xs)",
+        "[0, 1, 5]\n",
+    );
+    assert_output(
+        "xs = [1, 2]\nxs.extend([3, 4])\nprint(xs)",
+        "[1, 2, 3, 4]\n",
+    );
+}
+
+#[test]
+fn list_count_index() {
+    assert_output("print([1, 2, 2, 3, 2].count(2))", "3\n");
+    assert_output("print([10, 20, 30].index(20))", "1\n");
+    assert_raises("print([1, 2, 3].index(9))", "not in the sequence");
+}
+
+#[test]
+fn str_index_and_count_still_work() {
+    assert_output(
+        "print(\"banana\".count(\"a\"), \"banana\".index(\"nan\"))",
+        "3 2\n",
+    );
+    assert_raises("print(\"abc\".index(\"z\"))", "not in the sequence");
+}
+
 // --- set operations ---
 
 #[test]
@@ -1811,6 +1855,11 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "a = set([1, 2, 3, 4])\nb = set([3, 4, 5, 6])\nprint(sorted(a | b), sorted(a & b))\nprint(sorted(a - b), sorted(b - a), sorted(a ^ b))",
     "s = {1, 2}\ns |= {2, 3, 4}\nprint(sorted(s))\nprint(sorted({1, 2, 3} - {2} | {5}))",
     "print(sorted({1, 2, 3, 4} & {2, 4, 6}), sorted({1, 2} | {3} & {3, 4}))",
+    // list methods: sort, reverse, insert, extend, count, index
+    "xs = [3, 1, 2]\nxs.sort()\nprint(xs)\nxs.reverse()\nprint(xs)\nxs.insert(1, 99)\nprint(xs)\nxs.extend([7, 8])\nprint(xs)",
+    "print([1, 2, 2, 3, 2].count(2), [\"a\", \"b\", \"c\"].index(\"b\"))\nprint((1, 2, 3).count(2), (5, 6, 7).index(7))",
+    "words = [\"banana\", \"apple\", \"cherry\"]\nwords.sort()\nprint(words)\nnums = [5, 3, 8, 1]\nnums.sort()\nprint(nums, nums.index(8))",
+    "print(\"banana\".count(\"a\"), \"banana\".find(\"na\"), \"banana\".index(\"ana\"))",
     // f-string format specs: precision, width, alignment, zero-pad
     "print(f\"{3.14159:.2f}\", f\"{3.14159:.4f}\")\nprint(f\"pi is about {3.14159:.3f}\")",
     "print(f\"[{42:5}]\", f\"[{42:<5}]\", f\"[{42:^5}]\", f\"[{7:03}]\")",
