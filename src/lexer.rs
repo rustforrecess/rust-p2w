@@ -14,9 +14,11 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
-    /// An f-string, split into parts: (is_expression, text). Literal parts
-    /// are ready text; expression parts are raw source the parser re-parses.
-    FStr(Vec<(bool, String)>),
+    /// An f-string, split into parts: (is_expression, text, format_spec).
+    /// Literal parts are ready text; expression parts are raw source the parser
+    /// re-parses, with an optional format spec (the part after `:`, empty if
+    /// none).
+    FStr(Vec<(bool, String, String)>),
     Name(String),
 
     // Arithmetic
@@ -445,23 +447,27 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize),
     Ok((Tok::Int(n), i))
 }
 
-/// Lex `f"...{expr}..."` into (is_expression, text) parts. `{{`/`}}` are
-/// literal braces; format specs (`{x:...}`) and nested braces are not
-/// supported yet.
+/// Lex `f"...{expr[:spec]}..."` into (is_expression, text, spec) parts.
+/// `{{`/`}}` are literal braces. Bracket depth is tracked so a slice colon
+/// (`{xs[1:3]}`) and nested braces (`{ {1:2} }`) aren't mistaken for a spec.
+///
+/// Each part is `(is_expression, text, format_spec)`.
+type FStrParts = Vec<(bool, String, String)>;
+
 fn lex_fstring(
     chars: &[char],
     start: usize,
     line: usize,
-) -> Result<(Vec<(bool, String)>, usize), CompileError> {
+) -> Result<(FStrParts, usize), CompileError> {
     let quote = chars[start];
     let mut i = start + 1;
-    let mut parts: Vec<(bool, String)> = Vec::new();
+    let mut parts: Vec<(bool, String, String)> = Vec::new();
     let mut lit = String::new();
     while i < chars.len() {
         let c = chars[i];
         if c == quote {
             if !lit.is_empty() {
-                parts.push((false, lit));
+                parts.push((false, lit, String::new()));
             }
             return Ok((parts, i + 1));
         }
@@ -475,27 +481,36 @@ fn lex_fstring(
                 continue;
             }
             if !lit.is_empty() {
-                parts.push((false, std::mem::take(&mut lit)));
+                parts.push((false, std::mem::take(&mut lit), String::new()));
             }
             let expr_start = i + 1;
             let mut j = expr_start;
-            while j < chars.len() && chars[j] != '}' && chars[j] != quote && chars[j] != '\n' {
-                if chars[j] == ':' {
-                    return Err(CompileError::at(
-                        line,
-                        "format specifiers like {x:.2f} aren't supported yet",
-                    ));
+            let mut depth = 0i32;
+            let mut colon: Option<usize> = None;
+            while j < chars.len() && chars[j] != quote && chars[j] != '\n' {
+                match chars[j] {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    '}' if depth == 0 => break,
+                    '}' => depth -= 1,
+                    ':' if depth == 0 && colon.is_none() => colon = Some(j),
+                    _ => {}
                 }
                 j += 1;
             }
             if j >= chars.len() || chars[j] != '}' {
                 return Err(CompileError::at(line, "missing '}' in f-string"));
             }
-            let src: String = chars[expr_start..j].iter().collect();
+            let end = colon.unwrap_or(j);
+            let src: String = chars[expr_start..end].iter().collect();
             if src.trim().is_empty() {
                 return Err(CompileError::at(line, "empty expression in f-string"));
             }
-            parts.push((true, src));
+            let spec: String = match colon {
+                Some(ci) => chars[ci + 1..j].iter().collect(),
+                None => String::new(),
+            };
+            parts.push((true, src, spec));
             i = j + 1;
             continue;
         }

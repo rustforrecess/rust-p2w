@@ -1252,6 +1252,33 @@ fn default_arguments_arity_errors() {
     assert!(err.to_string().contains("too many positional"), "{err}");
 }
 
+// --- f-string format specs ---
+
+#[test]
+fn fstring_format_specs() {
+    assert_output("print(f\"{3.14159:.2f}\")", "3.14\n");
+    assert_output("print(f\"{1.5:.0f}\")", "2\n"); // ties to even
+    assert_output("print(f\"[{42:5}]\")", "[   42]\n");
+    assert_output("print(f\"[{42:<5}]\")", "[42   ]\n");
+    assert_output("print(f\"[{42:^5}]\")", "[ 42  ]\n");
+    assert_output("print(f\"[{7:03}]\")", "[007]\n");
+    assert_output("print(f\"[{'hi':>6}]\")", "[    hi]\n");
+}
+
+#[test]
+fn format_builtin_and_slice_colon_not_a_spec() {
+    assert_output("print(format(255, \"d\"))", "255\n");
+    assert_output("print(format(3.14159, \".3f\"))", "3.142\n");
+    // a slice colon inside an f-string field is NOT a format spec
+    assert_output("xs = [1, 2, 3, 4]\nprint(f\"{xs[1:3][0]}\")", "2\n");
+}
+
+#[test]
+fn bad_format_spec_is_an_error() {
+    let err = rust_p2w::compile_to_wat("x = 1\nprint(f\"{x:q}\")").unwrap_err();
+    assert!(err.to_string().contains("unsupported format"), "{err}");
+}
+
 // --- sets ---
 
 #[test]
@@ -1724,6 +1751,12 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "seen = set()\nfor x in [1, 2, 2, 3, 1]:\n    seen.add(x)\nprint(len(seen), sorted(seen))",
     "print(sorted({x % 3 for x in range(10)}))\nprint(sorted(set(\"mississippi\")))",
     "print(len({1, 1, 2, 3, 3}), sorted({c for c in \"hello\"}))",
+    // f-string format specs: precision, width, alignment, zero-pad
+    "print(f\"{3.14159:.2f}\", f\"{3.14159:.4f}\")\nprint(f\"pi is about {3.14159:.3f}\")",
+    "print(f\"[{42:5}]\", f\"[{42:<5}]\", f\"[{42:^5}]\", f\"[{7:03}]\")",
+    "print(f\"[{'hi':>6}]\", f\"[{'hi':<6}]\", f\"[{'hi':^6}]\")",
+    "n = 5\nprint(f\"{n} squared is {n * n:d}\")\nprint(f\"{255:d} {0:03d}\")",
+    "print(format(7, \"03\"), format(3.5, \".1f\"), format(\"ab\", \">5\"))",
 ];
 
 fn find_python() -> Option<&'static str> {

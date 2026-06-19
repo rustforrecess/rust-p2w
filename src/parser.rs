@@ -849,10 +849,24 @@ impl<'a> Parser<'a> {
                 // part is a Str, each {expr} part re-parses as a real
                 // expression wrapped in str().
                 let mut acc: Option<Expr> = None;
-                for (is_expr, text) in parts {
+                for (is_expr, text, spec) in parts {
                     let piece = if is_expr {
                         let inner = parse_fragment(&text, line)?;
-                        expr(ExprKind::Call("str".into(), vec![inner]))
+                        if spec.is_empty() {
+                            expr(ExprKind::Call("str".into(), vec![inner]))
+                        } else {
+                            // `{x:spec}` -> format(x, "spec")
+                            expr(ExprKind::Call(
+                                "format".into(),
+                                vec![
+                                    inner,
+                                    Expr {
+                                        kind: ExprKind::Str(spec),
+                                        line,
+                                    },
+                                ],
+                            ))
+                        }
                     } else {
                         expr(ExprKind::Str(text))
                     };

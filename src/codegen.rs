@@ -1692,6 +1692,105 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $f64_to_fixed: format a float with `prec` decimal places (rounded ties to
+    // even via f64.nearest), e.g. (3.14159, 2) -> "3.14". Assembled from pieces
+    // with $py_add. (Values whose scaled magnitude exceeds i32 saturate.)
+    let mut b = Body::new();
+    b.push("(local.set $neg (f64.lt (local.get $x) (f64.const 0)))");
+    b.push("(if (local.get $neg) (then (local.set $x (f64.neg (local.get $x)))))");
+    // scale = 10^prec (f64 and i32)
+    b.push("(local.set $scale (f64.const 1))");
+    b.push("(local.set $sci (i32.const 1))");
+    b.push("(local.set $k (i32.const 0))");
+    b.push("(block $sd (loop $sl");
+    b.push_in(2, "(br_if $sd (i32.ge_s (local.get $k) (local.get $prec)))");
+    b.push_in(
+        2,
+        "(local.set $scale (f64.mul (local.get $scale) (f64.const 10)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $sci (i32.mul (local.get $sci) (i32.const 10)))",
+    );
+    b.push_in(2, "(local.set $k (i32.add (local.get $k) (i32.const 1)))");
+    b.push_in(2, "(br $sl)))");
+    b.push("(local.set $scaled (i32.trunc_sat_f64_s (f64.nearest (f64.mul (local.get $x) (local.get $scale)))))");
+    b.push("(local.set $ip (i32.div_s (local.get $scaled) (local.get $sci)))");
+    b.push("(local.set $fp (i32.rem_s (local.get $scaled) (local.get $sci)))");
+    b.push("(local.set $res (call $i32_to_str (local.get $ip)))");
+    b.push("(if (i32.gt_s (local.get $prec) (i32.const 0))");
+    b.push_in(1, "(then");
+    // fracarr: prec digits, zero-padded, filled right-to-left
+    b.push_in(
+        2,
+        "(local.set $frac (array.new_default $STR (local.get $prec)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $k (i32.sub (local.get $prec) (i32.const 1)))",
+    );
+    b.push_in(2, "(block $fd (loop $fl");
+    b.push_in(3, "(br_if $fd (i32.lt_s (local.get $k) (i32.const 0)))");
+    b.push_in(
+        3,
+        "(array.set $STR (local.get $frac) (local.get $k) (i32.add (i32.const 48) (i32.rem_u (local.get $fp) (i32.const 10))))",
+    );
+    b.push_in(
+        3,
+        "(local.set $fp (i32.div_u (local.get $fp) (i32.const 10)))",
+    );
+    b.push_in(3, "(local.set $k (i32.sub (local.get $k) (i32.const 1)))");
+    b.push_in(3, "(br $fl)))");
+    b.push_in(
+        2,
+        "(local.set $res (call $py_add (call $py_add (local.get $res) (array.new_fixed $STR 1 (i32.const 46))) (local.get $frac)))",
+    );
+    b.push_in(1, "))");
+    b.push("(if (local.get $neg) (then (local.set $res (call $py_add (array.new_fixed $STR 1 (i32.const 45)) (local.get $res)))))");
+    b.push("(local.get $res)");
+    fs.push(Func {
+        signature: "(func $f64_to_fixed (param $x f64) (param $prec i32) (result (ref null eq))"
+            .into(),
+        locals: vec![
+            "(local $neg i32)".into(),
+            "(local $scale f64)".into(),
+            "(local $sci i32)".into(),
+            "(local $scaled i32)".into(),
+            "(local $ip i32)".into(),
+            "(local $fp i32)".into(),
+            "(local $k i32)".into(),
+            "(local $res (ref null eq))".into(),
+            "(local $frac (ref null $STR))".into(),
+        ],
+        body: b,
+    });
+
+    // $str_pad: pad a string to `width` with `fill`, aligned (0=left/1=right/
+    // 2=center). Returns the string unchanged if already wide enough.
+    let mut b = Body::new();
+    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
+    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(if (i32.ge_s (local.get $n) (local.get $width)) (then (return (local.get $ss))))");
+    b.push("(local.set $pad (i32.sub (local.get $width) (local.get $n)))");
+    b.push("(local.set $lp (if (result i32) (i32.eq (local.get $align) (i32.const 1)) (then (local.get $pad)) (else (if (result i32) (i32.eq (local.get $align) (i32.const 2)) (then (i32.div_s (local.get $pad) (i32.const 2))) (else (i32.const 0))))))");
+    b.push("(local.set $out (array.new_default $STR (local.get $width)))");
+    b.push("(array.fill $STR (local.get $out) (i32.const 0) (local.get $fill) (local.get $width))");
+    b.push("(array.copy $STR $STR (local.get $out) (local.get $lp) (local.get $ss) (i32.const 0) (local.get $n))");
+    b.push("(local.get $out)");
+    fs.push(Func {
+        signature:
+            "(func $str_pad (param $s (ref null eq)) (param $width i32) (param $fill i32) (param $align i32) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $ss (ref null $STR))".into(),
+            "(local $n i32)".into(),
+            "(local $pad i32)".into(),
+            "(local $lp i32)".into(),
+            "(local $out (ref null $STR))".into(),
+        ],
+        body: b,
+    });
+
     // $py_abs: float-aware absolute value.
     let mut b = Body::new();
     b.push("(if (result (ref null eq)) (ref.test (ref $FLOAT) (local.get $r))");
@@ -5616,6 +5715,49 @@ impl Gen {
                             };
                             return Ok(format!("(call $py_set {it})"));
                         }
+                        // format(value, "spec") — spec must be a string literal
+                        // (always is, from an f-string `{x:spec}`).
+                        "format" if args.len() == 2 => {
+                            let v = self.value_expr(cx, &args[0])?;
+                            let ExprKind::Str(spec) = &args[1].kind else {
+                                return Err(CompileError::at(
+                                    e.line,
+                                    "the format spec must be a string literal",
+                                ));
+                            };
+                            let (is_float, prec, width, fill, align) =
+                                parse_format_spec(spec).map_err(|m| CompileError::at(e.line, m))?;
+                            if is_float {
+                                let base = format!(
+                                    "(call $f64_to_fixed (call $unbox_f64 {v}) (i32.const {prec}))"
+                                );
+                                if width == 0 {
+                                    return Ok(base);
+                                }
+                                return Ok(format!(
+                                    "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (i32.const {align}))"
+                                ));
+                            }
+                            if width == 0 {
+                                return Ok(format!("(call $to_str {v})"));
+                            }
+                            if align == 3 {
+                                // Auto-align: numbers right, everything else
+                                // left — decided at runtime from the value type.
+                                let t = cx.scratch_local(VAL);
+                                let base = format!("(call $to_str (local.tee ${t} {v}))");
+                                let numeric = format!(
+                                    "(i32.or (i32.or (ref.test (ref i31) (local.get ${t})) (ref.test (ref $INT) (local.get ${t}))) (i32.or (ref.test (ref $BOOL) (local.get ${t})) (ref.test (ref $FLOAT) (local.get ${t}))))"
+                                );
+                                return Ok(format!(
+                                    "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (if (result i32) {numeric} (then (i32.const 1)) (else (i32.const 0))))"
+                                ));
+                            }
+                            let base = format!("(call $to_str {v})");
+                            return Ok(format!(
+                                "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (i32.const {align}))"
+                            ));
+                        }
                         // min/max: one iterable, or several positional args.
                         "min" | "max" if !args.is_empty() => {
                             let seq = if args.len() == 1 {
@@ -5818,6 +5960,77 @@ fn cmp_helper(op: BinOp) -> Option<&'static str> {
 
 fn emit_char(out: &mut Body, byte: u8) {
     out.push(format!("(call $write_char (i32.const {byte}))"));
+}
+
+/// Parse a (subset of the) Python format mini-language into
+/// `(is_float, precision, width, fill_char_code, align)` where align is
+/// 0=left, 1=right, 2=center. Supports `[[fill]align][0][width][.prec][type]`
+/// with type in `f`/`d`/`s` (or none).
+fn parse_format_spec(spec: &str) -> std::result::Result<(bool, i32, i32, i32, i32), String> {
+    let cs: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    let is_align = |c: char| matches!(c, '<' | '>' | '^');
+    let mut fill = ' ';
+    let mut align: Option<char> = None;
+    if cs.len() >= 2 && is_align(cs[1]) {
+        fill = cs[0];
+        align = Some(cs[1]);
+        i = 2;
+    } else if !cs.is_empty() && is_align(cs[0]) {
+        align = Some(cs[0]);
+        i = 1;
+    }
+    // `0` zero-pad (right-aligns numbers, fills with '0').
+    if i < cs.len() && cs[i] == '0' {
+        if align.is_none() {
+            align = Some('>');
+            fill = '0';
+        }
+        i += 1;
+    }
+    let mut width = 0i32;
+    while i < cs.len() && cs[i].is_ascii_digit() {
+        width = width * 10 + (cs[i] as i32 - '0' as i32);
+        i += 1;
+    }
+    let mut prec: Option<i32> = None;
+    if i < cs.len() && cs[i] == '.' {
+        i += 1;
+        let start = i;
+        let mut p = 0i32;
+        while i < cs.len() && cs[i].is_ascii_digit() {
+            p = p * 10 + (cs[i] as i32 - '0' as i32);
+            i += 1;
+        }
+        if i == start {
+            return Err("format precision needs a number after '.'".into());
+        }
+        prec = Some(p);
+    }
+    let mut ty = '\0';
+    if i < cs.len() {
+        ty = cs[i];
+        i += 1;
+    }
+    if i != cs.len() {
+        return Err(format!("unsupported format spec '{spec}'"));
+    }
+    if !matches!(ty, '\0' | 'f' | 'd' | 's') {
+        return Err(format!("unsupported format type '{ty}' in '{spec}'"));
+    }
+    let is_float = ty == 'f' || (prec.is_some() && ty != 'd' && ty != 's');
+    let prec_v = prec.unwrap_or(if ty == 'f' { 6 } else { 0 });
+    let align_code = match align {
+        Some('<') => 0,
+        Some('^') => 2,
+        Some('>') => 1,
+        // Default: floats/`d` right-align; `s` left; a bare width with no type
+        // is resolved at runtime by the value's type (code 3 = auto).
+        _ if ty == 'd' || is_float => 1,
+        _ if ty == 's' => 0,
+        _ => 3,
+    };
+    Ok((is_float, prec_v, width, fill as i32, align_code))
 }
 
 /// WAT for a `$STR` literal from Rust bytes (used for attribute/method-name
