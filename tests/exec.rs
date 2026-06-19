@@ -650,14 +650,12 @@ fn abs_min_max_int_builtins() {
 
 #[test]
 fn fstring_and_str_error_cases() {
+    // str(float) is still unsupported; str(list) now works.
     assert_raises(
         "print(str(2.5))",
         "TypeError: str() of 'float' values isn't supported yet",
     );
-    assert_raises(
-        "print(str([1]))",
-        "TypeError: str() of 'list' values isn't supported yet",
-    );
+    assert_output("print(str([1, 2]))", "[1, 2]\n");
 }
 
 // --- the in operator ---
@@ -1252,6 +1250,42 @@ fn default_arguments_arity_errors() {
     assert!(err.to_string().contains("too many positional"), "{err}");
 }
 
+// --- str() / repr() of collections ---
+
+#[test]
+fn str_of_collections() {
+    assert_output("print(str([1, 2, 3]))", "[1, 2, 3]\n");
+    assert_output("print(str((1,)))", "(1,)\n");
+    assert_output("print(str({\"a\": 1}))", "{'a': 1}\n");
+    assert_output(
+        "print(str([1, \"x\", True, None]))",
+        "[1, 'x', True, None]\n",
+    );
+    assert_output("print(\"v=\" + str([1, 2]))", "v=[1, 2]\n");
+    assert_output("print(f\"{[1, 2, 3]}\")", "[1, 2, 3]\n"); // bare f-string of a list
+}
+
+#[test]
+fn str_of_set_insertion_order_and_repr() {
+    // Our sets are insertion-ordered (direct test, not differential).
+    assert_output("print(str(set([3, 1, 2])))", "{3, 1, 2}\n");
+    assert_output("print(repr(\"hi\"), repr(5))", "'hi' 5\n");
+}
+
+#[test]
+fn str_of_object_uses_dunder() {
+    assert_output(
+        "class P:\n    def __repr__(self):\n        return \"P!\"\nprint(str(P()))\nprint(f\"{P()}\")",
+        "P!\nP!\n",
+    );
+}
+
+#[test]
+fn str_of_float_still_unsupported() {
+    assert_raises("print(str(3.14))", "str()");
+    assert_raises("print(str([1.5]))", "str()"); // float element
+}
+
 // --- f-string format specs ---
 
 #[test]
@@ -1757,6 +1791,12 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print(f\"[{'hi':>6}]\", f\"[{'hi':<6}]\", f\"[{'hi':^6}]\")",
     "n = 5\nprint(f\"{n} squared is {n * n:d}\")\nprint(f\"{255:d} {0:03d}\")",
     "print(format(7, \"03\"), format(3.5, \".1f\"), format(\"ab\", \">5\"))",
+    // str() / repr() of collections (no floats inside — str(float) unsupported)
+    "print(str([1, 2, 3]), str((1, 2)), str((9,)))\nprint(str({\"a\": 1, \"b\": 2}))",
+    "print(str([1, \"two\", True, None]), str([[1, 2], [3]]))",
+    "print(\"nums: \" + str([1, 2, 3]))\nprint(f\"list is {[1, 2, 3]} and dict {{'k': 1}}\")",
+    "d = {\"x\": [1, 2], \"y\": 3}\nprint(str(d))\nprint(repr(\"hi\"), repr([1, \"a\"]))",
+    "print(str(sorted(set([3, 1, 2, 1]))))",
 ];
 
 fn find_python() -> Option<&'static str> {

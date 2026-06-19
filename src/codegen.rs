@@ -1684,11 +1684,174 @@ fn runtime_helpers() -> Vec<Func> {
         "(then (return (call $i32_to_str (call $unbox (local.get $r)))))",
     );
     b.push(")");
+    // Collections render to their repr (elements in repr form). Floats inside
+    // still hit $raise_no_str — str(float) is unsupported.
+    b.push("(if (ref.test (ref $LIST) (local.get $r)) (then (return (call $list_to_str (ref.cast (ref $LIST) (local.get $r))))))");
+    b.push("(if (ref.test (ref $TUPLE) (local.get $r)) (then (return (call $tuple_to_str (ref.cast (ref $TUPLE) (local.get $r))))))");
+    b.push("(if (ref.test (ref $DICT) (local.get $r)) (then (return (call $dict_to_str (ref.cast (ref $DICT) (local.get $r))))))");
+    b.push("(if (ref.test (ref $SET) (local.get $r)) (then (return (call $set_to_str (ref.cast (ref $SET) (local.get $r))))))");
+    b.push("(if (ref.test (ref $OBJECT) (local.get $r)) (then (return (call $object_to_str (local.get $r) (i32.const 1)))))");
     b.push("(call $raise_no_str (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
         signature: "(func $to_str (param $r (ref null eq)) (result (ref null eq))".into(),
         locals: vec![],
+        body: b,
+    });
+
+    // $repr_str: the form used for collection elements — strings get quotes,
+    // everything else uses $to_str.
+    let mut b = Body::new();
+    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push_in(
+        1,
+        format!(
+            "(then (return (call $py_add (call $py_add {q} (local.get $r)) {q})))",
+            q = str_lit("'")
+        ),
+    );
+    b.push(")");
+    b.push("(if (ref.test (ref $OBJECT) (local.get $r)) (then (return (call $object_to_str (local.get $r) (i32.const 0)))))");
+    b.push("(call $to_str (local.get $r))");
+    fs.push(Func {
+        signature: "(func $repr_str (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $list_to_str / $tuple_to_str / $set_to_str: `[..]` / `(..)` / `{..}` with
+    // repr-form elements joined by ", ". Built with $py_add (quadratic, fine at
+    // classroom sizes).
+    for (fname, ty, open, close) in [
+        ("$list_to_str", "$LIST", "[", "]"),
+        ("$tuple_to_str", "$TUPLE", "(", ")"),
+        ("$set_to_str", "$SET", "{", "}"),
+    ] {
+        let mut b = Body::new();
+        b.push(format!("(local.set $n (struct.get {ty} 0 (local.get $s)))"));
+        if ty == "$SET" {
+            b.push(format!(
+                "(if (i32.eqz (local.get $n)) (then (return {})))",
+                str_lit("set()")
+            ));
+        }
+        b.push(format!("(local.set $res {})", str_lit(open)));
+        b.push("(block $done (loop $next");
+        b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+        b.push_in(
+            2,
+            format!(
+                "(if (i32.gt_s (local.get $i) (i32.const 0)) (then (local.set $res (call $py_add (local.get $res) {}))))",
+                str_lit(", ")
+            ),
+        );
+        b.push_in(
+            2,
+            format!("(local.set $res (call $py_add (local.get $res) (call $repr_str (array.get $ITEMS (struct.get {ty} 1 (local.get $s)) (local.get $i)))))"),
+        );
+        b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(2, "(br $next)))");
+        // A 1-tuple keeps its trailing comma.
+        if ty == "$TUPLE" {
+            b.push(format!(
+                "(if (i32.eq (local.get $n) (i32.const 1)) (then (local.set $res (call $py_add (local.get $res) {}))))",
+                str_lit(",")
+            ));
+        }
+        b.push(format!(
+            "(call $py_add (local.get $res) {})",
+            str_lit(close)
+        ));
+        fs.push(Func {
+            signature: format!("(func {fname} (param $s (ref null {ty})) (result (ref null eq))"),
+            locals: vec![
+                "(local $n i32)".into(),
+                "(local $i i32)".into(),
+                "(local $res (ref null eq))".into(),
+            ],
+            body: b,
+        });
+    }
+
+    // $dict_to_str: `{k: v, ...}` (both repr).
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $DICT 0 (local.get $d)))");
+    b.push(format!("(local.set $res {})", str_lit("{")));
+    b.push("(block $done (loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        format!(
+            "(if (i32.gt_s (local.get $i) (i32.const 0)) (then (local.set $res (call $py_add (local.get $res) {}))))",
+            str_lit(", ")
+        ),
+    );
+    b.push_in(
+        2,
+        "(local.set $res (call $py_add (local.get $res) (call $repr_str (array.get $ITEMS (struct.get $DICT 1 (local.get $d)) (local.get $i)))))",
+    );
+    b.push_in(
+        2,
+        format!(
+            "(local.set $res (call $py_add (local.get $res) {}))",
+            str_lit(": ")
+        ),
+    );
+    b.push_in(
+        2,
+        "(local.set $res (call $py_add (local.get $res) (call $repr_str (array.get $ITEMS (struct.get $DICT 2 (local.get $d)) (local.get $i)))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)))");
+    b.push(format!("(call $py_add (local.get $res) {})", str_lit("}")));
+    fs.push(Func {
+        signature: "(func $dict_to_str (param $d (ref null $DICT)) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $res (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
+    // $object_to_str: an instance as a string — __str__ (or __repr__) result if
+    // defined, else `<Name object>`. `prefer_str` mirrors $object_display.
+    let mut b = Body::new();
+    b.push("(local.set $cls (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))))");
+    b.push("(if (local.get $prefer_str)");
+    b.push_in(
+        1,
+        format!(
+            "(then (local.set $m (call $class_lookup_method (local.get $cls) {}))))",
+            str_lit("__str__")
+        ),
+    );
+    b.push("(if (i32.eqz (ref.test (ref $METHOD) (local.get $m)))");
+    b.push_in(
+        1,
+        format!(
+            "(then (local.set $m (call $class_lookup_method (local.get $cls) {}))))",
+            str_lit("__repr__")
+        ),
+    );
+    b.push("(if (ref.test (ref $METHOD) (local.get $m))");
+    b.push_in(
+        1,
+        "(then (return (call_ref $MFUNC (local.get $obj) (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)) (struct.get $METHOD 0 (ref.cast (ref $METHOD) (local.get $m)))))))",
+    );
+    b.push(format!(
+        "(call $py_add (call $py_add {lt} (struct.get $CLASS 0 (local.get $cls))) {obj})",
+        lt = str_lit("<"),
+        obj = str_lit(" object>")
+    ));
+    fs.push(Func {
+        signature:
+            "(func $object_to_str (param $obj (ref null eq)) (param $prefer_str i32) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $cls (ref null $CLASS))".into(),
+            "(local $m (ref null eq))".into(),
+        ],
         body: b,
     });
 
@@ -3993,50 +4156,16 @@ fn class_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $object_display: print an instance. With $prefer_str, try __str__ then
-    // __repr__ (Python's `str()` / `print`); otherwise __repr__ only (the
-    // `repr()` form used inside containers). Falls back to `<Name object>`.
+    // $object_display: print an instance via its string form ($object_to_str
+    // builds it — __str__/__repr__ result or the `<Name object>` default).
     let mut b = Body::new();
-    b.push("(local.set $cls (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))))");
-    b.push("(if (local.get $prefer_str)");
-    b.push_in(1, "(then");
-    b.push_in(
-        2,
-        format!(
-            "(local.set $m (call $class_lookup_method (local.get $cls) {}))",
-            str_lit("__str__")
-        ),
+    b.push(
+        "(call $print_str (ref.cast (ref null $STR) (call $object_to_str (local.get $obj) (local.get $prefer_str))))",
     );
-    b.push_in(1, "))");
-    b.push("(if (i32.eqz (ref.test (ref $METHOD) (local.get $m)))");
-    b.push_in(
-        1,
-        format!(
-            "(then (local.set $m (call $class_lookup_method (local.get $cls) {})))",
-            str_lit("__repr__")
-        ),
-    );
-    b.push(")");
-    b.push("(if (ref.test (ref $METHOD) (local.get $m))");
-    b.push_in(1, "(then");
-    b.push_in(
-        2,
-        "(call $print_str (ref.cast (ref null $STR) (call_ref $MFUNC (local.get $obj) (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)) (struct.get $METHOD 0 (ref.cast (ref $METHOD) (local.get $m))))))",
-    );
-    b.push_in(2, "(return)");
-    b.push_in(1, "))");
-    b.push("(call $write_char (i32.const 60))"); // <
-    b.push("(call $print_str (struct.get $CLASS 0 (local.get $cls)))");
-    for c in " object>".bytes() {
-        b.push(format!("(call $write_char (i32.const {c}))"));
-    }
     fs.push(Func {
         signature: "(func $object_display (param $obj (ref null eq)) (param $prefer_str i32)"
             .into(),
-        locals: vec![
-            "(local $cls (ref null $CLASS))".into(),
-            "(local $m (ref null eq))".into(),
-        ],
+        locals: vec![],
         body: b,
     });
 
@@ -5797,6 +5926,7 @@ impl Gen {
                     let builtin = match n.as_str() {
                         "len" => Some(("$py_len", 1, true)), // returns raw i32
                         "str" => Some(("$to_str", 1, false)),
+                        "repr" => Some(("$repr_str", 1, false)),
                         "float" => Some(("$py_float", 1, false)),
                         "abs" => Some(("$py_abs", 1, false)),
                         "int" => Some(("$py_int", 1, false)),
