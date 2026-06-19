@@ -5304,6 +5304,122 @@ impl Gen {
         }
     }
 
+    /// Format a value (given as WAT) by a format spec string — the shared core
+    /// of `format(x, spec)` and an f-string/`str.format()` field.
+    fn format_value_wat(
+        &mut self,
+        cx: &mut FuncCx,
+        v: &str,
+        spec: &str,
+        line: usize,
+    ) -> Result<String> {
+        let (is_float, prec, width, fill, align) =
+            parse_format_spec(spec).map_err(|m| CompileError::at(line, m))?;
+        if is_float {
+            let base = format!("(call $f64_to_fixed (call $unbox_f64 {v}) (i32.const {prec}))");
+            if width == 0 {
+                return Ok(base);
+            }
+            return Ok(format!(
+                "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (i32.const {align}))"
+            ));
+        }
+        if width == 0 {
+            return Ok(format!("(call $to_str {v})"));
+        }
+        if align == 3 {
+            // Auto-align: numbers right, everything else left — at runtime.
+            let t = cx.scratch_local(VAL);
+            let base = format!("(call $to_str (local.tee ${t} {v}))");
+            let numeric = format!(
+                "(i32.or (i32.or (ref.test (ref i31) (local.get ${t})) (ref.test (ref $INT) (local.get ${t}))) (i32.or (ref.test (ref $BOOL) (local.get ${t})) (ref.test (ref $FLOAT) (local.get ${t}))))"
+            );
+            return Ok(format!(
+                "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (if (result i32) {numeric} (then (i32.const 1)) (else (i32.const 0))))"
+            ));
+        }
+        let base = format!("(call $to_str {v})");
+        Ok(format!(
+            "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (i32.const {align}))"
+        ))
+    }
+
+    /// `"template".format(args)` — the template must be a string literal. Fields
+    /// are `{}` (auto-numbered), `{n}` (indexed), each with an optional `:spec`;
+    /// `{{`/`}}` are literal braces. Builds a `$py_add` concatenation.
+    fn gen_str_format(
+        &mut self,
+        cx: &mut FuncCx,
+        tmpl: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<String> {
+        let cs: Vec<char> = tmpl.chars().collect();
+        let mut pieces: Vec<String> = Vec::new();
+        let mut lit = String::new();
+        let mut auto = 0usize;
+        let mut i = 0;
+        while i < cs.len() {
+            match cs[i] {
+                '{' if cs.get(i + 1) == Some(&'{') => {
+                    lit.push('{');
+                    i += 2;
+                }
+                '}' if cs.get(i + 1) == Some(&'}') => {
+                    lit.push('}');
+                    i += 2;
+                }
+                '{' => {
+                    if !lit.is_empty() {
+                        pieces.push(str_lit(&std::mem::take(&mut lit)));
+                    }
+                    let mut j = i + 1;
+                    while j < cs.len() && cs[j] != '}' {
+                        j += 1;
+                    }
+                    if j >= cs.len() {
+                        return Err(CompileError::at(line, "missing '}' in format string"));
+                    }
+                    let field: String = cs[i + 1..j].iter().collect();
+                    let (name, spec) = match field.split_once(':') {
+                        Some((n, s)) => (n, s),
+                        None => (field.as_str(), ""),
+                    };
+                    let idx = if name.is_empty() {
+                        let a = auto;
+                        auto += 1;
+                        a
+                    } else {
+                        name.parse::<usize>().map_err(|_| {
+                            CompileError::at(
+                                line,
+                                "named format fields aren't supported; use {} or {0}",
+                            )
+                        })?
+                    };
+                    let arg = args.get(idx).ok_or_else(|| {
+                        CompileError::at(line, "not enough arguments for format string")
+                    })?;
+                    let v = self.value_expr(cx, arg)?;
+                    pieces.push(self.format_value_wat(cx, &v, spec, line)?);
+                    i = j + 1;
+                }
+                '}' => return Err(CompileError::at(line, "single '}' in format string")),
+                c => {
+                    lit.push(c);
+                    i += 1;
+                }
+            }
+        }
+        if !lit.is_empty() {
+            pieces.push(str_lit(&lit));
+        }
+        Ok(pieces
+            .into_iter()
+            .reduce(|acc, p| format!("(call $py_add {acc} {p})"))
+            .unwrap_or_else(|| str_lit("")))
+    }
+
     /// Build an `$LIST` from argument expressions (the method-call args
     /// container; same shape as a list literal).
     fn list_of(&mut self, cx: &mut FuncCx, args: &[Expr]) -> Result<String> {
@@ -6034,6 +6150,14 @@ impl Gen {
                 if self.is_module_ref(cx, recv) {
                     return self.gen_math_call(cx, method, args, e.line);
                 }
+                // `"template".format(...)` with a literal template (a class with
+                // a `.format` method still dispatches normally).
+                if method == "format" {
+                    if let ExprKind::Str(tmpl) = &recv.kind {
+                        let tmpl = tmpl.clone();
+                        return self.gen_str_format(cx, &tmpl, args, e.line);
+                    }
+                }
                 // String methods. Each helper falls back to method dispatch for
                 // a non-string receiver, so a class may reuse these names.
                 match method.as_str() {
@@ -6398,38 +6522,8 @@ impl Gen {
                                     "the format spec must be a string literal",
                                 ));
                             };
-                            let (is_float, prec, width, fill, align) =
-                                parse_format_spec(spec).map_err(|m| CompileError::at(e.line, m))?;
-                            if is_float {
-                                let base = format!(
-                                    "(call $f64_to_fixed (call $unbox_f64 {v}) (i32.const {prec}))"
-                                );
-                                if width == 0 {
-                                    return Ok(base);
-                                }
-                                return Ok(format!(
-                                    "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (i32.const {align}))"
-                                ));
-                            }
-                            if width == 0 {
-                                return Ok(format!("(call $to_str {v})"));
-                            }
-                            if align == 3 {
-                                // Auto-align: numbers right, everything else
-                                // left — decided at runtime from the value type.
-                                let t = cx.scratch_local(VAL);
-                                let base = format!("(call $to_str (local.tee ${t} {v}))");
-                                let numeric = format!(
-                                    "(i32.or (i32.or (ref.test (ref i31) (local.get ${t})) (ref.test (ref $INT) (local.get ${t}))) (i32.or (ref.test (ref $BOOL) (local.get ${t})) (ref.test (ref $FLOAT) (local.get ${t}))))"
-                                );
-                                return Ok(format!(
-                                    "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (if (result i32) {numeric} (then (i32.const 1)) (else (i32.const 0))))"
-                                ));
-                            }
-                            let base = format!("(call $to_str {v})");
-                            return Ok(format!(
-                                "(call $str_pad {base} (i32.const {width}) (i32.const {fill}) (i32.const {align}))"
-                            ));
+                            let spec = spec.clone();
+                            return self.format_value_wat(cx, &v, &spec, e.line);
                         }
                         // min/max: one iterable, or several positional args.
                         "min" | "max" if !args.is_empty() => {

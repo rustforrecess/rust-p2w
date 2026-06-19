@@ -1286,6 +1286,30 @@ fn str_of_float_still_unsupported() {
     assert_raises("print(str([1.5]))", "str()"); // float element
 }
 
+// --- str.format() ---
+
+#[test]
+fn str_format_method() {
+    assert_output("print(\"{} and {}\".format(1, 2))", "1 and 2\n");
+    assert_output("print(\"{1}-{0}\".format(\"a\", \"b\"))", "b-a\n");
+    assert_output("print(\"{:.2f}\".format(2.5))", "2.50\n");
+    assert_output("print(\"[{:>4}]\".format(7))", "[   7]\n");
+    assert_output("print(\"{{}} {}\".format(9))", "{} 9\n");
+}
+
+#[test]
+fn str_format_errors_and_class_fallback() {
+    let err = rust_p2w::compile_to_wat("print(\"{} {}\".format(1))").unwrap_err();
+    assert!(err.to_string().contains("not enough arguments"), "{err}");
+    let err = rust_p2w::compile_to_wat("print(\"{name}\".format(1))").unwrap_err();
+    assert!(err.to_string().contains("named format fields"), "{err}");
+    // a class method named `format` still dispatches
+    assert_output(
+        "class F:\n    def format(self):\n        return \"custom\"\nprint(F().format())",
+        "custom\n",
+    );
+}
+
 // --- dict and set methods ---
 
 #[test]
@@ -1897,6 +1921,10 @@ const DIFFERENTIAL_CORPUS: &[&str] = &[
     "print({1, 2, 3}.issubset({1, 2, 3, 4}), {1, 2, 3}.issuperset({1, 2}), {1, 2}.issubset({1, 2, 3}))\nprint(sorted({1, 2}.union([3, 4, 2])))",
     // dict methods
     "d = {\"a\": 1}\nd.update({\"b\": 2, \"a\": 10})\nprint(d)\nd.setdefault(\"c\", 3)\nd.setdefault(\"a\", 99)\nprint(d, d.setdefault(\"a\"))\nd.clear()\nprint(d, len(d))",
+    // str.format(): auto/indexed fields, specs, literal braces
+    "print(\"{} + {} = {}\".format(2, 3, 5))\nprint(\"{0} {1} {0}\".format(\"a\", \"b\"))",
+    "print(\"{:.2f}\".format(3.14159), \"[{:>5}]\".format(42))\nprint(\"{{x}} {} {}\".format(7, 8))",
+    "print(\"name={}, score={:.1f}\".format(\"Sam\", 9.5))\nprint(\"{} items\".format(len([1, 2, 3])))",
     // f-string format specs: precision, width, alignment, zero-pad
     "print(f\"{3.14159:.2f}\", f\"{3.14159:.4f}\")\nprint(f\"pi is about {3.14159:.3f}\")",
     "print(f\"[{42:5}]\", f\"[{42:<5}]\", f\"[{42:^5}]\", f\"[{7:03}]\")",
