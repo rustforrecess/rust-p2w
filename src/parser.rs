@@ -18,6 +18,23 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>> {
     p.program()
 }
 
+/// Parse as much as possible, never bailing on the first error. Returns the
+/// statements that did parse (a partial AST) plus every error encountered. Used
+/// by the IDE's text->blocks path so one typo doesn't blank the whole canvas —
+/// the valid statements still become blocks, and each mistake is reported.
+///
+/// Recovery is at the top-level statement boundary: a broken statement (and, if
+/// it was a block header, its orphaned indented body) is skipped, then parsing
+/// resumes with the next statement.
+pub fn parse_recovering(tokens: &[Token]) -> (Vec<Stmt>, Vec<CompileError>) {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        next_tmp: 0,
+    };
+    p.program_recovering()
+}
+
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
@@ -139,6 +156,70 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(stmts)
+    }
+
+    /// Like [`program`], but recovers after a bad statement and keeps going,
+    /// accumulating every error instead of returning the first.
+    fn program_recovering(&mut self) -> (Vec<Stmt>, Vec<CompileError>) {
+        let mut stmts = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            while matches!(self.peek(), Tok::Newline) {
+                self.advance();
+            }
+            if matches!(self.peek(), Tok::Eof) {
+                break;
+            }
+            let start = self.pos;
+            match self.statement() {
+                Ok(s) => stmts.push(s),
+                Err(e) => {
+                    errors.push(self.suggest_keyword(e, start));
+                    let before = self.pos;
+                    self.synchronize();
+                    // Guarantee forward progress so we can't loop forever.
+                    if self.pos == before {
+                        self.advance();
+                    }
+                }
+            }
+        }
+        (stmts, errors)
+    }
+
+    /// Skip past a broken statement to the next safe restart point: the rest of
+    /// the current line, plus — if the broken statement was a block header — its
+    /// orphaned indented body (a balanced INDENT..DEDENT), so the token stream
+    /// stays in sync.
+    fn synchronize(&mut self) {
+        while !matches!(self.peek(), Tok::Newline | Tok::Dedent | Tok::Eof) {
+            self.advance();
+        }
+        if matches!(self.peek(), Tok::Newline) {
+            self.advance();
+        }
+        if matches!(self.peek(), Tok::Indent) {
+            let mut depth = 0usize;
+            loop {
+                match self.peek() {
+                    Tok::Indent => {
+                        depth += 1;
+                        self.advance();
+                    }
+                    Tok::Dedent => {
+                        self.advance();
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Tok::Eof => break,
+                    _ => {
+                        self.advance();
+                    }
+                }
+            }
+        }
     }
 
     /// An indented block: INDENT, one or more statements, DEDENT.
@@ -1631,6 +1712,37 @@ mod tests {
                 "suggester wrongly rejected valid code: {src:?}"
             );
         }
+    }
+
+    #[test]
+    fn recovery_keeps_valid_statements_around_a_bad_one() {
+        // Missing colon on the `for`: the loop (and its orphaned body) is
+        // skipped, but the assignment before and the print after still parse.
+        let src = "total = 0\nfor i in range(1, 6)\n    total = total + 1\nprint(total)\n";
+        let (stmts, errors) = parse_recovering(&lex(src).unwrap());
+        assert_eq!(errors.len(), 1, "expected exactly one error");
+        assert!(errors[0].message.contains("colon"), "{}", errors[0].message);
+        assert_eq!(stmts.len(), 2, "assignment + print should survive");
+        assert!(matches!(stmts[0].kind, StmtKind::Assign(..)));
+        assert!(matches!(stmts[1].kind, StmtKind::Expr(_))); // print(total)
+    }
+
+    #[test]
+    fn recovery_collects_multiple_errors() {
+        // Two lines that lex fine but don't parse (`1 2 3`, `4 5 6` — numbers
+        // with no operators between them), between three clean assignments.
+        let src = "x = 1\n1 2 3\ny = 2\n4 5 6\nz = 3\n";
+        let (stmts, errors) = parse_recovering(&lex(src).unwrap());
+        assert!(errors.len() >= 2, "expected several errors, got {errors:?}");
+        assert_eq!(stmts.len(), 3, "the three clean assignments should survive");
+    }
+
+    #[test]
+    fn recovery_on_clean_program_has_no_errors() {
+        let src = "x = 1\nfor i in range(3):\n    print(i)\n";
+        let (stmts, errors) = parse_recovering(&lex(src).unwrap());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(stmts.len(), 2);
     }
 
     #[test]

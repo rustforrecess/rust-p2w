@@ -23,6 +23,44 @@
 //! dependencies (no serde).
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::error::CompileError;
+
+/// The result of a forgiving text->blocks conversion: a Blockly workspace JSON
+/// document (always valid — possibly an empty workspace) plus any diagnostics.
+///
+/// Unlike [`to_blockly_json`], this never gives up on the first problem. The
+/// parser recovers past syntax errors, and each top-level statement is rendered
+/// independently, so one mistake (or one not-yet-supported construct) doesn't
+/// blank the canvas — the rest still becomes blocks, and the issues are
+/// reported for the editor to show.
+pub struct BlocksOutcome {
+    pub json: String,
+    pub errors: Vec<CompileError>,
+}
+
+/// Forgiving Python -> Blockly conversion for the live editor. See
+/// [`BlocksOutcome`].
+pub fn to_blocks(source: &str) -> BlocksOutcome {
+    let tokens = match crate::lexer::lex(source) {
+        Ok(t) => t,
+        // Lexing is still all-or-nothing (e.g. an unterminated string); report
+        // it and leave the canvas empty.
+        Err(e) => {
+            return BlocksOutcome {
+                json: "{\"blocks\":{\"languageVersion\":0,\"blocks\":[]}}".to_string(),
+                errors: vec![e],
+            };
+        }
+    };
+    let (stmts, mut errors) = crate::parser::parse_recovering(&tokens);
+    let mut b = Builder::default();
+    let (tops, build_errors) = b.build_program(&stmts);
+    errors.extend(build_errors);
+    BlocksOutcome {
+        json: b.document(&tops),
+        errors,
+    }
+}
 
 /// Convert Python source to a Blockly workspace JSON document, or an error
 /// naming the first construct that has no block yet.
@@ -76,6 +114,47 @@ impl Builder {
             .map(|(name, id)| format!("{{\"name\":{},\"id\":{}}}", jstr(name), jstr(id)))
             .collect();
         format!(",\"variables\":[{}]", entries.join(","))
+    }
+
+    /// Render top-level statements forgivingly: each is built on its own, and a
+    /// statement that can't be represented (a not-yet-supported construct) is
+    /// skipped with a diagnostic instead of aborting. Consecutive renderable
+    /// statements are linked into one connected stack via `next`; a skipped one
+    /// just breaks the stack, so a fresh stack starts after it. Returns the
+    /// top-level (unpositioned) block stacks and the diagnostics.
+    fn build_program(&mut self, stmts: &[Stmt]) -> (Vec<String>, Vec<CompileError>) {
+        let mut tops = Vec::new();
+        let mut errors = Vec::new();
+        let mut run: Vec<String> = Vec::new();
+        for s in stmts {
+            match self.stmt_block(s, "") {
+                Ok(block) => run.push(block),
+                Err(msg) => {
+                    flush_run(&mut run, &mut tops);
+                    // The message already carries "line N:"; keep it verbatim.
+                    errors.push(CompileError::general(msg));
+                }
+            }
+        }
+        flush_run(&mut run, &mut tops);
+        (tops, errors)
+    }
+
+    /// Wrap top-level block stacks into a workspace document, giving each stack
+    /// its own (x, y) so separate stacks (after an error break) don't overlap.
+    fn document(&self, tops: &[String]) -> String {
+        let positioned: Vec<String> = tops
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("{{\"x\":20,\"y\":{},{}", 20 + i * 60, &t[1..]))
+            .collect();
+        let mut out = format!(
+            "{{\"blocks\":{{\"languageVersion\":0,\"blocks\":[{}]}}",
+            positioned.join(",")
+        );
+        out.push_str(&self.variables_json());
+        out.push('}');
+        out
     }
 
     /// A vertical chain of statement blocks: the first block, with the rest
@@ -376,6 +455,29 @@ fn block(ty: &str, fields: &str, inputs: &str, extra_state: &str, next: &str) ->
     format!("{{{p}}}")
 }
 
+/// Link a run of standalone block objects into one connected stack (each block
+/// becomes the `next` of the one before it), and push it as a top-level stack.
+/// Drains `run`.
+fn flush_run(run: &mut Vec<String>, tops: &mut Vec<String>) {
+    let Some(mut chain) = run.pop() else {
+        return;
+    };
+    while let Some(prev) = run.pop() {
+        chain = with_next(&prev, &chain);
+    }
+    tops.push(chain);
+}
+
+/// Splice `next` into a standalone block object (built with no `next`): insert
+/// `,"next":{"block":…}` just before the block's closing brace.
+fn with_next(block: &str, next: &str) -> String {
+    debug_assert!(block.ends_with('}'));
+    format!(
+        "{},\"next\":{{\"block\":{next}}}}}",
+        &block[..block.len() - 1]
+    )
+}
+
 /// One `"NAME": <value>` field entry. `value_json` is a raw JSON value.
 fn field(name: &str, value_json: &str) -> String {
     format!("{}:{value_json}", jstr(name))
@@ -531,5 +633,39 @@ mod tests {
         let json = to_blockly_json("while True:\n    if x:\n        break\n    continue").unwrap();
         assert!(json.contains("\"FLOW\":\"BREAK\""));
         assert!(json.contains("\"FLOW\":\"CONTINUE\""));
+    }
+
+    #[test]
+    fn to_blocks_clean_program_has_no_errors() {
+        let out = to_blocks("x = 5\nprint(x)\n");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.json.contains("\"type\":\"variables_set\""));
+        assert!(out.json.contains("\"type\":\"text_print\""));
+    }
+
+    #[test]
+    fn to_blocks_recovers_from_a_syntax_error() {
+        // Missing colon: the parser drops the broken loop, but the assignment
+        // before and the print after still render, with one diagnostic.
+        let out =
+            to_blocks("total = 0\nfor i in range(1, 6)\n    total = total + 1\nprint(total)\n");
+        assert!(out.json.contains("\"type\":\"variables_set\""));
+        assert!(out.json.contains("\"type\":\"text_print\""));
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(out.errors[0].to_string().contains("colon"));
+    }
+
+    #[test]
+    fn to_blocks_skips_unsupported_but_keeps_the_rest() {
+        // A list literal has no block yet; `x` and `z` still render as two
+        // separate stacks, and the list is reported.
+        let out = to_blocks("x = 1\ny = [1, 2, 3]\nz = 3\n");
+        assert!(out.json.contains("\"NUM\":1"), "{}", out.json); // x
+        assert!(out.json.contains("\"NUM\":3"), "{}", out.json); // z
+        assert!(
+            out.errors.iter().any(|e| e.to_string().contains("list")),
+            "{:?}",
+            out.errors
+        );
     }
 }
