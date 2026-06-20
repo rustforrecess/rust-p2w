@@ -35,7 +35,13 @@ use crate::error::CompileError;
 /// reported for the editor to show.
 pub struct BlocksOutcome {
     pub json: String,
+    /// All diagnostics, for the editor to show as gentle hints: real syntax
+    /// errors AND "this valid code just has no block yet" notes.
     pub errors: Vec<CompileError>,
+    /// Lines of *syntax* errors only (from the parser) — safe to highlight in
+    /// the editor as mistakes. Deliberately excludes the not-yet-representable
+    /// notes, since that code is valid Python and shouldn't be flagged as wrong.
+    pub error_lines: Vec<usize>,
 }
 
 /// Forgiving Python -> Blockly conversion for the live editor. See
@@ -48,17 +54,23 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
         Err(e) => {
             return BlocksOutcome {
                 json: "{\"blocks\":{\"languageVersion\":0,\"blocks\":[]}}".to_string(),
+                error_lines: e.line.into_iter().collect(),
                 errors: vec![e],
             };
         }
     };
-    let (stmts, mut errors) = crate::parser::parse_recovering(&tokens);
+    let (stmts, parse_errors) = crate::parser::parse_recovering(&tokens);
+    // Only genuine syntax errors are highlightable; the build notes below are
+    // for valid-but-unrepresentable code and must not flag the editor.
+    let error_lines: Vec<usize> = parse_errors.iter().filter_map(|e| e.line).collect();
+    let mut errors = parse_errors;
     let mut b = Builder::default();
-    let (tops, build_errors) = b.build_program(&stmts);
-    errors.extend(build_errors);
+    let (tops, build_notes) = b.build_program(&stmts);
+    errors.extend(build_notes);
     BlocksOutcome {
         json: b.document(&tops),
         errors,
+        error_lines,
     }
 }
 
@@ -639,6 +651,7 @@ mod tests {
     fn to_blocks_clean_program_has_no_errors() {
         let out = to_blocks("x = 5\nprint(x)\n");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.error_lines.is_empty());
         assert!(out.json.contains("\"type\":\"variables_set\""));
         assert!(out.json.contains("\"type\":\"text_print\""));
     }
@@ -646,19 +659,22 @@ mod tests {
     #[test]
     fn to_blocks_recovers_from_a_syntax_error() {
         // Missing colon: the parser drops the broken loop, but the assignment
-        // before and the print after still render, with one diagnostic.
+        // before and the print after still render, with one diagnostic that is
+        // highlightable on line 2.
         let out =
             to_blocks("total = 0\nfor i in range(1, 6)\n    total = total + 1\nprint(total)\n");
         assert!(out.json.contains("\"type\":\"variables_set\""));
         assert!(out.json.contains("\"type\":\"text_print\""));
         assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
         assert!(out.errors[0].to_string().contains("colon"));
+        assert_eq!(out.error_lines, vec![2], "syntax error should mark line 2");
     }
 
     #[test]
     fn to_blocks_skips_unsupported_but_keeps_the_rest() {
         // A list literal has no block yet; `x` and `z` still render as two
-        // separate stacks, and the list is reported.
+        // separate stacks, and the list is reported as a NOTE — but it's valid
+        // Python, so it must NOT be highlighted as a syntax error.
         let out = to_blocks("x = 1\ny = [1, 2, 3]\nz = 3\n");
         assert!(out.json.contains("\"NUM\":1"), "{}", out.json); // x
         assert!(out.json.contains("\"NUM\":3"), "{}", out.json); // z
@@ -666,6 +682,11 @@ mod tests {
             out.errors.iter().any(|e| e.to_string().contains("list")),
             "{:?}",
             out.errors
+        );
+        assert!(
+            out.error_lines.is_empty(),
+            "valid-but-unrepresentable code must not be flagged: {:?}",
+            out.error_lines
         );
     }
 }
