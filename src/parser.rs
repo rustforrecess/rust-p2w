@@ -55,8 +55,28 @@ impl<'a> Parser<'a> {
         } else {
             Err(CompileError::at(
                 self.line(),
-                format!("expected {what}, found {:?}", self.peek()),
+                format!("expected {what}, but found {}", describe(self.peek())),
             ))
+        }
+    }
+
+    /// Like `expect(Colon)`, but speaks the student's language: a header line
+    /// (`if`/`for`/`def`/…) that runs straight into the end of the line almost
+    /// always means a forgotten colon.
+    fn expect_colon(&mut self) -> Result<()> {
+        match self.peek() {
+            Tok::Colon => {
+                self.advance();
+                Ok(())
+            }
+            Tok::Newline | Tok::Eof => Err(CompileError::at(
+                self.line(),
+                "did you forget a colon ':' at the end of this line?",
+            )),
+            other => Err(CompileError::at(
+                self.line(),
+                format!("expected a ':' here, but found {}", describe(other)),
+            )),
         }
     }
 
@@ -305,7 +325,7 @@ impl<'a> Parser<'a> {
         let line = self.line();
         self.eat_keyword("if")?;
         let cond = self.expr(0)?;
-        self.expect(&Tok::Colon, "':'")?;
+        self.expect_colon()?;
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
 
@@ -315,13 +335,13 @@ impl<'a> Parser<'a> {
             if self.is_keyword("elif") {
                 self.advance();
                 let c = self.expr(0)?;
-                self.expect(&Tok::Colon, "':'")?;
+                self.expect_colon()?;
                 self.expect(&Tok::Newline, "a new line")?;
                 let b = self.block()?;
                 elifs.push((c, b));
             } else if self.is_keyword("else") {
                 self.advance();
-                self.expect(&Tok::Colon, "':'")?;
+                self.expect_colon()?;
                 self.expect(&Tok::Newline, "a new line")?;
                 else_body = Some(self.block()?);
                 break;
@@ -399,7 +419,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, "')'")?;
-        self.expect(&Tok::Colon, "':'")?;
+        self.expect_colon()?;
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
         Ok(Stmt {
@@ -454,7 +474,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(&Tok::RParen, "')'")?;
         }
-        self.expect(&Tok::Colon, "':'")?;
+        self.expect_colon()?;
         self.expect(&Tok::Newline, "a new line")?;
         // Reuse the normal block parser, then split the body into methods and
         // class-level variable assignments.
@@ -501,7 +521,7 @@ impl<'a> Parser<'a> {
         let line = self.line();
         self.eat_keyword("while")?;
         let cond = self.expr(0)?;
-        self.expect(&Tok::Colon, "':'")?;
+        self.expect_colon()?;
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
         Ok(Stmt {
@@ -543,7 +563,7 @@ impl<'a> Parser<'a> {
                     ))
                 }
             };
-            self.expect(&Tok::Colon, "':'")?;
+            self.expect_colon()?;
             self.expect(&Tok::Newline, "a new line")?;
             let body = self.block()?;
             return Ok(Stmt {
@@ -558,7 +578,7 @@ impl<'a> Parser<'a> {
             });
         }
         let iterable = self.expr(0)?;
-        self.expect(&Tok::Colon, "':'")?;
+        self.expect_colon()?;
         self.expect(&Tok::Newline, "a new line")?;
         let mut body = self.block()?;
         // A tuple target desugars to a single hidden loop variable plus an
@@ -1265,6 +1285,50 @@ fn contains_call(e: &Expr) -> bool {
     }
 }
 
+/// A short, student-friendly name for a token, for error messages (so a kid
+/// sees "the end of the line" instead of `Newline`, or "`for`" instead of
+/// `Name("for")`).
+fn describe(tok: &Tok) -> String {
+    match tok {
+        Tok::Int(n) => format!("the number {n}"),
+        Tok::Float(f) => format!("the number {f}"),
+        Tok::Str(_) => "a piece of text (a string)".to_string(),
+        Tok::FStr(_) => "an f-string".to_string(),
+        Tok::Name(n) => format!("`{n}`"),
+        Tok::Plus => "`+`".to_string(),
+        Tok::Minus => "`-`".to_string(),
+        Tok::Star => "`*`".to_string(),
+        Tok::DoubleStar => "`**`".to_string(),
+        Tok::Slash => "`/`".to_string(),
+        Tok::SlashSlash => "`//`".to_string(),
+        Tok::Percent => "`%`".to_string(),
+        Tok::Pipe => "`|`".to_string(),
+        Tok::Amp => "`&`".to_string(),
+        Tok::Caret => "`^`".to_string(),
+        Tok::Lt => "`<`".to_string(),
+        Tok::Le => "`<=`".to_string(),
+        Tok::Gt => "`>`".to_string(),
+        Tok::Ge => "`>=`".to_string(),
+        Tok::EqEq => "`==`".to_string(),
+        Tok::BangEq => "`!=`".to_string(),
+        Tok::Eq => "`=`".to_string(),
+        Tok::AugAssign(_) => "an augmented assignment (like `+=`)".to_string(),
+        Tok::Colon => "`:`".to_string(),
+        Tok::LParen => "`(`".to_string(),
+        Tok::RParen => "`)`".to_string(),
+        Tok::LBracket => "`[`".to_string(),
+        Tok::RBracket => "`]`".to_string(),
+        Tok::LBrace => "`{`".to_string(),
+        Tok::RBrace => "`}`".to_string(),
+        Tok::Dot => "`.`".to_string(),
+        Tok::Comma => "`,`".to_string(),
+        Tok::Newline => "the end of the line".to_string(),
+        Tok::Indent => "an indented block".to_string(),
+        Tok::Dedent => "less indentation (the end of a block)".to_string(),
+        Tok::Eof => "the end of your program".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,5 +1466,43 @@ mod tests {
     fn errors_carry_lines() {
         let err = parse_src("x = 1\ny = +\n").unwrap_err();
         assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn missing_colon_is_coached() {
+        // Every compound-statement header should suggest the forgotten colon.
+        for src in [
+            "for i in range(5)\n    print(i)\n",
+            "if x\n    print(x)\n",
+            "while x\n    print(x)\n",
+            "def f()\n    return 1\n",
+        ] {
+            let err = parse_src(src).unwrap_err();
+            assert!(
+                err.message.contains("colon"),
+                "expected colon coaching for {src:?}, got: {}",
+                err.message
+            );
+            assert_eq!(err.line, Some(1), "colon error should point at the header");
+        }
+    }
+
+    #[test]
+    fn error_messages_name_tokens_in_plain_language() {
+        // No raw `Newline`/`Tok::…` debug output leaks to the student.
+        let err = parse_src("if x:\nprint(x)\n").unwrap_err();
+        assert!(
+            !err.message.contains("Tok") && !err.message.contains("Newline"),
+            "message should be student-friendly: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn describe_is_friendly() {
+        assert_eq!(describe(&Tok::Newline), "the end of the line");
+        assert_eq!(describe(&Tok::Colon), "`:`");
+        assert_eq!(describe(&Tok::Name("foo".into())), "`foo`");
+        assert_eq!(describe(&Tok::Eof), "the end of your program");
     }
 }
