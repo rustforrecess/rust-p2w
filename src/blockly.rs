@@ -15,6 +15,12 @@
 //! single-argument `print`, numbers/strings/booleans/variables, arithmetic,
 //! comparisons, and `and`/`or`/`not`. Anything else is a clean `Err` so the IDE
 //! can keep the text as the source of truth rather than dropping code.
+//!
+//! The JSON is assembled as plain strings, bottom-up: the small free functions
+//! [`block`], [`field`], [`input`], [`var_ref`] and [`number`] are the
+//! constructors, and each `stmt_block`/`value_block` arm composes them into one
+//! block object. Hand-built on purpose, so the crate keeps zero runtime
+//! dependencies (no serde).
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 
@@ -28,8 +34,10 @@ pub fn to_blockly_json(source: &str) -> Result<String, String> {
     // `variables_json` runs afterwards, so the variable list is complete with no
     // separate pre-pass.
     let body = b.chain(&stmts)?;
-    // The single top-level block carries a position so it isn't dropped at the
-    // origin under the toolbox.
+    // Give the single top-level block an (x, y) so Blockly doesn't drop it at
+    // the origin under the toolbox. `body` is one complete block object —
+    // `{"type":...}` — so splice the coordinates in right after its opening
+    // brace (`&body[1..]` is everything past the leading `{`).
     let top = if body.is_empty() {
         String::new()
     } else {
@@ -389,6 +397,8 @@ fn var_ref(id: &str) -> String {
 fn step_is_negative(step: &Expr) -> bool {
     match &step.kind {
         ExprKind::Int(n) => *n < 0,
+        // `-N` parses as Neg(N), so a negated *positive* literal is a negative
+        // step (e.g. `-1` is Neg(1)).
         ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
             ExprKind::Int(n) => n > 0,
             ExprKind::Float(f) => f > 0.0,
