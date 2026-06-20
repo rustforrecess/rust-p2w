@@ -80,6 +80,36 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// If a statement failed to parse and it began with a word that looks like a
+    /// misspelled keyword — immediately followed by another value, e.g. `fro i`,
+    /// which is never valid Python — replace the error with a focused "did you
+    /// mean" suggestion. The "two values in a row" guard keeps this from
+    /// second-guessing valid code (`total = 0` never trips it). `start` is the
+    /// token index where the statement began.
+    fn suggest_keyword(&self, err: CompileError, start: usize) -> CompileError {
+        let Some(Tok::Name(n)) = self.toks.get(start).map(|t| &t.tok) else {
+            return err;
+        };
+        let next_is_value = matches!(
+            self.toks.get(start + 1).map(|t| &t.tok),
+            Some(Tok::Name(_) | Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::FStr(_))
+        );
+        if !next_is_value {
+            return err;
+        }
+        let line = self.toks[start].line;
+        if n == "print" {
+            return CompileError::at(line, "`print` needs parentheses, like `print(x)`");
+        }
+        match did_you_mean(n, STMT_KEYWORDS) {
+            Some(kw) => CompileError::at(
+                line,
+                format!("`{n}` isn't a keyword — did you mean `{kw}`?"),
+            ),
+            None => err,
+        }
+    }
+
     fn is_keyword(&self, kw: &str) -> bool {
         matches!(self.peek(), Tok::Name(n) if n == kw)
     }
@@ -102,7 +132,11 @@ impl<'a> Parser<'a> {
             if matches!(self.peek(), Tok::Eof) {
                 break;
             }
-            stmts.push(self.statement()?);
+            let start = self.pos;
+            match self.statement() {
+                Ok(s) => stmts.push(s),
+                Err(e) => return Err(self.suggest_keyword(e, start)),
+            }
         }
         Ok(stmts)
     }
@@ -118,7 +152,11 @@ impl<'a> Parser<'a> {
             if matches!(self.peek(), Tok::Dedent | Tok::Eof) {
                 break;
             }
-            stmts.push(self.statement()?);
+            let start = self.pos;
+            match self.statement() {
+                Ok(s) => stmts.push(s),
+                Err(e) => return Err(self.suggest_keyword(e, start)),
+            }
         }
         self.expect(&Tok::Dedent, "the end of the indented block")?;
         if stmts.is_empty() {
@@ -1285,6 +1323,55 @@ fn contains_call(e: &Expr) -> bool {
     }
 }
 
+/// Statement-starting keywords we offer "did you mean" suggestions for.
+const STMT_KEYWORDS: &[&str] = &[
+    "if", "elif", "else", "for", "while", "def", "class", "return", "import", "pass", "break",
+    "continue",
+];
+
+/// Closest candidate within an edit-distance threshold that scales with word
+/// length (short words must match almost exactly, to avoid wild guesses).
+/// Exact matches are excluded — those aren't typos.
+fn did_you_mean<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let threshold = if word.chars().count() <= 4 { 1 } else { 2 };
+    candidates
+        .iter()
+        .map(|c| (*c, edit_distance(word, c)))
+        .filter(|(_, d)| *d >= 1 && *d <= threshold)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
+}
+
+/// Optimal string alignment distance — Levenshtein plus *adjacent
+/// transpositions* counted as one edit, so the most common typos (`fro`->`for`,
+/// `improt`->`import`) score distance 1 instead of 2.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            // Adjacent transposition (e.g. ...ab... vs ...ba...).
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[n][m]
+}
+
 /// A short, student-friendly name for a token, for error messages (so a kid
 /// sees "the end of the line" instead of `Newline`, or "`for`" instead of
 /// `Name("for")`).
@@ -1504,5 +1591,56 @@ mod tests {
         assert_eq!(describe(&Tok::Colon), "`:`");
         assert_eq!(describe(&Tok::Name("foo".into())), "`foo`");
         assert_eq!(describe(&Tok::Eof), "the end of your program");
+    }
+
+    #[test]
+    fn misspelled_keyword_is_suggested() {
+        let cases = [
+            ("fro i in range(5):\n    print(i)\n", "for"),
+            ("whil x:\n    print(x)\n", "while"),
+            ("retrun x\n", "return"),
+            ("improt math\n", "import"),
+        ];
+        for (src, want) in cases {
+            let err = parse_src(src).unwrap_err();
+            assert!(
+                err.message.contains(&format!("`{want}`")) && err.message.contains("did you mean"),
+                "for {src:?} expected a suggestion of `{want}`, got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn print_without_parens_is_coached() {
+        let err = parse_src("print x\n").unwrap_err();
+        assert!(err.message.contains("parentheses"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn near_keyword_names_are_not_second_guessed() {
+        // These are all valid; the suggester must never fire on them.
+        for src in [
+            "fi = 5\n",          // `fi` is edit-distance 1 from `if`
+            "whil = 3\n",        // `whil` is 1 from `while`
+            "fro = fro + 1\n",   // `fro` is 1 from `for`
+            "x = 5\nprint(x)\n", // ordinary program
+        ] {
+            assert!(
+                parse_src(src).is_ok(),
+                "suggester wrongly rejected valid code: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("for", "for"), 0);
+        assert_eq!(edit_distance("fro", "for"), 1); // transposition = 1 (OSA)
+        assert_eq!(edit_distance("retrun", "return"), 1); // transposition
+        assert_eq!(edit_distance("whil", "while"), 1); // insertion
+        assert_eq!(did_you_mean("fro", STMT_KEYWORDS), Some("for"));
+        assert_eq!(did_you_mean("x", STMT_KEYWORDS), None); // too short/far
+        assert_eq!(did_you_mean("for", STMT_KEYWORDS), None); // exact = not a typo
     }
 }
