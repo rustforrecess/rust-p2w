@@ -24,7 +24,9 @@ pub fn to_blockly_json(source: &str) -> Result<String, String> {
     let tokens = crate::lexer::lex(source).map_err(|e| e.to_string())?;
     let stmts = crate::parser::parse(&tokens).map_err(|e| e.to_string())?;
     let mut b = Builder::default();
-    b.collect_vars_stmts(&stmts);
+    // `chain` registers every variable it references via `var_id`, and
+    // `variables_json` runs afterwards, so the variable list is complete with no
+    // separate pre-pass.
     let body = b.chain(&stmts)?;
     // The single top-level block carries a position so it isn't dropped at the
     // origin under the toolbox.
@@ -66,73 +68,6 @@ impl Builder {
             .map(|(name, id)| format!("{{\"name\":{},\"id\":{}}}", jstr(name), jstr(id)))
             .collect();
         format!(",\"variables\":[{}]", entries.join(","))
-    }
-
-    /// Pre-pass: register every variable name so `variables` is complete before
-    /// any `variables_get`/`variables_set` references it.
-    fn collect_vars_stmts(&mut self, stmts: &[Stmt]) {
-        for s in stmts {
-            match &s.kind {
-                StmtKind::Assign(name, e) => {
-                    self.var_id(name);
-                    self.collect_vars_expr(e);
-                }
-                StmtKind::For {
-                    var,
-                    start,
-                    end,
-                    step,
-                    body,
-                } => {
-                    self.var_id(var);
-                    self.collect_vars_expr(start);
-                    self.collect_vars_expr(end);
-                    self.collect_vars_expr(step);
-                    self.collect_vars_stmts(body);
-                }
-                StmtKind::While { cond, body } => {
-                    self.collect_vars_expr(cond);
-                    self.collect_vars_stmts(body);
-                }
-                StmtKind::If {
-                    cond,
-                    body,
-                    elifs,
-                    else_body,
-                } => {
-                    self.collect_vars_expr(cond);
-                    self.collect_vars_stmts(body);
-                    for (c, b) in elifs {
-                        self.collect_vars_expr(c);
-                        self.collect_vars_stmts(b);
-                    }
-                    if let Some(b) = else_body {
-                        self.collect_vars_stmts(b);
-                    }
-                }
-                StmtKind::Expr(e) => self.collect_vars_expr(e),
-                _ => {}
-            }
-        }
-    }
-
-    fn collect_vars_expr(&mut self, e: &Expr) {
-        match &e.kind {
-            ExprKind::Name(n) => {
-                self.var_id(n);
-            }
-            ExprKind::Unary(_, inner) => self.collect_vars_expr(inner),
-            ExprKind::Bin(_, a, b) => {
-                self.collect_vars_expr(a);
-                self.collect_vars_expr(b);
-            }
-            ExprKind::Call(_, args) => {
-                for a in args {
-                    self.collect_vars_expr(a);
-                }
-            }
-            _ => {}
-        }
     }
 
     /// A vertical chain of statement blocks: the first block, with the rest
@@ -235,8 +170,9 @@ impl Builder {
             } => {
                 let id = self.var_id(var);
                 // Blockly's `controls_for` TO bound is inclusive, but Python's
-                // range() end is exclusive — represent it as `end - 1`.
-                let to = self.inclusive_to(end)?;
+                // range() end is exclusive — represent it as `end - 1` ascending,
+                // `end + 1` descending.
+                let to = self.inclusive_to(end, step)?;
                 let mut ins = vec![
                     input("FROM", &self.value_block(start)?),
                     input("TO", &to),
@@ -279,16 +215,25 @@ impl Builder {
         }
     }
 
-    /// `end - 1` as a Blockly value block (folded when `end` is a literal int).
-    fn inclusive_to(&mut self, end: &Expr) -> Result<String, String> {
+    /// Blockly's inclusive TO for a Python exclusive `end`: `end - 1` for an
+    /// ascending loop, `end + 1` for a descending one (negative literal step).
+    /// Folded when `end` is a literal int.
+    fn inclusive_to(&mut self, end: &Expr, step: &Expr) -> Result<String, String> {
+        let descending = step_is_negative(step);
         if let ExprKind::Int(n) = end.kind {
-            return Ok(number(n as f64 - 1.0));
+            let adjusted = if descending {
+                n as f64 + 1.0
+            } else {
+                n as f64 - 1.0
+            };
+            return Ok(number(adjusted));
         }
         let e = self.value_block(end)?;
+        let op = if descending { "ADD" } else { "MINUS" };
         let ab = format!("{},{}", input("A", &e), input("B", &number(1.0)));
         Ok(block(
             "math_arithmetic",
-            &field("OP", &jstr("MINUS")),
+            &field("OP", &jstr(op)),
             &ab,
             "",
             "",
@@ -439,9 +384,26 @@ fn var_ref(id: &str) -> String {
     format!("{{\"id\":{}}}", jstr(id))
 }
 
+/// True if `step` is a negative numeric literal (so the loop counts down).
+/// A non-literal step (e.g. a variable) has unknown sign — treated as ascending.
+fn step_is_negative(step: &Expr) -> bool {
+    match &step.kind {
+        ExprKind::Int(n) => *n < 0,
+        ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
+            ExprKind::Int(n) => n > 0,
+            ExprKind::Float(f) => f > 0.0,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// A `math_number` block. Whole values serialize without a trailing `.0`.
 fn number(n: f64) -> String {
-    let num = if n.fract() == 0.0 && n.is_finite() {
+    let num = if !n.is_finite() {
+        // inf/NaN can't be valid JSON; fall back to 0 rather than emit `inf`.
+        "0".to_string()
+    } else if n.fract() == 0.0 {
         format!("{}", n as i64)
     } else {
         format!("{n}")
@@ -510,6 +472,19 @@ mod tests {
         let json = to_blockly_json("for i in range(1, 5):\n    print(i)").unwrap();
         assert!(json.contains("\"type\":\"controls_for\""));
         assert!(json.contains("\"NUM\":4"));
+    }
+
+    #[test]
+    fn for_descending_range_inclusive_to_is_end_plus_one() {
+        // range(10, 0, -1) is 10..1; Blockly's TO is inclusive, so for a
+        // descending loop it must be end + 1 = 1 (NOT end - 1 = -1). The BY
+        // input is legitimately -1, so check the TO input specifically.
+        let json = to_blockly_json("for i in range(10, 0, -1):\n    print(i)").unwrap();
+        assert!(json.contains("\"type\":\"controls_for\""), "{json}");
+        assert!(
+            json.contains("\"TO\":{\"block\":{\"type\":\"math_number\",\"fields\":{\"NUM\":1}}}"),
+            "expected inclusive TO of 1: {json}"
+        );
     }
 
     #[test]
