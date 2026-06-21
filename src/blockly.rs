@@ -564,7 +564,17 @@ impl Builder {
                 Ok(block("lists_create_with", "", &ins.join(","), &extra, ""))
             }
             ExprKind::Tuple(_) => unsupported("a tuple"),
-            ExprKind::Dict(_) => unsupported("a dict"),
+            // Dict literal `{k: v, ...}` -> python_dict with KEY0/VAL0.. value
+            // inputs and a pair count in extraState (a pair mutator backs it).
+            ExprKind::Dict(pairs) => {
+                let mut ins = Vec::with_capacity(pairs.len() * 2);
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    ins.push(input(&format!("KEY{i}"), &self.value_block(k)?));
+                    ins.push(input(&format!("VAL{i}"), &self.value_block(v)?));
+                }
+                let extra = format!("{{\"pairCount\":{}}}", pairs.len());
+                Ok(block("python_dict", "", &ins.join(","), &extra, ""))
+            }
             // Subscript read `target[index]` (lists, dicts, strings).
             ExprKind::Index(obj, idx) => {
                 let t = self.value_block(obj)?;
@@ -925,8 +935,8 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_error_gracefully() {
-        let err = to_blockly_json("d = {1: 2}").unwrap_err();
-        assert!(err.contains("dict"), "{err}");
+        let err = to_blockly_json("t = (1, 2)").unwrap_err();
+        assert!(err.contains("tuple"), "{err}");
         let err = to_blockly_json("class C:\n    pass").unwrap_err();
         assert!(err.contains("class"), "{err}");
     }
@@ -1044,6 +1054,22 @@ mod tests {
     }
 
     #[test]
+    fn dict_literal_round_trips() {
+        // `{"a": 1, "b": 2}` -> python_dict with KEY/VAL inputs + pair count.
+        let json = to_blockly_json("d = {\"a\": 1, \"b\": 2}").unwrap();
+        assert!(json.contains("\"type\":\"python_dict\""), "{json}");
+        assert!(json.contains("\"pairCount\":2"), "{json}");
+        assert!(json.contains("\"KEY0\""), "{json}");
+        assert!(json.contains("\"VAL1\""), "{json}");
+        assert!(json.contains("\"TEXT\":\"a\""), "{json}");
+
+        // An empty dict is representable too (pairCount 0).
+        let json = to_blockly_json("d = {}").unwrap();
+        assert!(json.contains("\"type\":\"python_dict\""), "{json}");
+        assert!(json.contains("\"pairCount\":0"), "{json}");
+    }
+
+    #[test]
     fn method_calls_statement_and_value() {
         // Void method call `xs.append(5)` -> python_method_statement.
         let json = to_blockly_json("xs.append(5)").unwrap();
@@ -1114,8 +1140,8 @@ mod tests {
     #[test]
     fn to_blocks_recovers_inside_a_compound_body() {
         // Per-block recovery: the `for` still renders (with the printable line in
-        // its body) even though one body line (a dict) can't be a block yet.
-        let out = to_blocks("for i in range(3):\n    print(i)\n    y = {1: 2}\n");
+        // its body) even though one body line (a tuple) can't be a block yet.
+        let out = to_blocks("for i in range(3):\n    print(i)\n    y = (1, 2)\n");
         assert!(
             out.json.contains("\"type\":\"controls_for\""),
             "{}",
@@ -1123,23 +1149,23 @@ mod tests {
         );
         assert!(out.json.contains("\"type\":\"text_print\""), "{}", out.json);
         assert!(
-            out.errors.iter().any(|e| e.to_string().contains("dict")),
+            out.errors.iter().any(|e| e.to_string().contains("tuple")),
             "{:?}",
             out.errors
         );
-        assert!(out.error_lines.is_empty(), "a dict isn't a syntax error");
+        assert!(out.error_lines.is_empty(), "a tuple isn't a syntax error");
     }
 
     #[test]
     fn to_blocks_skips_unsupported_but_keeps_the_rest() {
-        // A dict literal has no block yet; `x` and `z` still render as two
-        // separate stacks, and the dict is reported as a NOTE — but it's valid
-        // Python, so it must NOT be highlighted as a syntax error.
-        let out = to_blocks("x = 1\ny = {1: 2}\nz = 3\n");
+        // A tuple has no block yet; `x` and `z` still render as two separate
+        // stacks, and the tuple is reported as a NOTE — but it's valid Python,
+        // so it must NOT be highlighted as a syntax error.
+        let out = to_blocks("x = 1\ny = (1, 2)\nz = 3\n");
         assert!(out.json.contains("\"NUM\":1"), "{}", out.json); // x
         assert!(out.json.contains("\"NUM\":3"), "{}", out.json); // z
         assert!(
-            out.errors.iter().any(|e| e.to_string().contains("dict")),
+            out.errors.iter().any(|e| e.to_string().contains("tuple")),
             "{:?}",
             out.errors
         );
