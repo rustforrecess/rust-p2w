@@ -39,6 +39,28 @@ pub fn parse_recovering(tokens: &[Token]) -> (Vec<Stmt>, Vec<CompileError>) {
     p.program_recovering()
 }
 
+/// Parse a single expression (no trailing statement/newline) — used by the
+/// step debugger to evaluate watch expressions in the current scope.
+pub fn parse_expression(tokens: &[Token]) -> Result<Expr> {
+    let mut p = Parser {
+        toks: tokens,
+        pos: 0,
+        next_tmp: 0,
+        recovering: false,
+        errors: Vec::new(),
+    };
+    let e = p.expr(0)?;
+    // Allow a trailing newline/EOF (the lexer appends one), but nothing else —
+    // a watch is one expression, not a statement or a sequence.
+    match p.peek() {
+        Tok::Newline | Tok::Eof => Ok(e),
+        other => Err(CompileError::at(
+            p.line(),
+            format!("a watch must be a single expression; found {other:?}"),
+        )),
+    }
+}
+
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
