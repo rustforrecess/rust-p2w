@@ -71,9 +71,13 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
     error_lines.extend(typo_lines.iter().copied());
     errors.extend(typos);
 
-    let mut b = Builder::default();
-    let (tops, build_notes) = b.build_program(&stmts);
-    for note in build_notes {
+    let mut b = Builder {
+        tolerant: true,
+        ..Default::default()
+    };
+    let tops = b.build_program(&stmts);
+    let json = b.document(&tops);
+    for note in b.notes {
         // A typo'd call already has a clearer "did you mean" message on this
         // line; don't also say the vaguer "no block yet".
         if note.line.is_some_and(|l| typo_lines.contains(&l)) {
@@ -87,7 +91,7 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
     errors.sort_by_key(|e| e.line.unwrap_or(usize::MAX));
 
     BlocksOutcome {
-        json: b.document(&tops),
+        json,
         errors,
         error_lines,
     }
@@ -122,6 +126,13 @@ pub fn to_blockly_json(source: &str) -> Result<String, String> {
 struct Builder {
     /// Variable name -> stable Blockly id, in first-seen order.
     vars: Vec<(String, String)>,
+    /// When true (the `to_blocks` path), rendering a statement that can't be
+    /// represented records a note and is skipped instead of aborting — so one
+    /// bad line inside a loop/if body doesn't drop the whole compound. When
+    /// false (the strict `to_blockly_json` path), the first failure propagates.
+    tolerant: bool,
+    /// Notes gathered while tolerant: statements that couldn't be represented.
+    notes: Vec<CompileError>,
 }
 
 impl Builder {
@@ -149,33 +160,24 @@ impl Builder {
 
     /// Render top-level statements forgivingly: each is built on its own, and a
     /// statement that can't be represented (a not-yet-supported construct) is
-    /// skipped with a diagnostic instead of aborting. Consecutive renderable
-    /// statements are linked into one connected stack via `next`; a skipped one
-    /// just breaks the stack, so a fresh stack starts after it. Returns the
-    /// top-level (unpositioned) block stacks and the diagnostics.
-    fn build_program(&mut self, stmts: &[Stmt]) -> (Vec<String>, Vec<CompileError>) {
+    /// skipped — noted in `self.notes` — instead of aborting. Consecutive
+    /// renderable statements are linked into one connected stack via `next`; a
+    /// skipped one breaks the stack, so a fresh stack starts after it. Returns
+    /// the top-level (unpositioned) block stacks.
+    fn build_program(&mut self, stmts: &[Stmt]) -> Vec<String> {
         let mut tops = Vec::new();
-        let mut errors = Vec::new();
         let mut run: Vec<String> = Vec::new();
         for s in stmts {
             match self.stmt_block(s, "") {
                 Ok(block) => run.push(block),
                 Err(msg) => {
                     flush_run(&mut run, &mut tops);
-                    // The failure can come from a NESTED statement (deeper line
-                    // than `s`), so take the line from the message's own
-                    // "line N:" prefix, then strip it so the line isn't doubled
-                    // when CompileError is displayed.
-                    let (line, bare) = split_line_prefix(&msg);
-                    errors.push(match line {
-                        Some(n) => CompileError::at(n, bare),
-                        None => CompileError::general(bare),
-                    });
+                    self.notes.push(note_from(&msg));
                 }
             }
         }
         flush_run(&mut run, &mut tops);
-        (tops, errors)
+        tops
     }
 
     /// Wrap top-level block stacks into a workspace document, giving each stack
@@ -197,7 +199,22 @@ impl Builder {
 
     /// A vertical chain of statement blocks: the first block, with the rest
     /// nested in its `next`. Returns "" for an empty statement list.
+    ///
+    /// In tolerant mode (used for a compound's body), a statement that can't be
+    /// represented is noted and skipped, and the rest stay linked — so one bad
+    /// line inside a loop/if body doesn't discard the whole body. In strict mode
+    /// the first failure propagates.
     fn chain(&mut self, stmts: &[Stmt]) -> Result<String, String> {
+        if self.tolerant {
+            let mut rendered: Vec<String> = Vec::new();
+            for s in stmts {
+                match self.stmt_block(s, "") {
+                    Ok(b) => rendered.push(b),
+                    Err(msg) => self.notes.push(note_from(&msg)),
+                }
+            }
+            return Ok(stitch(rendered));
+        }
         let Some((first, rest)) = stmts.split_first() else {
             return Ok(String::new());
         };
@@ -505,17 +522,35 @@ fn split_line_prefix(msg: &str) -> (Option<usize>, String) {
     (None, msg.to_string())
 }
 
-/// Link a run of standalone block objects into one connected stack (each block
-/// becomes the `next` of the one before it), and push it as a top-level stack.
-/// Drains `run`.
-fn flush_run(run: &mut Vec<String>, tops: &mut Vec<String>) {
-    let Some(mut chain) = run.pop() else {
-        return;
+/// Turn a `stmt_block` error string into a structured note (line + message),
+/// taking the line from the message's own `"line N:"` prefix — the failure may
+/// come from a statement nested deeper than the one being rendered.
+fn note_from(msg: &str) -> CompileError {
+    match split_line_prefix(msg) {
+        (Some(n), bare) => CompileError::at(n, bare),
+        (None, bare) => CompileError::general(bare),
+    }
+}
+
+/// Link standalone block objects into one connected stack (each becomes the
+/// `next` of the one before it). Returns "" for an empty list.
+fn stitch(blocks: Vec<String>) -> String {
+    let mut iter = blocks.into_iter().rev();
+    let Some(mut chain) = iter.next() else {
+        return String::new();
     };
-    while let Some(prev) = run.pop() {
+    for prev in iter {
         chain = with_next(&prev, &chain);
     }
-    tops.push(chain);
+    chain
+}
+
+/// Stitch the current run into a connected stack and push it as a top-level
+/// stack. Drains `run`.
+fn flush_run(run: &mut Vec<String>, tops: &mut Vec<String>) {
+    if !run.is_empty() {
+        tops.push(stitch(std::mem::take(run)));
+    }
 }
 
 /// Splice `next` into a standalone block object (built with no `next`): insert
@@ -728,6 +763,25 @@ mod tests {
             out.errors
         );
         assert_eq!(out.error_lines, vec![3], "typo on line 3 is highlightable");
+    }
+
+    #[test]
+    fn to_blocks_recovers_inside_a_compound_body() {
+        // Per-block recovery: the `for` still renders (with the printable line in
+        // its body) even though one body line (a list) can't be a block.
+        let out = to_blocks("for i in range(3):\n    print(i)\n    y = [1, 2]\n");
+        assert!(
+            out.json.contains("\"type\":\"controls_for\""),
+            "{}",
+            out.json
+        );
+        assert!(out.json.contains("\"type\":\"text_print\""), "{}", out.json);
+        assert!(
+            out.errors.iter().any(|e| e.to_string().contains("list")),
+            "{:?}",
+            out.errors
+        );
+        assert!(out.error_lines.is_empty(), "a list isn't a syntax error");
     }
 
     #[test]
