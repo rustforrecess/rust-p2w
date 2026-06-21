@@ -161,6 +161,33 @@ Java is the real version of the revisit trigger — a genuinely *distinct* langu
   share an abstract syntax than NL and code do, and execution — not parsing — is
   the hard part.
 
+## Compile targets (backends) — the other axis
+
+The LLVM shape has two axes: front-ends (languages) *and* **backends (targets)**.
+The backend axis is real and planned — and it must stay true to the project's
+core philosophy: **we compile, we don't interpret** (the whole reason rust-p2w
+exists instead of shipping Pyodide/CPython). The device target is no exception:
+no MicroPython, no on-device interpreter.
+
+- **WASM-GC (browser)** — today; free, zero-hardware, runs on the Chromebooks
+  schools already have. (Currently a hand-written WAT emitter.)
+- **Raspberry Pi Pico 2 W — native, via LLVM** — eventual. A ~$7 RP2350 board
+  (WiFi + on-chip temp sensor + ADC/GPIO). We own the AST and **compile it
+  directly to embedded native code through LLVM** (RP2350 = Cortex-M33 + RISC-V,
+  both first-class LLVM targets) — **not** MicroPython, not any interpreter
+  shipped to the device. Same student Python, compiled to bare metal; the
+  artifact (ELF/UF2) is flashed from the browser (WebSerial/WebUSB / UF2 mass
+  storage). Device peripherals exposed through the same host-import-style
+  contract as the WASM runner.
+
+So "write Python once → run free in-browser **or compile it to native code on a
+$7 board**" is the backend story — a real compiler to bare metal, not an
+interpreter on the device. It's the answer to the micro:bit cost/sensor
+positioning, and it's why the IR/backend separation matters even while Python
+stays the only language. (Note: today's WASM backend is a bespoke WAT emitter;
+the native target introduces an LLVM lowering, which could later unify both since
+LLVM emits WASM as well.)
+
 ## Revisit trigger
 
 - A single **Python→Mojo** swap does **not** trigger an architecture change
