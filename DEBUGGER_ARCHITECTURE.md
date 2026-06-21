@@ -117,10 +117,10 @@ Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
    `current_line`, `output`, `variables`, `eval_watch`. The IDE has a 🐞 Debug
    mode with Step/Continue/Stop, a live variables list, watch expressions, and a
    paused-line highlight. Covers the teaching subset; unsupported constructs stop
-   with a friendly "use Run" message. Still to add at this layer: breakpoint
-   gutter (the engine's `run(breakpoints)` already takes them), watchpoints
-   (break-on-change), call stack across user functions, and the block highlight
-   (needs line metadata on blocks).
+   with a friendly "use Run" message. A clickable line-number **breakpoint
+   gutter** drives `run(breakpoints)`. Still to add at this layer: watchpoints
+   (break-on-change), a call stack across user functions, and the block
+   highlight (needs line metadata on blocks).
 2. Native LLVM backend (separate, large — see the Pico target notes).
 3. **`UsbStubAdapter`** — on-device step hooks + USB-CDC control channel + the
    variable-layout map. No probe, consistent UX.
