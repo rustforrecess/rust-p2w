@@ -225,7 +225,16 @@ impl Builder {
         self.stmt_block(first, &rest_json)
     }
 
+    /// Build a statement's block and tag it with its 1-based source line in the
+    /// Blockly `data` field, so the step debugger can highlight the block for the
+    /// line it's paused on. `data` round-trips through serialization and is
+    /// ignored by the blocks->Python generator, so it's a pure annotation.
     fn stmt_block(&mut self, s: &Stmt, next: &str) -> Result<String, String> {
+        let json = self.stmt_block_raw(s, next)?;
+        Ok(with_data(&json, s.line))
+    }
+
+    fn stmt_block_raw(&mut self, s: &Stmt, next: &str) -> Result<String, String> {
         let unsupported = |what: &str| {
             Err(format!(
                 "line {}: {what} has no block yet (edit it in the text pane)",
@@ -760,6 +769,14 @@ fn flush_run(run: &mut Vec<String>, tops: &mut Vec<String>) {
     }
 }
 
+/// Tag a block object with its source line in the `data` field, inserted right
+/// after the opening `{`. `data` is a standard Blockly per-block string that
+/// round-trips through serialization.
+fn with_data(block: &str, line: usize) -> String {
+    debug_assert!(block.starts_with('{'));
+    format!("{{\"data\":\"{line}\",{}", &block[1..])
+}
+
 /// Splice `next` into a standalone block object (built with no `next`): insert
 /// `,"next":{"block":…}` just before the block's closing brace.
 fn with_next(block: &str, next: &str) -> String {
@@ -1032,6 +1049,16 @@ mod tests {
         assert!(out.json.contains("\"PARAMS\":\"n: int\""), "{}", out.json);
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert!(out.error_lines.is_empty());
+    }
+
+    #[test]
+    fn statements_carry_their_source_line_in_data() {
+        // Each statement block is tagged with its 1-based line (for the debugger
+        // block highlight); nested body statements get their own line too.
+        let json = to_blockly_json("x = 1\nfor i in range(3):\n    print(i)\n").unwrap();
+        assert!(json.contains("\"data\":\"1\""), "x= on line 1: {json}");
+        assert!(json.contains("\"data\":\"2\""), "for on line 2: {json}");
+        assert!(json.contains("\"data\":\"3\""), "print on line 3: {json}");
     }
 
     #[test]

@@ -120,9 +120,13 @@ Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
    with a friendly "use Run" message. A clickable line-number **breakpoint
    gutter** drives `run(breakpoints)`, and **watchpoints** (break-on-change:
    `set_watchpoints` + a per-step value diff, reported as `watch_hit`) pause the
-   run when a watched expression's value changes. Still to add at this layer: a
-   call stack across user functions, and the block highlight (needs line
-   metadata on blocks).
+   run when a watched expression's value changes. Each statement block carries
+   its source line in Blockly's `data` field, so the paused line **glows the
+   matching block** too (the line↔block payoff). Still to add at this layer: a
+   call stack — it needs the Stepper to step *into* user functions (currently a
+   call to a user-defined function stops with "use Run"), which is the
+   tree-walker's hardest piece (suspending mid-expression — really wants the VM
+   form, or a step-over compromise).
 2. Native LLVM backend (separate, large — see the Pico target notes).
 3. **`UsbStubAdapter`** — on-device step hooks + USB-CDC control channel + the
    variable-layout map. No probe, consistent UX.
