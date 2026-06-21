@@ -176,13 +176,13 @@ fn walk_stmts(stmts: &[Stmt], known: &[&str], out: &mut Vec<CompileError>) {
 fn walk_expr(e: &Expr, known: &[&str], out: &mut Vec<CompileError>) {
     match &e.kind {
         ExprKind::Call(name, args) => {
-            if !known.contains(&name.as_str()) {
-                if let Some(sugg) = did_you_mean(name, known) {
-                    out.push(CompileError::at(
-                        e.line,
-                        format!("`{name}` isn't defined — did you mean `{sugg}`?"),
-                    ));
-                }
+            if !known.contains(&name.as_str())
+                && let Some(sugg) = did_you_mean(name, known)
+            {
+                out.push(CompileError::at(
+                    e.line,
+                    format!("`{name}` isn't defined — did you mean `{sugg}`?"),
+                ));
             }
             for a in args {
                 walk_expr(a, known, out);

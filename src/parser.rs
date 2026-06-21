@@ -276,7 +276,7 @@ impl<'a> Parser<'a> {
                         return Err(CompileError::at(
                             self.line(),
                             format!("expected a module name after 'import', found {other:?}"),
-                        ))
+                        ));
                     }
                 }
                 if matches!(self.peek(), Tok::Comma) {
@@ -491,7 +491,7 @@ impl<'a> Parser<'a> {
                 return Err(CompileError::at(
                     self.line(),
                     format!("expected a function name after 'def', found {other:?}"),
-                ))
+                ));
             }
         };
         self.expect(&Tok::LParen, "'(' after the function name")?;
@@ -524,7 +524,7 @@ impl<'a> Parser<'a> {
                         return Err(CompileError::at(
                             self.line(),
                             format!("expected a parameter name, found {other:?}"),
-                        ))
+                        ));
                     }
                 }
                 if matches!(self.peek(), Tok::Comma) {
@@ -564,7 +564,7 @@ impl<'a> Parser<'a> {
                 return Err(CompileError::at(
                     self.line(),
                     format!("expected a class name after 'class', found {other:?}"),
-                ))
+                ));
             }
         };
         // Optional single base class: `class Name(Base):`
@@ -581,7 +581,7 @@ impl<'a> Parser<'a> {
                         return Err(CompileError::at(
                             self.line(),
                             format!("expected a base class name, found {other:?}"),
-                        ))
+                        ));
                     }
                 }
                 if matches!(self.peek(), Tok::Comma) {
@@ -621,7 +621,7 @@ impl<'a> Parser<'a> {
                     return Err(CompileError::at(
                         stmt.line,
                         "a class body can only contain methods (def) and variable assignments",
-                    ))
+                    ));
                 }
             }
         }
@@ -679,7 +679,7 @@ impl<'a> Parser<'a> {
                     return Err(CompileError::at(
                         self.line(),
                         format!("range() takes 1 to 3 arguments, got {n}"),
-                    ))
+                    ));
                 }
             };
             self.expect_colon()?;
@@ -942,7 +942,7 @@ impl<'a> Parser<'a> {
                             return Err(CompileError::at(
                                 self.line(),
                                 format!("expected a name after '.', found {other:?}"),
-                            ))
+                            ));
                         }
                     };
                     // `.name(...)` is a method call; bare `.name` is an

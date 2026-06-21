@@ -466,7 +466,7 @@ impl Builder {
                 return Err(format!(
                     "line {}: this operator has no block yet (edit it in the text pane)",
                     a.line
-                ))
+                ));
             }
         })
     }
@@ -496,12 +496,11 @@ fn block(ty: &str, fields: &str, inputs: &str, extra_state: &str, next: &str) ->
 /// Split a `"line N: message"` diagnostic into its 1-based line and the bare
 /// message. Returns `(None, whole)` if there's no recognizable prefix.
 fn split_line_prefix(msg: &str) -> (Option<usize>, String) {
-    if let Some(rest) = msg.strip_prefix("line ") {
-        if let Some((num, tail)) = rest.split_once(": ") {
-            if let Ok(n) = num.parse::<usize>() {
-                return (Some(n), tail.to_string());
-            }
-        }
+    if let Some(rest) = msg.strip_prefix("line ")
+        && let Some((num, tail)) = rest.split_once(": ")
+        && let Ok(n) = num.parse::<usize>()
+    {
+        return (Some(n), tail.to_string());
     }
     (None, msg.to_string())
 }

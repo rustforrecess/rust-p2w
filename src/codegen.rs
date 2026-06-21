@@ -83,13 +83,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                     format!("'{name}' is defined twice"),
                 ));
             }
-            if let Some(b) = base {
-                if !g.classes.contains_key(b) {
-                    return Err(CompileError::at(
-                        s.line,
-                        format!("unknown base class '{b}' (define it before '{name}')"),
-                    ));
-                }
+            if let Some(b) = base
+                && !g.classes.contains_key(b)
+            {
+                return Err(CompileError::at(
+                    s.line,
+                    format!("unknown base class '{b}' (define it before '{name}')"),
+                ));
             }
             g.classes.insert(name.clone(), base.clone());
         }
@@ -5336,7 +5336,7 @@ impl Gen {
                 return Err(CompileError::at(
                     line,
                     "the range() step must be a plain number for now",
-                ))
+                ));
             }
         };
         let done_cmp = if step_v > 0 { "i32.ge_s" } else { "i32.le_s" };
@@ -5896,15 +5896,13 @@ impl Gen {
             inner = unpacked;
         }
         // `range(...)` over a single target is a counted i32 loop.
-        if single {
-            if let ExprKind::Call(name, args) = &iter.kind {
-                if name == "range"
-                    && (1..=3).contains(&args.len())
-                    && !self.funcs.contains_key("range")
-                {
-                    return self.comp_range_for(cx, &loopvar, args, inner, iter.line);
-                }
-            }
+        if single
+            && let ExprKind::Call(name, args) = &iter.kind
+            && name == "range"
+            && (1..=3).contains(&args.len())
+            && !self.funcs.contains_key("range")
+        {
+            return self.comp_range_for(cx, &loopvar, args, inner, iter.line);
         }
         self.comp_for(cx, &loopvar, iter, inner)
     }
@@ -6283,30 +6281,30 @@ impl Gen {
                 // `super().m(args)` dispatches from the enclosing class's base
                 // with the current `self` (resolved at compile time — v1 has
                 // no first-class super).
-                if let ExprKind::Call(callee, super_args) = &recv.kind {
-                    if callee == "super" {
-                        if !super_args.is_empty() {
-                            return Err(CompileError::at(
-                                e.line,
-                                "super() takes no arguments in this subset",
-                            ));
-                        }
-                        let class = cx.current_class.as_ref().ok_or_else(|| {
-                            CompileError::at(e.line, "super() can only be used inside a method")
-                        })?;
-                        let base = self.classes.get(class).cloned().flatten().ok_or_else(|| {
-                            CompileError::at(
-                                e.line,
-                                format!("super() needs a base class, but '{class}' has none"),
-                            )
-                        })?;
-                        let self_name = cx.self_name.clone().expect("method has self");
-                        let args_list = self.list_of(cx, args)?;
-                        return Ok(format!(
-                            "(call $dispatch_from (local.get ${self_name}) (global.get $g_class_{base}) {} {args_list})",
-                            str_lit(method)
+                if let ExprKind::Call(callee, super_args) = &recv.kind
+                    && callee == "super"
+                {
+                    if !super_args.is_empty() {
+                        return Err(CompileError::at(
+                            e.line,
+                            "super() takes no arguments in this subset",
                         ));
                     }
+                    let class = cx.current_class.as_ref().ok_or_else(|| {
+                        CompileError::at(e.line, "super() can only be used inside a method")
+                    })?;
+                    let base = self.classes.get(class).cloned().flatten().ok_or_else(|| {
+                        CompileError::at(
+                            e.line,
+                            format!("super() needs a base class, but '{class}' has none"),
+                        )
+                    })?;
+                    let self_name = cx.self_name.clone().expect("method has self");
+                    let args_list = self.list_of(cx, args)?;
+                    return Ok(format!(
+                        "(call $dispatch_from (local.get ${self_name}) (global.get $g_class_{base}) {} {args_list})",
+                        str_lit(method)
+                    ));
                 }
                 // `math.fn(...)` — a module function, not a value method.
                 if self.is_module_ref(cx, recv) {
@@ -6314,11 +6312,11 @@ impl Gen {
                 }
                 // `"template".format(...)` with a literal template (a class with
                 // a `.format` method still dispatches normally).
-                if method == "format" {
-                    if let ExprKind::Str(tmpl) = &recv.kind {
-                        let tmpl = tmpl.clone();
-                        return self.gen_str_format(cx, &tmpl, args, e.line);
-                    }
+                if method == "format"
+                    && let ExprKind::Str(tmpl) = &recv.kind
+                {
+                    let tmpl = tmpl.clone();
+                    return self.gen_str_format(cx, &tmpl, args, e.line);
                 }
                 // String methods. Each helper falls back to method dispatch for
                 // a non-string receiver, so a class may reuse these names.
@@ -6552,20 +6550,20 @@ impl Gen {
                 }
                 // dict.keys()/.values()/.items() — $dict_view falls back to
                 // method dispatch for a non-dict, so a class may reuse the names.
-                if args.is_empty() {
-                    if let Some(which) = match method.as_str() {
+                if args.is_empty()
+                    && let Some(which) = match method.as_str() {
                         "keys" => Some(0),
                         "values" => Some(1),
                         "items" => Some(2),
                         _ => None,
-                    } {
-                        let r = self.value_expr(cx, recv)?;
-                        let empty = self.list_of(cx, args)?;
-                        return Ok(format!(
-                            "(call $dict_view {r} (i32.const {which}) {} {empty})",
-                            str_lit(method)
-                        ));
                     }
+                {
+                    let r = self.value_expr(cx, recv)?;
+                    let empty = self.list_of(cx, args)?;
+                    return Ok(format!(
+                        "(call $dict_view {r} (i32.const {which}) {} {empty})",
+                        str_lit(method)
+                    ));
                 }
                 // `.append(v)` is the list fast path; every other method is a
                 // dynamic object dispatch.
@@ -6640,7 +6638,7 @@ impl Gen {
                                     return Err(CompileError::at(
                                         e.line,
                                         format!("range() takes 1 to 3 arguments, got {k}"),
-                                    ))
+                                    ));
                                 }
                             };
                             return Ok(format!("(call $range_list {start} {end} {step})"));
@@ -6819,7 +6817,7 @@ impl Gen {
                                     "{n}() is missing a required argument '{}'",
                                     params.get(j).map(|s| s.as_str()).unwrap_or("?")
                                 ),
-                            ))
+                            ));
                         }
                     };
                     wat.push(' ');
@@ -7229,14 +7227,18 @@ mod tests {
 
     #[test]
     fn literal_type_misuse_is_a_compile_error() {
-        assert!(compile("print(1 + \"a\")")
-            .unwrap_err()
-            .message
-            .contains("can't add text and a number"));
-        assert!(compile("print(\"a\" - 1)")
-            .unwrap_err()
-            .message
-            .contains("numbers on both sides"));
+        assert!(
+            compile("print(1 + \"a\")")
+                .unwrap_err()
+                .message
+                .contains("can't add text and a number")
+        );
+        assert!(
+            compile("print(\"a\" - 1)")
+                .unwrap_err()
+                .message
+                .contains("numbers on both sides")
+        );
         assert!(compile("print(\"a\" < \"b\")").is_err()); // lexicographic: later
         assert!(compile("for i in range(\"x\"):\n    print(i)\n").is_err());
     }
@@ -7376,14 +7378,18 @@ mod tests {
 
     #[test]
     fn break_continue_outside_loop_are_rejected() {
-        assert!(compile("break\n")
-            .unwrap_err()
-            .message
-            .contains("inside a loop"));
-        assert!(compile("continue\n")
-            .unwrap_err()
-            .message
-            .contains("inside a loop"));
+        assert!(
+            compile("break\n")
+                .unwrap_err()
+                .message
+                .contains("inside a loop")
+        );
+        assert!(
+            compile("continue\n")
+                .unwrap_err()
+                .message
+                .contains("inside a loop")
+        );
         // ...including in an if that isn't inside a loop.
         assert!(compile("if 1:\n    break\n").is_err());
     }
@@ -7473,23 +7479,29 @@ mod tests {
         let err = compile("def f(a):\n    return a\nprint(f(1, 2))\n").unwrap_err();
         assert!(err.message.contains("too many positional arguments"));
         // return at top level.
-        assert!(compile("return 1\n")
-            .unwrap_err()
-            .message
-            .contains("inside a function"));
+        assert!(
+            compile("return 1\n")
+                .unwrap_err()
+                .message
+                .contains("inside a function")
+        );
         // Nested def.
         let err = compile("def f():\n    def g():\n        return 1\n    return 2\n").unwrap_err();
         assert!(err.message.contains("top level"));
         // Unknown function.
-        assert!(compile("print(nope(1))\n")
-            .unwrap_err()
-            .message
-            .contains("unknown function"));
+        assert!(
+            compile("print(nope(1))\n")
+                .unwrap_err()
+                .message
+                .contains("unknown function")
+        );
         // Duplicate definition.
-        assert!(compile("def f():\n    return 1\ndef f():\n    return 2\n")
-            .unwrap_err()
-            .message
-            .contains("defined twice"));
+        assert!(
+            compile("def f():\n    return 1\ndef f():\n    return 2\n")
+                .unwrap_err()
+                .message
+                .contains("defined twice")
+        );
         // Function used without calling.
         let err = compile("def f():\n    return 1\nprint(f + 1)\n").unwrap_err();
         assert!(err.message.contains("call it"));
@@ -7500,9 +7512,10 @@ mod tests {
         // The guard fires in the parser (the middle operand would be cloned).
         let err = parse(&lex("def f():\n    return 2\nif 1 < f() < 3:\n    print(1)\n").unwrap())
             .unwrap_err();
-        assert!(err
-            .message
-            .contains("chained comparisons around a function call"));
+        assert!(
+            err.message
+                .contains("chained comparisons around a function call")
+        );
     }
 
     #[test]
