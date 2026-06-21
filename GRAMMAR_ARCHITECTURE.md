@@ -136,11 +136,42 @@ interpretability via derivation traces. It is a long-horizon pillar the current
 architecture already accommodates; nothing about the Python front-end needs to
 change to keep the door open.
 
+## Multi-language (e.g. Java): the LLVM-shaped answer, not a grammar engine
+
+Java is the real version of the revisit trigger — a genuinely *distinct* language
+(not a Python superset like Mojo). If it becomes firm:
+
+- **The parser is the cheap part.** Adding Java is dominated by (a) a Java
+  execution backend in the browser — Java's JVM / static-type model does **not**
+  reuse the Python→WASM-GC path, so this is effectively a *second compiler +
+  runtime* (TeaVM / CheerpJ / a JVM-subset interpreter), and (b) Java's
+  type-system semantics. A grammar engine helps with neither.
+- **The right multi-language architecture is compiler-shaped (LLVM-style):**
+  per-language front-ends → **one shared IR** → one WASM backend + IR-level
+  blocks. Adding a language = a new front-end that lowers to the shared IR; the
+  backend and the blocks mapping are written once. The investment is the **IR**,
+  not a grammar engine. (Today's AST is Python-specific; a language-neutral IR
+  *below* per-language ASTs is the actual multi-language move.)
+- **Front-ends are still a judgment call:** hand-write (best student errors — our
+  current strength, and the *product* of a teaching tool) vs. adopt **tree-sitter**
+  (off-the-shelf Python *and* Java grammars, but generic errors). For a teaching
+  tool, errors are the product, so lean hand-written/customized; tree-sitter is
+  reasonable for highlighting/structure only.
+- **GF/bidirectional grammar is still not the tool:** Python and Java no more
+  share an abstract syntax than NL and code do, and execution — not parsing — is
+  the hard part.
+
 ## Revisit trigger
 
-Reconsider a grammar-driven engine **only if a genuine family of teaching
-languages** (several, simultaneously, same modality) ever appears. A single
-Python→Mojo swap does not trigger it.
+- A single **Python→Mojo** swap does **not** trigger an architecture change
+  (Mojo is a Python superset → extend the existing front-end).
+- A second **distinct** language (e.g. **Java**) is where it starts to: if it's
+  *two* languages, keep the front-ends independent and introduce a shared IR
+  only when the backend/blocks duplication actually hurts; if it's the start of
+  a *family* (Python, Java, JS, C#…), design the shared IR **before** the second
+  language to avoid a painful retrofit. Even then the move is the **IR +
+  backend** (LLVM-shape), and optionally tree-sitter for parsing — *not* a
+  GF-style bidirectional grammar engine.
 
 ## What we did instead (the bounded, always-worth-it parts)
 
