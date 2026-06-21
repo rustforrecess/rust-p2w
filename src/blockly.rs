@@ -432,7 +432,28 @@ impl Builder {
                 };
                 Ok(block("python_return", "", &inputs, "", next))
             }
-            StmtKind::SetIndex { .. } => unsupported("item assignment"),
+            // Subscript assignment `target[index] = value` (lists, dicts).
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                let t = self.value_block(target)?;
+                let i = self.value_block(index)?;
+                let v = self.value_block(value)?;
+                Ok(block(
+                    "python_set_index",
+                    "",
+                    &format!(
+                        "{},{},{}",
+                        input("TARGET", &t),
+                        input("INDEX", &i),
+                        input("VALUE", &v)
+                    ),
+                    "",
+                    next,
+                ))
+            }
             StmtKind::SetAttr { .. } => unsupported("attribute assignment"),
             StmtKind::UnpackAssign { .. } => unsupported("tuple unpacking"),
             StmtKind::Import(_) => unsupported("`import`"),
@@ -537,7 +558,19 @@ impl Builder {
             }
             ExprKind::Tuple(_) => unsupported("a tuple"),
             ExprKind::Dict(_) => unsupported("a dict"),
-            ExprKind::Index(..) | ExprKind::Slice { .. } => unsupported("indexing/slicing"),
+            // Subscript read `target[index]` (lists, dicts, strings).
+            ExprKind::Index(obj, idx) => {
+                let t = self.value_block(obj)?;
+                let i = self.value_block(idx)?;
+                Ok(block(
+                    "python_index",
+                    "",
+                    &format!("{},{}", input("TARGET", &t), input("INDEX", &i)),
+                    "",
+                    "",
+                ))
+            }
+            ExprKind::Slice { .. } => unsupported("slicing"),
             ExprKind::Attr(..) => unsupported("an attribute"),
             ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => unsupported("a comprehension"),
             ExprKind::NoneLit => unsupported("None"),
@@ -950,6 +983,25 @@ mod tests {
         assert!(out.json.contains("\"PARAMS\":\"n: int\""), "{}", out.json);
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert!(out.error_lines.is_empty());
+    }
+
+    #[test]
+    fn indexing_read_and_assignment() {
+        // Subscript read `xs[0]` -> python_index with TARGET + INDEX.
+        let json = to_blockly_json("y = xs[0]").unwrap();
+        assert!(json.contains("\"type\":\"python_index\""), "{json}");
+        assert!(json.contains("\"TARGET\""), "{json}");
+        assert!(json.contains("\"INDEX\""), "{json}");
+
+        // Subscript assignment `xs[i] = 9` -> python_set_index.
+        let json = to_blockly_json("xs[i] = 9").unwrap();
+        assert!(json.contains("\"type\":\"python_set_index\""), "{json}");
+        assert!(json.contains("\"VALUE\""), "{json}");
+
+        // Dict-style key access round-trips through the same blocks.
+        let json = to_blockly_json("v = scores[\"ann\"]").unwrap();
+        assert!(json.contains("\"type\":\"python_index\""), "{json}");
+        assert!(json.contains("\"TEXT\":\"ann\""), "{json}");
     }
 
     #[test]
