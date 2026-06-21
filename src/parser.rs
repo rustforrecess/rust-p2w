@@ -14,6 +14,8 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>> {
         toks: tokens,
         pos: 0,
         next_tmp: 0,
+        recovering: false,
+        errors: Vec::new(),
     };
     p.program()
 }
@@ -31,6 +33,8 @@ pub fn parse_recovering(tokens: &[Token]) -> (Vec<Stmt>, Vec<CompileError>) {
         toks: tokens,
         pos: 0,
         next_tmp: 0,
+        recovering: true,
+        errors: Vec::new(),
     };
     p.program_recovering()
 }
@@ -42,6 +46,11 @@ struct Parser<'a> {
     /// tuple-target `for` loop). The `.u` prefix can't collide with a Python
     /// name.
     next_tmp: usize,
+    /// When true, a failed statement is recorded and skipped (at any nesting)
+    /// instead of aborting the whole parse — see [`take_statement`].
+    recovering: bool,
+    /// Errors gathered while `recovering`.
+    errors: Vec<CompileError>,
 }
 
 impl<'a> Parser<'a> {
@@ -149,42 +158,47 @@ impl<'a> Parser<'a> {
             if matches!(self.peek(), Tok::Eof) {
                 break;
             }
-            let start = self.pos;
-            match self.statement() {
-                Ok(s) => stmts.push(s),
-                Err(e) => return Err(self.suggest_keyword(e, start)),
-            }
+            self.take_statement(&mut stmts)?;
         }
         Ok(stmts)
     }
 
-    /// Like [`program`], but recovers after a bad statement and keeps going,
-    /// accumulating every error instead of returning the first.
-    fn program_recovering(&mut self) -> (Vec<Stmt>, Vec<CompileError>) {
-        let mut stmts = Vec::new();
-        let mut errors = Vec::new();
-        loop {
-            while matches!(self.peek(), Tok::Newline) {
-                self.advance();
+    /// Parse one statement into `stmts`. In recovering mode a failure is
+    /// recorded and the parser resynchronizes (returning Ok so the loop
+    /// continues); in strict mode the error propagates. Shared by `program` and
+    /// `block`, so recovery works at every nesting level.
+    fn take_statement(&mut self, stmts: &mut Vec<Stmt>) -> Result<()> {
+        let start = self.pos;
+        match self.statement() {
+            Ok(s) => {
+                stmts.push(s);
+                Ok(())
             }
-            if matches!(self.peek(), Tok::Eof) {
-                break;
-            }
-            let start = self.pos;
-            match self.statement() {
-                Ok(s) => stmts.push(s),
-                Err(e) => {
-                    errors.push(self.suggest_keyword(e, start));
-                    let before = self.pos;
-                    self.synchronize();
-                    // Guarantee forward progress so we can't loop forever.
-                    if self.pos == before {
-                        self.advance();
-                    }
+            Err(e) => {
+                let e = self.suggest_keyword(e, start);
+                if !self.recovering {
+                    return Err(e);
                 }
+                self.errors.push(e);
+                let before = self.pos;
+                self.synchronize();
+                // Guarantee forward progress so we can't loop forever.
+                if self.pos == before {
+                    self.advance();
+                }
+                Ok(())
             }
         }
-        (stmts, errors)
+    }
+
+    /// Like [`program`], but recovers after a bad statement and keeps going,
+    /// accumulating every error instead of returning the first. (Recovery
+    /// happens at every nesting level — see [`take_statement`] and [`block`].)
+    fn program_recovering(&mut self) -> (Vec<Stmt>, Vec<CompileError>) {
+        // `program` never returns Err while `recovering` (take_statement
+        // swallows statement errors).
+        let stmts = self.program().unwrap_or_default();
+        (stmts, std::mem::take(&mut self.errors))
     }
 
     /// Skip past a broken statement to the next safe restart point: the rest of
@@ -233,14 +247,13 @@ impl<'a> Parser<'a> {
             if matches!(self.peek(), Tok::Dedent | Tok::Eof) {
                 break;
             }
-            let start = self.pos;
-            match self.statement() {
-                Ok(s) => stmts.push(s),
-                Err(e) => return Err(self.suggest_keyword(e, start)),
-            }
+            self.take_statement(&mut stmts)?;
         }
         self.expect(&Tok::Dedent, "the end of the indented block")?;
-        if stmts.is_empty() {
+        // While recovering, every statement in the body may have been skipped;
+        // an empty body is fine (the compound still renders). Strict mode still
+        // rejects a genuinely empty block.
+        if stmts.is_empty() && !self.recovering {
             return Err(CompileError::at(self.line(), "this block is empty"));
         }
         Ok(stmts)
@@ -1325,6 +1338,8 @@ fn parse_fragment(src: &str, line: usize) -> Result<Expr> {
         toks: &tokens,
         pos: 0,
         next_tmp: 0,
+        recovering: false,
+        errors: Vec::new(),
     };
     let mut e = p.expr(0).map_err(|e| CompileError::at(line, e.message))?;
     if !matches!(p.peek(), Tok::Newline | Tok::Eof) {
@@ -1735,6 +1750,22 @@ mod tests {
         let (stmts, errors) = parse_recovering(&lex(src).unwrap());
         assert!(errors.len() >= 2, "expected several errors, got {errors:?}");
         assert_eq!(stmts.len(), 3, "the three clean assignments should survive");
+    }
+
+    #[test]
+    fn recovery_inside_a_block_keeps_the_compound() {
+        // A syntax error in the loop body drops only that line; the `for` and
+        // its other statements survive (per-block recovery).
+        let src = "for i in range(3):\n    print(i)\n    1 2 3\n    print(i)\n";
+        let (stmts, errors) = parse_recovering(&lex(src).unwrap());
+        assert_eq!(stmts.len(), 1, "the for loop should survive: {stmts:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        match &stmts[0].kind {
+            StmtKind::For { body, .. } => {
+                assert_eq!(body.len(), 2, "two prints survive, bad line dropped");
+            }
+            other => panic!("expected a for loop, got {other:?}"),
+        }
     }
 
     #[test]
