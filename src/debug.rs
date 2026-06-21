@@ -189,6 +189,8 @@ pub struct Stepper {
     /// before it executes).
     pending: Option<Stmt>,
     status: Status,
+    /// User functions registered as their `def`s are stepped over.
+    funcs: HashMap<String, FuncDef>,
     /// Data watchpoints: expressions whose value, when it changes, pauses a
     /// running program. Each remembers its last observed repr (None = it errored
     /// / was undefined last time).
@@ -202,6 +204,25 @@ struct Watchpoint {
     src: String,
     expr: Expr,
     last: Option<String>,
+}
+
+/// A user-defined function, captured when its `def` is stepped over. Calls to it
+/// run atomically (step-over) — the body executes to completion in one step.
+/// (True step-into / a call stack is the planned CPS rewrite; see
+/// DEBUGGER_ARCHITECTURE.md.)
+#[derive(Clone)]
+struct FuncDef {
+    params: Vec<String>,
+    defaults: Vec<Expr>,
+    body: Rc<Vec<Stmt>>,
+}
+
+/// How a statement finished inside the atomic function executor.
+enum Flow {
+    Normal,
+    Break,
+    Continue,
+    Return(Value),
 }
 
 impl Stepper {
@@ -219,6 +240,7 @@ impl Stepper {
             output: String::new(),
             pending: None,
             status: Status::Finished, // replaced by prime() below
+            funcs: HashMap::new(),
             watchpoints: Vec::new(),
             watch_hit: None,
         };
@@ -256,7 +278,7 @@ impl Stepper {
     /// returning its repr, or None if it errors (e.g. an undefined name).
     fn eval_repr(&self, expr: &Expr) -> Option<String> {
         let mut scratch = self.scope.clone();
-        Self::eval_in(&mut scratch, &mut None, expr)
+        Self::eval_in(&self.funcs, &mut scratch, &mut None, expr)
             .ok()
             .map(|v| v.py_repr())
     }
@@ -331,7 +353,7 @@ impl Stepper {
         let expr = crate::parser::parse_expression(&tokens).map_err(|e| e.to_string())?;
         // Watches must not mutate, so evaluate against a scratch copy of scope.
         let mut scratch = self.clone_scope();
-        Self::eval_in(&mut scratch, &mut None, &expr).map(|v| v.py_repr())
+        Self::eval_in(&self.funcs, &mut scratch, &mut None, &expr).map(|v| v.py_repr())
     }
 
     fn clone_scope(&self) -> HashMap<String, Value> {
@@ -427,9 +449,10 @@ impl Stepper {
                     let Some(Cont::While { cond, body }) = self.stack.pop() else {
                         unreachable!()
                     };
-                    let truthy = Self::eval_in(&mut self.scope, &mut Some(&mut self.output), &cond)
-                        .map_err(|m| (None, m))?
-                        .truthy();
+                    let truthy =
+                        Self::eval_in(&self.funcs, &mut self.scope, &mut Some(&mut self.output), &cond)
+                            .map_err(|m| (None, m))?
+                            .truthy();
                     if truthy {
                         self.stack.push(Cont::While {
                             cond,
@@ -602,9 +625,29 @@ impl Stepper {
                 }
                 Ok(())
             }
-            StmtKind::Def { .. }
-            | StmtKind::Return(_)
-            | StmtKind::ClassDef { .. }
+            // Stepping over a `def` registers the function; calls to it run
+            // atomically (see eval_call). The body isn't entered here.
+            StmtKind::Def {
+                name,
+                params,
+                defaults,
+                body,
+                ..
+            } => {
+                self.funcs.insert(
+                    name.clone(),
+                    FuncDef {
+                        params: params.clone(),
+                        defaults: defaults.clone(),
+                        body: Rc::new(body.clone()),
+                    },
+                );
+                Ok(())
+            }
+            StmtKind::Return(_) => {
+                Err("`return` outside a function — did you mean to indent it?".to_string())
+            }
+            StmtKind::ClassDef { .. }
             | StmtKind::SetAttr { .. }
             | StmtKind::UnpackAssign { .. }
             | StmtKind::Import(_) => Err(format!(
@@ -635,40 +678,9 @@ impl Stepper {
         Ok(None)
     }
 
-    /// Assign into `target[index]` — supports a list (int index, negative ok) or
-    /// a dict (any key). MVP: `target` must be a simple variable.
+    /// Assign into `target[index]` against the step machine's scope.
     fn assign_index(&mut self, target: &Expr, index: Value, value: Value) -> Result<(), String> {
-        let ExprKind::Name(name) = &target.kind else {
-            return Err(
-                "item assignment is only supported on a simple variable in the step debugger yet"
-                    .to_string(),
-            );
-        };
-        let slot = self
-            .scope
-            .get_mut(name)
-            .ok_or_else(|| format!("name '{name}' is not defined"))?;
-        match slot {
-            Value::List(items) => {
-                let i = as_int(&index).ok_or("list indices must be integers")?;
-                let n = items.len() as i64;
-                let real = if i < 0 { i + n } else { i };
-                if real < 0 || real >= n {
-                    return Err("list assignment index out of range".to_string());
-                }
-                items[real as usize] = value;
-                Ok(())
-            }
-            Value::Dict(pairs) => {
-                if let Some(slot) = pairs.iter_mut().find(|(k, _)| py_eq(k, &index)) {
-                    slot.1 = value;
-                } else {
-                    pairs.push((index, value));
-                }
-                Ok(())
-            }
-            _ => Err("only lists and dicts support item assignment".to_string()),
-        }
+        assign_index_in(&mut self.scope, target, index, value)
     }
 
     fn eval_int(&mut self, e: &Expr, what: &str) -> Result<i64, String> {
@@ -686,13 +698,14 @@ impl Stepper {
     }
 
     fn eval(&mut self, e: &Expr) -> Result<Value, String> {
-        Self::eval_in(&mut self.scope, &mut Some(&mut self.output), e)
+        Self::eval_in(&self.funcs, &mut self.scope, &mut Some(&mut self.output), e)
     }
 
     /// The expression evaluator. Takes the scope (and optional output sink, for
     /// the rare expression-with-output) explicitly so watches can run it against
     /// a scratch scope with no output.
     fn eval_in(
+        funcs: &HashMap<String, FuncDef>,
         scope: &mut HashMap<String, Value>,
         out: &mut Option<&mut String>,
         e: &Expr,
@@ -708,7 +721,7 @@ impl Stepper {
                 .cloned()
                 .ok_or_else(|| format!("name '{n}' is not defined")),
             ExprKind::Unary(op, inner) => {
-                let v = Self::eval_in(scope, out, inner)?;
+                let v = Self::eval_in(funcs, scope, out, inner)?;
                 match op {
                     UnOp::Not => Ok(Value::Bool(!v.truthy())),
                     UnOp::Neg => match v {
@@ -719,29 +732,32 @@ impl Stepper {
                     },
                 }
             }
-            ExprKind::Bin(op, a, b) => Self::eval_bin(scope, out, *op, a, b),
+            ExprKind::Bin(op, a, b) => Self::eval_bin(funcs, scope, out, *op, a, b),
             ExprKind::List(items) => {
                 let mut out_items = Vec::with_capacity(items.len());
                 for it in items {
-                    out_items.push(Self::eval_in(scope, out, it)?);
+                    out_items.push(Self::eval_in(funcs, scope, out, it)?);
                 }
                 Ok(Value::List(out_items))
             }
             ExprKind::Dict(pairs) => {
                 let mut out_pairs = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
-                    out_pairs.push((Self::eval_in(scope, out, k)?, Self::eval_in(scope, out, v)?));
+                    out_pairs.push((
+                        Self::eval_in(funcs, scope, out, k)?,
+                        Self::eval_in(funcs, scope, out, v)?,
+                    ));
                 }
                 Ok(Value::Dict(out_pairs))
             }
             ExprKind::Index(obj, idx) => {
-                let target = Self::eval_in(scope, out, obj)?;
-                let index = Self::eval_in(scope, out, idx)?;
+                let target = Self::eval_in(funcs, scope, out, obj)?;
+                let index = Self::eval_in(funcs, scope, out, idx)?;
                 index_get(&target, &index)
             }
-            ExprKind::Call(name, args) => Self::eval_call(scope, out, name, args),
+            ExprKind::Call(name, args) => Self::eval_call(funcs, scope, out, name, args),
             ExprKind::MethodCall(obj, method, args) => {
-                Self::eval_method(scope, out, obj, method, args)
+                Self::eval_method(funcs, scope, out, obj, method, args)
             }
             _ => Err(format!(
                 "{} isn't in the step debugger yet — use Run for that",
@@ -751,6 +767,7 @@ impl Stepper {
     }
 
     fn eval_bin(
+        funcs: &HashMap<String, FuncDef>,
         scope: &mut HashMap<String, Value>,
         out: &mut Option<&mut String>,
         op: BinOp,
@@ -759,24 +776,24 @@ impl Stepper {
     ) -> Result<Value, String> {
         // `and`/`or` short-circuit and return the deciding operand (Python).
         if op == BinOp::And {
-            let l = Self::eval_in(scope, out, a)?;
+            let l = Self::eval_in(funcs, scope, out, a)?;
             return if l.truthy() {
-                Self::eval_in(scope, out, b)
+                Self::eval_in(funcs, scope, out, b)
             } else {
                 Ok(l)
             };
         }
         if op == BinOp::Or {
-            let l = Self::eval_in(scope, out, a)?;
+            let l = Self::eval_in(funcs, scope, out, a)?;
             return if l.truthy() {
                 Ok(l)
             } else {
-                Self::eval_in(scope, out, b)
+                Self::eval_in(funcs, scope, out, b)
             };
         }
 
-        let l = Self::eval_in(scope, out, a)?;
-        let r = Self::eval_in(scope, out, b)?;
+        let l = Self::eval_in(funcs, scope, out, a)?;
+        let r = Self::eval_in(funcs, scope, out, b)?;
         match op {
             BinOp::Eq => Ok(Value::Bool(py_eq(&l, &r))),
             BinOp::Ne => Ok(Value::Bool(!py_eq(&l, &r))),
@@ -795,6 +812,7 @@ impl Stepper {
     }
 
     fn eval_call(
+        funcs: &HashMap<String, FuncDef>,
         scope: &mut HashMap<String, Value>,
         out: &mut Option<&mut String>,
         name: &str,
@@ -802,7 +820,11 @@ impl Stepper {
     ) -> Result<Value, String> {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
-            vals.push(Self::eval_in(scope, out, a)?);
+            vals.push(Self::eval_in(funcs, scope, out, a)?);
+        }
+        // A call to a user-defined function runs its body atomically (step-over).
+        if let Some(fdef) = funcs.get(name) {
+            return Self::call_user(funcs, out, name, fdef, vals);
         }
         match (name, vals.as_slice()) {
             ("len", [v]) => match v {
@@ -853,6 +875,7 @@ impl Stepper {
     }
 
     fn eval_method(
+        funcs: &HashMap<String, FuncDef>,
         scope: &mut HashMap<String, Value>,
         out: &mut Option<&mut String>,
         obj: &Expr,
@@ -861,7 +884,7 @@ impl Stepper {
     ) -> Result<Value, String> {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
-            vals.push(Self::eval_in(scope, out, a)?);
+            vals.push(Self::eval_in(funcs, scope, out, a)?);
         }
         // Mutating list methods need the variable itself, so require a Name.
         if let ExprKind::Name(name) = &obj.kind
@@ -890,6 +913,238 @@ impl Stepper {
         Err(format!(
             ".{method}() isn't in the step debugger yet — use Run for that"
         ))
+    }
+
+    /// Run a user function to completion (step-over): bind args (and defaults)
+    /// into a fresh local scope, execute the body atomically, and return its
+    /// value (None if it fell off the end). Recurses for nested/recursive calls.
+    fn call_user(
+        funcs: &HashMap<String, FuncDef>,
+        out: &mut Option<&mut String>,
+        name: &str,
+        fdef: &FuncDef,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        let nparams = fdef.params.len();
+        let nrequired = nparams - fdef.defaults.len();
+        if args.len() < nrequired || args.len() > nparams {
+            return Err(format!(
+                "{name}() takes {nparams} argument(s) but {} were given",
+                args.len()
+            ));
+        }
+        let mut local = HashMap::new();
+        for (i, p) in fdef.params.iter().enumerate() {
+            let v = if i < args.len() {
+                args[i].clone()
+            } else {
+                // Trailing parameter with a default; evaluated in an empty scope
+                // (good enough for the literal defaults beginners use).
+                let mut empty = HashMap::new();
+                Self::eval_in(funcs, &mut empty, out, &fdef.defaults[i - nrequired])?
+            };
+            local.insert(p.clone(), v);
+        }
+        match Self::exec_block(funcs, &mut local, out, &fdef.body)? {
+            Flow::Return(v) => Ok(v),
+            _ => Ok(Value::None), // ran off the end -> None
+        }
+    }
+
+    /// Execute a block of statements atomically (for step-over function bodies),
+    /// propagating break/continue/return as [`Flow`].
+    fn exec_block(
+        funcs: &HashMap<String, FuncDef>,
+        scope: &mut HashMap<String, Value>,
+        out: &mut Option<&mut String>,
+        stmts: &[Stmt],
+    ) -> Result<Flow, String> {
+        for s in stmts {
+            match Self::exec_atomic(funcs, scope, out, s)? {
+                Flow::Normal => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// One statement, executed atomically (no pausing) — the executor used
+    /// inside called functions. Mirrors the step machine's `exec`, but runs
+    /// compounds to completion and returns control flow as [`Flow`].
+    fn exec_atomic(
+        funcs: &HashMap<String, FuncDef>,
+        scope: &mut HashMap<String, Value>,
+        out: &mut Option<&mut String>,
+        s: &Stmt,
+    ) -> Result<Flow, String> {
+        match &s.kind {
+            StmtKind::Assign(name, e) => {
+                let v = Self::eval_in(funcs, scope, out, e)?;
+                scope.insert(name.clone(), v);
+                Ok(Flow::Normal)
+            }
+            StmtKind::Expr(e) => {
+                if let ExprKind::Call(name, args) = &e.kind
+                    && name == "print"
+                {
+                    let mut parts = Vec::with_capacity(args.len());
+                    for a in args {
+                        parts.push(Self::eval_in(funcs, scope, out, a)?.py_str());
+                    }
+                    if let Some(sink) = out {
+                        sink.push_str(&parts.join(" "));
+                        sink.push('\n');
+                    }
+                    return Ok(Flow::Normal);
+                }
+                Self::eval_in(funcs, scope, out, e)?;
+                Ok(Flow::Normal)
+            }
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                let idx = Self::eval_in(funcs, scope, out, index)?;
+                let val = Self::eval_in(funcs, scope, out, value)?;
+                assign_index_in(scope, target, idx, val)?;
+                Ok(Flow::Normal)
+            }
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                if Self::eval_in(funcs, scope, out, cond)?.truthy() {
+                    return Self::exec_block(funcs, scope, out, body);
+                }
+                for (c, b) in elifs {
+                    if Self::eval_in(funcs, scope, out, c)?.truthy() {
+                        return Self::exec_block(funcs, scope, out, b);
+                    }
+                }
+                match else_body {
+                    Some(eb) => Self::exec_block(funcs, scope, out, eb),
+                    None => Ok(Flow::Normal),
+                }
+            }
+            StmtKind::While { cond, body } => {
+                while Self::eval_in(funcs, scope, out, cond)?.truthy() {
+                    match Self::exec_block(funcs, scope, out, body)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Normal | Flow::Continue => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                let int = |v: Value, what: &str| as_int(&v).ok_or(format!("{what} must be an integer"));
+                let mut next = int(Self::eval_in(funcs, scope, out, start)?, "range() start")?;
+                let stop = int(Self::eval_in(funcs, scope, out, end)?, "range() stop")?;
+                let step = int(Self::eval_in(funcs, scope, out, step)?, "range() step")?;
+                if step == 0 {
+                    return Err("range() step must not be zero".to_string());
+                }
+                while (step > 0 && next < stop) || (step < 0 && next > stop) {
+                    scope.insert(var.clone(), Value::Int(next));
+                    match Self::exec_block(funcs, scope, out, body)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Normal | Flow::Continue => {}
+                    }
+                    next += step;
+                }
+                Ok(Flow::Normal)
+            }
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => {
+                let items = match Self::eval_in(funcs, scope, out, iterable)? {
+                    Value::List(v) => v,
+                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+                    Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
+                    other => return Err(format!("can't loop over {}", type_name(&other))),
+                };
+                for it in items {
+                    scope.insert(var.clone(), it);
+                    match Self::exec_block(funcs, scope, out, body)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Normal | Flow::Continue => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            StmtKind::Break => Ok(Flow::Break),
+            StmtKind::Continue => Ok(Flow::Continue),
+            StmtKind::Return(opt) => {
+                let v = match opt {
+                    Some(e) => Self::eval_in(funcs, scope, out, e)?,
+                    None => Value::None,
+                };
+                Ok(Flow::Return(v))
+            }
+            StmtKind::Def { .. } => {
+                Err("a nested function definition isn't in the step debugger yet — use Run".to_string())
+            }
+            StmtKind::ClassDef { .. }
+            | StmtKind::SetAttr { .. }
+            | StmtKind::UnpackAssign { .. }
+            | StmtKind::Import(_) => Err(format!(
+                "{} isn't in the step debugger yet — use Run for that",
+                describe_stmt(&s.kind)
+            )),
+        }
+    }
+}
+
+/// Assign into `target[index]` in `scope` — a list (int index, negative ok) or a
+/// dict (any key). MVP: `target` must be a simple variable.
+fn assign_index_in(
+    scope: &mut HashMap<String, Value>,
+    target: &Expr,
+    index: Value,
+    value: Value,
+) -> Result<(), String> {
+    let ExprKind::Name(name) = &target.kind else {
+        return Err(
+            "item assignment is only supported on a simple variable in the step debugger yet"
+                .to_string(),
+        );
+    };
+    let slot = scope
+        .get_mut(name)
+        .ok_or_else(|| format!("name '{name}' is not defined"))?;
+    match slot {
+        Value::List(items) => {
+            let i = as_int(&index).ok_or("list indices must be integers")?;
+            let n = items.len() as i64;
+            let real = if i < 0 { i + n } else { i };
+            if real < 0 || real >= n {
+                return Err("list assignment index out of range".to_string());
+            }
+            items[real as usize] = value;
+            Ok(())
+        }
+        Value::Dict(pairs) => {
+            if let Some(slot) = pairs.iter_mut().find(|(k, _)| py_eq(k, &index)) {
+                slot.1 = value;
+            } else {
+                pairs.push((index, value));
+            }
+            Ok(())
+        }
+        _ => Err("only lists and dicts support item assignment".to_string()),
     }
 }
 
@@ -1252,8 +1507,8 @@ mod tests {
 
     #[test]
     fn unsupported_construct_stops_friendly() {
-        // A user function call isn't in the stepper yet — friendly stop, not a panic.
-        let mut s = Stepper::new("def f():\n    return 1\nf()\n").unwrap();
+        // `import` isn't in the stepper yet — friendly stop, not a panic.
+        let mut s = Stepper::new("import math\nprint(1)\n").unwrap();
         for _ in 0..10 {
             if !s.is_paused() {
                 break;
@@ -1264,6 +1519,53 @@ mod tests {
             Status::Error { message, .. } => assert!(message.contains("step debugger")),
             other => panic!("expected a friendly error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn functions_run_over_with_return_values() {
+        // Calls to user functions execute atomically (step-over) and yield their
+        // return value.
+        assert_eq!(
+            run_to_end("def double(n):\n    return n * 2\nprint(double(21))\n"),
+            "42\n"
+        );
+        // Void function with a side effect.
+        assert_eq!(
+            run_to_end("def greet(name):\n    print(\"Hi \" + name)\ngreet(\"Bo\")\n"),
+            "Hi Bo\n"
+        );
+        // Falling off the end returns None.
+        assert_eq!(
+            run_to_end("def nothing():\n    x = 1\nprint(nothing())\n"),
+            "None\n"
+        );
+    }
+
+    #[test]
+    fn functions_support_recursion_and_defaults() {
+        assert_eq!(
+            run_to_end(
+                "def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\nprint(fact(5))\n"
+            ),
+            "120\n"
+        );
+        assert_eq!(
+            run_to_end("def inc(x, by=1):\n    return x + by\nprint(inc(5))\nprint(inc(5, 10))\n"),
+            "6\n15\n"
+        );
+    }
+
+    #[test]
+    fn a_call_is_a_single_step_over() {
+        // def registers (step 1); the call line runs the whole function in one
+        // step (step 2), leaving the result in scope.
+        let mut s = Stepper::new("def double(n):\n    return n * 2\nx = double(21)\n").unwrap();
+        assert_eq!(s.current_line(), Some(1)); // def
+        s.step(); // register def
+        assert_eq!(s.current_line(), Some(3)); // body line 2 is not stepped
+        s.step(); // x = double(21), function runs atomically
+        assert_eq!(*s.status(), Status::Finished);
+        assert_eq!(s.eval_watch("x").unwrap(), "42");
     }
 
     #[test]

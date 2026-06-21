@@ -122,11 +122,14 @@ Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
    `set_watchpoints` + a per-step value diff, reported as `watch_hit`) pause the
    run when a watched expression's value changes. Each statement block carries
    its source line in Blockly's `data` field, so the paused line **glows the
-   matching block** too (the line↔block payoff). Still to add at this layer: a
-   call stack — it needs the Stepper to step *into* user functions (currently a
-   call to a user-defined function stops with "use Run"), which is the
-   tree-walker's hardest piece (suspending mid-expression — really wants the VM
-   form, or a step-over compromise).
+   matching block** too (the line↔block payoff). User functions are supported via
+   **step-over**: a `def` registers a `FuncDef`; a call runs the body atomically
+   (an `exec_block`/`exec_atomic` recursive executor over the same `eval_in`),
+   so programs with functions — including **recursion and default args** — are
+   debuggable. **Planned: CPS rewrite for true step-*into* + a call stack** — the
+   tree-walker can't suspend mid-expression, so step-into needs an explicit
+   operand/frame VM. Step-over is the interim; the CPS form is the destination
+   (the atomic `exec_block` can serve as its reference oracle).
 2. Native LLVM backend (separate, large — see the Pico target notes).
 3. **`UsbStubAdapter`** — on-device step hooks + USB-CDC control channel + the
    variable-layout map. No probe, consistent UX.
