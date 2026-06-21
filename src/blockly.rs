@@ -346,7 +346,25 @@ impl Builder {
                 "",
                 next,
             )),
-            StmtKind::ForEach { .. } => unsupported("`for ... in <list>`"),
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => {
+                let id = self.var_id(var);
+                let mut ins = vec![input("LIST", &self.value_block(iterable)?)];
+                let d = self.chain(body)?;
+                if !d.is_empty() {
+                    ins.push(input("DO", &d));
+                }
+                Ok(block(
+                    "controls_forEach",
+                    &field("VAR", &var_ref(&id)),
+                    &ins.join(","),
+                    "",
+                    next,
+                ))
+            }
             StmtKind::Def { .. } => unsupported("function definitions"),
             StmtKind::ClassDef { .. } => unsupported("classes"),
             StmtKind::Return(_) => unsupported("`return`"),
@@ -441,7 +459,16 @@ impl Builder {
             ExprKind::Bin(op, a, b) => self.bin_block(*op, a, b),
             ExprKind::Call(..) => unsupported("a function call"),
             ExprKind::MethodCall(..) => unsupported("a method call"),
-            ExprKind::List(_) => unsupported("a list"),
+            ExprKind::List(items) => {
+                // Blockly's `lists_create_with` with N value inputs ADD0..ADDn-1
+                // and an extraState item count.
+                let mut ins = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    ins.push(input(&format!("ADD{i}"), &self.value_block(item)?));
+                }
+                let extra = format!("{{\"itemCount\":{}}}", items.len());
+                Ok(block("lists_create_with", "", &ins.join(","), &extra, ""))
+            }
             ExprKind::Tuple(_) => unsupported("a tuple"),
             ExprKind::Dict(_) => unsupported("a dict"),
             ExprKind::Index(..) | ExprKind::Slice { .. } => unsupported("indexing/slicing"),
@@ -707,10 +734,26 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_error_gracefully() {
-        let err = to_blockly_json("xs = [1, 2, 3]").unwrap_err();
-        assert!(err.contains("list"), "{err}");
+        let err = to_blockly_json("d = {1: 2}").unwrap_err();
+        assert!(err.contains("dict"), "{err}");
         let err = to_blockly_json("def f():\n    return 1").unwrap_err();
         assert!(err.contains("function"), "{err}");
+    }
+
+    #[test]
+    fn lists_and_for_each() {
+        // List literal -> lists_create_with with item count + ADD inputs.
+        let json = to_blockly_json("xs = [1, 2, 3]").unwrap();
+        assert!(json.contains("\"type\":\"lists_create_with\""), "{json}");
+        assert!(json.contains("\"itemCount\":3"), "{json}");
+        assert!(json.contains("\"ADD0\""), "{json}");
+        assert!(json.contains("\"ADD2\""), "{json}");
+
+        // `for x in xs:` -> controls_forEach with VAR + LIST + DO.
+        let json = to_blockly_json("for x in xs:\n    print(x)").unwrap();
+        assert!(json.contains("\"type\":\"controls_forEach\""), "{json}");
+        assert!(json.contains("\"LIST\""), "{json}");
+        assert!(json.contains("\"type\":\"text_print\""), "{json}");
     }
 
     #[test]
@@ -768,8 +811,8 @@ mod tests {
     #[test]
     fn to_blocks_recovers_inside_a_compound_body() {
         // Per-block recovery: the `for` still renders (with the printable line in
-        // its body) even though one body line (a list) can't be a block.
-        let out = to_blocks("for i in range(3):\n    print(i)\n    y = [1, 2]\n");
+        // its body) even though one body line (a dict) can't be a block yet.
+        let out = to_blocks("for i in range(3):\n    print(i)\n    y = {1: 2}\n");
         assert!(
             out.json.contains("\"type\":\"controls_for\""),
             "{}",
@@ -777,23 +820,23 @@ mod tests {
         );
         assert!(out.json.contains("\"type\":\"text_print\""), "{}", out.json);
         assert!(
-            out.errors.iter().any(|e| e.to_string().contains("list")),
+            out.errors.iter().any(|e| e.to_string().contains("dict")),
             "{:?}",
             out.errors
         );
-        assert!(out.error_lines.is_empty(), "a list isn't a syntax error");
+        assert!(out.error_lines.is_empty(), "a dict isn't a syntax error");
     }
 
     #[test]
     fn to_blocks_skips_unsupported_but_keeps_the_rest() {
-        // A list literal has no block yet; `x` and `z` still render as two
-        // separate stacks, and the list is reported as a NOTE — but it's valid
+        // A dict literal has no block yet; `x` and `z` still render as two
+        // separate stacks, and the dict is reported as a NOTE — but it's valid
         // Python, so it must NOT be highlighted as a syntax error.
-        let out = to_blocks("x = 1\ny = [1, 2, 3]\nz = 3\n");
+        let out = to_blocks("x = 1\ny = {1: 2}\nz = 3\n");
         assert!(out.json.contains("\"NUM\":1"), "{}", out.json); // x
         assert!(out.json.contains("\"NUM\":3"), "{}", out.json); // z
         assert!(
-            out.errors.iter().any(|e| e.to_string().contains("list")),
+            out.errors.iter().any(|e| e.to_string().contains("dict")),
             "{:?}",
             out.errors
         );
