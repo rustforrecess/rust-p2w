@@ -1413,7 +1413,7 @@ const STMT_KEYWORDS: &[&str] = &[
 /// Closest candidate within an edit-distance threshold that scales with word
 /// length (short words must match almost exactly, to avoid wild guesses).
 /// Exact matches are excluded — those aren't typos.
-fn did_you_mean<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn did_you_mean<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str> {
     let threshold = if word.chars().count() <= 4 { 1 } else { 2 };
     candidates
         .iter()

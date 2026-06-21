@@ -14,6 +14,7 @@ mod codegen;
 mod emit;
 mod error;
 mod lexer;
+mod lint;
 mod parser;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};

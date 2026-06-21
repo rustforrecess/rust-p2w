@@ -60,13 +60,32 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
         }
     };
     let (stmts, parse_errors) = crate::parser::parse_recovering(&tokens);
-    // Only genuine syntax errors are highlightable; the build notes below are
-    // for valid-but-unrepresentable code and must not flag the editor.
-    let error_lines: Vec<usize> = parse_errors.iter().filter_map(|e| e.line).collect();
+    // Highlightable mistakes: genuine syntax errors, plus typo'd function calls
+    // (`pint` -> `print`) — both are real errors. The build notes below are for
+    // valid-but-unrepresentable code and must NOT flag the editor.
+    let mut error_lines: Vec<usize> = parse_errors.iter().filter_map(|e| e.line).collect();
     let mut errors = parse_errors;
+
+    let typos = crate::lint::typo_diagnostics(&stmts);
+    let typo_lines: Vec<usize> = typos.iter().filter_map(|e| e.line).collect();
+    error_lines.extend(typo_lines.iter().copied());
+    errors.extend(typos);
+
     let mut b = Builder::default();
     let (tops, build_notes) = b.build_program(&stmts);
-    errors.extend(build_notes);
+    for note in build_notes {
+        // A typo'd call already has a clearer "did you mean" message on this
+        // line; don't also say the vaguer "no block yet".
+        if note.line.is_some_and(|l| typo_lines.contains(&l)) {
+            continue;
+        }
+        errors.push(note);
+    }
+
+    error_lines.sort_unstable();
+    error_lines.dedup();
+    errors.sort_by_key(|e| e.line.unwrap_or(usize::MAX));
+
     BlocksOutcome {
         json: b.document(&tops),
         errors,
@@ -143,8 +162,15 @@ impl Builder {
                 Ok(block) => run.push(block),
                 Err(msg) => {
                     flush_run(&mut run, &mut tops);
-                    // The message already carries "line N:"; keep it verbatim.
-                    errors.push(CompileError::general(msg));
+                    // The failure can come from a NESTED statement (deeper line
+                    // than `s`), so take the line from the message's own
+                    // "line N:" prefix, then strip it so the line isn't doubled
+                    // when CompileError is displayed.
+                    let (line, bare) = split_line_prefix(&msg);
+                    errors.push(match line {
+                        Some(n) => CompileError::at(n, bare),
+                        None => CompileError::general(bare),
+                    });
                 }
             }
         }
@@ -467,6 +493,19 @@ fn block(ty: &str, fields: &str, inputs: &str, extra_state: &str, next: &str) ->
     format!("{{{p}}}")
 }
 
+/// Split a `"line N: message"` diagnostic into its 1-based line and the bare
+/// message. Returns `(None, whole)` if there's no recognizable prefix.
+fn split_line_prefix(msg: &str) -> (Option<usize>, String) {
+    if let Some(rest) = msg.strip_prefix("line ") {
+        if let Some((num, tail)) = rest.split_once(": ") {
+            if let Ok(n) = num.parse::<usize>() {
+                return (Some(n), tail.to_string());
+            }
+        }
+    }
+    (None, msg.to_string())
+}
+
 /// Link a run of standalone block objects into one connected stack (each block
 /// becomes the `next` of the one before it), and push it as a top-level stack.
 /// Drains `run`.
@@ -668,6 +707,28 @@ mod tests {
         assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
         assert!(out.errors[0].to_string().contains("colon"));
         assert_eq!(out.error_lines, vec![2], "syntax error should mark line 2");
+    }
+
+    #[test]
+    fn to_blocks_flags_typod_function_call() {
+        // `pint` is a typo for `print`: a clear "did you mean" message that IS
+        // highlightable, and the vaguer "no block yet" note is suppressed.
+        let out = to_blocks("print(\"Hello\")\nfor i in range(1, 4):\n    pint(i)\n");
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.to_string().contains("did you mean `print`")),
+            "{:?}",
+            out.errors
+        );
+        assert!(
+            !out.errors
+                .iter()
+                .any(|e| e.to_string().contains("no block yet")),
+            "redundant note should be suppressed: {:?}",
+            out.errors
+        );
+        assert_eq!(out.error_lines, vec![3], "typo on line 3 is highlightable");
     }
 
     #[test]
