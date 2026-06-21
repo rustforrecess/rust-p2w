@@ -189,6 +189,19 @@ pub struct Stepper {
     /// before it executes).
     pending: Option<Stmt>,
     status: Status,
+    /// Data watchpoints: expressions whose value, when it changes, pauses a
+    /// running program. Each remembers its last observed repr (None = it errored
+    /// / was undefined last time).
+    watchpoints: Vec<Watchpoint>,
+    /// Set when `run` stopped because a watchpoint changed: (expr, old, new).
+    watch_hit: Option<(String, String, String)>,
+}
+
+/// One break-on-change watchpoint.
+struct Watchpoint {
+    src: String,
+    expr: Expr,
+    last: Option<String>,
 }
 
 impl Stepper {
@@ -206,9 +219,73 @@ impl Stepper {
             output: String::new(),
             pending: None,
             status: Status::Finished, // replaced by prime() below
+            watchpoints: Vec::new(),
+            watch_hit: None,
         };
         s.prime();
         Ok(s)
+    }
+
+    /// Set the break-on-change watchpoints (expression sources). Unparseable
+    /// entries are skipped; each one's "last seen" value is seeded from the
+    /// current scope so it only fires on a *future* change.
+    pub fn set_watchpoints(&mut self, srcs: &[String]) {
+        self.watch_hit = None;
+        self.watchpoints = srcs
+            .iter()
+            .filter_map(|s| {
+                let toks = crate::lexer::lex(s).ok()?;
+                let expr = crate::parser::parse_expression(&toks).ok()?;
+                let last = self.eval_repr(&expr);
+                Some(Watchpoint {
+                    src: s.clone(),
+                    expr,
+                    last,
+                })
+            })
+            .collect();
+    }
+
+    /// If `run` last stopped on a watchpoint, the `(expression, old, new)` that
+    /// changed.
+    pub fn watch_hit(&self) -> Option<(String, String, String)> {
+        self.watch_hit.clone()
+    }
+
+    /// Evaluate an expression against a scratch copy of the current scope,
+    /// returning its repr, or None if it errors (e.g. an undefined name).
+    fn eval_repr(&self, expr: &Expr) -> Option<String> {
+        let mut scratch = self.scope.clone();
+        Self::eval_in(&mut scratch, &mut None, expr)
+            .ok()
+            .map(|v| v.py_repr())
+    }
+
+    /// Re-evaluate every watchpoint; if any changed since last time, record the
+    /// first as `watch_hit`, resync all of them, and return true.
+    fn check_watchpoints(&mut self) -> bool {
+        if self.watchpoints.is_empty() {
+            return false;
+        }
+        let curs: Vec<Option<String>> =
+            self.watchpoints.iter().map(|w| self.eval_repr(&w.expr)).collect();
+        let mut hit = None;
+        for (w, cur) in self.watchpoints.iter().zip(&curs) {
+            if *cur != w.last {
+                let shown = |o: &Option<String>| o.clone().unwrap_or_else(|| "(undefined)".into());
+                hit = Some((w.src.clone(), shown(&w.last), shown(cur)));
+                break;
+            }
+        }
+        for (w, cur) in self.watchpoints.iter_mut().zip(curs) {
+            w.last = cur;
+        }
+        if let Some(h) = hit {
+            self.watch_hit = Some(h);
+            true
+        } else {
+            false
+        }
     }
 
     /// Everything written by `print` so far.
@@ -267,6 +344,7 @@ impl Stepper {
         if !self.is_paused() {
             return;
         }
+        self.watch_hit = None;
         let Some(stmt) = self.pending.take() else {
             self.status = Status::Finished;
             return;
@@ -285,6 +363,7 @@ impl Stepper {
     /// `breakpoints` (after taking at least one step, so "Continue" from a line
     /// that is itself a breakpoint doesn't stall there).
     pub fn run(&mut self, breakpoints: &[usize]) {
+        self.watch_hit = None;
         let mut took_step = false;
         while self.is_paused() {
             if took_step
@@ -295,6 +374,11 @@ impl Stepper {
             }
             self.step();
             took_step = true;
+            // A watchpoint changing pauses the run right after the step that
+            // changed it.
+            if self.check_watchpoints() {
+                return;
+            }
         }
     }
 
@@ -1115,6 +1199,43 @@ mod tests {
         // real list is untouched.
         let _ = s.eval_watch("xs.append(99)");
         assert_eq!(s.eval_watch("len(xs)").unwrap(), "2");
+    }
+
+    #[test]
+    fn watchpoint_breaks_on_change() {
+        let mut s = Stepper::new("x = 0\nx = 1\nx = 9\nprint(x)\n").unwrap();
+        s.set_watchpoints(&["x".to_string()]);
+
+        s.run(&[]); // x: undefined -> 0
+        let (src, old, new) = s.watch_hit().expect("watchpoint should fire");
+        assert_eq!(src, "x");
+        assert_eq!((old.as_str(), new.as_str()), ("(undefined)", "0"));
+
+        s.run(&[]); // x: 0 -> 1
+        assert_eq!(s.watch_hit().unwrap().2, "1");
+
+        s.run(&[]); // x: 1 -> 9
+        assert_eq!(s.watch_hit().unwrap().2, "9");
+
+        s.run(&[]); // no more changes -> runs to the end
+        assert_eq!(s.watch_hit(), None);
+        assert_eq!(*s.status(), Status::Finished);
+        assert_eq!(s.output(), "9\n");
+    }
+
+    #[test]
+    fn watchpoint_on_loop_variable_fires_each_iteration() {
+        // Classic "watch i change" — break each time the loop var advances.
+        let mut s = Stepper::new("for i in range(3):\n    print(i)\n").unwrap();
+        s.set_watchpoints(&["i".to_string()]);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            s.run(&[]);
+            if let Some((_, _, new)) = s.watch_hit() {
+                seen.push(new);
+            }
+        }
+        assert_eq!(seen, vec!["0", "1", "2"]);
     }
 
     #[test]
