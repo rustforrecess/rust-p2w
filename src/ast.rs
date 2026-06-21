@@ -52,13 +52,21 @@ pub enum StmtKind {
     Break,
     /// `continue` (inside a loop)
     Continue,
-    /// `def name(params): ...` (top level only). `defaults` holds the default
-    /// expressions for the trailing parameters (so `params[params.len() -
-    /// defaults.len() ..]` each have one).
+    /// `def name(params) [-> ret]: ...` (top level only). `defaults` holds the
+    /// default expressions for the trailing parameters (so `params[params.len()
+    /// - defaults.len() ..]` each have one).
+    ///
+    /// `param_types` runs parallel to `params` — each entry is that parameter's
+    /// `: T` annotation, or `None` if unannotated — and `return_type` is the
+    /// `-> T`. Annotations are *hints*: codegen ignores them, exactly as Python
+    /// does at runtime. They're kept so block surfaces can show types (the
+    /// roadmap's typed-ports layer) and as groundwork for Mojo.
     Def {
         name: String,
         params: Vec<String>,
+        param_types: Vec<Option<Expr>>,
         defaults: Vec<Expr>,
+        return_type: Option<Expr>,
         body: Vec<Stmt>,
     },
     /// `return [expr]` (inside a function; bare return yields None)

@@ -146,6 +146,28 @@ fn assert_raises(src: &str, message_contains: &str) {
     );
 }
 
+// --- type annotations: parsed, but runtime-ignored like Python ---
+
+#[test]
+fn type_annotations_compile_and_are_ignored() {
+    // Annotated params and a return type must compile and run identically to
+    // the untyped form — annotations are hints, not runtime checks.
+    assert_output(
+        "def add(a: int, b: int) -> int:\n    return a + b\nprint(add(2, 3))",
+        "5\n",
+    );
+    // A "wrong" annotation doesn't change behaviour (no enforcement).
+    assert_output(
+        "def label(x: str) -> int:\n    return x\nprint(label(\"hi\"))",
+        "hi\n",
+    );
+    // A subscripted type annotation (list[int]) is accepted too.
+    assert_output(
+        "def total(xs: list[int]) -> int:\n    s = 0\n    for v in xs:\n        s += v\n    return s\nprint(total([1, 2, 3]))",
+        "6\n",
+    );
+}
+
 // --- and / or: Python value semantics + short-circuit ---
 
 #[test]

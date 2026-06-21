@@ -509,6 +509,7 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::LParen, "'(' after the function name")?;
         let mut params = Vec::new();
+        let mut param_types: Vec<Option<Expr>> = Vec::new();
         let mut defaults: Vec<Expr> = Vec::new();
         if !matches!(self.peek(), Tok::RParen) {
             loop {
@@ -522,6 +523,14 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         params.push(p);
+                        // Optional type annotation (`: T`). A hint only — see
+                        // StmtKind::Def — but parsed so the signature is faithful.
+                        if matches!(self.peek(), Tok::Colon) {
+                            self.advance();
+                            param_types.push(Some(self.type_expr()?));
+                        } else {
+                            param_types.push(None);
+                        }
                         // Optional default value (`= expr`).
                         if matches!(self.peek(), Tok::Eq) {
                             self.advance();
@@ -551,6 +560,13 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, "')'")?;
+        // Optional return annotation (`-> T`).
+        let return_type = if matches!(self.peek(), Tok::Arrow) {
+            self.advance();
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
         self.expect_colon()?;
         self.expect(&Tok::Newline, "a new line")?;
         let body = self.block()?;
@@ -558,11 +574,20 @@ impl<'a> Parser<'a> {
             kind: StmtKind::Def {
                 name,
                 params,
+                param_types,
                 defaults,
+                return_type,
                 body,
             },
             line,
         })
+    }
+
+    /// Parse a type annotation (the `T` in `x: T` or `-> T`). A type is just an
+    /// expression here — `int`, `str`, `list[int]`, `dict[str, int]` — so we
+    /// reuse the expression parser; it stops cleanly at `,`, `=`, `)`, or `:`.
+    fn type_expr(&mut self) -> Result<Expr> {
+        self.expr(0)
     }
 
     fn class_stmt(&mut self) -> Result<Stmt> {
@@ -620,6 +645,9 @@ impl<'a> Parser<'a> {
                     params,
                     defaults,
                     body,
+                    // Method annotations are accepted but, like Python at
+                    // runtime, ignored (the Method struct stays untyped).
+                    ..
                 } => {
                     if !defaults.is_empty() {
                         return Err(CompileError::at(
@@ -1497,6 +1525,7 @@ fn describe(tok: &Tok) -> String {
         Tok::Eq => "`=`".to_string(),
         Tok::AugAssign(_) => "an augmented assignment (like `+=`)".to_string(),
         Tok::Colon => "`:`".to_string(),
+        Tok::Arrow => "`->`".to_string(),
         Tok::LParen => "`(`".to_string(),
         Tok::RParen => "`)`".to_string(),
         Tok::LBracket => "`[`".to_string(),
@@ -1572,6 +1601,64 @@ mod tests {
             got,
             bin(BinOp::And, bin(BinOp::Lt, name("a"), name("b")), name("c"))
         );
+    }
+
+    #[test]
+    fn def_parses_param_and_return_annotations() {
+        // `: T` per param (parallel to params, None when absent) and `-> T`.
+        let stmts =
+            parse_src("def greet(name: str, loud: bool, times=2) -> str:\n    return name").unwrap();
+        let StmtKind::Def {
+            params,
+            param_types,
+            defaults,
+            return_type,
+            ..
+        } = &stmts[0].kind
+        else {
+            panic!("expected a def, got {:?}", stmts[0].kind);
+        };
+        assert_eq!(params, &["name", "loud", "times"]);
+        assert_eq!(
+            param_types,
+            &[Some(name("str")), Some(name("bool")), None],
+            "annotations run parallel to params, None where absent (the default param)"
+        );
+        assert_eq!(defaults, &[int(2)], "the one default is unaffected");
+        assert_eq!(return_type, &Some(name("str")));
+    }
+
+    #[test]
+    fn def_subscripted_type_annotation_parses() {
+        // A generic type like `list[int]` is just an expression to the parser
+        // (a subscript), so it's accepted and stored without special-casing.
+        let stmts = parse_src("def f(xs: list[int]):\n    return xs").unwrap();
+        let StmtKind::Def { param_types, .. } = &stmts[0].kind else {
+            panic!("expected a def");
+        };
+        assert_eq!(
+            param_types[0],
+            Some(e(ExprKind::Index(
+                Box::new(name("list")),
+                Box::new(name("int"))
+            )))
+        );
+    }
+
+    #[test]
+    fn def_without_annotations_still_parses() {
+        // Regression: the untyped form must be unchanged (no annotations).
+        let stmts = parse_src("def add(a, b):\n    return a + b").unwrap();
+        let StmtKind::Def {
+            param_types,
+            return_type,
+            ..
+        } = &stmts[0].kind
+        else {
+            panic!("expected a def");
+        };
+        assert_eq!(param_types, &[None, None]);
+        assert_eq!(return_type, &None);
     }
 
     #[test]

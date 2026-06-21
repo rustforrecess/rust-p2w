@@ -374,14 +374,21 @@ impl Builder {
             StmtKind::Def {
                 name,
                 params,
+                param_types,
                 defaults,
+                return_type,
                 body,
             } => {
                 // Layer 1 is untyped and default-free: the block's PARAMS field
-                // is just the comma-joined names. Defaults round-trip through the
-                // text pane until typed surfaces land (see BLOCKS_ROADMAP.md).
+                // is just the comma-joined names. Defaults and type annotations
+                // round-trip through the text pane until typed surfaces land
+                // (see BLOCKS_ROADMAP.md) — keeping them out of blocks means
+                // they're preserved, not silently dropped.
                 if !defaults.is_empty() {
                     return unsupported("a default argument");
+                }
+                if return_type.is_some() || param_types.iter().any(Option::is_some) {
+                    return unsupported("a type annotation");
                 }
                 let fields = format!(
                     "{},{}",
@@ -862,6 +869,38 @@ mod tests {
         // text canonical instead of silently dropping the default.
         let err = to_blockly_json("def f(x=1):\n    return x").unwrap_err();
         assert!(err.contains("default argument"), "{err}");
+    }
+
+    #[test]
+    fn function_type_annotation_stays_in_text() {
+        // Annotations parse into the AST but have no typed block surface yet, so
+        // an annotated def is kept in the text pane (a clean error) rather than
+        // rendered as a block that would silently drop the `: T` / `-> T`.
+        let err = to_blockly_json("def double(n: int) -> int:\n    return n * 2").unwrap_err();
+        assert!(err.contains("type annotation"), "{err}");
+        // The untyped form still becomes a block (no regression).
+        let json = to_blockly_json("def double(n):\n    return n * 2").unwrap();
+        assert!(json.contains("\"type\":\"python_def\""), "{json}");
+    }
+
+    #[test]
+    fn to_blocks_annotated_def_is_a_note_not_a_red_line() {
+        // An annotated def is valid Python (it compiles + runs), it just has no
+        // block yet — so it must surface as a gentle note, never a highlighted
+        // syntax error.
+        let out = to_blocks("def double(n: int) -> int:\n    return n * 2\n");
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.to_string().contains("type annotation")),
+            "{:?}",
+            out.errors
+        );
+        assert!(
+            out.error_lines.is_empty(),
+            "valid annotated code must not be flagged red: {:?}",
+            out.error_lines
+        );
     }
 
     #[test]

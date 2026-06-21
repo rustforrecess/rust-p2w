@@ -46,6 +46,8 @@ pub enum Tok {
     /// Augmented assignment: `+=`, `-=`, `*=`, `/=`, `//=`, `%=`.
     AugAssign(BinOp),
     Colon,
+    /// `->`, the return-type arrow in `def f() -> int:`.
+    Arrow,
     LParen,
     RParen,
     LBracket,
@@ -165,9 +167,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 i += w;
             }
             '-' => {
-                let (tok, w) = aug_or(&chars, i, Tok::Minus, BinOp::Sub);
-                out.push(Token { tok, line });
-                i += w;
+                if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    // `->` (return-type arrow) before `-` / `-=`.
+                    out.push(Token {
+                        tok: Tok::Arrow,
+                        line,
+                    });
+                    i += 2;
+                } else {
+                    let (tok, w) = aug_or(&chars, i, Tok::Minus, BinOp::Sub);
+                    out.push(Token { tok, line });
+                    i += w;
+                }
             }
             '*' => {
                 if i + 1 < chars.len() && chars[i + 1] == '*' {
