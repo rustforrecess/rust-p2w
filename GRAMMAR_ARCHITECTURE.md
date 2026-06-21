@@ -173,6 +173,45 @@ Java is the real version of the revisit trigger — a genuinely *distinct* langu
   backend** (LLVM-shape), and optionally tree-sitter for parsing — *not* a
   GF-style bidirectional grammar engine.
 
+## Designing so others *could* add languages (while Python stays the focus)
+
+Goal: don't *build* multi-language now, but don't preclude it. The current
+structure already keeps the door open cheaply — most of this is "keep these
+boundaries clean," not new code.
+
+**Already reusable / language-neutral — build on these, don't fork them:**
+
+- **The execution contract.** The emitted WASM talks to the host via
+  `env.write_char` / `write_i32` / `write_f64` / `read_char`. Any language's
+  backend targets this same ABI; the IDE runner doesn't care which language
+  produced the module. This is *the* stable interface a new backend plugs into.
+- **The block set + serialization.** `controls_if`, `controls_for`,
+  `math_arithmetic`, … are generic programming-construct blocks (Blockly
+  standard), serialized as JSON. They are **not** Python-specific — another
+  imperative language can reuse the same blocks and the same
+  `Blockly.serialization` round-trip.
+- **The language-agnostic utilities** — the friendly-error infra (`describe`,
+  `did_you_mean`, recovery), the lint pass shape, and the thirtyfour + `dx serve`
+  e2e harness — all transfer to any language.
+
+**Per-language — what a new language actually brings:** its own lexer + parser +
+AST, its codegen (lowering to the shared execution ABI), and its AST↔blocks/text
+mapping.
+
+**The clean seam today is the AST.** `codegen` and `to_blocks` consume the AST
+and never reach into lexer/parser internals, so the front-end is swappable. For a
+language close to Python, a contributor can produce a compatible AST and reuse
+the back-end; for a *distinct* one (Java), introduce a **shared IR** below the
+per-language ASTs — and that stays a *localized* change precisely because the
+back-end already funnels through one representation.
+
+**Do now (cheap, keeps the door open):** keep `lib.rs`'s public surface small and
+stable, and keep `codegen`/`to_blocks` AST-only (no front-end coupling) — both
+already true. **Don't do now (premature until language #2 is real):** a language
+registry, parser traits, a shared IR, or tree-sitter. Python stays the sole
+focus; the IR/backend work is the documented move *if and when* a second distinct
+language actually lands.
+
 ## What we did instead (the bounded, always-worth-it parts)
 
 - Kept per-domain front-ends focused.
