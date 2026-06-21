@@ -10,11 +10,14 @@
 //!   "variables": [ { "name": "x", "id": "var_0" } ] }
 //! ```
 //!
-//! Only the constructs that have a standard Blockly block are representable:
-//! assignment, `if`/`elif`/`else`, `while`, counted `for`, `break`/`continue`,
-//! single-argument `print`, numbers/strings/booleans/variables, arithmetic,
-//! comparisons, and `and`/`or`/`not`. Anything else is a clean `Err` so the IDE
-//! can keep the text as the source of truth rather than dropping code.
+//! Most constructs map to a standard Blockly block: assignment,
+//! `if`/`elif`/`else`, `while`, counted `for`, for-each, `break`/`continue`,
+//! single-argument `print`, list literals, numbers/strings/booleans/variables,
+//! arithmetic, comparisons, and `and`/`or`/`not`. Functions use our own
+//! Python-shaped custom blocks (`python_def`, `python_return`,
+//! `python_call_statement`, `python_call_value`) — see `blockly-init.js`.
+//! Anything else is a clean `Err` so the IDE can keep the text as the source of
+//! truth rather than dropping code.
 //!
 //! The JSON is assembled as plain strings, bottom-up: the small free functions
 //! [`block`], [`field`], [`input`], [`var_ref`] and [`number`] are the
@@ -249,6 +252,9 @@ impl Builder {
                     let v = self.value_block(&args[0])?;
                     Ok(block("text_print", "", &input("TEXT", &v), "", next))
                 }
+                // Any other named call as a statement (a void call like
+                // `greet("Bo")`) becomes our generic Python-shaped call block.
+                ExprKind::Call(name, args) => self.call_block(name, args, true, next),
                 _ => unsupported("this statement"),
             },
             StmtKind::If {
@@ -365,9 +371,39 @@ impl Builder {
                     next,
                 ))
             }
-            StmtKind::Def { .. } => unsupported("function definitions"),
+            StmtKind::Def {
+                name,
+                params,
+                defaults,
+                body,
+            } => {
+                // Layer 1 is untyped and default-free: the block's PARAMS field
+                // is just the comma-joined names. Defaults round-trip through the
+                // text pane until typed surfaces land (see BLOCKS_ROADMAP.md).
+                if !defaults.is_empty() {
+                    return unsupported("a default argument");
+                }
+                let fields = format!(
+                    "{},{}",
+                    field("NAME", &jstr(name)),
+                    field("PARAMS", &jstr(&params.join(", ")))
+                );
+                let stack = self.chain(body)?;
+                let inputs = if stack.is_empty() {
+                    String::new()
+                } else {
+                    input("STACK", &stack)
+                };
+                Ok(block("python_def", &fields, &inputs, "", next))
+            }
             StmtKind::ClassDef { .. } => unsupported("classes"),
-            StmtKind::Return(_) => unsupported("`return`"),
+            StmtKind::Return(value) => {
+                let inputs = match value {
+                    Some(e) => input("VALUE", &self.value_block(e)?),
+                    None => String::new(),
+                };
+                Ok(block("python_return", "", &inputs, "", next))
+            }
             StmtKind::SetIndex { .. } => unsupported("item assignment"),
             StmtKind::SetAttr { .. } => unsupported("attribute assignment"),
             StmtKind::UnpackAssign { .. } => unsupported("tuple unpacking"),
@@ -457,7 +493,9 @@ impl Builder {
                 ))
             }
             ExprKind::Bin(op, a, b) => self.bin_block(*op, a, b),
-            ExprKind::Call(..) => unsupported("a function call"),
+            // A named call used as a value (`double(x)` in `y = double(x)`)
+            // becomes the output-shaped call block.
+            ExprKind::Call(name, args) => self.call_block(name, args, false, ""),
             ExprKind::MethodCall(..) => unsupported("a method call"),
             ExprKind::List(items) => {
                 // Blockly's `lists_create_with` with N value inputs ADD0..ADDn-1
@@ -513,6 +551,38 @@ impl Builder {
                 ));
             }
         })
+    }
+
+    /// A call to a named function — `python_call_statement` (void call, in a
+    /// statement stack) or `python_call_value` (returns a value, has an output).
+    /// The function name is a field; the positional arguments are value inputs
+    /// `ARG0..ARGn-1`, with the count carried in `extraState` so the custom
+    /// block can rebuild that many sockets on load. Keyword arguments have no
+    /// block yet.
+    fn call_block(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        statement: bool,
+        next: &str,
+    ) -> Result<String, String> {
+        let mut ins = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            if let ExprKind::Kwarg(..) = a.kind {
+                return Err(format!(
+                    "line {}: a keyword argument has no block yet (edit it in the text pane)",
+                    a.line
+                ));
+            }
+            ins.push(input(&format!("ARG{i}"), &self.value_block(a)?));
+        }
+        let ty = if statement {
+            "python_call_statement"
+        } else {
+            "python_call_value"
+        };
+        let extra = format!("{{\"argCount\":{}}}", args.len());
+        Ok(block(ty, &field("NAME", &jstr(name)), &ins.join(","), &extra, next))
     }
 }
 
@@ -736,8 +806,8 @@ mod tests {
     fn unsupported_constructs_error_gracefully() {
         let err = to_blockly_json("d = {1: 2}").unwrap_err();
         assert!(err.contains("dict"), "{err}");
-        let err = to_blockly_json("def f():\n    return 1").unwrap_err();
-        assert!(err.contains("function"), "{err}");
+        let err = to_blockly_json("class C:\n    pass").unwrap_err();
+        assert!(err.contains("class"), "{err}");
     }
 
     #[test]
@@ -754,6 +824,44 @@ mod tests {
         assert!(json.contains("\"type\":\"controls_forEach\""), "{json}");
         assert!(json.contains("\"LIST\""), "{json}");
         assert!(json.contains("\"type\":\"text_print\""), "{json}");
+    }
+
+    #[test]
+    fn function_def_call_and_return() {
+        // def with a body and a return value -> python_def + python_return,
+        // PARAMS is the comma-joined name list.
+        let json =
+            to_blockly_json("def double(n):\n    return n * 2").unwrap();
+        assert!(json.contains("\"type\":\"python_def\""), "{json}");
+        assert!(json.contains("\"NAME\":\"double\""), "{json}");
+        assert!(json.contains("\"PARAMS\":\"n\""), "{json}");
+        assert!(json.contains("\"type\":\"python_return\""), "{json}");
+        assert!(json.contains("\"VALUE\""), "{json}");
+
+        // A bare return (no value) emits the block with no VALUE input.
+        let json = to_blockly_json("def f():\n    return").unwrap();
+        assert!(json.contains("\"type\":\"python_return\""), "{json}");
+
+        // A value call -> python_call_value with ARG inputs + an argCount.
+        let json = to_blockly_json("y = double(21)").unwrap();
+        assert!(json.contains("\"type\":\"python_call_value\""), "{json}");
+        assert!(json.contains("\"NAME\":\"double\""), "{json}");
+        assert!(json.contains("\"argCount\":1"), "{json}");
+        assert!(json.contains("\"ARG0\""), "{json}");
+
+        // A void call statement -> python_call_statement.
+        let json = to_blockly_json("greet(\"Bo\", 3)").unwrap();
+        assert!(json.contains("\"type\":\"python_call_statement\""), "{json}");
+        assert!(json.contains("\"argCount\":2"), "{json}");
+        assert!(json.contains("\"ARG1\""), "{json}");
+    }
+
+    #[test]
+    fn function_default_arg_has_no_block_yet() {
+        // Defaults aren't representable in Layer 1 — a clean error keeps the
+        // text canonical instead of silently dropping the default.
+        let err = to_blockly_json("def f(x=1):\n    return x").unwrap_err();
+        assert!(err.contains("default argument"), "{err}");
     }
 
     #[test]
