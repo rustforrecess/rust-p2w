@@ -255,6 +255,10 @@ impl Builder {
                 // Any other named call as a statement (a void call like
                 // `greet("Bo")`) becomes our generic Python-shaped call block.
                 ExprKind::Call(name, args) => self.call_block(name, args, true, next),
+                // A method call as a statement (`xs.append(5)`).
+                ExprKind::MethodCall(obj, method, args) => {
+                    self.method_block(obj, method, args, true, next)
+                }
                 _ => unsupported("this statement"),
             },
             StmtKind::If {
@@ -545,7 +549,10 @@ impl Builder {
             // A named call used as a value (`double(x)` in `y = double(x)`)
             // becomes the output-shaped call block.
             ExprKind::Call(name, args) => self.call_block(name, args, false, ""),
-            ExprKind::MethodCall(..) => unsupported("a method call"),
+            // A method call used as a value (`xs.pop()`, `s.upper()`).
+            ExprKind::MethodCall(obj, method, args) => {
+                self.method_block(obj, method, args, false, "")
+            }
             ExprKind::List(items) => {
                 // Blockly's `lists_create_with` with N value inputs ADD0..ADDn-1
                 // and an extraState item count.
@@ -644,6 +651,38 @@ impl Builder {
         };
         let extra = format!("{{\"argCount\":{}}}", args.len());
         Ok(block(ty, &field("NAME", &jstr(name)), &ins.join(","), &extra, next))
+    }
+
+    /// A method call `obj.method(args)` — `python_method_statement` (void, e.g.
+    /// `xs.append(5)`) or `python_method_value` (returns a value, e.g.
+    /// `xs.pop()`). The receiver is the OBJECT value input, the method name is a
+    /// field, and positional args are ARG0..ARGn-1 with the count in extraState
+    /// (the same call mutator backs them).
+    fn method_block(
+        &mut self,
+        obj: &Expr,
+        method: &str,
+        args: &[Expr],
+        statement: bool,
+        next: &str,
+    ) -> Result<String, String> {
+        let mut ins = vec![input("OBJECT", &self.value_block(obj)?)];
+        for (i, a) in args.iter().enumerate() {
+            if let ExprKind::Kwarg(..) = a.kind {
+                return Err(format!(
+                    "line {}: a keyword argument has no block yet (edit it in the text pane)",
+                    a.line
+                ));
+            }
+            ins.push(input(&format!("ARG{i}"), &self.value_block(a)?));
+        }
+        let ty = if statement {
+            "python_method_statement"
+        } else {
+            "python_method_value"
+        };
+        let extra = format!("{{\"argCount\":{}}}", args.len());
+        Ok(block(ty, &field("METHOD", &jstr(method)), &ins.join(","), &extra, next))
     }
 }
 
@@ -1002,6 +1041,22 @@ mod tests {
         let json = to_blockly_json("v = scores[\"ann\"]").unwrap();
         assert!(json.contains("\"type\":\"python_index\""), "{json}");
         assert!(json.contains("\"TEXT\":\"ann\""), "{json}");
+    }
+
+    #[test]
+    fn method_calls_statement_and_value() {
+        // Void method call `xs.append(5)` -> python_method_statement.
+        let json = to_blockly_json("xs.append(5)").unwrap();
+        assert!(json.contains("\"type\":\"python_method_statement\""), "{json}");
+        assert!(json.contains("\"METHOD\":\"append\""), "{json}");
+        assert!(json.contains("\"OBJECT\""), "{json}");
+        assert!(json.contains("\"argCount\":1"), "{json}");
+
+        // Value method call `last = xs.pop()` -> python_method_value, 0 args.
+        let json = to_blockly_json("last = xs.pop()").unwrap();
+        assert!(json.contains("\"type\":\"python_method_value\""), "{json}");
+        assert!(json.contains("\"METHOD\":\"pop\""), "{json}");
+        assert!(json.contains("\"argCount\":0"), "{json}");
     }
 
     #[test]
