@@ -379,21 +379,42 @@ impl Builder {
                 return_type,
                 body,
             } => {
-                // Layer 1 is untyped and default-free: the block's PARAMS field
-                // is just the comma-joined names. Defaults and type annotations
-                // round-trip through the text pane until typed surfaces land
-                // (see BLOCKS_ROADMAP.md) — keeping them out of blocks means
-                // they're preserved, not silently dropped.
+                // Defaults still round-trip through the text pane (no block yet).
                 if !defaults.is_empty() {
                     return unsupported("a default argument");
                 }
-                if return_type.is_some() || param_types.iter().any(Option::is_some) {
-                    return unsupported("a type annotation");
+                // Reconstruct the signature text, folding any `: T` annotations
+                // inline (typed surfaces, roadmap layer 4). A type shape we can't
+                // render keeps the whole def in text rather than emit a broken
+                // signature.
+                let mut parts = Vec::with_capacity(params.len());
+                for (p, t) in params.iter().zip(param_types.iter()) {
+                    match t {
+                        None => parts.push(p.clone()),
+                        Some(ty) => {
+                            let Some(src) = type_to_source(ty) else {
+                                return unsupported("this type annotation");
+                            };
+                            parts.push(format!("{p}: {src}"));
+                        }
+                    }
                 }
+                let params_str = parts.join(", ");
+                // The return annotation rides in extraState so the block rebuilds
+                // its `-> T` row on load.
+                let extra = match return_type {
+                    Some(ty) => {
+                        let Some(src) = type_to_source(ty) else {
+                            return unsupported("this return type");
+                        };
+                        format!("{{\"returns\":{}}}", jstr(&src))
+                    }
+                    None => String::new(),
+                };
                 let fields = format!(
                     "{},{}",
                     field("NAME", &jstr(name)),
-                    field("PARAMS", &jstr(&params.join(", ")))
+                    field("PARAMS", &jstr(&params_str))
                 );
                 let stack = self.chain(body)?;
                 let inputs = if stack.is_empty() {
@@ -401,7 +422,7 @@ impl Builder {
                 } else {
                     input("STACK", &stack)
                 };
-                Ok(block("python_def", &fields, &inputs, "", next))
+                Ok(block("python_def", &fields, &inputs, &extra, next))
             }
             StmtKind::ClassDef { .. } => unsupported("classes"),
             StmtKind::Return(value) => {
@@ -713,6 +734,27 @@ fn number(n: f64) -> String {
     block("math_number", &field("NUM", &num), "", "", "")
 }
 
+/// Render a type-annotation expression back to Python source for a block's
+/// signature field — `int`, `list[int]`, `dict[str, int]`, `mod.T`. Returns
+/// `None` for shapes we don't reconstruct (e.g. a call), so the caller can keep
+/// that def in the text pane rather than emit a broken signature.
+fn type_to_source(e: &Expr) -> Option<String> {
+    Some(match &e.kind {
+        ExprKind::Name(n) => n.clone(),
+        ExprKind::NoneLit => "None".to_string(),
+        ExprKind::Attr(obj, attr) => format!("{}.{attr}", type_to_source(obj)?),
+        ExprKind::Index(obj, key) => {
+            format!("{}[{}]", type_to_source(obj)?, type_to_source(key)?)
+        }
+        // `dict[str, int]` subscripts the type with a tuple of args.
+        ExprKind::Tuple(items) => {
+            let parts: Option<Vec<String>> = items.iter().map(type_to_source).collect();
+            parts?.join(", ")
+        }
+        _ => return None,
+    })
+}
+
 /// JSON-encode a string (quotes included).
 fn jstr(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -872,35 +914,42 @@ mod tests {
     }
 
     #[test]
-    fn function_type_annotation_stays_in_text() {
-        // Annotations parse into the AST but have no typed block surface yet, so
-        // an annotated def is kept in the text pane (a clean error) rather than
-        // rendered as a block that would silently drop the `: T` / `-> T`.
-        let err = to_blockly_json("def double(n: int) -> int:\n    return n * 2").unwrap_err();
-        assert!(err.contains("type annotation"), "{err}");
-        // The untyped form still becomes a block (no regression).
-        let json = to_blockly_json("def double(n):\n    return n * 2").unwrap();
+    fn function_type_annotation_becomes_a_typed_block() {
+        // Typed surfaces: a `: T` annotation folds inline into PARAMS and a
+        // `-> T` rides in extraState, so the signature round-trips faithfully.
+        let json = to_blockly_json("def double(n: int) -> int:\n    return n * 2").unwrap();
         assert!(json.contains("\"type\":\"python_def\""), "{json}");
+        assert!(json.contains("\"PARAMS\":\"n: int\""), "{json}");
+        assert!(json.contains("\"returns\":\"int\""), "{json}");
+
+        // A subscripted type (list[int]) and a param-only annotation also work.
+        let json = to_blockly_json("def total(xs: list[int]):\n    return xs").unwrap();
+        assert!(json.contains("\"PARAMS\":\"xs: list[int]\""), "{json}");
+        assert!(!json.contains("\"returns\""), "no return annotation: {json}");
+
+        // The untyped form is unchanged (no regression).
+        let json = to_blockly_json("def double(n):\n    return n * 2").unwrap();
+        assert!(json.contains("\"PARAMS\":\"n\""), "{json}");
+        assert!(!json.contains("\"returns\""), "{json}");
     }
 
     #[test]
-    fn to_blocks_annotated_def_is_a_note_not_a_red_line() {
-        // An annotated def is valid Python (it compiles + runs), it just has no
-        // block yet — so it must surface as a gentle note, never a highlighted
-        // syntax error.
+    fn unreconstructable_type_annotation_stays_in_text() {
+        // A type shape we don't render (here a call `int()`) keeps the def in the
+        // text pane rather than emitting a broken signature.
+        let err = to_blockly_json("def f(x: int()) -> int:\n    return x").unwrap_err();
+        assert!(err.contains("type annotation"), "{err}");
+    }
+
+    #[test]
+    fn to_blocks_annotated_def_becomes_a_block_with_no_errors() {
+        // An annotated def is valid Python and now has a typed block — so it
+        // renders cleanly with no diagnostics at all.
         let out = to_blocks("def double(n: int) -> int:\n    return n * 2\n");
-        assert!(
-            out.errors
-                .iter()
-                .any(|e| e.to_string().contains("type annotation")),
-            "{:?}",
-            out.errors
-        );
-        assert!(
-            out.error_lines.is_empty(),
-            "valid annotated code must not be flagged red: {:?}",
-            out.error_lines
-        );
+        assert!(out.json.contains("\"type\":\"python_def\""), "{}", out.json);
+        assert!(out.json.contains("\"PARAMS\":\"n: int\""), "{}", out.json);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.error_lines.is_empty());
     }
 
     #[test]
