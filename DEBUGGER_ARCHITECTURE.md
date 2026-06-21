@@ -110,14 +110,22 @@ Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
 
 ## Build order
 
-1. **`DebugAdapter` interface + `InterpreterAdapter`** (browser) — fully usable
-   today, no native backend required. Get the UI (step/watches/watchpoints/
-   variables/stack + block & line highlight) right here.
+1. **`InterpreterAdapter` (browser)** — ✅ **shipped.** The `Stepper` lives in
+   `src/debug.rs`: a resumable tree-walking interpreter (explicit control stack +
+   one-statement-ahead `pending`, so it single-steps without blocking — works in
+   the IDE's WASM). Public API: `Stepper::new/step/run`, `status`,
+   `current_line`, `output`, `variables`, `eval_watch`. The IDE has a 🐞 Debug
+   mode with Step/Continue/Stop, a live variables list, watch expressions, and a
+   paused-line highlight. Covers the teaching subset; unsupported constructs stop
+   with a friendly "use Run" message. Still to add at this layer: breakpoint
+   gutter (the engine's `run(breakpoints)` already takes them), watchpoints
+   (break-on-change), call stack across user functions, and the block highlight
+   (needs line metadata on blocks).
 2. Native LLVM backend (separate, large — see the Pico target notes).
 3. **`UsbStubAdapter`** — on-device step hooks + USB-CDC control channel + the
    variable-layout map. No probe, consistent UX.
 4. **`ProbeAdapter`** — DWARF emission + `probe-rs`/DAP + DWT watchpoints. The
    gold-standard hardware path.
 
-Design the step-1 interface cleanly and steps 3–4 slot in under the same UI with
-no rework.
+`Stepper`'s API *is* the de-facto `DebugAdapter` interface; steps 3–4 implement
+the same surface so they slot in under the same UI with no rework.
