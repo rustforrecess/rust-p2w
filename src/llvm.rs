@@ -48,6 +48,21 @@ declare i32 @p2w_ne(i32, i32)
 declare i32 @p2w_not(i32)
 declare i1 @p2w_truthy(i32)
 declare void @p2w_print(i32)
+; containers
+declare i32 @p2w_list_new()
+declare i32 @p2w_list_append(i32, i32)
+declare i32 @p2w_dict_new()
+declare i32 @p2w_index(i32, i32)
+declare void @p2w_setindex(i32, i32, i32)
+declare i32 @p2w_len(i32)
+; method dispatch by name (runtime resolves on the receiver's type)
+declare i32 @p2w_method0(i32, ptr, i32)
+declare i32 @p2w_method1(i32, ptr, i32, i32)
+declare i32 @p2w_method2(i32, ptr, i32, i32, i32)
+; iteration protocol (for-each)
+declare i32 @p2w_iter(i32)
+declare i1 @p2w_iter_has(i32)
+declare i32 @p2w_iter_next(i32)
 ";
 
 /// Emit a textual LLVM IR module for the supported subset of `stmts`, or an
@@ -234,6 +249,20 @@ impl<'a> FuncEmitter<'a> {
         t
     }
 
+    /// Add a private string constant to the module and return its global name
+    /// (used for both string literals and method names). Caller knows the byte
+    /// length.
+    fn intern_str(&mut self, bytes: &[u8]) -> String {
+        let g = format!("@.str.{}.{}", self.gprefix, self.gcount);
+        self.gcount += 1;
+        self.globals.push_str(&format!(
+            "{g} = private unnamed_addr constant [{} x i8] c\"{}\"\n",
+            bytes.len(),
+            llvm_escape(bytes)
+        ));
+        g
+    }
+
     fn block(&mut self, stmts: &[Stmt]) -> Result<(), String> {
         for s in stmts {
             self.stmt(s)?;
@@ -264,12 +293,31 @@ impl<'a> FuncEmitter<'a> {
                     self.line(&format!("call void @p2w_print(i32 {v})"));
                     Ok(())
                 }
-                ExprKind::Call(..) => {
+                // Any other expression statement (a call, a method call like
+                // xs.append(1), ...) runs for its side effects.
+                _ => {
                     self.expr(e)?;
                     Ok(())
                 }
-                _ => nope("this statement"),
             },
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                // The target is a reference value, so the runtime mutates the
+                // shared heap object in place — no variable-slot special-casing.
+                let t = self.expr(target)?;
+                let i = self.expr(index)?;
+                let v = self.expr(value)?;
+                self.line(&format!("call void @p2w_setindex(i32 {t}, i32 {i}, i32 {v})"));
+                Ok(())
+            }
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => self.emit_foreach(var, iterable, body),
             StmtKind::Return(value) => {
                 let v = match value {
                     Some(e) => self.expr(e)?,
@@ -413,6 +461,35 @@ impl<'a> FuncEmitter<'a> {
         Ok(())
     }
 
+    /// `for var in iterable:` over the runtime iteration protocol
+    /// (`p2w_iter` / `p2w_iter_has` / `p2w_iter_next`).
+    fn emit_foreach(&mut self, var: &str, iterable: &Expr, body: &[Stmt]) -> Result<(), String> {
+        let seq = self.expr(iterable)?;
+        let it = self.call_value(&format!("call i32 @p2w_iter(i32 {seq})"));
+        let slot = self.var_slot(var);
+
+        let head = self.fresh_label("ehead");
+        let body_l = self.fresh_label("ebody");
+        let end = self.fresh_label("eend");
+
+        self.br_to(&head);
+        self.place_label(&head);
+        let has = self.temp();
+        self.line(&format!("{has} = call i1 @p2w_iter_has(i32 {it})"));
+        self.terminator(&format!("br i1 {has}, label %{body_l}, label %{end}"));
+
+        self.place_label(&body_l);
+        let cur = self.call_value(&format!("call i32 @p2w_iter_next(i32 {it})"));
+        self.line(&format!("store i32 {cur}, ptr {slot}"));
+        self.loops.push((head.clone(), end.clone()));
+        self.block(body)?;
+        self.loops.pop();
+        self.br_to(&head);
+
+        self.place_label(&end);
+        Ok(())
+    }
+
     /// Evaluate a condition to an `i1` via the runtime's truthiness.
     fn cond_i1(&mut self, cond: &Expr) -> Result<String, String> {
         let v = self.expr(cond)?;
@@ -437,13 +514,7 @@ impl<'a> FuncEmitter<'a> {
             ExprKind::NoneLit => Ok(self.call_value("call i32 @p2w_none()")),
             ExprKind::Str(s) => {
                 let bytes = s.as_bytes();
-                let g = format!("@.str.{}.{}", self.gprefix, self.gcount);
-                self.gcount += 1;
-                self.globals.push_str(&format!(
-                    "{g} = private unnamed_addr constant [{} x i8] c\"{}\"\n",
-                    bytes.len(),
-                    llvm_escape(bytes)
-                ));
+                let g = self.intern_str(bytes);
                 Ok(self.call_value(&format!("call i32 @p2w_str(ptr {g}, i32 {})", bytes.len())))
             }
             ExprKind::Name(name) => {
@@ -463,8 +534,16 @@ impl<'a> FuncEmitter<'a> {
             }
             ExprKind::Bin(op, a, b) => self.bin(*op, a, b),
             ExprKind::Call(name, args) => {
+                // len() is the one builtin lowered to the runtime so far.
+                if name == "len" {
+                    if args.len() != 1 {
+                        return nope("len() with other than one argument");
+                    }
+                    let v = self.expr(&args[0])?;
+                    return Ok(self.call_value(&format!("call i32 @p2w_len(i32 {v})")));
+                }
                 if !self.funcs.contains(name) {
-                    return nope("calling this function (only your own functions + print)");
+                    return nope("calling this function (only your own functions, len, + print)");
                 }
                 let mut ops = Vec::with_capacity(args.len());
                 for a in args {
@@ -472,8 +551,59 @@ impl<'a> FuncEmitter<'a> {
                 }
                 Ok(self.call_value(&format!("call i32 @{name}({})", ops.join(", "))))
             }
+            ExprKind::List(items) => {
+                let list = self.call_value("call i32 @p2w_list_new()");
+                for it in items {
+                    let v = self.expr(it)?;
+                    self.line(&format!("call i32 @p2w_list_append(i32 {list}, i32 {v})"));
+                }
+                Ok(list)
+            }
+            ExprKind::Dict(pairs) => {
+                let dict = self.call_value("call i32 @p2w_dict_new()");
+                for (k, v) in pairs {
+                    let kv = self.expr(k)?;
+                    let vv = self.expr(v)?;
+                    self.line(&format!(
+                        "call void @p2w_setindex(i32 {dict}, i32 {kv}, i32 {vv})"
+                    ));
+                }
+                Ok(dict)
+            }
+            ExprKind::Index(obj, idx) => {
+                let o = self.expr(obj)?;
+                let i = self.expr(idx)?;
+                Ok(self.call_value(&format!("call i32 @p2w_index(i32 {o}, i32 {i})")))
+            }
+            ExprKind::MethodCall(obj, method, args) => self.method_call(obj, method, args),
             _ => nope("this expression"),
         }
+    }
+
+    /// `recv.method(args)` -> a name-dispatched runtime call (the runtime
+    /// resolves the method on the receiver's type). 0–2 args for now.
+    fn method_call(&mut self, obj: &Expr, method: &str, args: &[Expr]) -> Result<String, String> {
+        if args.len() > 2 {
+            return Err(format!(
+                "line {}: the native backend handles methods with up to 2 arguments yet",
+                obj.line
+            ));
+        }
+        let recv = self.expr(obj)?;
+        let mut argvals = Vec::with_capacity(args.len());
+        for a in args {
+            argvals.push(self.expr(a)?);
+        }
+        let name_g = self.intern_str(method.as_bytes());
+        let nlen = method.len();
+        let extra: String = argvals
+            .iter()
+            .map(|v| format!(", i32 {v}"))
+            .collect();
+        Ok(self.call_value(&format!(
+            "call i32 @p2w_method{}(i32 {recv}, ptr {name_g}, i32 {nlen}{extra})",
+            args.len()
+        )))
     }
 
     fn bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<String, String> {
@@ -627,19 +757,48 @@ mod tests {
     }
 
     #[test]
+    fn lists_dicts_index_and_setindex() {
+        let out = ir("xs = [1, 2, 3]\nprint(xs[0])\nxs[1] = 9\n");
+        assert!(out.contains("call i32 @p2w_list_new()"), "{out}");
+        assert!(out.contains("call i32 @p2w_list_append(i32"), "{out}");
+        assert!(out.contains("call i32 @p2w_index(i32"), "read: {out}");
+        assert!(out.contains("call void @p2w_setindex(i32"), "write: {out}");
+
+        let out = ir("d = {\"a\": 1, \"b\": 2}\nprint(d[\"a\"])\n");
+        assert!(out.contains("call i32 @p2w_dict_new()"), "{out}");
+        assert!(out.contains("call void @p2w_setindex(i32"), "dict build: {out}");
+        assert!(out.contains("call i32 @p2w_index(i32"), "dict read: {out}");
+    }
+
+    #[test]
+    fn methods_dispatch_by_name() {
+        let out = ir("xs = [1]\nxs.append(2)\nlast = xs.pop()\n");
+        assert!(out.contains("constant [6 x i8] c\"append\""), "method name: {out}");
+        assert!(out.contains("call i32 @p2w_method1(i32"), "1-arg method: {out}");
+        assert!(out.contains("constant [3 x i8] c\"pop\""), "{out}");
+        assert!(out.contains("call i32 @p2w_method0(i32"), "0-arg method: {out}");
+    }
+
+    #[test]
+    fn len_builtin_and_for_each() {
+        assert!(ir("xs = [1, 2]\nprint(len(xs))\n").contains("call i32 @p2w_len(i32"));
+        let out = ir("for x in [1, 2, 3]:\n    print(x)\n");
+        assert!(out.contains("call i32 @p2w_iter(i32"), "{out}");
+        assert!(out.contains("call i1 @p2w_iter_has(i32"), "{out}");
+        assert!(out.contains("call i32 @p2w_iter_next(i32"), "{out}");
+        assert!(out.contains("ehead"), "loop labels: {out}");
+    }
+
+    #[test]
     fn unsupported_constructs_are_clean_errors() {
+        // and/or and tuples are still pending the relevant runtime/emitter work.
         assert!(
             emit_llvm_ir(&parse("ok = 1 < 2 and 3 < 4\n"))
                 .unwrap_err()
                 .contains("native")
         );
         assert!(
-            emit_llvm_ir(&parse("xs = [1, 2]\n"))
-                .unwrap_err()
-                .contains("native")
-        );
-        assert!(
-            emit_llvm_ir(&parse("for x in [1, 2]:\n    print(x)\n"))
+            emit_llvm_ir(&parse("t = (1, 2)\n"))
                 .unwrap_err()
                 .contains("native")
         );

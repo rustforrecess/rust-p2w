@@ -120,15 +120,16 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    counted for, break/continue, comparisons, `not`, user functions + recursion).
    (Originally `i32`; now superseded by the boxed model in phase 3.)
 3. **Value model + runtime** — ✅ **decided + emitter converted.** Every value is
-   a tagged `i64`; the emitter is rep-agnostic and routes all value ops through
-   the `p2w_*` runtime ABI (see the Value model section). Ints, bools, **strings**
-   (global constants + `p2w_str`), arithmetic (`+ - * / // % **`), comparisons,
-   `not`, conditions (`p2w_truthy`), control flow, and functions all work over
-   boxed values; vars are entry-block `alloca i64`. **Still to do in phase 3:**
-   the runtime crate itself (the `p2w_*` impls + bump allocator), and
-   **lists/dicts/indexing/methods/for-each + `and`/`or`** (more ABI:
-   `p2w_list_*`, `p2w_dict_*`, `p2w_index`, `p2w_len`, iterators). The emitted IR
-   isn't runnable until the runtime + toolchain (phase 1) land.
+   a tagged `i32` (see the Value model section); the emitter is rep-agnostic and
+   routes all value ops through the `p2w_*` runtime ABI. Done: ints, bools,
+   **strings** (`p2w_str`), arithmetic (`+ - * / // % **`), comparisons, `not`,
+   conditions (`p2w_truthy`), control flow, functions; **lists/dicts** (literals,
+   subscript read/write via `p2w_index`/`p2w_setindex`, `len()`), **methods**
+   (name-dispatched `p2w_method0/1/2`), and **for-each** (`p2w_iter`/`iter_has`/
+   `iter_next`). Vars are entry-block `alloca i32`. **Still to do in phase 3:**
+   the runtime crate itself (the `p2w_*` impls + bump allocator), and `and`/`or`
+   (short-circuit) + tuples/comprehensions. The emitted IR isn't runnable until
+   the runtime + toolchain (phase 1) land.
 4. **I/O + peripherals:** USB-CDC `print`, the temp sensor, GPIO.
 5. **Debug transports:** USB stub, then SWD/probe-rs + DWARF.
 6. **RISC-V** target variant.
