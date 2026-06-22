@@ -608,7 +608,7 @@ impl<'a> FuncEmitter<'a> {
 
     fn bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<String, String> {
         if matches!(op, BinOp::And | BinOp::Or) {
-            return Err("`and`/`or` aren't in the native backend yet".to_string());
+            return self.short_circuit(op, a, b);
         }
         let rt = match op {
             BinOp::Add => "p2w_add",
@@ -634,6 +634,39 @@ impl<'a> FuncEmitter<'a> {
         let va = self.expr(a)?;
         let vb = self.expr(b)?;
         Ok(self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})")))
+    }
+
+    /// `and`/`or` with Python semantics: short-circuit, and the result is the
+    /// *deciding operand* (not a bool). The left value goes in a slot; the right
+    /// is evaluated (and overwrites the slot) only when needed.
+    ///   and: keep left if falsy, else right.   or: keep left if truthy, else right.
+    fn short_circuit(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<String, String> {
+        let id = self.next_label;
+        self.next_label += 1;
+        let slot = format!("%sc{id}");
+        self.allocas.push_str(&format!("  {slot} = alloca i32\n"));
+
+        let va = self.expr(a)?;
+        self.line(&format!("store i32 {va}, ptr {slot}"));
+        let c = self.temp();
+        self.line(&format!("{c} = call i1 @p2w_truthy(i32 {va})"));
+
+        let rhs = format!("scrhs{id}");
+        let end = format!("scend{id}");
+        // `and` evaluates the rhs when the lhs is truthy; `or` when it's falsy.
+        if matches!(op, BinOp::And) {
+            self.terminator(&format!("br i1 {c}, label %{rhs}, label %{end}"));
+        } else {
+            self.terminator(&format!("br i1 {c}, label %{end}, label %{rhs}"));
+        }
+
+        self.place_label(&rhs);
+        let vb = self.expr(b)?;
+        self.line(&format!("store i32 {vb}, ptr {slot}"));
+        self.br_to(&end);
+
+        self.place_label(&end);
+        Ok(self.call_value(&format!("load i32, ptr {slot}")))
     }
 }
 
@@ -790,13 +823,20 @@ mod tests {
     }
 
     #[test]
+    fn and_or_short_circuit_into_a_slot() {
+        // `and`: lhs in a slot, rhs only on the truthy branch; result is loaded.
+        let out = ir("ok = 1 < 2 and 3 < 4\n");
+        assert!(out.contains("alloca i32"), "result slot: {out}");
+        assert!(out.contains("call i1 @p2w_truthy(i32"), "{out}");
+        assert!(out.contains("scrhs"), "rhs branch: {out}");
+        assert!(out.contains("load i32, ptr %sc"), "result load: {out}");
+        // `or` also compiles (different branch wiring).
+        assert!(ir("x = 0 or 5\n").contains("scrhs"), "or compiles");
+    }
+
+    #[test]
     fn unsupported_constructs_are_clean_errors() {
-        // and/or and tuples are still pending the relevant runtime/emitter work.
-        assert!(
-            emit_llvm_ir(&parse("ok = 1 < 2 and 3 < 4\n"))
-                .unwrap_err()
-                .contains("native")
-        );
+        // Tuples/comprehensions are still pending.
         assert!(
             emit_llvm_ir(&parse("t = (1, 2)\n"))
                 .unwrap_err()
