@@ -5,7 +5,7 @@
 //! crate needs no LLVM build dependency; turning the `.ll` into an RP2350 binary
 //! (`llc`/`lld`/`picotool`) is a later, toolchain-gated phase.
 //!
-//! **Value model (phase 3):** every Python value is a uniform tagged `i64`, and
+//! **Value model (phase 3):** every Python value is a uniform tagged `i32`, and
 //! this emitter is **representation-agnostic** — it never assumes a bit layout,
 //! it only *calls* a small **runtime ABI** of `p2w_*` functions (declared at the
 //! top of the module). The device runtime owns the actual rep + allocator. This
@@ -26,28 +26,28 @@ use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 /// The runtime ABI the emitted module depends on (implemented by the device
 /// runtime). Declared at the top of every module.
 const RUNTIME_DECLS: &str = "\
-; runtime ABI — values are opaque tagged i64; the device runtime owns the rep.
-declare i64 @p2w_int(i32)
-declare i64 @p2w_bool(i1)
-declare i64 @p2w_none()
-declare i64 @p2w_str(ptr, i32)
-declare i64 @p2w_add(i64, i64)
-declare i64 @p2w_sub(i64, i64)
-declare i64 @p2w_mul(i64, i64)
-declare i64 @p2w_div(i64, i64)
-declare i64 @p2w_floordiv(i64, i64)
-declare i64 @p2w_mod(i64, i64)
-declare i64 @p2w_pow(i64, i64)
-declare i64 @p2w_neg(i64)
-declare i64 @p2w_lt(i64, i64)
-declare i64 @p2w_le(i64, i64)
-declare i64 @p2w_gt(i64, i64)
-declare i64 @p2w_ge(i64, i64)
-declare i64 @p2w_eq(i64, i64)
-declare i64 @p2w_ne(i64, i64)
-declare i64 @p2w_not(i64)
-declare i1 @p2w_truthy(i64)
-declare void @p2w_print(i64)
+; runtime ABI — values are opaque tagged i32; the device runtime owns the rep.
+declare i32 @p2w_int(i32)
+declare i32 @p2w_bool(i1)
+declare i32 @p2w_none()
+declare i32 @p2w_str(ptr, i32)
+declare i32 @p2w_add(i32, i32)
+declare i32 @p2w_sub(i32, i32)
+declare i32 @p2w_mul(i32, i32)
+declare i32 @p2w_div(i32, i32)
+declare i32 @p2w_floordiv(i32, i32)
+declare i32 @p2w_mod(i32, i32)
+declare i32 @p2w_pow(i32, i32)
+declare i32 @p2w_neg(i32)
+declare i32 @p2w_lt(i32, i32)
+declare i32 @p2w_le(i32, i32)
+declare i32 @p2w_gt(i32, i32)
+declare i32 @p2w_ge(i32, i32)
+declare i32 @p2w_eq(i32, i32)
+declare i32 @p2w_ne(i32, i32)
+declare i32 @p2w_not(i32)
+declare i1 @p2w_truthy(i32)
+declare void @p2w_print(i32)
 ";
 
 /// Emit a textual LLVM IR module for the supported subset of `stmts`, or an
@@ -106,17 +106,17 @@ fn emit_function(
     let mut f = FuncEmitter::new(funcs, name);
     for (i, p) in params.iter().enumerate() {
         let ptr = f.var_slot(p);
-        f.line(&format!("store i64 %a{i}, ptr {ptr}"));
+        f.line(&format!("store i32 %a{i}, ptr {ptr}"));
     }
     f.block(body)?;
     if !f.terminated {
         let none = f.temp();
-        f.line(&format!("{none} = call i64 @p2w_none()"));
-        f.body.push_str(&format!("  ret i64 {none}\n"));
+        f.line(&format!("{none} = call i32 @p2w_none()"));
+        f.body.push_str(&format!("  ret i32 {none}\n"));
     }
-    let sig: Vec<String> = (0..params.len()).map(|i| format!("i64 %a{i}")).collect();
+    let sig: Vec<String> = (0..params.len()).map(|i| format!("i32 %a{i}")).collect();
     let def = format!(
-        "define i64 @{name}({}) {{\nentry:\n{}{}}}\n",
+        "define i32 @{name}({}) {{\nentry:\n{}{}}}\n",
         sig.join(", "),
         f.allocas,
         f.body
@@ -139,7 +139,7 @@ fn emit_main(top: &[&Stmt], funcs: &HashSet<String>) -> Result<(String, String),
     Ok((def, f.globals))
 }
 
-/// Per-function emission state. Values are tagged `i64`; variables are
+/// Per-function emission state. Values are tagged `i32`; variables are
 /// entry-block `alloca`s; control flow uses labelled basic blocks.
 struct FuncEmitter<'a> {
     funcs: &'a HashSet<String>,
@@ -221,7 +221,7 @@ impl<'a> FuncEmitter<'a> {
     fn var_slot(&mut self, name: &str) -> String {
         let ptr = format!("%v_{name}");
         if !self.vars.iter().any(|v| v == name) {
-            self.allocas.push_str(&format!("  {ptr} = alloca i64\n"));
+            self.allocas.push_str(&format!("  {ptr} = alloca i32\n"));
             self.vars.push(name.to_string());
         }
         ptr
@@ -252,7 +252,7 @@ impl<'a> FuncEmitter<'a> {
             StmtKind::Assign(name, value) => {
                 let v = self.expr(value)?;
                 let ptr = self.var_slot(name);
-                self.line(&format!("store i64 {v}, ptr {ptr}"));
+                self.line(&format!("store i32 {v}, ptr {ptr}"));
                 Ok(())
             }
             StmtKind::Expr(e) => match &e.kind {
@@ -261,7 +261,7 @@ impl<'a> FuncEmitter<'a> {
                         return nope("print() with multiple arguments");
                     }
                     let v = self.expr(&args[0])?;
-                    self.line(&format!("call void @p2w_print(i64 {v})"));
+                    self.line(&format!("call void @p2w_print(i32 {v})"));
                     Ok(())
                 }
                 ExprKind::Call(..) => {
@@ -273,9 +273,9 @@ impl<'a> FuncEmitter<'a> {
             StmtKind::Return(value) => {
                 let v = match value {
                     Some(e) => self.expr(e)?,
-                    None => self.call_value("call i64 @p2w_none()"),
+                    None => self.call_value("call i32 @p2w_none()"),
                 };
-                self.terminator(&format!("ret i64 {v}"));
+                self.terminator(&format!("ret i32 {v}"));
                 Ok(())
             }
             StmtKind::If {
@@ -376,9 +376,9 @@ impl<'a> FuncEmitter<'a> {
         }
         let start_v = self.expr(start)?;
         let end_v = self.expr(end_expr)?;
-        let step_v = self.call_value(&format!("call i64 @p2w_int(i32 {step_lit})"));
+        let step_v = self.call_value(&format!("call i32 @p2w_int(i32 {step_lit})"));
         let slot = self.var_slot(var);
-        self.line(&format!("store i64 {start_v}, ptr {slot}"));
+        self.line(&format!("store i32 {start_v}, ptr {slot}"));
 
         let head = self.fresh_label("fhead");
         let body_l = self.fresh_label("fbody");
@@ -388,12 +388,12 @@ impl<'a> FuncEmitter<'a> {
         self.br_to(&head);
         self.place_label(&head);
         let iv = self.temp();
-        self.line(&format!("{iv} = load i64, ptr {slot}"));
+        self.line(&format!("{iv} = load i32, ptr {slot}"));
         // Ascending loops compare with `<`, descending with `>` (Python range).
         let cmp_fn = if step_lit > 0 { "p2w_lt" } else { "p2w_gt" };
-        let cmpv = self.call_value(&format!("call i64 @{cmp_fn}(i64 {iv}, i64 {end_v})"));
+        let cmpv = self.call_value(&format!("call i32 @{cmp_fn}(i32 {iv}, i32 {end_v})"));
         let cond = self.temp();
-        self.line(&format!("{cond} = call i1 @p2w_truthy(i64 {cmpv})"));
+        self.line(&format!("{cond} = call i1 @p2w_truthy(i32 {cmpv})"));
         self.terminator(&format!("br i1 {cond}, label %{body_l}, label %{end}"));
 
         self.place_label(&body_l);
@@ -404,9 +404,9 @@ impl<'a> FuncEmitter<'a> {
 
         self.place_label(&cont);
         let cur = self.temp();
-        self.line(&format!("{cur} = load i64, ptr {slot}"));
-        let inc = self.call_value(&format!("call i64 @p2w_add(i64 {cur}, i64 {step_v})"));
-        self.line(&format!("store i64 {inc}, ptr {slot}"));
+        self.line(&format!("{cur} = load i32, ptr {slot}"));
+        let inc = self.call_value(&format!("call i32 @p2w_add(i32 {cur}, i32 {step_v})"));
+        self.line(&format!("store i32 {inc}, ptr {slot}"));
         self.br_to(&head);
 
         self.place_label(&end);
@@ -417,11 +417,11 @@ impl<'a> FuncEmitter<'a> {
     fn cond_i1(&mut self, cond: &Expr) -> Result<String, String> {
         let v = self.expr(cond)?;
         let t = self.temp();
-        self.line(&format!("{t} = call i1 @p2w_truthy(i64 {v})"));
+        self.line(&format!("{t} = call i1 @p2w_truthy(i32 {v})"));
         Ok(t)
     }
 
-    /// Evaluate an expression to a tagged-`i64` value operand.
+    /// Evaluate an expression to a tagged-`i32` value operand.
     fn expr(&mut self, e: &Expr) -> Result<String, String> {
         let nope = |what: &str| {
             Err(format!(
@@ -430,11 +430,11 @@ impl<'a> FuncEmitter<'a> {
             ))
         };
         match &e.kind {
-            ExprKind::Int(n) => Ok(self.call_value(&format!("call i64 @p2w_int(i32 {})", *n as i32))),
+            ExprKind::Int(n) => Ok(self.call_value(&format!("call i32 @p2w_int(i32 {})", *n as i32))),
             ExprKind::Bool(b) => {
-                Ok(self.call_value(&format!("call i64 @p2w_bool(i1 {})", if *b { 1 } else { 0 })))
+                Ok(self.call_value(&format!("call i32 @p2w_bool(i1 {})", if *b { 1 } else { 0 })))
             }
-            ExprKind::NoneLit => Ok(self.call_value("call i64 @p2w_none()")),
+            ExprKind::NoneLit => Ok(self.call_value("call i32 @p2w_none()")),
             ExprKind::Str(s) => {
                 let bytes = s.as_bytes();
                 let g = format!("@.str.{}.{}", self.gprefix, self.gcount);
@@ -444,22 +444,22 @@ impl<'a> FuncEmitter<'a> {
                     bytes.len(),
                     llvm_escape(bytes)
                 ));
-                Ok(self.call_value(&format!("call i64 @p2w_str(ptr {g}, i32 {})", bytes.len())))
+                Ok(self.call_value(&format!("call i32 @p2w_str(ptr {g}, i32 {})", bytes.len())))
             }
             ExprKind::Name(name) => {
                 if !self.vars.iter().any(|v| v == name) {
                     return Err(format!("line {}: name '{name}' is not defined", e.line));
                 }
                 let ptr = format!("%v_{name}");
-                Ok(self.call_value(&format!("load i64, ptr {ptr}")))
+                Ok(self.call_value(&format!("load i32, ptr {ptr}")))
             }
             ExprKind::Unary(UnOp::Neg, inner) => {
                 let v = self.expr(inner)?;
-                Ok(self.call_value(&format!("call i64 @p2w_neg(i64 {v})")))
+                Ok(self.call_value(&format!("call i32 @p2w_neg(i32 {v})")))
             }
             ExprKind::Unary(UnOp::Not, inner) => {
                 let v = self.expr(inner)?;
-                Ok(self.call_value(&format!("call i64 @p2w_not(i64 {v})")))
+                Ok(self.call_value(&format!("call i32 @p2w_not(i32 {v})")))
             }
             ExprKind::Bin(op, a, b) => self.bin(*op, a, b),
             ExprKind::Call(name, args) => {
@@ -468,9 +468,9 @@ impl<'a> FuncEmitter<'a> {
                 }
                 let mut ops = Vec::with_capacity(args.len());
                 for a in args {
-                    ops.push(format!("i64 {}", self.expr(a)?));
+                    ops.push(format!("i32 {}", self.expr(a)?));
                 }
-                Ok(self.call_value(&format!("call i64 @{name}({})", ops.join(", "))))
+                Ok(self.call_value(&format!("call i32 @{name}({})", ops.join(", "))))
             }
             _ => nope("this expression"),
         }
@@ -503,7 +503,7 @@ impl<'a> FuncEmitter<'a> {
         };
         let va = self.expr(a)?;
         let vb = self.expr(b)?;
-        Ok(self.call_value(&format!("call i64 @{rt}(i64 {va}, i64 {vb})")))
+        Ok(self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})")))
     }
 }
 
@@ -548,12 +548,12 @@ mod tests {
     #[test]
     fn module_declares_runtime_and_boxes_values() {
         let out = ir("print(6 * 7)\n");
-        assert!(out.contains("declare i64 @p2w_add(i64, i64)"), "{out}");
-        assert!(out.contains("declare void @p2w_print(i64)"), "{out}");
-        assert!(out.contains("call i64 @p2w_int(i32 6)"), "{out}");
-        assert!(out.contains("call i64 @p2w_int(i32 7)"), "{out}");
-        assert!(out.contains("call i64 @p2w_mul(i64"), "{out}");
-        assert!(out.contains("call void @p2w_print(i64"), "{out}");
+        assert!(out.contains("declare i32 @p2w_add(i32, i32)"), "{out}");
+        assert!(out.contains("declare void @p2w_print(i32)"), "{out}");
+        assert!(out.contains("call i32 @p2w_int(i32 6)"), "{out}");
+        assert!(out.contains("call i32 @p2w_int(i32 7)"), "{out}");
+        assert!(out.contains("call i32 @p2w_mul(i32"), "{out}");
+        assert!(out.contains("call void @p2w_print(i32"), "{out}");
         assert!(out.contains("ret i32 0"), "main exit: {out}");
     }
 
@@ -561,10 +561,10 @@ mod tests {
     fn strings_become_global_constants() {
         let out = ir("print(\"hi\")\n");
         assert!(out.contains("constant [2 x i8] c\"hi\""), "{out}");
-        assert!(out.contains("call i64 @p2w_str(ptr @.str.main.0, i32 2)"), "{out}");
+        assert!(out.contains("call i32 @p2w_str(ptr @.str.main.0, i32 2)"), "{out}");
         // String concatenation goes through p2w_add (the runtime dispatches).
         let out = ir("x = \"a\" + \"b\"\n");
-        assert!(out.contains("call i64 @p2w_add(i64"), "{out}");
+        assert!(out.contains("call i32 @p2w_add(i32"), "{out}");
     }
 
     #[test]
@@ -577,17 +577,17 @@ mod tests {
 
     #[test]
     fn arithmetic_and_comparisons_route_through_runtime() {
-        assert!(ir("print(7 / 2)\n").contains("call i64 @p2w_div(i64"));
-        assert!(ir("print(7 // 2)\n").contains("call i64 @p2w_floordiv(i64"));
-        assert!(ir("print(2 ** 10)\n").contains("call i64 @p2w_pow(i64"));
-        assert!(ir("x = 1 < 2\n").contains("call i64 @p2w_lt(i64"));
-        assert!(ir("y = not 0\n").contains("call i64 @p2w_not(i64"));
+        assert!(ir("print(7 / 2)\n").contains("call i32 @p2w_div(i32"));
+        assert!(ir("print(7 // 2)\n").contains("call i32 @p2w_floordiv(i32"));
+        assert!(ir("print(2 ** 10)\n").contains("call i32 @p2w_pow(i32"));
+        assert!(ir("x = 1 < 2\n").contains("call i32 @p2w_lt(i32"));
+        assert!(ir("y = not 0\n").contains("call i32 @p2w_not(i32"));
     }
 
     #[test]
     fn control_flow_uses_truthy_and_blocks() {
         let out = ir("x = 5\nif x < 1:\n    print(1)\nelse:\n    print(2)\n");
-        assert!(out.contains("call i1 @p2w_truthy(i64"), "{out}");
+        assert!(out.contains("call i1 @p2w_truthy(i32"), "{out}");
         assert!(out.contains("br i1"), "{out}");
         assert!(out.contains("ifend"), "{out}");
 
@@ -599,19 +599,19 @@ mod tests {
     #[test]
     fn for_range_uses_value_ops() {
         let out = ir("for i in range(1, 5):\n    print(i)\n");
-        assert!(out.contains("call i64 @p2w_lt(i64"), "ascending: {out}");
-        assert!(out.contains("call i64 @p2w_add(i64"), "increment: {out}");
+        assert!(out.contains("call i32 @p2w_lt(i32"), "ascending: {out}");
+        assert!(out.contains("call i32 @p2w_add(i32"), "increment: {out}");
         let out = ir("for i in range(5, 0, -1):\n    print(i)\n");
-        assert!(out.contains("call i64 @p2w_gt(i64"), "descending: {out}");
+        assert!(out.contains("call i32 @p2w_gt(i32"), "descending: {out}");
     }
 
     #[test]
     fn functions_take_and_return_values() {
         let out = ir("def double(n):\n    return n * 2\nprint(double(21))\n");
-        assert!(out.contains("define i64 @double(i64 %a0)"), "{out}");
-        assert!(out.contains("store i64 %a0, ptr %v_n"), "param slot: {out}");
-        assert!(out.contains("ret i64"), "{out}");
-        assert!(out.contains("call i64 @double(i64"), "{out}");
+        assert!(out.contains("define i32 @double(i32 %a0)"), "{out}");
+        assert!(out.contains("store i32 %a0, ptr %v_n"), "param slot: {out}");
+        assert!(out.contains("ret i32"), "{out}");
+        assert!(out.contains("call i32 @double(i32"), "{out}");
     }
 
     #[test]
@@ -619,11 +619,11 @@ mod tests {
         let out = ir(
             "def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\nprint(fact(5))\n",
         );
-        assert!(out.contains("define i64 @fact(i64 %a0)"), "{out}");
-        assert!(out.contains("call i64 @fact(i64"), "self-call: {out}");
+        assert!(out.contains("define i32 @fact(i32 %a0)"), "{out}");
+        assert!(out.contains("call i32 @fact(i32"), "self-call: {out}");
         // A void function falls off the end returning None.
         let out = ir("def greet(name):\n    print(name)\ngreet(\"x\")\n");
-        assert!(out.contains("call i64 @p2w_none()"), "implicit None: {out}");
+        assert!(out.contains("call i32 @p2w_none()"), "implicit None: {out}");
     }
 
     #[test]

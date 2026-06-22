@@ -52,20 +52,30 @@ Bare metal has **no GC**. This is the hard part and the main multi-phase work:
   arena, grow later.
 
 ## Value model — DECIDED (phase 3)
-Every Python value is a uniform **tagged `i64`**, and **the emitter is
+Every Python value is a uniform **tagged `i32`**, and **the emitter is
 rep-agnostic**: it never assumes a bit layout — it only *calls* a small **runtime
-ABI** of `p2w_*` functions that take/return `i64`. The device runtime (written
-later in Rust/C for the target) owns the actual representation (e.g. low-bit tags:
-small int inline, or a tagged pointer to a heap string/list/dict) and the
-**allocator** (start with a bump arena reset per run; ref-counting later — full GC
-is overkill for short kid programs). This is the same "box values + call runtime
-ops" split the WASM backend uses (`ref.i31` + `py_add`), and it's why we can add
-strings/lists/dicts without touching the emitter's control-flow.
+ABI** of `p2w_*` functions that take/return `i32`. The device runtime (written
+later in Rust/C for the target) owns the actual representation (low-bit tags on
+an aligned word: small int inline, or a tagged pointer to a heap string/list/
+dict) and the **allocator** (start with a bump arena reset per run; ref-counting
+later — full GC is overkill for short kid programs). Same "box values + call
+runtime ops" split the WASM backend uses (`ref.i31` + `py_add`).
 
-Trade-off: boxing every value is slower than Phase 2's raw `i32`. That raw path
-isn't lost — it returns later as an **optimization via the type annotations**
-(monomorphize typed functions/locals to machine ints), with the boxed model as
-the always-correct fallback. Correct first, fast later.
+**Why `i32`, not `i64`:** the universal value must be ≥ pointer width to hold a
+heap reference; on the RP2350 a pointer is **32-bit**, so `i32` is the natural
+word — one register, not two — and matches the established embedded/dynamic
+runtimes (**MicroPython**'s word-sized `mp_obj_t`, **V8**'s 31-bit SMI). `i64`
+would waste a register per value on a 32-bit core. (A value *narrower* than a
+pointer — `i16`/`i8` — can't be the universal slot at all.) Trade-off: inline
+ints are ~30-bit before the runtime promotes to a heap bignum — plenty for kids.
+
+**Where `i8`/`i16`/`i32`-raw belong:** *not* the universal value, but the
+**typed fast path** the annotations unlock — a `: int` local compiles to a raw
+unboxed machine int (native `add`/`icmp`, no runtime call — literally Phase 2's
+codegen reborn), and a typed *homogeneous* container (`list[int]`, bytes, audio,
+pixels) packs into an `i8`/`i16`/`i32` array instead of boxed values (crucial on
+a 520 KB MCU). So the design is two-tier: boxed `i32` for dynamic code, narrow
+machine ints chosen *by type* for typed code. Correct first, fast later.
 
 **Runtime ABI (the emitted IR `declare`s these):**
 `p2w_int(i32)->i64`, `p2w_bool(i1)->i64`, `p2w_none()->i64`,
