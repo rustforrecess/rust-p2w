@@ -16,6 +16,7 @@ mod emit;
 mod error;
 mod lexer;
 mod lint;
+mod llvm;
 mod parser;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
@@ -37,6 +38,15 @@ pub fn try_compile(source: &str) -> Result<String, CompileError> {
     let tokens = lexer::lex(source)?;
     let stmts = parser::parse(&tokens)?;
     codegen::generate(&stmts)
+}
+
+/// Compile Python to textual LLVM IR — Phase 0 of the native Pico 2 W backend
+/// (the integer subset; see `PICO_BACKEND.md`). Text only: turning this into an
+/// RP2350 binary is a later, toolchain-gated phase.
+pub fn compile_to_llvm_ir(source: &str) -> Result<String, String> {
+    let tokens = lexer::lex(source).map_err(|e| e.to_string())?;
+    let stmts = parser::parse(&tokens).map_err(|e| e.to_string())?;
+    llvm::emit_llvm_ir(&stmts)
 }
 
 #[cfg(test)]
