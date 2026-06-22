@@ -48,6 +48,9 @@ declare i32 @p2w_ne(i32, i32)
 declare i32 @p2w_not(i32)
 declare i1 @p2w_truthy(i32)
 declare void @p2w_print(i32)
+; reference counting (no-ops for inline int/bool/None at runtime)
+declare void @p2w_retain(i32)
+declare void @p2w_release(i32)
 ; containers
 declare i32 @p2w_list_new()
 declare i32 @p2w_list_append(i32, i32)
@@ -153,6 +156,26 @@ fn emit_main(top: &[&Stmt], funcs: &HashSet<String>) -> Result<(String, String),
     );
     Ok((def, f.globals))
 }
+
+// --- Ownership contract for the (upcoming) RC insertion pass ----------------
+//
+// The runtime is already RC-correct (free releases children; setindex/dict-update
+// release the replaced value; index/iter_next return owned refs; pop transfers).
+// What remains is the EMITTER inserting retain/release. The model (transfer-based,
+// "Model A"):
+//   - every expr() result is an OWNED reference (+1). Constructors (p2w_int/str/
+//     list_new/add/call/index/iter_next/...) already return +1; a Name *load* is
+//     BORROWED, so the pass emits `p2w_retain` after it to make it owned.
+//   - assign `x = e`: release the OLD x, then store e (transfer — don't release e).
+//   - container insert (append / list+dict literals / setindex value & key):
+//     TRANSFER (don't release the inserted temp); the runtime owns + frees it
+//     later. (List indices are ints, so transferring the index is a no-op.)
+//   - borrowing ops (arithmetic/compare operands, print, conditions, index
+//     target+index, call args): release each operand temp after the op.
+//   - scope / function exit: release all locals.
+// Step 1 emits these naively (release at scope end); precision (last-use),
+// borrowed params, and reuse (drop-reuse) follow — see MEMORY_MANAGEMENT.md.
+// NOT YET WIRED: the emitter currently relies on run-to-completion arena reset.
 
 /// Per-function emission state. Values are tagged `i32`; variables are
 /// entry-block `alloca`s; control flow uses labelled basic blocks.

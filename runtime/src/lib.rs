@@ -249,11 +249,12 @@ pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
     if is_heap(a) && obj_tag(a) == T_LIST && is_heap(b) && obj_tag(b) == T_LIST {
         let r = coll_new(T_LIST);
         let ro = r as usize;
+        // The new list gets its own reference to each copied element.
         for i in 0..coll_len(a as usize) {
-            list_push(ro, list_get(a as usize, i));
+            list_push(ro, owned(list_get(a as usize, i)));
         }
         for i in 0..coll_len(b as usize) {
-            list_push(ro, list_get(b as usize, i));
+            list_push(ro, owned(list_get(b as usize, i)));
         }
         return r;
     }
@@ -411,6 +412,16 @@ fn rc_dec(o: usize) -> u32 {
     n
 }
 
+/// Return `v` as an **owned** reference (retaining if it's a heap value), so a
+/// borrowed element handed out by `p2w_index`/iteration becomes the caller's to
+/// release. Inline values pass through unchanged.
+fn owned(v: Value) -> Value {
+    if is_heap(v) {
+        rc_inc(v as usize);
+    }
+    v
+}
+
 /// Free one object — the single **free seam**. To bound worst-case latency
 /// under an RTOS (a `release` of a large graph cascades into many frees), this
 /// can later be made *deferred/incremental*: enqueue the object/children on a
@@ -418,11 +429,30 @@ fn rc_dec(o: usize) -> u32 {
 /// freeing recursively here. When child retain/release lands (the emitter's RC
 /// wiring), release children here before `dealloc`.
 fn free_object(o: usize) {
-    if matches!(rd(o), T_LIST | T_DICT) {
-        let data = coll_data(o);
-        if data != 0 {
-            dealloc(data);
+    // A container owns one reference to each child, so releasing it releases the
+    // children (ownership model: insert transfers the value's ref in; free
+    // releases it). This is the cascading free the RTOS note wants to bound.
+    match rd(o) {
+        T_LIST => {
+            for i in 0..coll_len(o) {
+                p2w_release(list_get(o, i));
+            }
+            let d = coll_data(o);
+            if d != 0 {
+                dealloc(d);
+            }
         }
+        T_DICT => {
+            for i in 0..coll_len(o) {
+                p2w_release(dict_key(o, i));
+                p2w_release(dict_val(o, i));
+            }
+            let d = coll_data(o);
+            if d != 0 {
+                dealloc(d);
+            }
+        }
+        _ => {}
     }
     dealloc(o);
 }
@@ -535,8 +565,12 @@ fn dict_find(o: usize, key: Value) -> Option<usize> {
     (0..coll_len(o)).find(|&i| value_eq(dict_key(o, i), key))
 }
 fn dict_set(o: usize, key: Value, val: Value) {
+    // Ownership: the new key/value arrive owned (transferred in). On update we
+    // keep the existing key, so release the old value and the redundant new key.
     if let Some(i) = dict_find(o, key) {
-        wr(coll_data(o) + i * 8 + 4, val as u32); // update existing
+        p2w_release(dict_val(o, i));
+        wr(coll_data(o) + i * 8 + 4, val as u32);
+        p2w_release(key);
         return;
     }
     let len = coll_len(o);
@@ -582,10 +616,10 @@ pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
         }
         T_LIST => {
             let i = norm_index(index, coll_len(o) as i64);
-            list_get(o, i as usize)
+            owned(list_get(o, i as usize)) // hand the caller an owned ref
         }
         T_DICT => match dict_find(o, index) {
-            Some(i) => dict_val(o, i),
+            Some(i) => owned(dict_val(o, i)),
             None => trap("key not found"),
         },
         _ => trap("object is not subscriptable"),
@@ -602,7 +636,8 @@ pub extern "C" fn p2w_setindex(target: Value, index: Value, value: Value) {
     match obj_tag(target) {
         T_LIST => {
             let i = norm_index(index, coll_len(o) as i64);
-            list_set_at(o, i as usize, value);
+            p2w_release(list_get(o, i as usize)); // release the replaced element
+            list_set_at(o, i as usize, value); // new value transferred in
         }
         T_DICT => dict_set(o, index, value),
         _ => trap("object does not support item assignment"),
@@ -639,9 +674,9 @@ fn container_len(c: Value) -> usize {
 /// char, or dict key).
 fn element_at(c: Value, i: usize) -> Value {
     match obj_tag(c) {
-        T_STR => str_alloc(&[str_byte(c, i)]),
-        T_LIST => list_get(c as usize, i),
-        T_DICT => dict_key(c as usize, i),
+        T_STR => str_alloc(&[str_byte(c, i)]), // freshly allocated -> already owned
+        T_LIST => owned(list_get(c as usize, i)),
+        T_DICT => owned(dict_key(c as usize, i)),
         _ => trap("object is not iterable"),
     }
 }
@@ -1107,6 +1142,42 @@ mod tests {
         assert_eq!(p2w_eq(a, b), V_TRUE);
         p2w_list_append(b, p2w_int(3));
         assert_eq!(p2w_eq(a, b), V_FALSE);
+    }
+
+    #[test]
+    fn releasing_a_list_releases_its_children() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        let a = str_val("alpha"); // rc 1, transferred to the list on append
+        p2w_list_append(xs, a);
+        p2w_retain(a); // rc 2: the list + our test handle
+        p2w_release(xs); // frees buffer/object and releases children: a 2 -> 1
+        assert_eq!(shown(a), "alpha"); // still alive because we hold a ref
+        p2w_release(a); // 1 -> 0: now freed (no leak)
+    }
+
+    #[test]
+    fn setindex_releases_the_replaced_element() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        let old = str_val("old");
+        p2w_list_append(xs, old); // list owns `old`
+        p2w_retain(old); // rc 2: list + handle
+        p2w_setindex(xs, p2w_int(0), str_val("new")); // releases old (2 -> 1)
+        assert_eq!(shown(old), "old"); // survives via our handle
+        assert_eq!(shown(p2w_index(xs, p2w_int(0))), "new");
+        p2w_release(old);
+    }
+
+    #[test]
+    fn index_returns_an_owned_reference() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        let s = str_val("hi");
+        p2w_list_append(xs, s); // list owns s (rc 1)
+        let got = p2w_index(xs, p2w_int(0)); // owned -> retains, rc 2
+        assert_eq!(got, s);
+        assert_eq!(rd(got as usize + 4), 2, "index hands back an owned ref");
     }
 
     // Note: division-by-zero / type errors call `trap`, which on the device
