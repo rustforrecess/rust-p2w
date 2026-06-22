@@ -245,6 +245,18 @@ pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
         }
         return p as Value;
     }
+    // List + list = a new concatenated list.
+    if is_heap(a) && obj_tag(a) == T_LIST && is_heap(b) && obj_tag(b) == T_LIST {
+        let r = coll_new(T_LIST);
+        let ro = r as usize;
+        for i in 0..coll_len(a as usize) {
+            list_push(ro, list_get(a as usize, i));
+        }
+        for i in 0..coll_len(b as usize) {
+            list_push(ro, list_get(b as usize, i));
+        }
+        return r;
+    }
     numeric(a, b, |x, y| x + y)
 }
 
@@ -321,9 +333,33 @@ fn value_eq(a: Value, b: Value) -> bool {
     if let (Some(x), Some(y)) = (num(a), num(b)) {
         return x == y; // int/bool compare numerically (True == 1)
     }
-    if is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR {
-        let n = str_len(a);
-        return n == str_len(b) && (0..n).all(|i| str_byte(a, i) == str_byte(b, i));
+    if is_heap(a) && is_heap(b) && obj_tag(a) == obj_tag(b) {
+        let (oa, ob) = (a as usize, b as usize);
+        match obj_tag(a) {
+            T_STR => {
+                let n = coll_len(oa);
+                return n == coll_len(ob) && (0..n).all(|i| str_byte(a, i) == str_byte(b, i));
+            }
+            T_LIST => {
+                let n = coll_len(oa);
+                return n == coll_len(ob)
+                    && (0..n).all(|i| value_eq(list_get(oa, i), list_get(ob, i)));
+            }
+            T_DICT => {
+                let n = coll_len(oa);
+                if n != coll_len(ob) {
+                    return false;
+                }
+                return (0..n).all(|i| {
+                    let k = dict_key(oa, i);
+                    match dict_find(ob, k) {
+                        Some(j) => value_eq(dict_val(oa, i), dict_val(ob, j)),
+                        None => false,
+                    }
+                });
+            }
+            _ => {}
+        }
     }
     a == b // None == None; identical specials/heap identity
 }
@@ -333,10 +369,10 @@ pub extern "C" fn p2w_truthy(v: Value) -> bool {
     if let Some(n) = num(v) {
         return n != 0;
     }
-    if is_heap(v) && obj_tag(v) == T_STR {
-        return str_len(v) != 0; // empty string is falsy
+    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT) {
+        return coll_len(v as usize) != 0; // empty string/list/dict is falsy
     }
-    v != V_NONE // None is falsy; other heap types (nonempty) once they land
+    v != V_NONE // None is falsy; other heap values are truthy
 }
 
 #[unsafe(no_mangle)]
@@ -357,34 +393,8 @@ pub unsafe extern "C" fn p2w_str(ptr: *const u8, len: i32) -> Value {
     str_alloc(bytes)
 }
 
-/// `len(v)` — string length for now (list/dict later).
-#[unsafe(no_mangle)]
-pub extern "C" fn p2w_len(v: Value) -> Value {
-    if is_heap(v) && obj_tag(v) == T_STR {
-        make_int(str_len(v) as i64)
-    } else {
-        trap("object has no len()")
-    }
-}
-
-/// `target[i]` — for a string, the 1-char string at index `i` (negative ok).
-#[unsafe(no_mangle)]
-pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
-    if is_heap(target) && obj_tag(target) == T_STR {
-        let n = str_len(target) as i64;
-        let i = match num(index) {
-            Some(i) => {
-                if i < 0 { i + n } else { i }
-            }
-            None => trap("string indices must be integers"),
-        };
-        if i < 0 || i >= n {
-            trap("string index out of range");
-        }
-        return str_alloc(&[str_byte(target, i as usize)]);
-    }
-    trap("object is not subscriptable")
-}
+// p2w_len / p2w_index / p2w_setindex dispatch over str/list/dict — defined in
+// the container section below.
 
 /// Retain: increment a heap value's refcount (no-op for inline values).
 #[unsafe(no_mangle)]
@@ -399,14 +409,331 @@ pub extern "C" fn p2w_retain(v: Value) {
 /// types this will release children first — strings have none.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_release(v: Value) {
-    if is_heap(v) {
-        let rc = rd(v as usize + 4);
-        if rc <= 1 {
-            dealloc(v as usize);
-        } else {
-            wr(v as usize + 4, rc - 1);
+    if !is_heap(v) {
+        return;
+    }
+    let o = v as usize;
+    let rc = rd(o + 4);
+    if rc > 1 {
+        wr(o + 4, rc - 1);
+        return;
+    }
+    // rc -> 0: free. Containers free their backing buffer too. (Recursively
+    // releasing children lands with the emitter's RC-wiring phase — values
+    // aren't retained on insert yet, so they aren't released here yet.)
+    if matches!(obj_tag(v), T_LIST | T_DICT) {
+        let data = coll_data(o);
+        if data != 0 {
+            dealloc(data);
         }
     }
+    dealloc(o);
+}
+
+// --- lists, dicts, iterators -----------------------------------------------
+//
+// Object tags. STR is `[tag][rc][len][bytes..]`. LIST and DICT share
+// `[tag][rc][len][cap][data_off]` with a *separately allocated* backing buffer
+// at `data_off`, so the object's offset (its Value) stays stable across growth
+// (append/setindex never move the object). ITER is `[tag][rc][container][idx]`.
+const T_LIST: u32 = 2;
+const T_DICT: u32 = 3;
+const T_ITER: u32 = 4;
+
+fn coll_len(o: usize) -> usize {
+    rd(o + 8) as usize
+}
+fn coll_cap(o: usize) -> usize {
+    rd(o + 12) as usize
+}
+fn coll_data(o: usize) -> usize {
+    rd(o + 16) as usize
+}
+fn set_len(o: usize, n: usize) {
+    wr(o + 8, n as u32);
+}
+
+/// A fresh empty collection object of `tag` (no backing buffer yet).
+fn coll_new(tag: u32) -> Value {
+    let o = alloc(20);
+    if o == 0 {
+        trap("out of memory");
+    }
+    wr(o, tag);
+    wr(o + 4, 1); // refcount
+    wr(o + 8, 0); // len
+    wr(o + 12, 0); // cap
+    wr(o + 16, 0); // data_off
+    o as Value
+}
+
+/// Ensure the backing buffer holds at least `need` slots of `slot_bytes` each,
+/// growing (and copying `used` slots) if necessary.
+fn ensure_cap(o: usize, need: usize, used: usize, slot_bytes: usize) {
+    let cap = coll_cap(o);
+    if cap >= need {
+        return;
+    }
+    let mut new_cap = if cap == 0 { 4 } else { cap * 2 };
+    if new_cap < need {
+        new_cap = need;
+    }
+    let new_data = alloc(new_cap * slot_bytes);
+    if new_data == 0 {
+        trap("out of memory");
+    }
+    let old_data = coll_data(o);
+    for i in 0..(used * slot_bytes / 4) {
+        wr(new_data + i * 4, rd(old_data + i * 4));
+    }
+    if cap != 0 {
+        dealloc(old_data);
+    }
+    wr(o + 12, new_cap as u32);
+    wr(o + 16, new_data as u32);
+}
+
+fn list_get(o: usize, i: usize) -> Value {
+    rd(coll_data(o) + i * 4) as Value
+}
+fn list_set_at(o: usize, i: usize, x: Value) {
+    wr(coll_data(o) + i * 4, x as u32);
+}
+fn list_push(o: usize, x: Value) {
+    let len = coll_len(o);
+    ensure_cap(o, len + 1, len, 4);
+    wr(coll_data(o) + len * 4, x as u32);
+    set_len(o, len + 1);
+}
+
+fn dict_key(o: usize, i: usize) -> Value {
+    rd(coll_data(o) + i * 8) as Value
+}
+fn dict_val(o: usize, i: usize) -> Value {
+    rd(coll_data(o) + i * 8 + 4) as Value
+}
+fn dict_find(o: usize, key: Value) -> Option<usize> {
+    (0..coll_len(o)).find(|&i| value_eq(dict_key(o, i), key))
+}
+fn dict_set(o: usize, key: Value, val: Value) {
+    if let Some(i) = dict_find(o, key) {
+        wr(coll_data(o) + i * 8 + 4, val as u32); // update existing
+        return;
+    }
+    let len = coll_len(o);
+    ensure_cap(o, len + 1, len, 8); // 8 bytes/pair
+    wr(coll_data(o) + len * 8, key as u32);
+    wr(coll_data(o) + len * 8 + 4, val as u32);
+    set_len(o, len + 1);
+}
+
+/// Normalize an index (negative-from-end) and bounds-check, or trap.
+fn norm_index(index: Value, n: i64) -> i64 {
+    let i = match num(index) {
+        Some(i) => i,
+        None => trap("indices must be integers"),
+    };
+    let r = if i < 0 { i + n } else { i };
+    if r < 0 || r >= n {
+        trap("index out of range");
+    }
+    r
+}
+
+/// `len(v)` for any collection (string/list/dict all store len at +8).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_len(v: Value) -> Value {
+    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT) {
+        return make_int(coll_len(v as usize) as i64);
+    }
+    trap("object has no len()")
+}
+
+/// `target[index]` — string char, list element, or dict value.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
+    if !is_heap(target) {
+        trap("object is not subscriptable");
+    }
+    let o = target as usize;
+    match obj_tag(target) {
+        T_STR => {
+            let i = norm_index(index, coll_len(o) as i64);
+            str_alloc(&[str_byte(target, i as usize)])
+        }
+        T_LIST => {
+            let i = norm_index(index, coll_len(o) as i64);
+            list_get(o, i as usize)
+        }
+        T_DICT => match dict_find(o, index) {
+            Some(i) => dict_val(o, i),
+            None => trap("key not found"),
+        },
+        _ => trap("object is not subscriptable"),
+    }
+}
+
+/// `target[index] = value` — list element or dict entry.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_setindex(target: Value, index: Value, value: Value) {
+    if !is_heap(target) {
+        trap("object does not support item assignment");
+    }
+    let o = target as usize;
+    match obj_tag(target) {
+        T_LIST => {
+            let i = norm_index(index, coll_len(o) as i64);
+            list_set_at(o, i as usize, value);
+        }
+        T_DICT => dict_set(o, index, value),
+        _ => trap("object does not support item assignment"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_list_new() -> Value {
+    coll_new(T_LIST)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_list_append(list: Value, v: Value) -> Value {
+    if !(is_heap(list) && obj_tag(list) == T_LIST) {
+        trap("append() expects a list");
+    }
+    list_push(list as usize, v);
+    V_NONE
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_dict_new() -> Value {
+    coll_new(T_DICT)
+}
+
+// --- iteration protocol ----------------------------------------------------
+
+/// Number of elements a for-each yields over `c`.
+fn container_len(c: Value) -> usize {
+    coll_len(c as usize)
+}
+
+/// The element at position `i` of a for-each over `c` (list element, string
+/// char, or dict key).
+fn element_at(c: Value, i: usize) -> Value {
+    match obj_tag(c) {
+        T_STR => str_alloc(&[str_byte(c, i)]),
+        T_LIST => list_get(c as usize, i),
+        T_DICT => dict_key(c as usize, i),
+        _ => trap("object is not iterable"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_iter(c: Value) -> Value {
+    if !(is_heap(c) && matches!(obj_tag(c), T_STR | T_LIST | T_DICT)) {
+        trap("object is not iterable");
+    }
+    let o = alloc(16);
+    if o == 0 {
+        trap("out of memory");
+    }
+    wr(o, T_ITER);
+    wr(o + 4, 1);
+    wr(o + 8, c as u32); // container
+    wr(o + 12, 0); // index
+    o as Value
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_iter_has(it: Value) -> bool {
+    let o = it as usize;
+    let c = rd(o + 8) as Value;
+    (rd(o + 12) as usize) < container_len(c)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_iter_next(it: Value) -> Value {
+    let o = it as usize;
+    let c = rd(o + 8) as Value;
+    let i = rd(o + 12) as usize;
+    wr(o + 12, (i + 1) as u32);
+    element_at(c, i)
+}
+
+// --- method dispatch (by name, on the receiver's type) ---------------------
+
+/// True if the (ptr,len) method name equals `expected`.
+///
+/// # Safety
+/// `ptr` must point to `len` valid bytes.
+unsafe fn name_eq(ptr: *const u8, len: i32, expected: &[u8]) -> bool {
+    len as usize == expected.len()
+        && unsafe { core::slice::from_raw_parts(ptr, len as usize) } == expected
+}
+
+/// `recv.method()` — 0-argument methods (e.g. list `pop`).
+///
+/// # Safety
+/// `name` must point to `name_len` valid bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn p2w_method0(recv: Value, name: *const u8, name_len: i32) -> Value {
+    if is_heap(recv) && obj_tag(recv) == T_LIST && unsafe { name_eq(name, name_len, b"pop") } {
+        let o = recv as usize;
+        let len = coll_len(o);
+        if len == 0 {
+            trap("pop from empty list");
+        }
+        let v = list_get(o, len - 1);
+        set_len(o, len - 1);
+        return v;
+    }
+    trap("method not supported in the native backend yet")
+}
+
+/// `recv.method(a)` — 1-argument methods (e.g. list `append`, `pop(i)`).
+///
+/// # Safety
+/// `name` must point to `name_len` valid bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn p2w_method1(
+    recv: Value,
+    name: *const u8,
+    name_len: i32,
+    a: Value,
+) -> Value {
+    if is_heap(recv) && obj_tag(recv) == T_LIST {
+        if unsafe { name_eq(name, name_len, b"append") } {
+            list_push(recv as usize, a);
+            return V_NONE;
+        }
+        if unsafe { name_eq(name, name_len, b"pop") } {
+            let o = recv as usize;
+            let n = coll_len(o) as i64;
+            let i = norm_index(a, n) as usize;
+            let v = list_get(o, i);
+            // shift the tail down by one
+            for j in i..(coll_len(o) - 1) {
+                list_set_at(o, j, list_get(o, j + 1));
+            }
+            set_len(o, coll_len(o) - 1);
+            return v;
+        }
+    }
+    trap("method not supported in the native backend yet")
+}
+
+/// `recv.method(a, b)` — 2-argument methods (none yet; reserved).
+///
+/// # Safety
+/// `name` must point to `name_len` valid bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn p2w_method2(
+    _recv: Value,
+    _name: *const u8,
+    _name_len: i32,
+    _a: Value,
+    _b: Value,
+) -> Value {
+    trap("method not supported in the native backend yet")
 }
 
 // --- printing --------------------------------------------------------------
@@ -416,19 +743,62 @@ pub extern "C" fn p2w_release(v: Value) {
 fn write_value(v: Value, out: &mut impl FnMut(u8)) {
     if is_int(v) {
         write_int(as_int(v), out);
+        return;
     } else if v == V_TRUE {
-        write_bytes(b"True", out);
+        return write_bytes(b"True", out);
     } else if v == V_FALSE {
-        write_bytes(b"False", out);
+        return write_bytes(b"False", out);
     } else if v == V_NONE {
-        write_bytes(b"None", out);
-    } else if is_heap(v) && obj_tag(v) == T_STR {
-        // print() shows a string bare (no quotes), like Python str().
+        return write_bytes(b"None", out);
+    }
+    if !is_heap(v) {
+        return write_bytes(b"<object>", out);
+    }
+    let o = v as usize;
+    match obj_tag(v) {
+        T_STR => {
+            // print() shows a string bare (no quotes), like Python str().
+            for i in 0..str_len(v) {
+                out(str_byte(v, i));
+            }
+        }
+        T_LIST => {
+            out(b'[');
+            for i in 0..coll_len(o) {
+                if i > 0 {
+                    write_bytes(b", ", out);
+                }
+                write_repr(list_get(o, i), out);
+            }
+            out(b']');
+        }
+        T_DICT => {
+            out(b'{');
+            for i in 0..coll_len(o) {
+                if i > 0 {
+                    write_bytes(b", ", out);
+                }
+                write_repr(dict_key(o, i), out);
+                write_bytes(b": ", out);
+                write_repr(dict_val(o, i), out);
+            }
+            out(b'}');
+        }
+        _ => write_bytes(b"<object>", out),
+    }
+}
+
+/// Like `write_value`, but strings are quoted (the `repr()` form used *inside*
+/// containers, matching Python).
+fn write_repr(v: Value, out: &mut impl FnMut(u8)) {
+    if is_heap(v) && obj_tag(v) == T_STR {
+        out(b'\'');
         for i in 0..str_len(v) {
             out(str_byte(v, i));
         }
+        out(b'\'');
     } else {
-        write_bytes(b"<object>", out); // list/dict: next slice
+        write_value(v, out);
     }
 }
 
@@ -489,6 +859,30 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn p2w_putc(_c: u8) {}
 
+    // The heap is one shared `static mut`, but `cargo test` runs tests in
+    // parallel — so heap-touching tests serialize on this lock (and reset the
+    // arena under it). Tests using only inline ints/bools/None don't need it.
+    static HEAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn heap_guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        heap_reset();
+        g
+    }
+
+    fn str_val(s: &str) -> Value {
+        str_alloc(s.as_bytes())
+    }
+
+    /// Drive a for-each iterator to completion, collecting integer elements.
+    fn collect_ints(c: Value) -> Vec<i64> {
+        let it = p2w_iter(c);
+        let mut out = Vec::new();
+        while p2w_iter_has(it) {
+            out.push(as_int(p2w_iter_next(it)));
+        }
+        out
+    }
+
     fn shown(v: Value) -> String {
         let mut s = Vec::new();
         write_value(v, &mut |c| s.push(c));
@@ -541,13 +935,9 @@ mod tests {
         assert_eq!(p2w_not(p2w_int(0)), V_TRUE);
     }
 
-    fn str_val(s: &str) -> Value {
-        str_alloc(s.as_bytes())
-    }
-
     #[test]
     fn strings_alloc_print_len_index_concat_eq() {
-        heap_reset();
+        let _g = heap_guard();
         let hi = str_val("hi");
         assert_eq!(shown(hi), "hi");
         assert_eq!(as_int(p2w_len(hi)), 2);
@@ -567,7 +957,7 @@ mod tests {
 
     #[test]
     fn refcount_release_frees_and_reuses() {
-        heap_reset();
+        let _g = heap_guard();
         let a = str_val("abcd"); // some block
         let off_a = a as usize;
         p2w_retain(a); // rc 1 -> 2
@@ -589,6 +979,115 @@ mod tests {
         assert_eq!(as_int(n), 7);
         p2w_release(p2w_none());
         p2w_release(p2w_bool(1));
+    }
+
+    #[test]
+    fn lists_build_index_set_len_print_concat() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        p2w_list_append(xs, p2w_int(1));
+        p2w_list_append(xs, p2w_int(2));
+        p2w_list_append(xs, p2w_int(3));
+        assert_eq!(as_int(p2w_len(xs)), 3);
+        assert_eq!(as_int(p2w_index(xs, p2w_int(0))), 1);
+        assert_eq!(as_int(p2w_index(xs, p2w_int(-1))), 3); // negative index
+        p2w_setindex(xs, p2w_int(1), p2w_int(9));
+        assert_eq!(as_int(p2w_index(xs, p2w_int(1))), 9);
+        assert_eq!(shown(xs), "[1, 9, 3]");
+        // strings inside a list print quoted (repr form)
+        let ys = p2w_list_new();
+        p2w_list_append(ys, str_val("hi"));
+        assert_eq!(shown(ys), "['hi']");
+        // concatenation
+        assert_eq!(as_int(p2w_len(p2w_add(xs, ys))), 4);
+        assert!(p2w_truthy(xs));
+        assert!(!p2w_truthy(p2w_list_new())); // empty list is falsy
+    }
+
+    #[test]
+    fn list_growth_keeps_object_offset_stable() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        let off = xs as usize;
+        for i in 0..50 {
+            p2w_list_append(xs, p2w_int(i)); // forces several reallocs of the buffer
+        }
+        assert_eq!(xs as usize, off, "append must not move the list object");
+        assert_eq!(as_int(p2w_len(xs)), 50);
+        assert_eq!(as_int(p2w_index(xs, p2w_int(49))), 49);
+    }
+
+    #[test]
+    fn dicts_set_get_update_len_print() {
+        let _g = heap_guard();
+        let d = p2w_dict_new();
+        p2w_setindex(d, str_val("a"), p2w_int(1));
+        p2w_setindex(d, str_val("b"), p2w_int(2));
+        assert_eq!(as_int(p2w_len(d)), 2);
+        assert_eq!(as_int(p2w_index(d, str_val("a"))), 1);
+        // updating an existing key doesn't add a pair
+        p2w_setindex(d, str_val("a"), p2w_int(9));
+        assert_eq!(as_int(p2w_len(d)), 2);
+        assert_eq!(as_int(p2w_index(d, str_val("a"))), 9);
+        assert_eq!(shown(d), "{'a': 9, 'b': 2}"); // insertion order preserved
+    }
+
+    #[test]
+    fn for_each_iterates_list_string_dict() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        for i in 1..=3 {
+            p2w_list_append(xs, p2w_int(i));
+        }
+        assert_eq!(collect_ints(xs), vec![1, 2, 3]);
+
+        // string -> characters
+        let it = p2w_iter(str_val("ab"));
+        let mut s = String::new();
+        while p2w_iter_has(it) {
+            s.push_str(&shown(p2w_iter_next(it)));
+        }
+        assert_eq!(s, "ab");
+
+        // dict -> keys, in insertion order
+        let d = p2w_dict_new();
+        p2w_setindex(d, p2w_int(10), p2w_int(0));
+        p2w_setindex(d, p2w_int(20), p2w_int(0));
+        assert_eq!(collect_ints(d), vec![10, 20]);
+    }
+
+    #[test]
+    fn methods_append_and_pop() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        unsafe {
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(1));
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(2));
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(3));
+        }
+        assert_eq!(as_int(p2w_len(xs)), 3);
+        let last = unsafe { p2w_method0(xs, "pop".as_ptr(), 3) };
+        assert_eq!(as_int(last), 3);
+        assert_eq!(as_int(p2w_len(xs)), 2);
+        // pop(0) shifts the tail down
+        let first = unsafe { p2w_method1(xs, "pop".as_ptr(), 3, p2w_int(0)) };
+        assert_eq!(as_int(first), 1);
+        assert_eq!(as_int(p2w_len(xs)), 1);
+        assert_eq!(as_int(p2w_index(xs, p2w_int(0))), 2);
+    }
+
+    #[test]
+    fn list_equality_is_structural() {
+        let _g = heap_guard();
+        let a = p2w_list_new();
+        p2w_list_append(a, p2w_int(1));
+        p2w_list_append(a, p2w_int(2));
+        let b = p2w_list_new();
+        p2w_list_append(b, p2w_int(1));
+        p2w_list_append(b, p2w_int(2));
+        assert_eq!(p2w_eq(a, b), V_TRUE);
+        p2w_list_append(b, p2w_int(3));
+        assert_eq!(p2w_eq(a, b), V_FALSE);
     }
 
     // Note: division-by-zero / type errors call `trap`, which on the device
