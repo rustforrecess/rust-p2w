@@ -126,10 +126,12 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    conditions (`p2w_truthy`), control flow, functions; **lists/dicts** (literals,
    subscript read/write via `p2w_index`/`p2w_setindex`, `len()`), **methods**
    (name-dispatched `p2w_method0/1/2`), and **for-each** (`p2w_iter`/`iter_has`/
-   `iter_next`). Vars are entry-block `alloca i32`. **Still to do in phase 3:**
-   the runtime crate itself (the `p2w_*` impls + bump allocator), and `and`/`or`
-   (short-circuit) + tuples/comprehensions. The emitted IR isn't runnable until
-   the runtime + toolchain (phase 1) land.
+   `iter_next`), and **`and`/`or`** (short-circuit, returns the deciding operand
+   via a result slot). Vars are entry-block `alloca i32`. The emitter now covers
+   the **full teaching subset** (sans tuples/comprehensions/classes). **Still to
+   do in phase 3:** the runtime crate itself (the `p2w_*` impls + bump
+   allocator). The emitted IR isn't runnable until the runtime + toolchain
+   (phase 1) land.
 4. **I/O + peripherals:** USB-CDC `print`, the temp sensor, GPIO.
 5. **Debug transports:** USB stub, then SWD/probe-rs + DWARF.
 6. **RISC-V** target variant.
