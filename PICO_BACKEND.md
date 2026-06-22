@@ -129,14 +129,16 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    `iter_next`), and **`and`/`or`** (short-circuit, returns the deciding operand
    via a result slot). Vars are entry-block `alloca i32`. The emitter now covers
    the **full teaching subset** (sans tuples/comprehensions/classes). The
-   **runtime crate** (`runtime/`, `p2w-rt`) is **started**: a `no_std`,
-   host-testable impl of the `p2w_*` ABI over the concrete tagged-`i32` value
-   rep (2-bit tag: small int / heap ptr / immediate singleton). Done so far —
-   int/bool/None values, arithmetic (`+ - * // %`, neg), comparisons + equality,
-   truthiness, `not`, and `print` (no-alloc int formatting). **Still to do:** the
-   bump allocator + heap value types (strings/lists/dicts), float (which `/` and
-   `**` need), and `p2w_putc` over USB-CDC. The emitted IR isn't runnable until
-   the runtime is complete + the toolchain (phase 1) links it.
+   **runtime crate** (`runtime/`, `p2w-rt`) is `no_std` + host-tested over the
+   concrete tagged-`i32` rep (2-bit tag: small int / heap ptr / immediate
+   singleton). Done: int/bool/None + arithmetic (`+ - * // %`, neg) + comparisons
+   + equality + truthiness + `not` + `print`; a **static-arena allocator**
+   (first-fit free list) + **strings, lists, dicts** (literals, subscript get/set,
+   `len`, concat, structural eq, print), the **iteration protocol**, **methods**
+   (append/pop), and ref-count primitives (`p2w_retain`/`release`, buffers freed).
+   **Still to do:** float (which `/` and `**` need), `p2w_putc` over USB-CDC,
+   Perceus-style RC reuse + emitter `dup`/`drop` wiring (see MEMORY_MANAGEMENT.md),
+   then the toolchain spike (phase 1) to link + run on a board.
 4. **I/O + peripherals:** USB-CDC `print`, the temp sensor, GPIO.
 5. **Debug transports:** USB stub, then SWD/probe-rs + DWARF.
 6. **RISC-V** target variant.
