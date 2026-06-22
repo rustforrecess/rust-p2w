@@ -77,6 +77,128 @@ fn num(v: Value) -> Option<i64> {
     }
 }
 
+// --- heap: a static arena + first-fit free list ----------------------------
+//
+// Heap values are tagged pointers (`TAG_PTR`, low 2 bits 0): the value IS a
+// 4-byte-aligned **offset** into the arena (an offset, not a raw machine
+// pointer, so it fits `i32` identically on the 32-bit device and a 64-bit test
+// host). Object layout at offset `p`: [tag u32][refcount u32][len u32][data...].
+// Allocation bumps a cursor; `free` pushes whole blocks onto a first-fit free
+// list (block size is kept in a u32 header just before the payload). Reset-per-
+// run reclaims everything at once; ref counting (retain/release) reclaims
+// mid-run. Strings are the first heap type; lists/dicts follow.
+
+const HEAP_SIZE: usize = 64 * 1024; // device build tunes this to available SRAM
+
+#[unsafe(no_mangle)]
+static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+static mut CURSOR: usize = 4; // offset 0 is reserved (never a valid object)
+static mut FREELIST: usize = 0; // head block offset, 0 = empty
+
+/// Object type tags (in the header's first word).
+const T_STR: u32 = 1;
+
+fn heap_base() -> *mut u8 {
+    &raw mut HEAP as *mut u8
+}
+
+fn rd(off: usize) -> u32 {
+    unsafe { core::ptr::read_unaligned(heap_base().add(off) as *const u32) }
+}
+fn wr(off: usize, v: u32) {
+    unsafe { core::ptr::write_unaligned(heap_base().add(off) as *mut u32, v) }
+}
+fn rd_byte(off: usize) -> u8 {
+    unsafe { *heap_base().add(off) }
+}
+fn wr_byte(off: usize, b: u8) {
+    unsafe { *heap_base().add(off) = b }
+}
+
+fn align4(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+/// Reset the arena (run-to-completion reclamation; also resets between tests).
+pub fn heap_reset() {
+    unsafe {
+        CURSOR = 4;
+        FREELIST = 0;
+    }
+}
+
+/// Allocate `payload` bytes; returns the payload offset, or 0 on OOM. The block
+/// carries a u32 size header just before the payload (for `free`).
+fn alloc(payload: usize) -> usize {
+    let need = align4(4 + payload);
+    unsafe {
+        // First-fit reuse from the free list (whole block; no splitting).
+        let mut prev = 0usize;
+        let mut cur = FREELIST;
+        while cur != 0 {
+            let bsize = rd(cur) as usize;
+            let next = rd(cur + 4) as usize;
+            if bsize >= need {
+                if prev == 0 {
+                    FREELIST = next;
+                } else {
+                    wr(prev + 4, next as u32);
+                }
+                return cur + 4;
+            }
+            prev = cur;
+            cur = next;
+        }
+        // Bump.
+        let blk = CURSOR;
+        if blk + need > HEAP_SIZE {
+            return 0;
+        }
+        wr(blk, need as u32);
+        CURSOR = blk + need;
+        blk + 4
+    }
+}
+
+fn dealloc(payload_off: usize) {
+    let block = payload_off - 4;
+    unsafe {
+        wr(block + 4, FREELIST as u32); // reuse the payload's first word as `next`
+        FREELIST = block;
+    }
+}
+
+fn is_heap(v: Value) -> bool {
+    v != 0 && (v & TAG_MASK) == TAG_PTR
+}
+
+fn obj_tag(v: Value) -> u32 {
+    rd(v as usize)
+}
+
+fn str_len(v: Value) -> usize {
+    rd(v as usize + 8) as usize
+}
+
+fn str_byte(v: Value, i: usize) -> u8 {
+    rd_byte(v as usize + 12 + i)
+}
+
+/// Allocate a string object from raw bytes (refcount starts at 1).
+fn str_alloc(bytes: &[u8]) -> Value {
+    let p = alloc(12 + bytes.len());
+    if p == 0 {
+        trap("out of memory");
+    }
+    wr(p, T_STR);
+    wr(p + 4, 1);
+    wr(p + 8, bytes.len() as u32);
+    for (i, &b) in bytes.iter().enumerate() {
+        wr_byte(p + 12 + i, b);
+    }
+    p as Value
+}
+
 // --- the p2w_* ABI ---------------------------------------------------------
 
 #[unsafe(no_mangle)]
@@ -105,6 +227,24 @@ fn numeric<F: Fn(i64, i64) -> i64>(a: Value, b: Value, f: F) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
+    // String + string = concatenation; otherwise numeric.
+    if is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR {
+        let (la, lb) = (str_len(a), str_len(b));
+        let p = alloc(12 + la + lb);
+        if p == 0 {
+            trap("out of memory");
+        }
+        wr(p, T_STR);
+        wr(p + 4, 1);
+        wr(p + 8, (la + lb) as u32);
+        for i in 0..la {
+            wr_byte(p + 12 + i, str_byte(a, i));
+        }
+        for i in 0..lb {
+            wr_byte(p + 12 + la + i, str_byte(b, i));
+        }
+        return p as Value;
+    }
     numeric(a, b, |x, y| x + y)
 }
 
@@ -178,25 +318,95 @@ pub extern "C" fn p2w_ne(a: Value, b: Value) -> Value {
 }
 
 fn value_eq(a: Value, b: Value) -> bool {
-    match (num(a), num(b)) {
-        (Some(x), Some(y)) => x == y, // int/bool compare numerically (True == 1)
-        _ => a == b,                  // None == None; identical specials
+    if let (Some(x), Some(y)) = (num(a), num(b)) {
+        return x == y; // int/bool compare numerically (True == 1)
     }
+    if is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR {
+        let n = str_len(a);
+        return n == str_len(b) && (0..n).all(|i| str_byte(a, i) == str_byte(b, i));
+    }
+    a == b // None == None; identical specials/heap identity
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_truthy(v: Value) -> bool {
     if let Some(n) = num(v) {
-        n != 0
-    } else {
-        // None is falsy; heap types (nonempty) handled with the next slice.
-        v != V_NONE
+        return n != 0;
     }
+    if is_heap(v) && obj_tag(v) == T_STR {
+        return str_len(v) != 0; // empty string is falsy
+    }
+    v != V_NONE // None is falsy; other heap types (nonempty) once they land
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_not(v: Value) -> Value {
     make_bool(!p2w_truthy(v))
+}
+
+// --- heap value ABI (strings; lists/dicts follow) --------------------------
+
+/// Build a string value from a UTF-8 buffer (the emitter passes a pointer to a
+/// private constant + its length).
+///
+/// # Safety
+/// `ptr` must point to `len` valid bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn p2w_str(ptr: *const u8, len: i32) -> Value {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
+    str_alloc(bytes)
+}
+
+/// `len(v)` — string length for now (list/dict later).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_len(v: Value) -> Value {
+    if is_heap(v) && obj_tag(v) == T_STR {
+        make_int(str_len(v) as i64)
+    } else {
+        trap("object has no len()")
+    }
+}
+
+/// `target[i]` — for a string, the 1-char string at index `i` (negative ok).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
+    if is_heap(target) && obj_tag(target) == T_STR {
+        let n = str_len(target) as i64;
+        let i = match num(index) {
+            Some(i) => {
+                if i < 0 { i + n } else { i }
+            }
+            None => trap("string indices must be integers"),
+        };
+        if i < 0 || i >= n {
+            trap("string index out of range");
+        }
+        return str_alloc(&[str_byte(target, i as usize)]);
+    }
+    trap("object is not subscriptable")
+}
+
+/// Retain: increment a heap value's refcount (no-op for inline values).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_retain(v: Value) {
+    if is_heap(v) {
+        let rc = rd(v as usize + 4);
+        wr(v as usize + 4, rc + 1);
+    }
+}
+
+/// Release: decrement; free at zero (no-op for inline values). For container
+/// types this will release children first — strings have none.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_release(v: Value) {
+    if is_heap(v) {
+        let rc = rd(v as usize + 4);
+        if rc <= 1 {
+            dealloc(v as usize);
+        } else {
+            wr(v as usize + 4, rc - 1);
+        }
+    }
 }
 
 // --- printing --------------------------------------------------------------
@@ -212,8 +422,13 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
         write_bytes(b"False", out);
     } else if v == V_NONE {
         write_bytes(b"None", out);
+    } else if is_heap(v) && obj_tag(v) == T_STR {
+        // print() shows a string bare (no quotes), like Python str().
+        for i in 0..str_len(v) {
+            out(str_byte(v, i));
+        }
     } else {
-        write_bytes(b"<object>", out); // heap types: next slice
+        write_bytes(b"<object>", out); // list/dict: next slice
     }
 }
 
@@ -324,6 +539,56 @@ mod tests {
         assert_eq!(p2w_eq(p2w_none(), p2w_none()), V_TRUE);
         assert_eq!(p2w_eq(p2w_none(), p2w_int(0)), V_FALSE);
         assert_eq!(p2w_not(p2w_int(0)), V_TRUE);
+    }
+
+    fn str_val(s: &str) -> Value {
+        str_alloc(s.as_bytes())
+    }
+
+    #[test]
+    fn strings_alloc_print_len_index_concat_eq() {
+        heap_reset();
+        let hi = str_val("hi");
+        assert_eq!(shown(hi), "hi");
+        assert_eq!(as_int(p2w_len(hi)), 2);
+        // index -> 1-char string
+        assert_eq!(shown(p2w_index(hi, p2w_int(0))), "h");
+        assert_eq!(shown(p2w_index(hi, p2w_int(-1))), "i");
+        // concat
+        let ab = p2w_add(str_val("a"), str_val("b"));
+        assert_eq!(shown(ab), "ab");
+        // equality is by contents, not identity
+        assert_eq!(p2w_eq(str_val("hi"), str_val("hi")), V_TRUE);
+        assert_eq!(p2w_ne(str_val("hi"), str_val("ho")), V_TRUE);
+        // truthiness: empty string is falsy
+        assert!(p2w_truthy(str_val("x")));
+        assert!(!p2w_truthy(str_val("")));
+    }
+
+    #[test]
+    fn refcount_release_frees_and_reuses() {
+        heap_reset();
+        let a = str_val("abcd"); // some block
+        let off_a = a as usize;
+        p2w_retain(a); // rc 1 -> 2
+        p2w_release(a); // rc 2 -> 1 (still alive)
+        assert_eq!(shown(a), "abcd");
+        p2w_release(a); // rc 1 -> 0: freed
+        // A new same-size allocation reuses the freed block (proves free works).
+        let b = str_val("wxyz");
+        assert_eq!(b as usize, off_a, "freed block should be reused");
+        assert_eq!(shown(b), "wxyz");
+    }
+
+    #[test]
+    fn inline_values_ignore_retain_release() {
+        // retain/release on int/bool/None are safe no-ops.
+        let n = p2w_int(7);
+        p2w_retain(n);
+        p2w_release(n);
+        assert_eq!(as_int(n), 7);
+        p2w_release(p2w_none());
+        p2w_release(p2w_bool(1));
     }
 
     // Note: division-by-zero / type errors call `trap`, which on the device
