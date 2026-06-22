@@ -126,10 +126,16 @@ Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
    **step-over**: a `def` registers a `FuncDef`; a call runs the body atomically
    (an `exec_block`/`exec_atomic` recursive executor over the same `eval_in`),
    so programs with functions — including **recursion and default args** — are
-   debuggable. **Planned: CPS rewrite for true step-*into* + a call stack** — the
-   tree-walker can't suspend mid-expression, so step-into needs an explicit
-   operand/frame VM. Step-over is the interim; the CPS form is the destination
-   (the atomic `exec_block` can serve as its reference oracle).
+   debuggable. **CPS VM shipped (`Vm`)** — an explicit-stack interpreter
+   (per-frame work stack of `Task`s + operand stack) that suspends anywhere,
+   including mid-expression at a call, giving true **step-into** and a live
+   **call stack** (`call_stack()`). The IDE now runs on `Vm` (▸ Step steps into;
+   a Call-stack panel shows the frames). At parity with `Stepper` for the
+   teaching subset (control flow, functions+recursion+defaults, lists/dicts/
+   index/methods/for-each, watches/watchpoints/breakpoints). The atomic
+   `Stepper` is retained as the semantics **reference oracle** + regression
+   suite, not the IDE engine. Remaining niceties: step-over/step-out controls
+   (Step is step-into today), and globals-write from functions (`global`).
 2. Native LLVM backend (separate, large — see the Pico target notes).
 3. **`UsbStubAdapter`** — on-device step hooks + USB-CDC control channel + the
    variable-layout map. No probe, consistent UX.
