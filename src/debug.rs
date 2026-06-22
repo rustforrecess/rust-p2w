@@ -1417,12 +1417,34 @@ enum Task {
     Break,
     Continue,
     Return,
+    /// Pop `n` values and build a list.
+    BuildList(usize),
+    /// Pop `2n` values (key/value interleaved) and build a dict.
+    BuildDict(usize),
+    /// Pop index then target; push `target[index]`.
+    IndexGet,
+    /// Pop `argc` args and call `name.method(...)` on a list variable.
+    MethodOnName(String, String, usize),
+    /// Pop the iterable value and start a for-each loop.
+    ForEachSetup(String, Rc<Vec<Stmt>>),
+    /// A live for-each loop (also a break/continue marker).
+    ForEachHead {
+        var: String,
+        items: Rc<Vec<Value>>,
+        idx: usize,
+        body: Rc<Vec<Stmt>>,
+    },
+    /// Pop value then index; assign `name[index] = value`.
+    StoreIndex(String),
 }
 
 impl Task {
     /// Loop markers that `break`/`continue` unwind to.
     fn is_loop(&self) -> bool {
-        matches!(self, Task::WhileHead(..) | Task::ForHead { .. })
+        matches!(
+            self,
+            Task::WhileHead(..) | Task::ForHead { .. } | Task::ForEachHead { .. }
+        )
     }
 }
 
@@ -1728,11 +1750,27 @@ impl Vm {
                     },
                 );
             }
-            StmtKind::ForEach { .. } | StmtKind::SetIndex { .. } => {
-                return Err(format!(
-                    "{} isn't in the step debugger's call-stack mode yet — use Run",
-                    describe_stmt(&s.kind)
-                ));
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => {
+                self.push_task(Task::ForEachSetup(var.clone(), Rc::new(body.clone())));
+                self.push_task(Task::Eval(Rc::new(iterable.clone())));
+            }
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                let ExprKind::Name(name) = &target.kind else {
+                    return Err(
+                        "item assignment needs a simple variable (e.g. xs[i] = ..) yet".to_string(),
+                    );
+                };
+                self.push_task(Task::StoreIndex(name.clone()));
+                self.push_task(Task::Eval(Rc::new(value.clone())));
+                self.push_task(Task::Eval(Rc::new(index.clone())));
             }
             StmtKind::ClassDef { .. }
             | StmtKind::SetAttr { .. }
@@ -1891,6 +1929,82 @@ impl Vm {
                 let v = self.pop_op().unwrap_or(Value::None);
                 self.return_value(v);
             }
+            Task::BuildList(n) => {
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.pop_op()?);
+                }
+                items.reverse();
+                self.push_op(Value::List(items));
+            }
+            Task::BuildDict(n) => {
+                let mut flat = Vec::with_capacity(2 * n);
+                for _ in 0..(2 * n) {
+                    flat.push(self.pop_op()?);
+                }
+                flat.reverse(); // now [k0, v0, k1, v1, ...]
+                let mut pairs = Vec::with_capacity(n);
+                let mut i = 0;
+                while i + 1 < flat.len() {
+                    pairs.push((flat[i].clone(), flat[i + 1].clone()));
+                    i += 2;
+                }
+                self.push_op(Value::Dict(pairs));
+            }
+            Task::IndexGet => {
+                let idx = self.pop_op()?;
+                let obj = self.pop_op()?;
+                self.push_op(index_get(&obj, &idx)?);
+            }
+            Task::MethodOnName(name, method, argc) => {
+                let mut args = Vec::with_capacity(argc);
+                for _ in 0..argc {
+                    args.push(self.pop_op()?);
+                }
+                args.reverse();
+                let result = list_method(self.top(), &name, &method, args)?;
+                self.push_op(result);
+            }
+            Task::ForEachSetup(var, body) => {
+                let items = match self.pop_op()? {
+                    Value::List(v) => v,
+                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+                    Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
+                    other => return Err(format!("can't loop over {}", type_name(&other))),
+                };
+                self.push_task(Task::ForEachHead {
+                    var,
+                    items: Rc::new(items),
+                    idx: 0,
+                    body,
+                });
+            }
+            Task::ForEachHead {
+                var,
+                items,
+                idx,
+                body,
+            } => {
+                if idx < items.len() {
+                    self.top().scope.insert(var.clone(), items[idx].clone());
+                    self.push_task(Task::ForEachHead {
+                        var,
+                        items: items.clone(),
+                        idx: idx + 1,
+                        body: body.clone(),
+                    });
+                    self.push_task(Task::Next(body, 0));
+                }
+            }
+            Task::StoreIndex(name) => {
+                let value = self.pop_op()?;
+                let index = self.pop_op()?;
+                let target = Expr {
+                    kind: ExprKind::Name(name),
+                    line: 0,
+                };
+                assign_index_in(&mut self.top().scope, &target, index, value)?;
+            }
         }
         Ok(())
     }
@@ -1928,6 +2042,37 @@ impl Vm {
             }
             ExprKind::Call(name, args) => {
                 self.push_task(Task::Call(name.clone(), args.len()));
+                for a in args.iter().rev() {
+                    self.push_task(Task::Eval(Rc::new(a.clone())));
+                }
+            }
+            ExprKind::List(items) => {
+                self.push_task(Task::BuildList(items.len()));
+                for it in items.iter().rev() {
+                    self.push_task(Task::Eval(Rc::new(it.clone())));
+                }
+            }
+            ExprKind::Dict(pairs) => {
+                self.push_task(Task::BuildDict(pairs.len()));
+                // Push so each pair evaluates key-then-value, in source order.
+                for (k, v) in pairs.iter().rev() {
+                    self.push_task(Task::Eval(Rc::new(v.clone())));
+                    self.push_task(Task::Eval(Rc::new(k.clone())));
+                }
+            }
+            ExprKind::Index(obj, idx) => {
+                self.push_task(Task::IndexGet);
+                self.push_task(Task::Eval(Rc::new((**idx).clone())));
+                self.push_task(Task::Eval(Rc::new((**obj).clone())));
+            }
+            ExprKind::MethodCall(obj, method, args) => {
+                let ExprKind::Name(recv) = &obj.kind else {
+                    return Err(
+                        "method calls need a simple variable (e.g. xs.append(..)) in call-stack mode yet"
+                            .to_string(),
+                    );
+                };
+                self.push_task(Task::MethodOnName(recv.clone(), method.clone(), args.len()));
                 for a in args.iter().rev() {
                     self.push_task(Task::Eval(Rc::new(a.clone())));
                 }
@@ -2054,6 +2199,23 @@ impl Vm {
             ExprKind::Bin(op, a, b) => {
                 apply_bin(*op, &self.watch_eval(a)?, &self.watch_eval(b)?)
             }
+            ExprKind::Index(obj, idx) => {
+                index_get(&self.watch_eval(obj)?, &self.watch_eval(idx)?)
+            }
+            ExprKind::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.watch_eval(it)?);
+                }
+                Ok(Value::List(out))
+            }
+            ExprKind::Dict(pairs) => {
+                let mut out = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    out.push((self.watch_eval(k)?, self.watch_eval(v)?));
+                }
+                Ok(Value::Dict(out))
+            }
             _ => Err("that watch isn't supported in call-stack mode yet".to_string()),
         }
     }
@@ -2141,6 +2303,37 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         _ => Err(format!(
             "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
         )),
+    }
+}
+
+/// `name.method(args)` on a list variable in `frame`'s scope (append / pop).
+fn list_method(
+    frame: &mut VmFrame,
+    name: &str,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    let unsupported =
+        || format!(".{method}() isn't in the step debugger's call-stack mode yet — use Run");
+    let Some(Value::List(items)) = frame.scope.get_mut(name) else {
+        return Err(unsupported());
+    };
+    match (method, args.as_slice()) {
+        ("append", [v]) => {
+            items.push(v.clone());
+            Ok(Value::None)
+        }
+        ("pop", []) => items.pop().ok_or_else(|| "pop from empty list".to_string()),
+        ("pop", [i]) => {
+            let i = as_int(i).ok_or("pop index must be an integer")?;
+            let n = items.len() as i64;
+            let real = if i < 0 { i + n } else { i };
+            if real < 0 || real >= n {
+                return Err("pop index out of range".to_string());
+            }
+            Ok(items.remove(real as usize))
+        }
+        _ => Err(unsupported()),
     }
 }
 
@@ -2441,6 +2634,33 @@ mod tests {
         }
         // module + down(3)+down(2)+down(1)+down(0) = 5 frames at the deepest.
         assert!(max_depth >= 5, "recursion should deepen the stack, got {max_depth}");
+    }
+
+    #[test]
+    fn vm_lists_dicts_indexing_methods_foreach() {
+        assert_eq!(vm_run("xs = [1, 2, 3]\nxs[0] = 9\nprint(xs[0])\n"), "9\n");
+        assert_eq!(vm_run("xs = [1]\nxs.append(2)\nprint(xs)\n"), "[1, 2]\n");
+        assert_eq!(
+            vm_run("d = {\"a\": 1}\nd[\"b\"] = 2\nprint(d[\"b\"])\n"),
+            "2\n"
+        );
+        assert_eq!(
+            vm_run("total = 0\nfor v in [10, 20, 30]:\n    total = total + v\nprint(total)\n"),
+            "60\n"
+        );
+        // A function that builds and returns a list, stepped over by Continue.
+        assert_eq!(
+            vm_run("def squares(n):\n    out = []\n    for i in range(n):\n        out.append(i * i)\n    return out\nprint(squares(4))\n"),
+            "[0, 1, 4, 9]\n"
+        );
+    }
+
+    #[test]
+    fn vm_watch_reads_index_into_a_list() {
+        let mut vm = Vm::new("xs = [5, 6, 7]\nprint(xs)\n").unwrap();
+        vm.step(); // xs = ...
+        assert_eq!(vm.eval_watch("xs[1]").unwrap(), "6");
+        assert_eq!(vm.eval_watch("len(xs)").unwrap_err().contains("call-stack"), true);
     }
 
     #[test]
