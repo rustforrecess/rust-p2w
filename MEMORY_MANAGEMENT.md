@@ -118,6 +118,41 @@ The 2021→2026 frontier matches the plan:
 4. **VerusBelt/RustBelt** foundations available if we later want *verified* safety
    for the typed subset.
 
+## Perceus → concrete implementation plan (RC + reuse tier)
+*(From the published algorithm + abstract; a line-by-line read of the PDF is
+still worth doing before final implementation.)*
+
+Mechanisms we adopt:
+- **Ownership + dup/drop insertion (compile-time):** values are owned; emit
+  `dup` (= `p2w_retain`) on every non-last use, `drop` (= `p2w_release`) at
+  last-use or when a binding is dead. The runtime ops are trivial; **the insertion
+  analysis is the real work.**
+- **Garbage-free:** drops at last-use (not scope-end) → objects die immediately,
+  like Rust's `Drop`.
+- **Reuse analysis (`drop-reuse`):** when a `drop` frees a *unique* object (rc→0)
+  and a *same-size* allocation follows, the drop returns a **reuse token** (the
+  freed cell, or null if it was shared) and the allocation **reuses it in place**
+  → zero allocator traffic; safe when shared (null → fresh alloc).
+- **Reuse specialization (FIP):** reusing the same constructor only rewrites
+  changed fields.
+- **Borrowed params:** read-only args are *borrowed* → no dup at call, no drop in
+  callee (kills churn, e.g. `len(xs)`).
+- **FBIP:** in-place "match-and-rebuild" with no allocation.
+- **Cycles leak** — and unlike Koka (mostly immutable), **Python has mutable
+  containers → real cycles**, so the cycle tier is mandatory for us.
+
+The embedded payoff = the named use cases: a **sensor-log append** / **game-state
+update** in a loop becomes **in-place reuse → near-zero per-iteration allocation**
+on the 520 KB chip. That's why RC must be Perceus-style, not naïve.
+
+ABI additions for reuse: `p2w_drop_reuse(v) -> token` and reuse-token constructor
+variants (`p2w_list_new_reuse(token, …)`, str/dict similarly).
+
+Implementation order: (1) emit naïve retain/release (correct, drop at scope end);
+(2) move drops to last-use (precise/garbage-free); (3) borrowed-param analysis;
+(4) drop-reuse + token constructors + reuse specialization; (5) cycle collector
+(trial-deletion / CPython-style, or weak refs).
+
 ## Status
 - **Built:** the heap allocator (static arena + first-fit free list), the string
   heap type, and naïve RC primitives (`p2w_retain`/`p2w_release`) in `runtime/`
