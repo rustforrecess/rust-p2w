@@ -20,7 +20,7 @@ mod parser;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
-pub use debug::{Status, Stepper, Value};
+pub use debug::{Status, Stepper, Value, Vm};
 pub use error::CompileError;
 
 /// Compile Python (the supported subset) to WebAssembly text (WAT).

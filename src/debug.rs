@@ -1349,6 +1349,801 @@ fn describe_expr(k: &ExprKind) -> &'static str {
     }
 }
 
+// ======================================================================
+// CPS VM — an explicit-stack interpreter that can step *into* functions
+// and expose a live call stack (the destination from DEBUGGER_ARCHITECTURE.md).
+//
+// Unlike `Stepper` (a tree-walker that runs calls atomically), this keeps an
+// explicit work stack of `Task`s plus an operand stack per call frame, so
+// execution can suspend ANYWHERE — including mid-expression at a call — and
+// resume. That's what makes true step-into and a call stack possible.
+//
+// Phase 1 scope: control flow (if/elif/else, while, counted for, break/continue,
+// return), user functions (step-into, recursion, default args), arithmetic /
+// comparison / and-or / unary, names with a global read-fallback, print, and a
+// few builtins. Lists/dicts/indexing/methods/for-each come in Phase 2; they stop
+// with a friendly message for now. The atomic `Stepper` stays the IDE engine
+// until this reaches parity.
+// ======================================================================
+
+/// A captured user function for the VM.
+#[derive(Clone)]
+struct VmFunc {
+    params: Vec<String>,
+    defaults: Vec<Expr>,
+    body: Rc<Vec<Stmt>>,
+}
+
+/// Normalized `if`/`elif`/`else`: ordered branches, each `(condition, body)`
+/// with `None` condition meaning the `else`.
+type Branches = Rc<Vec<(Option<Expr>, Rc<Vec<Stmt>>)>>;
+
+/// One unit of pending work on a frame's continuation stack. Popped from the
+/// back (top). Expression tasks push their result onto the operand stack.
+enum Task {
+    /// Statement iterator over a block; `idx < len` is a step boundary.
+    Next(Rc<Vec<Stmt>>, usize),
+    Eval(Rc<Expr>),
+    Bin(BinOp),
+    Unary(UnOp),
+    /// Short-circuit `and`/`or`: inspect the operand on top, maybe eval the rhs.
+    AndThen(Rc<Expr>),
+    OrElse(Rc<Expr>),
+    /// Pop a value and bind it to a name in the current scope.
+    Store(String),
+    /// Pop `n` values and print them (space-joined + newline).
+    Print(usize),
+    /// Discard the top operand (an expression statement's result).
+    Pop,
+    /// Pop `argc` args and call `name` (user function -> new frame; else builtin).
+    Call(String, usize),
+    /// `if`/`elif`/`else` as a normalized branch list; decides which to run.
+    IfChain(Branches, usize),
+    /// Pop a bool: branch `idx` taken if true, else fall through to the next.
+    IfTest(Branches, usize),
+    /// `while`: (re)evaluate the condition, then decide.
+    WhileHead(Rc<Expr>, Rc<Vec<Stmt>>),
+    WhileTest(Rc<Expr>, Rc<Vec<Stmt>>),
+    /// Pop start/end/step and start a counted loop.
+    ForSetup(String, Rc<Vec<Stmt>>),
+    /// A live counted loop (also the break/continue marker).
+    ForHead {
+        var: String,
+        next: i64,
+        stop: i64,
+        step: i64,
+        body: Rc<Vec<Stmt>>,
+    },
+    Break,
+    Continue,
+    Return,
+}
+
+impl Task {
+    /// Loop markers that `break`/`continue` unwind to.
+    fn is_loop(&self) -> bool {
+        matches!(self, Task::WhileHead(..) | Task::ForHead { .. })
+    }
+}
+
+/// One call frame: its own continuation + operand stacks and local scope.
+struct VmFrame {
+    /// Display name for the call stack ("<module>" for the top level).
+    func: String,
+    work: Vec<Task>,
+    operands: Vec<Value>,
+    scope: HashMap<String, Value>,
+    line: usize,
+}
+
+/// The CPS virtual machine. Same public surface as [`Stepper`], plus
+/// [`Vm::call_stack`].
+pub struct Vm {
+    frames: Vec<VmFrame>,
+    funcs: HashMap<String, VmFunc>,
+    output: String,
+    status: Status,
+    watchpoints: Vec<Watchpoint>,
+    watch_hit: Option<(String, String, String)>,
+}
+
+impl Vm {
+    pub fn new(source: &str) -> Result<Vm, CompileError> {
+        let tokens = crate::lexer::lex(source)?;
+        let program = crate::parser::parse(&tokens)?;
+        let module = VmFrame {
+            func: "<module>".to_string(),
+            work: vec![Task::Next(Rc::new(program), 0)],
+            operands: Vec::new(),
+            scope: HashMap::new(),
+            line: 0,
+        };
+        let mut vm = Vm {
+            frames: vec![module],
+            funcs: HashMap::new(),
+            output: String::new(),
+            status: Status::Finished,
+            watchpoints: Vec::new(),
+            watch_hit: None,
+        };
+        vm.settle();
+        Ok(vm)
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+    pub fn status(&self) -> &Status {
+        &self.status
+    }
+    pub fn is_paused(&self) -> bool {
+        matches!(self.status, Status::Paused { .. })
+    }
+    pub fn current_line(&self) -> Option<usize> {
+        match self.status {
+            Status::Paused { line } => Some(line),
+            _ => None,
+        }
+    }
+
+    /// The call stack, innermost first: `(function name, current line)`.
+    pub fn call_stack(&self) -> Vec<(String, usize)> {
+        self.frames
+            .iter()
+            .rev()
+            .map(|f| (f.func.clone(), f.line))
+            .collect()
+    }
+
+    /// Variables in the current (innermost) frame, sorted, sans temporaries.
+    pub fn variables(&self) -> Vec<(String, String)> {
+        let Some(frame) = self.frames.last() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = frame
+            .scope
+            .iter()
+            .filter(|(n, _)| !n.contains('.'))
+            .map(|(n, v)| (n.clone(), v.py_repr()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Evaluate a watch expression against the current frame (read-only; no calls
+    /// in Phase 1). Returns its repr.
+    pub fn eval_watch(&self, src: &str) -> Result<String, String> {
+        let tokens = crate::lexer::lex(src).map_err(|e| e.to_string())?;
+        let expr = crate::parser::parse_expression(&tokens).map_err(|e| e.to_string())?;
+        self.watch_eval(&expr).map(|v| v.py_repr())
+    }
+
+    pub fn set_watchpoints(&mut self, srcs: &[String]) {
+        self.watch_hit = None;
+        self.watchpoints = srcs
+            .iter()
+            .filter_map(|s| {
+                let toks = crate::lexer::lex(s).ok()?;
+                let expr = crate::parser::parse_expression(&toks).ok()?;
+                let last = self.watch_eval(&expr).ok().map(|v| v.py_repr());
+                Some(Watchpoint {
+                    src: s.clone(),
+                    expr,
+                    last,
+                })
+            })
+            .collect();
+    }
+
+    pub fn watch_hit(&self) -> Option<(String, String, String)> {
+        self.watch_hit.clone()
+    }
+
+    /// Execute one statement, stepping *into* any function it calls.
+    pub fn step(&mut self) {
+        if !self.is_paused() {
+            return;
+        }
+        self.watch_hit = None;
+        self.exec_current_statement();
+        self.settle();
+        self.check_watchpoints();
+    }
+
+    /// Run until finished, errored, or about to execute a breakpoint line (after
+    /// at least one step), or a watchpoint changes.
+    pub fn run(&mut self, breakpoints: &[usize]) {
+        self.watch_hit = None;
+        let mut took = false;
+        while self.is_paused() {
+            if took
+                && let Status::Paused { line } = self.status
+                && breakpoints.contains(&line)
+            {
+                return;
+            }
+            self.step();
+            took = true;
+            if self.watch_hit.is_some() {
+                return;
+            }
+        }
+    }
+
+    // --- internals --------------------------------------------------------
+
+    fn top(&mut self) -> &mut VmFrame {
+        self.frames.last_mut().expect("a frame")
+    }
+
+    fn push_op(&mut self, v: Value) {
+        self.top().operands.push(v);
+    }
+
+    fn pop_op(&mut self) -> Result<Value, String> {
+        self.top()
+            .operands
+            .pop()
+            .ok_or_else(|| "internal: operand stack underflow".to_string())
+    }
+
+    fn push_task(&mut self, t: Task) {
+        self.top().work.push(t);
+    }
+
+    /// Is the top frame poised at a statement to run? Returns its line.
+    fn boundary_line(&self) -> Option<usize> {
+        let f = self.frames.last()?;
+        if let Some(Task::Next(stmts, idx)) = f.work.last()
+            && *idx < stmts.len()
+        {
+            return Some(stmts[*idx].line);
+        }
+        None
+    }
+
+    /// Pump tasks until poised at the next statement, finished, or errored.
+    fn settle(&mut self) {
+        loop {
+            if matches!(self.status, Status::Error { .. }) {
+                return;
+            }
+            if let Some(line) = self.boundary_line() {
+                // Keep the top frame's line current so the call stack is accurate
+                // at the pause point (it otherwise only updates when a statement
+                // is consumed).
+                if let Some(f) = self.frames.last_mut() {
+                    f.line = line;
+                }
+                self.status = Status::Paused { line };
+                return;
+            }
+            if self.frames.is_empty() {
+                self.status = Status::Finished;
+                return;
+            }
+            if let Err(msg) = self.pump_one() {
+                let line = self.frames.last().map(|f| f.line);
+                self.status = Status::Error { line, message: msg };
+                return;
+            }
+        }
+    }
+
+    /// Consume the boundary statement: set the line, schedule the continuation,
+    /// and expand the statement into tasks.
+    fn exec_current_statement(&mut self) {
+        let frame = self.top();
+        let Some(Task::Next(stmts, idx)) = frame.work.pop() else {
+            return; // not at a boundary (shouldn't happen)
+        };
+        let stmt = stmts[idx].clone();
+        frame.line = stmt.line;
+        frame.work.push(Task::Next(stmts, idx + 1));
+        if let Err(msg) = self.expand_stmt(&stmt) {
+            self.status = Status::Error {
+                line: Some(stmt.line),
+                message: msg,
+            };
+        }
+    }
+
+    /// Push the tasks that carry out one statement.
+    fn expand_stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        match &s.kind {
+            StmtKind::Assign(name, e) => {
+                self.push_task(Task::Store(name.clone()));
+                self.push_task(Task::Eval(Rc::new(e.clone())));
+            }
+            StmtKind::Expr(e) => {
+                if let ExprKind::Call(name, args) = &e.kind
+                    && name == "print"
+                {
+                    self.push_task(Task::Print(args.len()));
+                    for a in args.iter().rev() {
+                        self.push_task(Task::Eval(Rc::new(a.clone())));
+                    }
+                } else {
+                    self.push_task(Task::Pop);
+                    self.push_task(Task::Eval(Rc::new(e.clone())));
+                }
+            }
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                let mut branches: Vec<(Option<Expr>, Rc<Vec<Stmt>>)> =
+                    vec![(Some(cond.clone()), Rc::new(body.clone()))];
+                for (c, b) in elifs {
+                    branches.push((Some(c.clone()), Rc::new(b.clone())));
+                }
+                if let Some(eb) = else_body {
+                    branches.push((None, Rc::new(eb.clone())));
+                }
+                self.push_task(Task::IfChain(Rc::new(branches), 0));
+            }
+            StmtKind::While { cond, body } => {
+                self.push_task(Task::WhileHead(Rc::new(cond.clone()), Rc::new(body.clone())));
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                self.push_task(Task::ForSetup(var.clone(), Rc::new(body.clone())));
+                self.push_task(Task::Eval(Rc::new(step.clone())));
+                self.push_task(Task::Eval(Rc::new(end.clone())));
+                self.push_task(Task::Eval(Rc::new(start.clone())));
+            }
+            StmtKind::Break => self.push_task(Task::Break),
+            StmtKind::Continue => self.push_task(Task::Continue),
+            StmtKind::Return(opt) => {
+                self.push_task(Task::Return);
+                let e = match opt {
+                    Some(e) => e.clone(),
+                    None => Expr {
+                        kind: ExprKind::NoneLit,
+                        line: s.line,
+                    },
+                };
+                self.push_task(Task::Eval(Rc::new(e)));
+            }
+            StmtKind::Def {
+                name,
+                params,
+                defaults,
+                body,
+                ..
+            } => {
+                self.funcs.insert(
+                    name.clone(),
+                    VmFunc {
+                        params: params.clone(),
+                        defaults: defaults.clone(),
+                        body: Rc::new(body.clone()),
+                    },
+                );
+            }
+            StmtKind::ForEach { .. } | StmtKind::SetIndex { .. } => {
+                return Err(format!(
+                    "{} isn't in the step debugger's call-stack mode yet — use Run",
+                    describe_stmt(&s.kind)
+                ));
+            }
+            StmtKind::ClassDef { .. }
+            | StmtKind::SetAttr { .. }
+            | StmtKind::UnpackAssign { .. }
+            | StmtKind::Import(_) => {
+                return Err(format!(
+                    "{} isn't in the step debugger yet — use Run for that",
+                    describe_stmt(&s.kind)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute one task.
+    fn pump_one(&mut self) -> Result<(), String> {
+        // An empty frame returns None to its caller (implicit fall-off-the-end).
+        if self.top().work.is_empty() {
+            self.return_value(Value::None);
+            return Ok(());
+        }
+        let task = self.top().work.pop().unwrap();
+        match task {
+            Task::Next(stmts, idx) => {
+                // Only reached for an exhausted block (idx >= len); a live one is
+                // a boundary handled by step(). Exhausted -> just drop it.
+                debug_assert!(idx >= stmts.len());
+            }
+            Task::Eval(e) => self.eval_task(&e)?,
+            Task::Bin(op) => {
+                let r = self.pop_op()?;
+                let l = self.pop_op()?;
+                self.push_op(apply_bin(op, &l, &r)?);
+            }
+            Task::Unary(op) => {
+                let v = self.pop_op()?;
+                self.push_op(apply_unary(op, v)?);
+            }
+            Task::AndThen(b) => {
+                let keep = self.top().operands.last().cloned().unwrap_or(Value::None);
+                if keep.truthy() {
+                    self.pop_op()?;
+                    self.push_task(Task::Eval(b));
+                }
+            }
+            Task::OrElse(b) => {
+                let keep = self.top().operands.last().cloned().unwrap_or(Value::None);
+                if !keep.truthy() {
+                    self.pop_op()?;
+                    self.push_task(Task::Eval(b));
+                }
+            }
+            Task::Store(name) => {
+                let v = self.pop_op()?;
+                self.top().scope.insert(name, v);
+            }
+            Task::Print(n) => {
+                let mut vals = Vec::with_capacity(n);
+                for _ in 0..n {
+                    vals.push(self.pop_op()?);
+                }
+                vals.reverse();
+                let parts: Vec<String> = vals.iter().map(Value::py_str).collect();
+                self.output.push_str(&parts.join(" "));
+                self.output.push('\n');
+            }
+            Task::Pop => {
+                self.pop_op()?;
+            }
+            Task::Call(name, argc) => self.do_call(&name, argc)?,
+            Task::IfChain(branches, idx) => {
+                if idx < branches.len() {
+                    match &branches[idx].0 {
+                        None => {
+                            let body = branches[idx].1.clone();
+                            self.push_task(Task::Next(body, 0));
+                        }
+                        Some(cond) => {
+                            self.push_task(Task::IfTest(branches.clone(), idx));
+                            self.push_task(Task::Eval(Rc::new(cond.clone())));
+                        }
+                    }
+                }
+            }
+            Task::IfTest(branches, idx) => {
+                let v = self.pop_op()?;
+                if v.truthy() {
+                    let body = branches[idx].1.clone();
+                    self.push_task(Task::Next(body, 0));
+                } else {
+                    self.push_task(Task::IfChain(branches, idx + 1));
+                }
+            }
+            Task::WhileHead(cond, body) => {
+                self.push_task(Task::WhileTest(cond.clone(), body));
+                self.push_task(Task::Eval(cond));
+            }
+            Task::WhileTest(cond, body) => {
+                let v = self.pop_op()?;
+                if v.truthy() {
+                    self.push_task(Task::WhileHead(cond, body.clone()));
+                    self.push_task(Task::Next(body, 0));
+                }
+            }
+            Task::ForSetup(var, body) => {
+                let step = as_int(&self.pop_op()?).ok_or("range() step must be an integer")?;
+                let stop = as_int(&self.pop_op()?).ok_or("range() stop must be an integer")?;
+                let next = as_int(&self.pop_op()?).ok_or("range() start must be an integer")?;
+                if step == 0 {
+                    return Err("range() step must not be zero".to_string());
+                }
+                self.push_task(Task::ForHead {
+                    var,
+                    next,
+                    stop,
+                    step,
+                    body,
+                });
+            }
+            Task::ForHead {
+                var,
+                next,
+                stop,
+                step,
+                body,
+            } => {
+                let go = (step > 0 && next < stop) || (step < 0 && next > stop);
+                if go {
+                    self.top().scope.insert(var.clone(), Value::Int(next));
+                    self.push_task(Task::ForHead {
+                        var,
+                        next: next + step,
+                        stop,
+                        step,
+                        body: body.clone(),
+                    });
+                    self.push_task(Task::Next(body, 0));
+                }
+            }
+            Task::Break => {
+                while let Some(t) = self.top().work.pop() {
+                    if t.is_loop() {
+                        break;
+                    }
+                }
+            }
+            Task::Continue => {
+                while let Some(t) = self.top().work.last() {
+                    if t.is_loop() {
+                        break;
+                    }
+                    self.top().work.pop();
+                }
+            }
+            Task::Return => {
+                let v = self.pop_op().unwrap_or(Value::None);
+                self.return_value(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Expand one expression into evaluation tasks (or push a literal directly).
+    fn eval_task(&mut self, e: &Expr) -> Result<(), String> {
+        match &e.kind {
+            ExprKind::Int(n) => self.push_op(Value::Int(*n)),
+            ExprKind::Float(f) => self.push_op(Value::Float(*f)),
+            ExprKind::Bool(b) => self.push_op(Value::Bool(*b)),
+            ExprKind::Str(s) => self.push_op(Value::Str(s.clone())),
+            ExprKind::NoneLit => self.push_op(Value::None),
+            ExprKind::Name(n) => {
+                let v = self
+                    .lookup(n)
+                    .ok_or_else(|| format!("name '{n}' is not defined"))?;
+                self.push_op(v);
+            }
+            ExprKind::Unary(op, inner) => {
+                self.push_task(Task::Unary(*op));
+                self.push_task(Task::Eval(Rc::new((**inner).clone())));
+            }
+            ExprKind::Bin(BinOp::And, a, b) => {
+                self.push_task(Task::AndThen(Rc::new((**b).clone())));
+                self.push_task(Task::Eval(Rc::new((**a).clone())));
+            }
+            ExprKind::Bin(BinOp::Or, a, b) => {
+                self.push_task(Task::OrElse(Rc::new((**b).clone())));
+                self.push_task(Task::Eval(Rc::new((**a).clone())));
+            }
+            ExprKind::Bin(op, a, b) => {
+                self.push_task(Task::Bin(*op));
+                self.push_task(Task::Eval(Rc::new((**b).clone())));
+                self.push_task(Task::Eval(Rc::new((**a).clone())));
+            }
+            ExprKind::Call(name, args) => {
+                self.push_task(Task::Call(name.clone(), args.len()));
+                for a in args.iter().rev() {
+                    self.push_task(Task::Eval(Rc::new(a.clone())));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{} isn't in the step debugger's call-stack mode yet — use Run",
+                    describe_expr(&e.kind)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a name: current frame, then module globals (read fallback).
+    fn lookup(&self, name: &str) -> Option<Value> {
+        let top = self.frames.last()?;
+        if let Some(v) = top.scope.get(name) {
+            return Some(v.clone());
+        }
+        if self.frames.len() > 1 {
+            return self.frames[0].scope.get(name).cloned();
+        }
+        None
+    }
+
+    /// Perform a call: user function -> push a new frame (step-into); builtin ->
+    /// compute and push the result.
+    fn do_call(&mut self, name: &str, argc: usize) -> Result<(), String> {
+        let mut args = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            args.push(self.pop_op()?);
+        }
+        args.reverse();
+
+        if let Some(f) = self.funcs.get(name).cloned() {
+            let nparams = f.params.len();
+            let nrequired = nparams - f.defaults.len();
+            if args.len() < nrequired || args.len() > nparams {
+                return Err(format!(
+                    "{name}() takes {nparams} argument(s) but {} were given",
+                    args.len()
+                ));
+            }
+            let mut scope = HashMap::new();
+            for (i, p) in f.params.iter().enumerate() {
+                let v = if i < args.len() {
+                    args[i].clone()
+                } else {
+                    eval_const(&f.defaults[i - nrequired])?
+                };
+                scope.insert(p.clone(), v);
+            }
+            let line = f.body.first().map(|s| s.line).unwrap_or(0);
+            self.frames.push(VmFrame {
+                func: name.to_string(),
+                work: vec![Task::Next(f.body, 0)],
+                operands: Vec::new(),
+                scope,
+                line,
+            });
+            Ok(())
+        } else {
+            let v = call_builtin(name, &args)?;
+            self.push_op(v);
+            Ok(())
+        }
+    }
+
+    /// Pop the current frame, delivering `v` to the caller (or finishing the
+    /// program if the module frame returns).
+    fn return_value(&mut self, v: Value) {
+        self.frames.pop();
+        if let Some(caller) = self.frames.last_mut() {
+            caller.operands.push(v);
+        }
+        // else: module frame ended -> settle() will report Finished.
+    }
+
+    fn check_watchpoints(&mut self) {
+        if self.watchpoints.is_empty() {
+            return;
+        }
+        let curs: Vec<Option<String>> = self
+            .watchpoints
+            .iter()
+            .map(|w| self.watch_eval(&w.expr).ok().map(|v| v.py_repr()))
+            .collect();
+        let mut hit = None;
+        for (w, cur) in self.watchpoints.iter().zip(&curs) {
+            if *cur != w.last {
+                let shown = |o: &Option<String>| o.clone().unwrap_or_else(|| "(undefined)".into());
+                hit = Some((w.src.clone(), shown(&w.last), shown(cur)));
+                break;
+            }
+        }
+        for (w, cur) in self.watchpoints.iter_mut().zip(curs) {
+            w.last = cur;
+        }
+        self.watch_hit = hit;
+    }
+
+    /// Read-only watch evaluation against the current frame (+ globals). No
+    /// calls in Phase 1.
+    fn watch_eval(&self, e: &Expr) -> Result<Value, String> {
+        match &e.kind {
+            ExprKind::Int(n) => Ok(Value::Int(*n)),
+            ExprKind::Float(f) => Ok(Value::Float(*f)),
+            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
+            ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+            ExprKind::NoneLit => Ok(Value::None),
+            ExprKind::Name(n) => self
+                .lookup(n)
+                .ok_or_else(|| format!("name '{n}' is not defined")),
+            ExprKind::Unary(op, inner) => apply_unary(*op, self.watch_eval(inner)?),
+            ExprKind::Bin(BinOp::And, a, b) => {
+                let l = self.watch_eval(a)?;
+                if l.truthy() { self.watch_eval(b) } else { Ok(l) }
+            }
+            ExprKind::Bin(BinOp::Or, a, b) => {
+                let l = self.watch_eval(a)?;
+                if l.truthy() { Ok(l) } else { self.watch_eval(b) }
+            }
+            ExprKind::Bin(op, a, b) => {
+                apply_bin(*op, &self.watch_eval(a)?, &self.watch_eval(b)?)
+            }
+            _ => Err("that watch isn't supported in call-stack mode yet".to_string()),
+        }
+    }
+}
+
+/// Apply a binary operator to two evaluated values (shared by the VM).
+fn apply_bin(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    match op {
+        BinOp::Eq => Ok(Value::Bool(py_eq(l, r))),
+        BinOp::Ne => Ok(Value::Bool(!py_eq(l, r))),
+        BinOp::In => Ok(Value::Bool(contains(r, l)?)),
+        BinOp::NotIn => Ok(Value::Bool(!contains(r, l)?)),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => compare(op, l, r),
+        BinOp::Add => add(l, r),
+        BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
+            arith(op, l, r)
+        }
+        BinOp::And | BinOp::Or => unreachable!("short-circuited before apply"),
+        BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => {
+            Err("set operators aren't in the step debugger yet — use Run".to_string())
+        }
+    }
+}
+
+fn apply_unary(op: UnOp, v: Value) -> Result<Value, String> {
+    match op {
+        UnOp::Not => Ok(Value::Bool(!v.truthy())),
+        UnOp::Neg => match v {
+            Value::Int(n) => Ok(Value::Int(-n)),
+            Value::Float(f) => Ok(Value::Float(-f)),
+            Value::Bool(b) => Ok(Value::Int(if b { -1 } else { 0 })),
+            _ => Err(format!("can't negate {}", type_name(&v))),
+        },
+    }
+}
+
+/// Evaluate a constant expression (for default arguments) — literals only.
+fn eval_const(e: &Expr) -> Result<Value, String> {
+    match &e.kind {
+        ExprKind::Int(n) => Ok(Value::Int(*n)),
+        ExprKind::Float(f) => Ok(Value::Float(*f)),
+        ExprKind::Bool(b) => Ok(Value::Bool(*b)),
+        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::NoneLit => Ok(Value::None),
+        ExprKind::Unary(op, inner) => apply_unary(*op, eval_const(inner)?),
+        _ => Err("only literal default arguments are supported in call-stack mode yet".to_string()),
+    }
+}
+
+/// The VM's builtin functions (a curated K-12 subset).
+fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    match (name, args) {
+        ("len", [v]) => match v {
+            Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+            Value::List(l) => Ok(Value::Int(l.len() as i64)),
+            Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
+            _ => Err(format!("object of type {} has no len()", type_name(v))),
+        },
+        ("abs", [v]) => match v {
+            Value::Int(n) => Ok(Value::Int(n.abs())),
+            Value::Float(f) => Ok(Value::Float(f.abs())),
+            Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+            _ => Err(format!("bad operand type for abs(): {}", type_name(v))),
+        },
+        ("str", [v]) => Ok(Value::Str(v.py_str())),
+        ("int", [v]) => match v {
+            Value::Int(n) => Ok(Value::Int(*n)),
+            Value::Float(f) => Ok(Value::Int(*f as i64)),
+            Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+            Value::Str(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(Value::Int)
+                .map_err(|_| format!("invalid literal for int(): '{s}'")),
+            _ => Err(format!("int() argument can't be {}", type_name(v))),
+        },
+        ("float", [v]) => as_num(v)
+            .map(Value::Float)
+            .or_else(|| match v {
+                Value::Str(s) => s.trim().parse::<f64>().ok().map(Value::Float),
+                _ => None,
+            })
+            .ok_or_else(|| format!("can't convert {} to float", type_name(v))),
+        ("bool", [v]) => Ok(Value::Bool(v.truthy())),
+        _ => Err(format!(
+            "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,5 +2367,89 @@ mod tests {
     fn nested_loops_produce_correct_output() {
         let src = "for i in range(2):\n    for j in range(2):\n        print(i * 10 + j)\n";
         assert_eq!(run_to_end(src), "0\n1\n10\n11\n");
+    }
+
+    // --- CPS VM (step-into + call stack) ---
+
+    fn vm_run(src: &str) -> String {
+        let mut vm = Vm::new(src).expect("parse");
+        let mut guard = 0;
+        while vm.is_paused() {
+            vm.step();
+            guard += 1;
+            assert!(guard < 100_000, "ran away");
+        }
+        assert_eq!(*vm.status(), Status::Finished, "did not finish: {:?}", vm.status());
+        vm.output().to_string()
+    }
+
+    #[test]
+    fn vm_runs_control_flow() {
+        assert_eq!(vm_run("x = 5\nprint(x)\n"), "5\n");
+        assert_eq!(vm_run("print(7 // 2)\nprint(7 / 2)\n"), "3\n3.5\n");
+        assert_eq!(vm_run("print(2 and 0 or 9)\n"), "9\n");
+        let src = "total = 0\nfor i in range(1, 6):\n    total = total + i\nprint(total)\n";
+        assert_eq!(vm_run(src), "15\n");
+        let src = "i = 0\nwhile i < 5:\n    i = i + 1\n    if i == 3:\n        continue\n    print(i)\n";
+        assert_eq!(vm_run(src), "1\n2\n4\n5\n");
+    }
+
+    #[test]
+    fn vm_runs_functions_with_recursion_and_defaults() {
+        assert_eq!(vm_run("def double(n):\n    return n * 2\nprint(double(21))\n"), "42\n");
+        assert_eq!(
+            vm_run("def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\nprint(fact(5))\n"),
+            "120\n"
+        );
+        assert_eq!(
+            vm_run("def inc(x, by=1):\n    return x + by\nprint(inc(5))\nprint(inc(5, 10))\n"),
+            "6\n15\n"
+        );
+    }
+
+    #[test]
+    fn vm_steps_into_a_function_and_shows_the_call_stack() {
+        let mut vm = Vm::new("def f(n):\n    return n + 1\nprint(f(10))\n").unwrap();
+        assert_eq!(vm.current_line(), Some(1)); // def
+        vm.step(); // register def -> next is line 3 (print)
+        assert_eq!(vm.current_line(), Some(3));
+        // At line 3 only the module frame exists.
+        assert_eq!(vm.call_stack(), vec![("<module>".to_string(), 3)]);
+        vm.step(); // step INTO f -> paused on line 2 (return), inside f
+        assert_eq!(vm.current_line(), Some(2));
+        let stack = vm.call_stack();
+        assert_eq!(stack.len(), 2, "should be inside f: {stack:?}");
+        assert_eq!(stack[0].0, "f");
+        assert_eq!(stack[1].0, "<module>");
+        // n is visible in f's frame.
+        assert_eq!(vm.eval_watch("n").unwrap(), "10");
+        // Finish.
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(vm.output(), "11\n");
+    }
+
+    #[test]
+    fn vm_call_stack_deepens_with_recursion() {
+        let mut vm =
+            Vm::new("def down(n):\n    if n > 0:\n        down(n - 1)\ndown(3)\n").unwrap();
+        let mut max_depth = 0;
+        while vm.is_paused() {
+            max_depth = max_depth.max(vm.call_stack().len());
+            vm.step();
+        }
+        // module + down(3)+down(2)+down(1)+down(0) = 5 frames at the deepest.
+        assert!(max_depth >= 5, "recursion should deepen the stack, got {max_depth}");
+    }
+
+    #[test]
+    fn vm_watchpoint_breaks_on_change() {
+        let mut vm = Vm::new("x = 0\nx = 1\nx = 9\nprint(x)\n").unwrap();
+        vm.set_watchpoints(&["x".to_string()]);
+        vm.run(&[]);
+        assert_eq!(vm.watch_hit().unwrap().2, "0");
+        vm.run(&[]);
+        assert_eq!(vm.watch_hit().unwrap().2, "1");
     }
 }
