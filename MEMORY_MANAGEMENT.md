@@ -153,6 +153,30 @@ Implementation order: (1) emit naïve retain/release (correct, drop at scope end
 (4) drop-reuse + token constructors + reuse specialization; (5) cycle collector
 (trial-deletion / CPython-style, or weak refs).
 
+## Cycle-free fast path: no mutation ⇒ drop the collector
+Key fact: **you cannot build a heap cycle without mutation.** `a = [a]` is a
+NameError; the only way to make an object reach itself is to *mutate* an existing
+one (`a.append(a)`, `node.parent = p`, `d[k] = d`). So the sound criterion is
+**"the program performs no mutating operations"** (no `append`/`pop`, no
+`xs[i] = v`, no `obj.attr = v`, no mutating method) — lists/dicts may still be
+*constructed and read*, just not mutated. No mutation ⇒ DAG, never a cycle ⇒ the
+**cycle collector (tier 5) can be omitted entirely** (smaller binary, no pauses,
+fully garbage-free RC — the Koka/Lean sweet spot). And with reuse analysis,
+immutable "build a new value" code still runs **in place** (FBIP), so this is a
+perf *enabler*, not a penalty.
+
+Deliver both:
+- **Automatic detection (default):** scan for any mutating op; if none, omit the
+  collector and take the lean path automatically ("pay for cycles only if you
+  mutate"). The IDE can surface it ("✓ allocation-lean: no cycle collector").
+- **Explicit `--no-mutation` / "pure" mode:** *enforce* the no-mutation subset
+  (compile error on mutation) for a guaranteed lean binary + to teach functional
+  style (which FBIP reuse makes efficient).
+
+Coarse rule first (any mutation → keep the collector); a finer analysis (prove a
+specific mutation can't create a back-edge) is a later refinement. This is our
+compiler-checkable version of how Rust programmers structure around `Rc` cycles.
+
 ## Status
 - **Built:** the heap allocator (static arena + first-fit free list), the string
   heap type, and naïve RC primitives (`p2w_retain`/`p2w_release`) in `runtime/`
