@@ -1572,6 +1572,32 @@ impl Vm {
         self.check_watchpoints();
     }
 
+    /// Step *over*: execute the current statement fully — running any functions
+    /// it calls to completion — and stop at the next statement in this (or an
+    /// outer) frame, rather than descending into the callee.
+    pub fn step_over(&mut self) {
+        if !self.is_paused() {
+            return;
+        }
+        let depth = self.frames.len();
+        self.step();
+        while self.is_paused() && self.frames.len() > depth {
+            self.step();
+        }
+    }
+
+    /// Step *out*: run until the current function returns, pausing in the caller.
+    /// At the top level this runs to the end.
+    pub fn step_out(&mut self) {
+        if !self.is_paused() {
+            return;
+        }
+        let depth = self.frames.len();
+        while self.is_paused() && self.frames.len() >= depth {
+            self.step();
+        }
+    }
+
     /// Run until finished, errored, or about to execute a breakpoint line (after
     /// at least one step), or a watchpoint changes.
     pub fn run(&mut self, breakpoints: &[usize]) {
@@ -2661,6 +2687,37 @@ mod tests {
         vm.step(); // xs = ...
         assert_eq!(vm.eval_watch("xs[1]").unwrap(), "6");
         assert_eq!(vm.eval_watch("len(xs)").unwrap_err().contains("call-stack"), true);
+    }
+
+    #[test]
+    fn vm_step_over_runs_a_call_without_descending() {
+        let mut vm = Vm::new("def f(n):\n    return n + 1\nx = f(10)\nprint(x)\n").unwrap();
+        vm.step(); // def -> line 3 (x = f(10))
+        assert_eq!(vm.current_line(), Some(3));
+        vm.step_over(); // run f(10) atomically -> line 4 (print), still top-level
+        assert_eq!(vm.current_line(), Some(4));
+        assert_eq!(vm.call_stack().len(), 1, "step-over must not descend into f");
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(vm.output(), "11\n");
+    }
+
+    #[test]
+    fn vm_step_out_returns_to_the_caller() {
+        let mut vm =
+            Vm::new("def f(n):\n    a = n + 1\n    return a\nx = f(5)\nprint(x)\n").unwrap();
+        vm.step(); // def -> line 4 (x = f(5))
+        vm.step(); // step INTO f -> line 2 (a = n + 1)
+        assert_eq!(vm.call_stack().len(), 2);
+        assert_eq!(vm.current_line(), Some(2));
+        vm.step_out(); // finish f, back in the caller -> line 5 (print)
+        assert_eq!(vm.call_stack().len(), 1, "step-out should return to <module>");
+        assert_eq!(vm.current_line(), Some(5));
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(vm.output(), "6\n");
     }
 
     #[test]
