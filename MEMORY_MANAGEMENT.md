@@ -177,6 +177,37 @@ Coarse rule first (any mutation → keep the collector); a finer analysis (prove
 specific mutation can't create a back-edge) is a later refinement. This is our
 compiler-checkable version of how Rust programmers structure around `Rc` cycles.
 
+## Real-time / ROS (micro-ROS) considerations
+On the Pico, "ROS" means **micro-ROS**, which runs on an **RTOS** (FreeRTOS/
+Zephyr) — so robotics pulls in real-time + concurrency constraints. RC is a good
+fit (no stop-the-world GC), but the RC pass must keep two seams open, plus one
+invariant:
+
+- **Atomicity swap point.** `retain`/`release` are non-atomic (single-threaded).
+  If a value is shared across RTOS tasks they must become atomic (CAS) + a locked
+  arena. Isolated in `rc_inc`/`rc_dec` so it's swappable without touching the
+  insertion pass. *(Implemented as a seam.)*
+- **Deferrable free.** A `release` of a large graph cascades into many frees → an
+  unbounded pause in a control loop. `free_object` is the single free seam so it
+  can later become **incremental** (enqueue children, free a bounded amount per
+  tick). *(Implemented as a seam.)*
+- **Invariant — single-threaded interpreter, marshal at the boundary.** p2w runs
+  as the logic inside one ROS node/task; the host bridges ROS topics ↔ p2w via
+  the host-import seam (`p2w_ros_publish`, subscriber callbacks), and values are
+  **copied** in/out at the boundary, never shared as live heap refs across tasks.
+  This keeps RC single-threaded and the arena lock-free.
+
+**Why reuse matters for robotics:** a control loop runs forever (the games/
+sensor-log case → needs RC), and must not churn memory each tick. Perceus
+**reuse** → a **zero-allocation steady state** (no allocator on the hot path),
+which is exactly what RT/micro-ROS wants (it favors static pools). The
+no-mutation fast path compounds this.
+
+Watch-items for an RT-hardening phase (not blocking): O(1) size-class allocator +
+coalescing (our first-fit fragments over long runs — reuse mostly sidesteps it);
+fault-safe behavior for `trap`/OOM in a robot (halt motors, not loop forever);
+float/fixed-point for robotics math (M33 has an FPU).
+
 ## Status
 - **Built:** the heap allocator (static arena + first-fit free list), the string
   heap type, and naïve RC primitives (`p2w_retain`/`p2w_release`) in `runtime/`

@@ -396,38 +396,57 @@ pub unsafe extern "C" fn p2w_str(ptr: *const u8, len: i32) -> Value {
 // p2w_len / p2w_index / p2w_setindex dispatch over str/list/dict — defined in
 // the container section below.
 
-/// Retain: increment a heap value's refcount (no-op for inline values).
-#[unsafe(no_mangle)]
-pub extern "C" fn p2w_retain(v: Value) {
-    if is_heap(v) {
-        let rc = rd(v as usize + 4);
-        wr(v as usize + 4, rc + 1);
-    }
+// Refcount inc/dec — the **atomicity swap point**. Single-threaded today
+// (non-atomic). For micro-ROS / an RTOS where a value can be shared across
+// tasks, these must become atomic (e.g. CAS) and the arena must be locked; the
+// rest of the RC machinery is unaffected. The intended invariant is instead to
+// keep the interpreter single-threaded and *marshal* values (copy) at the ROS
+// boundary — see MEMORY_MANAGEMENT.md.
+fn rc_inc(o: usize) {
+    wr(o + 4, rd(o + 4) + 1);
+}
+fn rc_dec(o: usize) -> u32 {
+    let n = rd(o + 4) - 1;
+    wr(o + 4, n);
+    n
 }
 
-/// Release: decrement; free at zero (no-op for inline values). For container
-/// types this will release children first — strings have none.
-#[unsafe(no_mangle)]
-pub extern "C" fn p2w_release(v: Value) {
-    if !is_heap(v) {
-        return;
-    }
-    let o = v as usize;
-    let rc = rd(o + 4);
-    if rc > 1 {
-        wr(o + 4, rc - 1);
-        return;
-    }
-    // rc -> 0: free. Containers free their backing buffer too. (Recursively
-    // releasing children lands with the emitter's RC-wiring phase — values
-    // aren't retained on insert yet, so they aren't released here yet.)
-    if matches!(obj_tag(v), T_LIST | T_DICT) {
+/// Free one object — the single **free seam**. To bound worst-case latency
+/// under an RTOS (a `release` of a large graph cascades into many frees), this
+/// can later be made *deferred/incremental*: enqueue the object/children on a
+/// pending-drop worklist and process a bounded amount per tick instead of
+/// freeing recursively here. When child retain/release lands (the emitter's RC
+/// wiring), release children here before `dealloc`.
+fn free_object(o: usize) {
+    if matches!(rd(o), T_LIST | T_DICT) {
         let data = coll_data(o);
         if data != 0 {
             dealloc(data);
         }
     }
     dealloc(o);
+}
+
+/// Retain: increment a heap value's refcount (no-op for inline values).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_retain(v: Value) {
+    if is_heap(v) {
+        rc_inc(v as usize);
+    }
+}
+
+/// Release: decrement; free at zero (no-op for inline values).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_release(v: Value) {
+    if !is_heap(v) {
+        return;
+    }
+    let o = v as usize;
+    if rd(o + 4) > 1 {
+        rc_dec(o);
+    } else {
+        free_object(o);
+    }
 }
 
 // --- lists, dicts, iterators -----------------------------------------------
