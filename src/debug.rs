@@ -1467,6 +1467,9 @@ pub struct Vm {
     status: Status,
     watchpoints: Vec<Watchpoint>,
     watch_hit: Option<(String, String, String)>,
+    /// The value most recently returned to a caller during the last step
+    /// (cleared at the start of each step) — a teaching cue for "what came back".
+    last_return: Option<Value>,
 }
 
 impl Vm {
@@ -1487,6 +1490,7 @@ impl Vm {
             status: Status::Finished,
             watchpoints: Vec::new(),
             watch_hit: None,
+            last_return: None,
         };
         vm.settle();
         Ok(vm)
@@ -1567,9 +1571,16 @@ impl Vm {
             return;
         }
         self.watch_hit = None;
+        self.last_return = None;
         self.exec_current_statement();
         self.settle();
         self.check_watchpoints();
+    }
+
+    /// The value most recently returned to a caller during the last step, as its
+    /// repr (e.g. after Step out / stepping past a `return`).
+    pub fn last_return(&self) -> Option<String> {
+        self.last_return.as_ref().map(Value::py_repr)
     }
 
     /// Step *over*: execute the current statement fully — running any functions
@@ -2173,7 +2184,8 @@ impl Vm {
     fn return_value(&mut self, v: Value) {
         self.frames.pop();
         if let Some(caller) = self.frames.last_mut() {
-            caller.operands.push(v);
+            caller.operands.push(v.clone());
+            self.last_return = Some(v); // a real return to a caller
         }
         // else: module frame ended -> settle() will report Finished.
     }
@@ -2714,6 +2726,7 @@ mod tests {
         vm.step_out(); // finish f, back in the caller -> line 5 (print)
         assert_eq!(vm.call_stack().len(), 1, "step-out should return to <module>");
         assert_eq!(vm.current_line(), Some(5));
+        assert_eq!(vm.last_return().as_deref(), Some("6"), "f returned 6");
         while vm.is_paused() {
             vm.step();
         }
