@@ -134,8 +134,11 @@ Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
    teaching subset (control flow, functions+recursion+defaults, lists/dicts/
    index/methods/for-each, watches/watchpoints/breakpoints). The atomic
    `Stepper` is retained as the semantics **reference oracle** + regression
-   suite, not the IDE engine. Remaining niceties: step-over/step-out controls
-   (Step is step-into today), and globals-write from functions (`global`).
+   suite, not the IDE engine. The IDE has the full stepping model — **Step into /
+   Over / Out** (`step`/`step_over`/`step_out`) — plus Continue/Stop, breakpoints,
+   watches, watchpoints, the variables list, the call-stack panel, and the
+   line+block highlight. Remaining niceties: writing globals from a function
+   (`global`), and calling user functions inside a watch expression.
 2. Native LLVM backend (separate, large — see the Pico target notes).
 3. **`UsbStubAdapter`** — on-device step hooks + USB-CDC control channel + the
    variable-layout map. No probe, consistent UX.
