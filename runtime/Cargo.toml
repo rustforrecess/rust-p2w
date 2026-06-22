@@ -1,0 +1,10 @@
+[package]
+name = "p2w-rt"
+version = "0.1.0"
+edition = "2024"
+description = "Bare-metal runtime for the rust-p2w native (Pico) backend: the p2w_* ABI over tagged-i32 Python values."
+
+[lib]
+# `lib` for now (host unit tests); a `staticlib` build for the device links
+# against the emitted LLVM IR in the toolchain phase.
+crate-type = ["lib"]
