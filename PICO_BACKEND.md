@@ -51,6 +51,30 @@ Bare metal has **no GC**. This is the hard part and the main multi-phase work:
 - **Strings/lists/dicts** ride on whatever allocator we pick; start with a fixed
   arena, grow later.
 
+## Value model — DECIDED (phase 3)
+Every Python value is a uniform **tagged `i64`**, and **the emitter is
+rep-agnostic**: it never assumes a bit layout — it only *calls* a small **runtime
+ABI** of `p2w_*` functions that take/return `i64`. The device runtime (written
+later in Rust/C for the target) owns the actual representation (e.g. low-bit tags:
+small int inline, or a tagged pointer to a heap string/list/dict) and the
+**allocator** (start with a bump arena reset per run; ref-counting later — full GC
+is overkill for short kid programs). This is the same "box values + call runtime
+ops" split the WASM backend uses (`ref.i31` + `py_add`), and it's why we can add
+strings/lists/dicts without touching the emitter's control-flow.
+
+Trade-off: boxing every value is slower than Phase 2's raw `i32`. That raw path
+isn't lost — it returns later as an **optimization via the type annotations**
+(monomorphize typed functions/locals to machine ints), with the boxed model as
+the always-correct fallback. Correct first, fast later.
+
+**Runtime ABI (the emitted IR `declare`s these):**
+`p2w_int(i32)->i64`, `p2w_bool(i1)->i64`, `p2w_none()->i64`,
+`p2w_str(ptr,i32)->i64`; `p2w_add/sub/mul/div/floordiv/mod/pow(i64,i64)->i64`,
+`p2w_neg(i64)->i64`; `p2w_lt/le/gt/ge/eq/ne(i64,i64)->i64` (return a bool value);
+`p2w_truthy(i64)->i1` (for conditions); `p2w_print(i64)`. Lists/dicts add
+`p2w_list_new/append/get/set`, `p2w_dict_new/get/set`, `p2w_index`, `p2w_len`,
+`p2w_iter*` next.
+
 ## Runtime & I/O (the host-import seam, on metal)
 - `print` → a runtime `@p2w_print_int` / `@p2w_write_char` that pushes bytes over
   **USB-CDC** (the Pico's own cable) — the bare-metal mirror of the browser's
@@ -82,12 +106,19 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    a real board). Gated like `e2e`. *(Deferred — needs the LLVM/embedded
    toolchain installed; the emitter phases below are pure-Rust + offline-testable,
    so they went first.)*
-2. **Control flow + functions** — ✅ done. The emitter is now block-structured:
-   `if`/`elif`/`else`, `while`, counted `for` (literal step), `break`/`continue`,
-   integer comparisons + `not`, and **user functions** (`def`/`return`/calls,
-   incl. recursion), all `i32`. Variables are entry-block `alloca`s (no phi).
-   Still integer-only; `and`/`or`, for-each, and non-int values are clean errors.
-3. **Value model + runtime** (the crux above): allocator, strings, lists, dicts.
+2. **Control flow + functions** — ✅ done (block-structured: if/elif/else, while,
+   counted for, break/continue, comparisons, `not`, user functions + recursion).
+   (Originally `i32`; now superseded by the boxed model in phase 3.)
+3. **Value model + runtime** — ✅ **decided + emitter converted.** Every value is
+   a tagged `i64`; the emitter is rep-agnostic and routes all value ops through
+   the `p2w_*` runtime ABI (see the Value model section). Ints, bools, **strings**
+   (global constants + `p2w_str`), arithmetic (`+ - * / // % **`), comparisons,
+   `not`, conditions (`p2w_truthy`), control flow, and functions all work over
+   boxed values; vars are entry-block `alloca i64`. **Still to do in phase 3:**
+   the runtime crate itself (the `p2w_*` impls + bump allocator), and
+   **lists/dicts/indexing/methods/for-each + `and`/`or`** (more ABI:
+   `p2w_list_*`, `p2w_dict_*`, `p2w_index`, `p2w_len`, iterators). The emitted IR
+   isn't runnable until the runtime + toolchain (phase 1) land.
 4. **I/O + peripherals:** USB-CDC `print`, the temp sensor, GPIO.
 5. **Debug transports:** USB stub, then SWD/probe-rs + DWARF.
 6. **RISC-V** target variant.
