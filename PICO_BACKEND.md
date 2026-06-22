@@ -75,14 +75,18 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
   gold path. DWARF is a *reason* we emit via LLVM rather than MicroPython.
 
 ## Phases
-0. **AST → textual LLVM IR for the integer subset** — ✅ *this commit*
-   (`src/llvm.rs`, `compile_to_llvm_ir`). Text only; unit-tested by string
-   assertions. No device binary yet.
-1. **Toolchain spike (gated test):** run `llc`+`lld` on the emitted `.ll` for the
-   integer subset, link a tiny C/asm runtime + startup, produce an ELF, then a
-   `.uf2`; smoke it (QEMU or a real board). Gated like `e2e`.
-2. **Control flow + functions** in the LLVM emitter (if/while/for, calls) — the
-   integer-typed slice of the language.
+0. **AST → textual LLVM IR for the integer subset** — ✅ done (`src/llvm.rs`,
+   `compile_to_llvm_ir`). Text only; unit-tested by string assertions.
+1. **Toolchain spike (gated test):** run `llc`+`lld` on the emitted `.ll`, link a
+   tiny C/asm runtime + startup, produce an ELF, then a `.uf2`; smoke it (QEMU or
+   a real board). Gated like `e2e`. *(Deferred — needs the LLVM/embedded
+   toolchain installed; the emitter phases below are pure-Rust + offline-testable,
+   so they went first.)*
+2. **Control flow + functions** — ✅ done. The emitter is now block-structured:
+   `if`/`elif`/`else`, `while`, counted `for` (literal step), `break`/`continue`,
+   integer comparisons + `not`, and **user functions** (`def`/`return`/calls,
+   incl. recursion), all `i32`. Variables are entry-block `alloca`s (no phi).
+   Still integer-only; `and`/`or`, for-each, and non-int values are clean errors.
 3. **Value model + runtime** (the crux above): allocator, strings, lists, dicts.
 4. **I/O + peripherals:** USB-CDC `print`, the temp sensor, GPIO.
 5. **Debug transports:** USB stub, then SWD/probe-rs + DWARF.
