@@ -13,13 +13,15 @@
 //! - `0b01` → **small int**, payload `v >> 2` (signed, 30-bit; bignum promotion
 //!   on overflow is a TODO).
 //! - `0b00` → **heap pointer** (objects are ≥4-byte aligned, so the low bits are
-//!   free); the object header carries a type tag (str/list/dict). *(Heap types
-//!   are the next slice; this one is ints/bools/None.)*
+//!   free); the object header carries a type tag (str/list/dict/float). An
+//!   `f64` can't be inline (too wide for the tagged `i32`), so floats are boxed.
 //! - `0b10` → **immediate singleton**: `None`, `False`, `True`.
 //!
-//! Scope of this slice: int/bool/None values, arithmetic (`+ - * // %`, neg),
-//! comparisons, truthiness, `not`, and `print`. Strings/lists/dicts + the bump
-//! allocator + float (which `/` and `**` need) come next.
+//! Implemented: int/bool/None/float values, arithmetic (`+ - * / // % **`, neg)
+//! with int→float promotion, comparisons, truthiness, `not`, `print`, and the
+//! heap types (strings/lists/dicts/iterators) on a bump+free-list allocator with
+//! ref-counting. Float `**`/formatting use the no_std `libm` crate (also device-
+//! ready). TODO: bignum promotion, scientific-notation float repr.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -97,6 +99,10 @@ static mut FREELIST: usize = 0; // head block offset, 0 = empty
 
 /// Object type tags (in the header's first word).
 const T_STR: u32 = 1;
+/// A boxed `f64`: layout `[tag][rc][f64 (8 bytes)]`. Floats can't be inline —
+/// an `f64` doesn't fit a tagged `i32` — so they're heap values, matching the
+/// browser backend's `$FLOAT` struct (the two backends stay at parity).
+const T_FLOAT: u32 = 5;
 
 fn heap_base() -> *mut u8 {
     &raw mut HEAP as *mut u8
@@ -199,11 +205,51 @@ fn str_alloc(bytes: &[u8]) -> Value {
     p as Value
 }
 
+// --- floats (heap-boxed f64) -----------------------------------------------
+
+fn is_float(v: Value) -> bool {
+    is_heap(v) && obj_tag(v) == T_FLOAT
+}
+
+fn as_f64(v: Value) -> f64 {
+    unsafe { core::ptr::read_unaligned(heap_base().add(v as usize + 8) as *const f64) }
+}
+
+/// Box an `f64` on the heap (refcount starts at 1).
+fn float_alloc(x: f64) -> Value {
+    let p = alloc(8 + 8); // [tag][rc][f64]
+    if p == 0 {
+        trap("out of memory");
+    }
+    wr(p, T_FLOAT);
+    wr(p + 4, 1);
+    unsafe { core::ptr::write_unaligned(heap_base().add(p + 8) as *mut f64, x) };
+    p as Value
+}
+
+/// Numeric-as-float view: int/bool widen to `f64`, a float yields its value,
+/// anything else is non-numeric. (Our ints are ≤30-bit, so `as f64` is exact.)
+fn fnum(v: Value) -> Option<f64> {
+    if let Some(n) = num(v) {
+        Some(n as f64)
+    } else if is_float(v) {
+        Some(as_f64(v))
+    } else {
+        None
+    }
+}
+
 // --- the p2w_* ABI ---------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_int(n: i32) -> Value {
     make_int(n as i64)
+}
+
+/// Box a float literal (the emitter passes the IR `double` constant).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_float(x: f64) -> Value {
+    float_alloc(x)
 }
 
 #[unsafe(no_mangle)]
@@ -222,6 +268,25 @@ fn numeric<F: Fn(i64, i64) -> i64>(a: Value, b: Value, f: F) -> Value {
     match (num(a), num(b)) {
         (Some(x), Some(y)) => make_int(f(x, y)),
         _ => trap("unsupported operand type for a numeric op (heap types are TODO)"),
+    }
+}
+
+/// Numeric op with int and float variants: if either operand is a float, both
+/// promote to `f64` and the result is a boxed float (Python's promotion rule);
+/// otherwise it's integer arithmetic.
+fn arith<FI: Fn(i64, i64) -> i64, FF: Fn(f64, f64) -> f64>(
+    a: Value,
+    b: Value,
+    fi: FI,
+    ff: FF,
+) -> Value {
+    if is_float(a) || is_float(b) {
+        match (fnum(a), fnum(b)) {
+            (Some(x), Some(y)) => float_alloc(ff(x, y)),
+            _ => trap("unsupported operand type for a numeric op"),
+        }
+    } else {
+        numeric(a, b, fi)
     }
 }
 
@@ -258,21 +323,67 @@ pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
         }
         return r;
     }
-    numeric(a, b, |x, y| x + y)
+    arith(a, b, |x, y| x + y, |x, y| x + y)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_sub(a: Value, b: Value) -> Value {
-    numeric(a, b, |x, y| x - y)
+    arith(a, b, |x, y| x - y, |x, y| x - y)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_mul(a: Value, b: Value) -> Value {
-    numeric(a, b, |x, y| x * y)
+    arith(a, b, |x, y| x * y, |x, y| x * y)
+}
+
+/// True division (`/`) is *always* float in Python: `4 / 2 == 2.0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_div(a: Value, b: Value) -> Value {
+    match (fnum(a), fnum(b)) {
+        (Some(x), Some(y)) => {
+            if y == 0.0 {
+                trap("division by zero");
+            }
+            float_alloc(x / y)
+        }
+        _ => trap("unsupported operand type for /"),
+    }
+}
+
+/// Power (`**`): `int ** non-negative int` stays an exact int; everything else
+/// (float operand, or negative exponent like `2 ** -1 == 0.5`) is float.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_pow(a: Value, b: Value) -> Value {
+    if !is_float(a)
+        && !is_float(b)
+        && let (Some(base), Some(exp)) = (num(a), num(b))
+        && exp >= 0
+    {
+        let mut acc: i64 = 1;
+        for _ in 0..exp {
+            acc *= base;
+        }
+        return make_int(acc);
+    }
+    match (fnum(a), fnum(b)) {
+        (Some(x), Some(y)) => float_alloc(libm::pow(x, y)),
+        _ => trap("unsupported operand type for **"),
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_floordiv(a: Value, b: Value) -> Value {
+    if is_float(a) || is_float(b) {
+        return match (fnum(a), fnum(b)) {
+            (Some(x), Some(y)) => {
+                if y == 0.0 {
+                    trap("float floor division by zero");
+                }
+                float_alloc(libm::floor(x / y))
+            }
+            _ => trap("unsupported operand type for //"),
+        };
+    }
     match (num(a), num(b)) {
         (Some(_), Some(0)) => trap("integer division or modulo by zero"),
         (Some(x), Some(y)) => make_int(x.div_euclid(y)),
@@ -282,6 +393,18 @@ pub extern "C" fn p2w_floordiv(a: Value, b: Value) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_mod(a: Value, b: Value) -> Value {
+    if is_float(a) || is_float(b) {
+        return match (fnum(a), fnum(b)) {
+            (Some(x), Some(y)) => {
+                if y == 0.0 {
+                    trap("float modulo by zero");
+                }
+                // Python's `%` takes the divisor's sign: a - floor(a/b)*b.
+                float_alloc(x - libm::floor(x / y) * y)
+            }
+            _ => trap("unsupported operand type for %"),
+        };
+    }
     match (num(a), num(b)) {
         (Some(_), Some(0)) => trap("integer division or modulo by zero"),
         (Some(x), Some(y)) => make_int(x.rem_euclid(y)),
@@ -291,34 +414,48 @@ pub extern "C" fn p2w_mod(a: Value, b: Value) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_neg(a: Value) -> Value {
+    if is_float(a) {
+        return float_alloc(-as_f64(a));
+    }
     match num(a) {
         Some(x) => make_int(-x),
         None => trap("bad operand type for unary -"),
     }
 }
 
-fn compare<F: Fn(i64, i64) -> bool>(a: Value, b: Value, f: F) -> Value {
+fn compare<FI: Fn(i64, i64) -> bool, FF: Fn(f64, f64) -> bool>(
+    a: Value,
+    b: Value,
+    fi: FI,
+    ff: FF,
+) -> Value {
+    if is_float(a) || is_float(b) {
+        return match (fnum(a), fnum(b)) {
+            (Some(x), Some(y)) => make_bool(ff(x, y)),
+            _ => trap("unsupported operand type for a comparison"),
+        };
+    }
     match (num(a), num(b)) {
-        (Some(x), Some(y)) => make_bool(f(x, y)),
+        (Some(x), Some(y)) => make_bool(fi(x, y)),
         _ => trap("unsupported operand type for a comparison"),
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_lt(a: Value, b: Value) -> Value {
-    compare(a, b, |x, y| x < y)
+    compare(a, b, |x, y| x < y, |x, y| x < y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_le(a: Value, b: Value) -> Value {
-    compare(a, b, |x, y| x <= y)
+    compare(a, b, |x, y| x <= y, |x, y| x <= y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_gt(a: Value, b: Value) -> Value {
-    compare(a, b, |x, y| x > y)
+    compare(a, b, |x, y| x > y, |x, y| x > y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_ge(a: Value, b: Value) -> Value {
-    compare(a, b, |x, y| x >= y)
+    compare(a, b, |x, y| x >= y, |x, y| x >= y)
 }
 
 #[unsafe(no_mangle)]
@@ -331,6 +468,11 @@ pub extern "C" fn p2w_ne(a: Value, b: Value) -> Value {
 }
 
 fn value_eq(a: Value, b: Value) -> bool {
+    if (is_float(a) || is_float(b))
+        && let (Some(x), Some(y)) = (fnum(a), fnum(b))
+    {
+        return x == y; // numeric cross-type: 1 == 1.0
+    }
     if let (Some(x), Some(y)) = (num(a), num(b)) {
         return x == y; // int/bool compare numerically (True == 1)
     }
@@ -369,6 +511,9 @@ fn value_eq(a: Value, b: Value) -> bool {
 pub extern "C" fn p2w_truthy(v: Value) -> bool {
     if let Some(n) = num(v) {
         return n != 0;
+    }
+    if is_float(v) {
+        return as_f64(v) != 0.0; // 0.0 and -0.0 are falsy
     }
     if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT) {
         return coll_len(v as usize) != 0; // empty string/list/dict is falsy
@@ -798,6 +943,9 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
     if is_int(v) {
         write_int(as_int(v), out);
         return;
+    } else if is_float(v) {
+        write_float(as_f64(v), out);
+        return;
     } else if v == V_TRUE {
         return write_bytes(b"True", out);
     } else if v == V_FALSE {
@@ -880,6 +1028,66 @@ fn write_int(n: i64, out: &mut impl FnMut(u8)) {
         }
     }
     write_bytes(&buf[i..], out);
+}
+
+/// Decimal of an unsigned integer (used for a float's integer part).
+fn write_u64(mut n: u64, out: &mut impl FnMut(u8)) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    write_bytes(&buf[i..], out);
+}
+
+/// Format an `f64` Python-style (always a decimal point: `2.0`, `3.5`, `0.1`).
+///
+/// This is a fixed-point formatter good for the teaching range: it rounds to 15
+/// fractional digits and trims trailing zeros. It is **not** CPython's
+/// shortest-round-trip `repr` and does **not** use scientific notation, so very
+/// large/small magnitudes print in long fixed-point — a documented v1 limit.
+fn write_float(x: f64, out: &mut impl FnMut(u8)) {
+    if x.is_nan() {
+        return write_bytes(b"nan", out);
+    }
+    let neg = x.is_sign_negative(); // also catches -0.0, like Python
+    let mut ax = if neg { -x } else { x };
+    if neg {
+        out(b'-');
+    }
+    if ax.is_infinite() {
+        return write_bytes(b"inf", out);
+    }
+    const SCALE: u64 = 1_000_000_000_000_000; // 10^15
+    let mut ip = libm::trunc(ax);
+    ax -= ip;
+    let mut frac = libm::round(ax * SCALE as f64) as u64;
+    if frac >= SCALE {
+        // rounding carried into the integer part (e.g. 0.9999… -> 1.0)
+        ip += 1.0;
+        frac -= SCALE;
+    }
+    write_u64(ip as u64, out);
+    out(b'.');
+    // 15-digit zero-padded fraction, then trim trailing zeros (keep one).
+    let mut buf = [b'0'; 15];
+    let mut f = frac;
+    let mut i = buf.len();
+    while i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (f % 10) as u8;
+        f /= 10;
+    }
+    let mut end = buf.len();
+    while end > 1 && buf[end - 1] == b'0' {
+        end -= 1;
+    }
+    write_bytes(&buf[..end], out);
 }
 
 unsafe extern "C" {
@@ -987,6 +1195,73 @@ mod tests {
         assert_eq!(p2w_eq(p2w_none(), p2w_none()), V_TRUE);
         assert_eq!(p2w_eq(p2w_none(), p2w_int(0)), V_FALSE);
         assert_eq!(p2w_not(p2w_int(0)), V_TRUE);
+    }
+
+    #[test]
+    fn floats_format_like_python() {
+        let _g = heap_guard();
+        assert_eq!(shown(p2w_float(2.0)), "2.0"); // always a decimal point
+        assert_eq!(shown(p2w_float(3.5)), "3.5");
+        assert_eq!(shown(p2w_float(0.5)), "0.5");
+        assert_eq!(shown(p2w_float(0.1)), "0.1"); // trims float noise
+        assert_eq!(shown(p2w_float(-2.75)), "-2.75");
+        assert_eq!(shown(p2w_float(123.0)), "123.0");
+        assert_eq!(shown(p2w_float(0.9999999999999999)), "1.0"); // rounds & carries
+    }
+
+    #[test]
+    fn float_arithmetic_and_promotion() {
+        let _g = heap_guard();
+        // any float operand promotes the result to float
+        assert_eq!(shown(p2w_add(p2w_float(1.5), p2w_int(2))), "3.5");
+        assert_eq!(shown(p2w_mul(p2w_int(2), p2w_float(2.5))), "5.0");
+        assert_eq!(shown(p2w_sub(p2w_float(5.0), p2w_float(1.25))), "3.75");
+        assert_eq!(shown(p2w_neg(p2w_float(4.0))), "-4.0");
+        // int-only arithmetic stays int
+        assert_eq!(shown(p2w_add(p2w_int(2), p2w_int(3))), "5");
+    }
+
+    #[test]
+    fn true_division_is_always_float() {
+        let _g = heap_guard();
+        assert_eq!(shown(p2w_div(p2w_int(7), p2w_int(2))), "3.5");
+        assert_eq!(shown(p2w_div(p2w_int(4), p2w_int(2))), "2.0"); // exact -> still float
+        assert_eq!(shown(p2w_div(p2w_float(1.0), p2w_int(4))), "0.25");
+    }
+
+    #[test]
+    fn power_keeps_int_when_it_can() {
+        let _g = heap_guard();
+        assert_eq!(shown(p2w_pow(p2w_int(2), p2w_int(10))), "1024"); // int ** +int = int
+        assert_eq!(shown(p2w_pow(p2w_int(2), p2w_int(0))), "1");
+        assert_eq!(shown(p2w_pow(p2w_int(2), p2w_int(-1))), "0.5"); // negative exp -> float
+        assert_eq!(shown(p2w_pow(p2w_float(2.0), p2w_int(3))), "8.0"); // float base -> float
+    }
+
+    #[test]
+    fn float_floordiv_mod_compare_eq() {
+        let _g = heap_guard();
+        assert_eq!(shown(p2w_floordiv(p2w_float(7.0), p2w_int(2))), "3.0");
+        assert_eq!(shown(p2w_mod(p2w_float(7.5), p2w_int(2))), "1.5");
+        assert_eq!(p2w_lt(p2w_float(1.5), p2w_int(2)), V_TRUE);
+        assert_eq!(p2w_ge(p2w_float(2.0), p2w_int(2)), V_TRUE);
+        assert_eq!(p2w_eq(p2w_int(1), p2w_float(1.0)), V_TRUE); // cross-type ==
+        assert!(p2w_truthy(p2w_float(0.1)));
+        assert!(!p2w_truthy(p2w_float(0.0)));
+    }
+
+    #[test]
+    fn floats_print_inside_containers_and_release() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        p2w_list_append(xs, p2w_float(1.5));
+        p2w_list_append(xs, p2w_int(2));
+        assert_eq!(shown(xs), "[1.5, 2]");
+        // releasing the list frees the boxed float child too (no leak).
+        let before = unsafe { CURSOR };
+        p2w_release(xs);
+        heap_reset();
+        let _ = before; // arena reset reclaims; the release path must not trap
     }
 
     #[test]

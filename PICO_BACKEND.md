@@ -131,8 +131,10 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    the **full teaching subset** (sans tuples/comprehensions/classes). The
    **runtime crate** (`runtime/`, `p2w-rt`) is `no_std` + host-tested over the
    concrete tagged-`i32` rep (2-bit tag: small int / heap ptr / immediate
-   singleton). Done: int/bool/None + arithmetic (`+ - * // %`, neg) + comparisons
-   + equality + truthiness + `not` + `print`; a **static-arena allocator**
+   singleton). Done: int/bool/None/**float** + arithmetic (`+ - * / // % **`, neg)
+   with **int→float promotion** (Python: `/` is always float; `**` stays int for
+   `int ** non-negative-int`) + comparisons + equality (cross-type `1 == 1.0`)
+   + truthiness + `not` + `print`; a **static-arena allocator**
    (first-fit free list) + **strings, lists, dicts** (literals, subscript get/set,
    `len`, concat, structural eq, print), the **iteration protocol**, **methods**
    (append/pop), and ref-count primitives (`p2w_retain`/`release`, buffers freed).

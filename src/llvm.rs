@@ -13,11 +13,12 @@
 //! it's what lets strings (and later lists/dicts) drop in without touching the
 //! control-flow machinery.
 //!
-//! Supported now: ints, bools, strings, `print`, arithmetic (`+ - * / // % **`),
-//! comparisons, `not`, `if`/`elif`/`else`, `while`, counted `for` (literal step),
-//! `break`/`continue`, and user functions (`def`/`return`/calls, incl. recursion).
-//! Not yet (clean errors): `and`/`or`, lists/dicts/indexing/methods, for-each,
-//! default args, floats-as-literals beyond what the runtime handles.
+//! Supported now: ints, floats, bools, strings, `print`, arithmetic
+//! (`+ - * / // % **`), comparisons, `not`, `and`/`or`, `if`/`elif`/`else`,
+//! `while`, counted `for` (literal step), `break`/`continue`, for-each,
+//! lists/dicts/indexing/methods, and user functions (`def`/`return`/calls,
+//! incl. recursion). Not yet (clean errors): tuples, comprehensions, classes,
+//! default args.
 
 use std::collections::HashSet;
 
@@ -28,6 +29,7 @@ use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 const RUNTIME_DECLS: &str = "\
 ; runtime ABI — values are opaque tagged i32; the device runtime owns the rep.
 declare i32 @p2w_int(i32)
+declare i32 @p2w_float(double)
 declare i32 @p2w_bool(i1)
 declare i32 @p2w_none()
 declare i32 @p2w_str(ptr, i32)
@@ -155,6 +157,13 @@ fn emit_main(top: &[&Stmt], funcs: &HashSet<String>) -> Result<(String, String),
         f.allocas, f.body
     );
     Ok((def, f.globals))
+}
+
+/// Format an `f64` as an LLVM IR `double` constant. LLVM only accepts decimal
+/// literals that are *exactly* representable; anything else must use the hex
+/// form (`0x` + the 16-hex-digit IEEE-754 bit pattern), which is always exact.
+fn fmt_double(f: f64) -> String {
+    format!("0x{:016X}", f.to_bits())
 }
 
 // --- Ownership contract for the (upcoming) RC insertion pass ----------------
@@ -531,6 +540,10 @@ impl<'a> FuncEmitter<'a> {
         };
         match &e.kind {
             ExprKind::Int(n) => Ok(self.call_value(&format!("call i32 @p2w_int(i32 {})", *n as i32))),
+            ExprKind::Float(f) => {
+                // LLVM wants a portable double constant; hex float is exact.
+                Ok(self.call_value(&format!("call i32 @p2w_float(double {})", fmt_double(*f))))
+            }
             ExprKind::Bool(b) => {
                 Ok(self.call_value(&format!("call i32 @p2w_bool(i1 {})", if *b { 1 } else { 0 })))
             }
@@ -768,6 +781,17 @@ mod tests {
         assert!(ir("print(2 ** 10)\n").contains("call i32 @p2w_pow(i32"));
         assert!(ir("x = 1 < 2\n").contains("call i32 @p2w_lt(i32"));
         assert!(ir("y = not 0\n").contains("call i32 @p2w_not(i32"));
+    }
+
+    #[test]
+    fn float_literals_box_through_p2w_float() {
+        let out = ir("x = 3.5\nprint(x)\n");
+        assert!(out.contains("declare i32 @p2w_float(double)"), "{out}");
+        // 3.5 is exactly representable; its bit pattern is 0x400C000000000000.
+        assert!(
+            out.contains("call i32 @p2w_float(double 0x400C000000000000)"),
+            "{out}"
+        );
     }
 
     #[test]

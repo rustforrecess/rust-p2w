@@ -8,3 +8,8 @@ description = "Bare-metal runtime for the rust-p2w native (Pico) backend: the p2
 # `lib` for now (host unit tests); a `staticlib` build for the device links
 # against the emitted LLVM IR in the toolchain phase.
 crate-type = ["lib"]
+
+[dependencies]
+# Pure-Rust no_std math (trunc/round/pow) for float formatting and `**`.
+# Works on the host *and* the bare-metal device (no C libm linkage needed).
+libm = "0.2"
