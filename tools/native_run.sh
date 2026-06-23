@@ -49,8 +49,13 @@ run_case() {
     echo "FAIL [$name]: clang compile"; cat "$OUT/$name.err"; return 1; }
   clang -Wno-override-module "$OUT/$name.o" "$OUT/putc.c" "$LIB" -o "$OUT/$name.exe" \
     2>"$OUT/$name.err" || { echo "FAIL [$name]: link"; cat "$OUT/$name.err"; return 1; }
-  # strip CR: the Windows CRT writes \n as \r\n in text mode.
-  local got; got=$("$OUT/$name.exe" 2>"$OUT/$name.live" | tr -d '\r')
+  # strip CR: the Windows CRT writes \n as \r\n in text mode. A runtime trap
+  # spin-loops (device behavior), so cap each run — a hang is a bug, not a pass.
+  local got; got=$(timeout 10 "$OUT/$name.exe" 2>"$OUT/$name.live" | tr -d '\r')
+  if [ $? -eq 124 ]; then
+    echo "FAIL [$name]: timed out (likely a runtime trap / use-after-free)"
+    return 1
+  fi
   local live; live=$(sed -n 's/.*P2W_LIVE=\(-\?[0-9]*\).*/\1/p' "$OUT/$name.live")
   : "${live:=?}"
   if [ "$got" != "$(printf '%b' "$want")" ]; then
@@ -91,6 +96,11 @@ run_case shortcirc 'print("" or "x")\nprint("a" and "b")\n'                     
 run_case concatloop 's = ""\nfor i in range(3):\n    s = s + "x"\nprint(s)\n'    'xxx'         || fails=$((fails+1))
 run_case poptest   'xs = [1, 2, 3]\nv = xs.pop()\nprint(v)\nprint(len(xs))\n'    '3\n2'        || fails=$((fails+1))
 run_case strlist   'names = ["amy", "bob"]\nnames.append("cy")\nfor n in names:\n    print(n)\n' 'amy\nbob\ncy' || fails=$((fails+1))
+# --- borrowed params: a named heap value read by a helper must survive the call
+run_case borrowarg 'def total(xs):\n    s = 0\n    for x in xs:\n        s = s + x\n    return s\nys = [1, 2, 3, 4]\nprint(total(ys))\nprint(len(ys))\n' '10\n4' || fails=$((fails+1))
+run_case borrowtwice 'def total(xs):\n    s = 0\n    for x in xs:\n        s = s + x\n    return s\nys = [2, 3]\nprint(total(ys))\nprint(total(ys))\n' '5\n5' || fails=$((fails+1))
+run_case escarg    'def echo(xs):\n    return xs\nzs = echo([5, 6])\nprint(zs)\n' '[5, 6]' || fails=$((fails+1))
+run_case borrowstr 'def shout(s):\n    print(s)\nname = "hi"\nshout(name)\nprint(name)\n' 'hi\nhi' || fails=$((fails+1))
 
 echo "---"
 if [ "$fails" -eq 0 ]; then

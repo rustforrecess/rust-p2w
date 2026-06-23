@@ -20,7 +20,7 @@
 //! incl. recursion). Not yet (clean errors): tuples, comprehensions, classes,
 //! default args.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 
@@ -80,6 +80,19 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         }
     }
 
+    // Borrowed-parameter masks, computed up front so call sites (which may
+    // precede the definition) can emit the matching convention.
+    let mut borrow_masks: HashMap<String, Vec<bool>> = HashMap::new();
+    for s in stmts {
+        if let StmtKind::Def {
+            name, params, body, ..
+        } = &s.kind
+        {
+            let mask = params.iter().map(|p| !param_escapes(body, p)).collect();
+            borrow_masks.insert(name.clone(), mask);
+        }
+    }
+
     let mut globals = String::new();
     let mut defs = String::new();
 
@@ -98,7 +111,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
                     s.line
                 ));
             }
-            let (def, g) = emit_function(name, params, body, &funcs)?;
+            let (def, g) = emit_function(name, params, body, &funcs, &borrow_masks)?;
             defs.push_str(&def);
             defs.push('\n');
             globals.push_str(&g);
@@ -109,7 +122,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         .iter()
         .filter(|s| !matches!(s.kind, StmtKind::Def { .. }))
         .collect();
-    let (main_def, main_g) = emit_main(&top, &funcs)?;
+    let (main_def, main_g) = emit_main(&top, &funcs, &borrow_masks)?;
     globals.push_str(&main_g);
 
     Ok(format!(
@@ -122,11 +135,16 @@ fn emit_function(
     params: &[String],
     body: &[Stmt],
     funcs: &HashSet<String>,
+    borrow_masks: &HashMap<String, Vec<bool>>,
 ) -> Result<(String, String), String> {
-    let mut f = FuncEmitter::new(funcs, name);
+    let mut f = FuncEmitter::new(funcs, borrow_masks, name);
+    let mask = borrow_masks.get(name).cloned().unwrap_or_default();
     for (i, p) in params.iter().enumerate() {
         let ptr = f.var_slot(p);
         f.line(&format!("store i32 %a{i}, ptr {ptr}"));
+        if mask.get(i).copied().unwrap_or(false) {
+            f.borrowed_params.push(p.clone()); // caller owns it; don't release
+        }
     }
     f.block(body)?;
     if !f.terminated {
@@ -145,8 +163,12 @@ fn emit_function(
     Ok((def, f.globals))
 }
 
-fn emit_main(top: &[&Stmt], funcs: &HashSet<String>) -> Result<(String, String), String> {
-    let mut f = FuncEmitter::new(funcs, "main");
+fn emit_main(
+    top: &[&Stmt],
+    funcs: &HashSet<String>,
+    borrow_masks: &HashMap<String, Vec<bool>>,
+) -> Result<(String, String), String> {
+    let mut f = FuncEmitter::new(funcs, borrow_masks, "main");
     for s in top {
         f.stmt(s)?;
     }
@@ -205,6 +227,12 @@ fn fmt_double(f: f64) -> String {
 /// entry-block `alloca`s; control flow uses labelled basic blocks.
 struct FuncEmitter<'a> {
     funcs: &'a HashSet<String>,
+    /// Per-function borrowed-parameter masks (function name → one bool per param,
+    /// `true` = borrowed). Used to emit the matching convention at call sites.
+    borrow_masks: &'a HashMap<String, Vec<bool>>,
+    /// This function's own parameters that are borrowed (slots we must NOT
+    /// release at exit — the caller still owns them).
+    borrowed_params: Vec<String>,
     /// Prefix for this function's string-constant globals (unique per function).
     gprefix: String,
     /// Module-level string-constant definitions produced by this function.
@@ -225,9 +253,15 @@ struct FuncEmitter<'a> {
 }
 
 impl<'a> FuncEmitter<'a> {
-    fn new(funcs: &'a HashSet<String>, gprefix: &str) -> Self {
+    fn new(
+        funcs: &'a HashSet<String>,
+        borrow_masks: &'a HashMap<String, Vec<bool>>,
+        gprefix: &str,
+    ) -> Self {
         FuncEmitter {
             funcs,
+            borrow_masks,
+            borrowed_params: Vec::new(),
             gprefix: gprefix.to_string(),
             globals: String::new(),
             gcount: 0,
@@ -262,6 +296,10 @@ impl<'a> FuncEmitter<'a> {
         }
         let vars = self.vars.clone();
         for name in vars {
+            // Borrowed params are owned by the caller — don't release them.
+            if self.borrowed_params.contains(&name) {
+                continue;
+            }
             let t = self.temp();
             self.line(&format!("{t} = load i32, ptr %v_{name}"));
             self.release(&t);
@@ -673,11 +711,29 @@ impl<'a> FuncEmitter<'a> {
                 if !self.funcs.contains(name) {
                     return nope("calling this function (only your own functions, len, + print)");
                 }
+                // Match the callee's per-parameter convention: a borrowed param
+                // takes a borrowed reference (no transfer); an owned param takes
+                // an owned value (transferred — the callee releases it).
+                let mask = self.borrow_masks.get(name).cloned().unwrap_or_default();
                 let mut ops = Vec::with_capacity(args.len());
-                for a in args {
-                    ops.push(format!("i32 {}", self.expr(a)?));
+                let mut borrowed_temps = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    if mask.get(i).copied().unwrap_or(false) {
+                        let (v, owned) = self.expr_borrow(a)?;
+                        if owned {
+                            borrowed_temps.push(v.clone()); // a temp we still own
+                        }
+                        ops.push(format!("i32 {v}"));
+                    } else {
+                        ops.push(format!("i32 {}", self.expr(a)?)); // transferred
+                    }
                 }
-                Ok(self.call_value(&format!("call i32 @{name}({})", ops.join(", "))))
+                let r = self.call_value(&format!("call i32 @{name}({})", ops.join(", ")));
+                // Release borrowed args that were owned temps (a Name borrow isn't).
+                for v in borrowed_temps {
+                    self.release(&v);
+                }
+                Ok(r)
             }
             ExprKind::List(items) => {
                 let list = self.call_value("call i32 @p2w_list_new()");
@@ -842,6 +898,114 @@ impl<'a> FuncEmitter<'a> {
     }
 }
 
+// --- Borrowed-parameter escape analysis -------------------------------------
+//
+// A parameter is *borrowable* when the function only ever READS it — never
+// transfers it onward (return, assignment, call/method arg, container insert) or
+// reassigns its name. For a borrowable param the caller keeps ownership and the
+// callee neither retains nor releases it, so passing a named heap value to a
+// read-only helper costs zero refcount traffic. We compute the opposite —
+// "does `p` escape?" — and default to `true` (escapes ⇒ owned, today's safe
+// behavior) for any construct we don't explicitly recognize as read-only.
+
+/// Whether parameter `p` escapes anywhere in `body` (⇒ not borrowable).
+fn param_escapes(body: &[Stmt], p: &str) -> bool {
+    body.iter().any(|s| stmt_escapes(s, p))
+}
+
+fn block_escapes(body: &[Stmt], p: &str) -> bool {
+    body.iter().any(|s| stmt_escapes(s, p))
+}
+
+fn stmt_escapes(s: &Stmt, p: &str) -> bool {
+    match &s.kind {
+        // Reassigning the name (`p = …`, or a loop var shadowing it) means the
+        // slot no longer holds the borrowed value — treat as an escape.
+        StmtKind::Assign(name, value) => name == p || expr_escapes(value, true, p),
+        StmtKind::Return(Some(e)) => expr_escapes(e, true, p),
+        StmtKind::Return(None) => false,
+        StmtKind::Expr(e) => match &e.kind {
+            ExprKind::Call(n, args) if n == "print" => {
+                args.iter().any(|a| expr_escapes(a, false, p))
+            }
+            _ => expr_escapes(e, false, p),
+        },
+        StmtKind::SetIndex {
+            target,
+            index,
+            value,
+        } => {
+            expr_escapes(target, false, p)
+                || expr_escapes(index, false, p)
+                || expr_escapes(value, true, p) // the inserted value is transferred
+        }
+        StmtKind::If {
+            cond,
+            body,
+            elifs,
+            else_body,
+        } => {
+            expr_escapes(cond, false, p)
+                || block_escapes(body, p)
+                || elifs
+                    .iter()
+                    .any(|(c, b)| expr_escapes(c, false, p) || block_escapes(b, p))
+                || else_body.as_deref().is_some_and(|b| block_escapes(b, p))
+        }
+        StmtKind::While { cond, body } => expr_escapes(cond, false, p) || block_escapes(body, p),
+        StmtKind::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } => {
+            var == p
+                || expr_escapes(start, false, p)
+                || expr_escapes(end, false, p)
+                || expr_escapes(step, false, p)
+                || block_escapes(body, p)
+        }
+        StmtKind::ForEach {
+            var,
+            iterable,
+            body,
+        } => var == p || expr_escapes(iterable, false, p) || block_escapes(body, p),
+        StmtKind::Break | StmtKind::Continue => false,
+        _ => true, // unknown statement (e.g. a nested def) — assume it escapes
+    }
+}
+
+/// Whether `p` escapes within `e`. `owning` is true when `e`'s value is itself
+/// transferred (so a bare `p` here escapes); operands of read-only ops are not.
+fn expr_escapes(e: &Expr, owning: bool, p: &str) -> bool {
+    match &e.kind {
+        ExprKind::Name(n) => owning && n == p,
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
+        | ExprKind::NoneLit => false,
+        ExprKind::Unary(_, x) => expr_escapes(x, false, p),
+        // and/or yield one operand as the result, so they inherit the context.
+        ExprKind::Bin(BinOp::And | BinOp::Or, a, b) => {
+            expr_escapes(a, owning, p) || expr_escapes(b, owning, p)
+        }
+        ExprKind::Bin(_, a, b) => expr_escapes(a, false, p) || expr_escapes(b, false, p),
+        ExprKind::Index(o, i) => expr_escapes(o, false, p) || expr_escapes(i, false, p),
+        ExprKind::List(items) => items.iter().any(|it| expr_escapes(it, true, p)),
+        ExprKind::Dict(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_escapes(k, true, p) || expr_escapes(v, true, p)),
+        ExprKind::Call(n, args) if n == "len" => args.iter().any(|a| expr_escapes(a, false, p)),
+        ExprKind::Call(_, args) => args.iter().any(|a| expr_escapes(a, true, p)),
+        ExprKind::MethodCall(obj, _, args) => {
+            expr_escapes(obj, false, p) || args.iter().any(|a| expr_escapes(a, true, p))
+        }
+        _ => true, // unknown expression — assume it escapes
+    }
+}
+
 /// The integer value of a literal `step` (handling `-1` parsed as `Neg(1)`).
 fn step_literal(e: &Expr) -> Option<i64> {
     match &e.kind {
@@ -937,6 +1101,24 @@ mod tests {
         assert!(
             !out.contains("call void @p2w_retain"),
             "no retain for borrowed reads: {out}"
+        );
+    }
+
+    #[test]
+    fn borrowed_param_skips_retain_but_escaping_param_keeps_it() {
+        // `peek` only reads xs (read-index + returns the element) -> borrowed, so
+        // passing a named list needs no retain anywhere in the program.
+        let borrowed = ir("def peek(xs):\n    return xs[0]\nys = [1, 2]\nprint(peek(ys))\n");
+        assert!(
+            !borrowed.contains("call void @p2w_retain"),
+            "borrowed param should avoid retain: {borrowed}"
+        );
+        // `echo` returns xs itself -> escapes -> owned, so the caller must retain
+        // the named argument it transfers in.
+        let owned = ir("def echo(xs):\n    return xs\nys = [1, 2]\nzs = echo(ys)\nprint(zs)\n");
+        assert!(
+            owned.contains("call void @p2w_retain"),
+            "escaping param should retain on transfer: {owned}"
         );
     }
 

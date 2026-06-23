@@ -95,9 +95,15 @@ Implemented in `src/llvm.rs` (release at scope end; no last-use precision yet).
       rather than at scope end (needs per-block liveness; borrow-on-read already
       covers the common read-then-use). The leftover scope-end releases are mostly
       ints (runtime no-ops) — typed-int monomorphization would drop those too.
-- [ ] **Borrowed params:** params that don't escape are borrowed (no retain/release).
-      Needs per-param escape analysis + flipping the call convention (today args
-      are transferred to the callee); defer until escape analysis exists.
+- [x] **Borrowed params:** a conservative escape analysis (`param_escapes` in
+      llvm.rs) marks params used only for reading (never returned/assigned/passed
+      onward/inserted/reassigned) as borrowable. The caller passes a named arg
+      borrowed (no retain) and the callee doesn't release the param slot, so
+      passing a named collection to a read-only helper costs zero refcount
+      traffic. Escaping params keep the owned/transfer convention. Validated: 25
+      oracle cases `live==0` (incl. borrowarg/borrowtwice/escarg/borrowstr);
+      mutation through a borrowed param (`xs.append`, `xs[i]=`) matches Python
+      pass-by-reference. Test: `borrowed_param_skips_retain_but_escaping_param_keeps_it`.
 - [ ] **Drop-reuse tokens (FBIP):** when a unique value is dropped and a same-shape
       value is allocated, reuse the buffer in place (the big embedded win — mutate
       in place vs alloc/free churn). Needs a runtime reuse path + uniqueness
