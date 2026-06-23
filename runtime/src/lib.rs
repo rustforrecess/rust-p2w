@@ -153,6 +153,17 @@ pub extern "C" fn p2w_live() -> i32 {
     unsafe { LIVE }
 }
 
+/// Extract a raw `i32` from a boxed value — the unbox half of the value model's
+/// boundary (the box half is `p2w_int`). Traps on a non-int (a runtime
+/// TypeError). See VALUE_MODEL.md.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_unbox_int(v: Value) -> i32 {
+    if !is_int(v) {
+        trap("expected an int");
+    }
+    as_int(v) as i32
+}
+
 /// Allocate `payload` bytes; returns the payload offset, or 0 on OOM. The block
 /// carries a u32 size header just before the payload (for `free`).
 fn alloc(payload: usize) -> usize {

@@ -130,6 +130,14 @@ because the ints that generated them are no longer boxed.
 - **B — typed function signatures.** Annotated params/returns become unboxed in
   the LLVM signature; callers coerce at the call. (Recursion like `fib(n: int)`
   becomes raw-`i32` throughout.)
+  - *Done (Int):* `: int` params get raw slots and `-> int` returns raw; the body
+    runs native (`def sq(n: int) -> int: return n*n` emits just `load`/`mul`/`ret`
+    — **zero** runtime calls). Coercions at the boundaries via `coerce` (box =
+    `p2w_int`, unbox = new runtime `p2w_unbox_int`): boxed arg → int param unboxes,
+    int result → `print` boxes. Validated: oracle `typedsq`/`typedfact`/
+    `typedboxarg`/`typedreassign`, all `live==0`. *Float params (LLVM `double`
+    signature) remain.* Note: boxing a >30-bit unboxed int is lossy until the
+    heap-int box (decision 3) lands.
 - **C — packed arrays** (`list[int]`/`list[float]`): a raw-element collection;
   index/append/iterate stay unboxed; box only on escape to a dynamic sink. *The
   memory win for sensor logs / game state.*
