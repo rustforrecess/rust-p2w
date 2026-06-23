@@ -1113,6 +1113,19 @@ fn trap(_msg: &str) -> ! {
     }
 }
 
+/// Panic handler for `no_std` artifacts — the host run-oracle's static lib and
+/// the eventual bare-metal device build. (Under `cfg(test)` the crate is `std`,
+/// which supplies its own handler, so this is excluded there.) Anything that
+/// panics here — a Rust overflow check, say — is an unrecoverable bug, so we
+/// halt like `trap`.
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

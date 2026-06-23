@@ -145,5 +145,16 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
 5. **Debug transports:** USB stub, then SWD/probe-rs + DWARF.
 6. **RISC-V** target variant.
 
+**Phase 1 — validated on the host (2026-06-23).** `clang` (real LLVM) compiles
+our emitted IR, and because values are i32 *arena offsets* (not machine
+pointers) the IR + `p2w-rt` link and **run on the host** with output matching
+CPython. `tools/native_run.sh` is the run-oracle: IR → `clang` `.o` → link the
+runtime staticlib (`cargo rustc --crate-type staticlib -- -C panic=abort`) + a
+`p2w_putc` stub → execute → diff (7 cases pass). The runtime now carries a
+`#[cfg(not(test))] #[panic_handler]` (needed for any no_std artifact — this lib
+and the device build). **Still device-gated:** the on-board path (`.o` → RP2350
+boot block → ELF → UF2 via `llc`/`lld`/`picotool`, run over USB-CDC) — but host
+execution already proves IR validity + runtime correctness without hardware.
+
 Design for the front-end (lexer/parser/AST) to stay 100% shared with the WASM
 backend; only the emitter + runtime + toolchain differ.

@@ -1,10 +1,14 @@
-# Emitter RC Pass — Resume When a Board Arrives
+# Emitter RC Pass — Resume Plan
 
-**Status: PAUSED (2026-06-22).** The runtime is RC-correct and host-tested; the
-emitter does **not** yet emit `retain`/`release`. We paused here deliberately:
-the emitter insertion is memory-safety-critical and **cannot be validated
-offline** — it needs to *run*, which needs a board (or QEMU) + the Phase-1
-toolchain. Building it blind banks unproven safety-critical code, so we wait.
+**Status: UNBLOCKED on host (updated 2026-06-23).** Originally paused for "needs a
+board to validate." That assumption was wrong: `clang` compiles our emitted LLVM
+IR and — because our values are i32 *offsets* into a static arena, not machine
+pointers — the IR + `p2w-rt` link and **run on the host**. `tools/native_run.sh`
+is the working run-oracle (7 cases pass, output matches CPython). So the RC pass
+can be validated offline after all; a board is only needed for *on-device*
+confirmation, not for proving memory correctness. The one missing piece for the
+RC oracle is alloc/free *accounting* (step 0 below) — then the safety-critical
+emitter insertion has a real pass/fail gate without hardware.
 
 See also: `MEMORY_MANAGEMENT.md` (model + research), `PICO_BACKEND.md` (phases),
 the ownership-contract comment in `src/llvm.rs` (above `struct FuncEmitter`).
@@ -43,16 +47,20 @@ Every `expr()` result is an **owned** (+1) reference.
 
 ## TODO — resume order (each step is one focused commit)
 
-### 0. Prereq: stand up Phase-1 toolchain so we can VALIDATE (board/QEMU)
-This is the whole reason we paused. Without it, steps 1–3 are unverifiable.
-- [ ] Install/confirm `llc`, `lld` (or `ld.lld`), `picotool`, target
-      `thumbv8m.main-none-eabihf`. QEMU `qemu-system-arm` for boardless runs if possible.
-- [ ] Phase-1 spike (see PICO_BACKEND.md): emitted IR → `.o` → link RP2350 boot
-      block → ELF → UF2; flash + run "hello + print(int)" over USB-CDC.
-- [ ] **Add an alloc/free balance assert harness:** runtime counters
-      (`allocs`, `frees`, `live_objects`) exposed via a debug host-import; a test
-      program must end with `live_objects == 0`. This is our offline-proxy oracle
-      and the acceptance gate for every RC step below.
+### 0. Run-oracle so we can VALIDATE — mostly DONE (host), no board needed
+
+- [x] **Host run-oracle exists:** `tools/native_run.sh` — emitted IR → `clang`
+      `.o` → link `p2w-rt` staticlib + `p2w_putc` stub → run on host → diff vs
+      expected. 7 cases pass (ints/floats/loops/funcs/lists/strcat). This works
+      because values are i32 arena offsets, not machine pointers.
+- [ ] **Add alloc/free accounting** — the actual RC gate. Runtime counters
+      (`allocs`, `frees`, `live_objects`) behind a tiny ABI (e.g. `p2w_live()`);
+      have the harness emit a trailing call and assert **`live_objects == 0`** at
+      program end. THIS is the acceptance gate for every RC step below. (No board
+      required — runs in `native_run.sh`.)
+- [ ] *(later, board-gated, NOT needed for RC correctness)* Phase-1 device spike:
+      `llc`/`picotool` + `thumbv8m.main-none-eabihf` → ELF → UF2; flash + run over
+      USB-CDC. This confirms *on-device*, but host accounting already proves the RC.
 
 ### 1. Emitter insertion pass (the big one — gated on step 0)
 Implement the contract in `src/llvm.rs`. Naive first (release at scope end; no
