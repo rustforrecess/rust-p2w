@@ -29,7 +29,16 @@ LIB=$(cargo metadata --manifest-path runtime/Cargo.toml --format-version 1 --no-
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/release/p2w_rt.lib
 [ -f "$LIB" ] || { echo "FAIL: staticlib not found at $LIB"; exit 1; }
 
-printf '#include <stdio.h>\nvoid p2w_putc(unsigned char c){putchar(c);}\n' > "$OUT/putc.c"
+# Byte sink for p2w_print + a leak readout: at process exit, print the live
+# heap-object count to stderr so the harness can gate on RC correctness.
+cat > "$OUT/putc.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+extern int p2w_live(void);
+static void report(void) { fprintf(stderr, "P2W_LIVE=%d\n", p2w_live()); }
+void p2w_putc(unsigned char c) { putchar(c); }
+__attribute__((constructor)) static void init(void) { atexit(report); }
+EOF
 
 # A case: name | source | expected-stdout.  Use \n in source for newlines.
 run_case() {
@@ -41,15 +50,24 @@ run_case() {
   clang -Wno-override-module "$OUT/$name.o" "$OUT/putc.c" "$LIB" -o "$OUT/$name.exe" \
     2>"$OUT/$name.err" || { echo "FAIL [$name]: link"; cat "$OUT/$name.err"; return 1; }
   # strip CR: the Windows CRT writes \n as \r\n in text mode.
-  local got; got=$("$OUT/$name.exe" | tr -d '\r')
-  if [ "$got" = "$(printf '%b' "$want")" ]; then
-    echo "PASS [$name]"
-    return 0
+  local got; got=$("$OUT/$name.exe" 2>"$OUT/$name.live" | tr -d '\r')
+  local live; live=$(sed -n 's/.*P2W_LIVE=\(-\?[0-9]*\).*/\1/p' "$OUT/$name.live")
+  : "${live:=?}"
+  if [ "$got" != "$(printf '%b' "$want")" ]; then
+    echo "FAIL [$name]: got [$got] want [$(printf '%b' "$want")]  live=$live"
+    return 1
   fi
-  echo "FAIL [$name]: got [$got] want [$(printf '%b' "$want")]"
-  return 1
+  if [ "$GATE_LEAKS" = "1" ] && [ "$live" != "0" ]; then
+    echo "LEAK [$name]: output ok but live=$live (expected 0)"
+    return 1
+  fi
+  echo "PASS [$name]  live=$live"
+  return 0
 }
 
+# Set GATE_LEAKS=1 to also fail a case whose program leaks (live != 0). Off by
+# default until the emitter RC pass lands; on, it's the RC acceptance gate.
+GATE_LEAKS=${GATE_LEAKS:-0}
 fails=0
 run_case ints      'print(6 * 7)\nprint(10 - 3)\n'                              '42\n7'        || fails=$((fails+1))
 run_case floats    'print(7 / 2)\nprint(2 ** 10)\nprint(1.5 + 2)\n'            '3.5\n1024\n3.5' || fails=$((fails+1))

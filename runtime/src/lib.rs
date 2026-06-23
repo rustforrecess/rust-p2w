@@ -96,6 +96,9 @@ const HEAP_SIZE: usize = 64 * 1024; // device build tunes this to available SRAM
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 static mut CURSOR: usize = 4; // offset 0 is reserved (never a valid object)
 static mut FREELIST: usize = 0; // head block offset, 0 = empty
+// Live heap-object count (births − frees). The RC acceptance gate: a finished
+// program with balanced retain/release must end at 0. See tools/native_run.sh.
+static mut LIVE: i32 = 0;
 
 /// Object type tags (in the header's first word).
 const T_STR: u32 = 1;
@@ -130,7 +133,24 @@ pub fn heap_reset() {
     unsafe {
         CURSOR = 4;
         FREELIST = 0;
+        LIVE = 0;
     }
+}
+
+/// One heap object was born (refcount initialized to 1).
+fn live_inc() {
+    unsafe { LIVE += 1 }
+}
+/// One heap object was freed.
+fn live_dec() {
+    unsafe { LIVE -= 1 }
+}
+
+/// Number of live heap objects right now (births − frees). The run-oracle calls
+/// this at program exit: a leak-free program with correct RC returns 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_live() -> i32 {
+    unsafe { LIVE }
 }
 
 /// Allocate `payload` bytes; returns the payload offset, or 0 on OOM. The block
@@ -198,6 +218,7 @@ fn str_alloc(bytes: &[u8]) -> Value {
     }
     wr(p, T_STR);
     wr(p + 4, 1);
+    live_inc();
     wr(p + 8, bytes.len() as u32);
     for (i, &b) in bytes.iter().enumerate() {
         wr_byte(p + 12 + i, b);
@@ -223,6 +244,7 @@ fn float_alloc(x: f64) -> Value {
     }
     wr(p, T_FLOAT);
     wr(p + 4, 1);
+    live_inc();
     unsafe { core::ptr::write_unaligned(heap_base().add(p + 8) as *mut f64, x) };
     p as Value
 }
@@ -301,6 +323,7 @@ pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
         }
         wr(p, T_STR);
         wr(p + 4, 1);
+        live_inc();
         wr(p + 8, (la + lb) as u32);
         for i in 0..la {
             wr_byte(p + 12 + i, str_byte(a, i));
@@ -600,6 +623,7 @@ fn free_object(o: usize) {
         _ => {}
     }
     dealloc(o);
+    live_dec();
 }
 
 /// Retain: increment a heap value's refcount (no-op for inline values).
@@ -655,6 +679,7 @@ fn coll_new(tag: u32) -> Value {
     }
     wr(o, tag);
     wr(o + 4, 1); // refcount
+    live_inc();
     wr(o + 8, 0); // len
     wr(o + 12, 0); // cap
     wr(o + 16, 0); // data_off
@@ -837,6 +862,7 @@ pub extern "C" fn p2w_iter(c: Value) -> Value {
     }
     wr(o, T_ITER);
     wr(o + 4, 1);
+    live_inc();
     wr(o + 8, c as u32); // container
     wr(o + 12, 0); // index
     o as Value
@@ -1261,6 +1287,19 @@ mod tests {
         assert_eq!(p2w_eq(p2w_int(1), p2w_float(1.0)), V_TRUE); // cross-type ==
         assert!(p2w_truthy(p2w_float(0.1)));
         assert!(!p2w_truthy(p2w_float(0.0)));
+    }
+
+    #[test]
+    fn live_count_tracks_births_and_frees() {
+        let _g = heap_guard(); // resets the arena AND LIVE
+        assert_eq!(p2w_live(), 0);
+        let s = str_val("hello");
+        assert_eq!(p2w_live(), 1);
+        let xs = p2w_list_new();
+        assert_eq!(p2w_live(), 2);
+        p2w_list_append(xs, s); // transfers s into the list
+        p2w_release(xs); // frees the list AND its string child
+        assert_eq!(p2w_live(), 0, "releasing a container must free its children");
     }
 
     #[test]
