@@ -715,7 +715,7 @@ impl<'a> FuncEmitter<'a> {
                 self.release_if_owned(&v, o);
                 Ok((r, Repr::Boxed))
             }
-            ExprKind::Bin(op, a, b) => Ok((self.bin(*op, a, b)?, Repr::Boxed)),
+            ExprKind::Bin(op, a, b) => self.bin(*op, a, b),
             ExprKind::Call(name, args) => {
                 // len() is the one builtin lowered to the runtime so far.
                 if name == "len" {
@@ -856,6 +856,23 @@ impl<'a> FuncEmitter<'a> {
         Ok((self.expr(e)?, true))
     }
 
+    /// Like `expr_borrow`, but preserves the operand's `Repr` so callers can take
+    /// a native fast path. Returns `(operand, repr, owned)`; `owned` is true only
+    /// for a Boxed value the caller must release — a borrowed `Name` and any
+    /// unboxed scalar are not owned.
+    fn expr_borrow_typed(&mut self, e: &Expr) -> Result<(String, Repr, bool), String> {
+        if let ExprKind::Name(name) = &e.kind {
+            if !self.vars.iter().any(|v| v == name) {
+                return Err(format!("line {}: name '{name}' is not defined", e.line));
+            }
+            let t = self.call_value(&format!("load i32, ptr %v_{name}"));
+            return Ok((t, Repr::Boxed, false));
+        }
+        let (op, repr) = self.expr_typed(e)?;
+        let owned = matches!(repr, Repr::Boxed);
+        Ok((op, repr, owned))
+    }
+
     /// Release a borrowed operand only if it was actually an owned temp.
     fn release_if_owned(&mut self, v: &str, owned: bool) {
         if owned {
@@ -863,10 +880,24 @@ impl<'a> FuncEmitter<'a> {
         }
     }
 
-    fn bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<String, String> {
+    fn bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<(String, Repr), String> {
         if matches!(op, BinOp::And | BinOp::Or) {
-            return self.short_circuit(op, a, b);
+            return Ok((self.short_circuit(op, a, b)?, Repr::Boxed));
         }
+        let (va, ar, ao) = self.expr_borrow_typed(a)?;
+        let (vb, br, bo) = self.expr_borrow_typed(b)?;
+
+        // Native fast path: both operands are unboxed ints and the op is a simple
+        // wraparound — emit a raw LLVM instruction, no boxing, no runtime call,
+        // no refcount traffic. The result stays an unboxed Int and only boxes if
+        // it later reaches a dynamic sink (via as_boxed).
+        if let (Some(instr), Repr::Int, Repr::Int) = (int_native_op(op), ar, br) {
+            let r = self.temp();
+            self.line(&format!("{r} = {instr} i32 {va}, {vb}"));
+            return Ok((r, Repr::Int));
+        }
+
+        // Boxed fallback: box each operand, call the runtime, release temps.
         let rt = match op {
             BinOp::Add => "p2w_add",
             BinOp::Sub => "p2w_sub",
@@ -888,13 +919,16 @@ impl<'a> FuncEmitter<'a> {
                 ));
             }
         };
-        let (va, oa) = self.expr_borrow(a)?;
-        let (vb, ob) = self.expr_borrow(b)?;
+        // Boxing an Int yields a fresh owned temp (must release); a Boxed operand
+        // keeps its borrow/own status.
+        let a_owned = matches!(ar, Repr::Int) || ao;
+        let b_owned = matches!(br, Repr::Int) || bo;
+        let va = self.as_boxed(va, ar);
+        let vb = self.as_boxed(vb, br);
         let r = self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})"));
-        // Operands are borrowed; the result is a new owned value.
-        self.release_if_owned(&va, oa);
-        self.release_if_owned(&vb, ob);
-        Ok(r)
+        self.release_if_owned(&va, a_owned);
+        self.release_if_owned(&vb, b_owned);
+        Ok((r, Repr::Boxed))
     }
 
     /// `and`/`or` with Python semantics: short-circuit, and the result is the
@@ -1043,6 +1077,20 @@ fn expr_escapes(e: &Expr, owning: bool, p: &str) -> bool {
     }
 }
 
+/// The LLVM instruction for a native (unboxed) integer binop, or `None` for ops
+/// that fall back to the boxed runtime. `//`, `%`, `**` differ from LLVM's
+/// truncating `sdiv`/`srem` (Python floors) or aren't a single instruction;
+/// comparisons return a bool (a later repr). Native ops use i32 wraparound,
+/// matching the value model's overflow decision.
+fn int_native_op(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Add => Some("add"),
+        BinOp::Sub => Some("sub"),
+        BinOp::Mul => Some("mul"),
+        _ => None,
+    }
+}
+
 /// The integer value of a literal `step` (handling `-1` parsed as `Neg(1)`).
 fn step_literal(e: &Expr) -> Option<i64> {
     match &e.kind {
@@ -1082,13 +1130,16 @@ mod tests {
     }
 
     #[test]
-    fn module_declares_runtime_and_boxes_values() {
+    fn module_declares_runtime_and_native_int_arithmetic() {
         let out = ir("print(6 * 7)\n");
         assert!(out.contains("declare i32 @p2w_add(i32, i32)"), "{out}");
         assert!(out.contains("declare void @p2w_print(i32)"), "{out}");
-        assert!(out.contains("call i32 @p2w_int(i32 6)"), "{out}");
-        assert!(out.contains("call i32 @p2w_int(i32 7)"), "{out}");
-        assert!(out.contains("call i32 @p2w_mul(i32"), "{out}");
+        // 6 * 7 is unboxed native integer multiply — no boxed operands, no
+        // runtime mul call.
+        assert!(out.contains("mul i32 6, 7"), "native mul: {out}");
+        assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
+        // the native result is boxed exactly once, at the dynamic sink (print).
+        assert!(out.contains("call i32 @p2w_int(i32 %"), "box result for print: {out}");
         assert!(out.contains("call void @p2w_print(i32"), "{out}");
         assert!(out.contains("ret i32 0"), "main exit: {out}");
     }

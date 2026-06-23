@@ -122,6 +122,11 @@ because the ints that generated them are no longer boxed.
   refactor + `box`/`unbox` at boundaries + repr-aware RC. *The bulk of the
   speed/RAM win (arithmetic, loops).* Validate: annotated int loop emits no
   `p2w_int`/RC in its body; output matches; `live==0`.
+  - *Done so far:* the `(operand, Repr)` plumbing (`expr_typed`/`as_boxed`,
+    bit-identical) and **native unboxed integer `+`/`-`/`*`** — `print(2 + 3 * 4)`
+    emits raw `add`/`mul i32` and boxes once at `print` (5 runtime calls → 1).
+    `Float`/`Bool` reprs, `//`/`%`/comparisons, and unboxed *variables* (which
+    need Phase B typed slots) remain.
 - **B — typed function signatures.** Annotated params/returns become unboxed in
   the LLVM signature; callers coerce at the call. (Recursion like `fib(n: int)`
   becomes raw-`i32` throughout.)
