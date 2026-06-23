@@ -743,11 +743,11 @@ impl<'a> FuncEmitter<'a> {
 
     /// Evaluate `e` for a *borrowing* use — an operand of an op that reads but
     /// doesn't keep the reference (arithmetic, compare, print, len, condition,
-    /// read-index, method receiver). Returns `(value, owned)`:
-    ///   - a plain `Name` is borrowed through its variable slot, which already
-    ///     owns it for the duration of this op — no `retain`/`release` at all.
-    ///   - anything else is a freshly owned temp (`owned = true`); the caller
-    ///     must `release` it after the op.
+    /// read-index, method receiver). Returns `(value, owned)`. A plain `Name` is
+    /// borrowed through its variable slot, which already owns it for the duration
+    /// of this op, so `owned = false` and there's no `retain`/`release` at all.
+    /// Anything else is a freshly owned temp (`owned = true`) the caller must
+    /// `release` after the op.
     /// Borrowing is sound here because a single op evaluates its operands and
     /// consumes them immediately — no statement runs in between to reassign the
     /// slot. (This is the practical core of Perceus last-use: the common
