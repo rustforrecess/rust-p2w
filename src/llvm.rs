@@ -130,8 +130,9 @@ fn emit_function(
     }
     f.block(body)?;
     if !f.terminated {
-        let none = f.temp();
-        f.line(&format!("{none} = call i32 @p2w_none()"));
+        // Implicit `return None` on fall-through: release locals first.
+        let none = f.call_value("call i32 @p2w_none()");
+        f.emit_exit_releases();
         f.body.push_str(&format!("  ret i32 {none}\n"));
     }
     let sig: Vec<String> = (0..params.len()).map(|i| format!("i32 %a{i}")).collect();
@@ -150,6 +151,8 @@ fn emit_main(top: &[&Stmt], funcs: &HashSet<String>) -> Result<(String, String),
         f.stmt(s)?;
     }
     if !f.terminated {
+        // Release all top-level locals so a finished program ends at live==0.
+        f.emit_exit_releases();
         f.body.push_str("  ret i32 0\n");
     }
     let def = format!(
@@ -179,12 +182,24 @@ fn fmt_double(f: f64) -> String {
 //   - container insert (append / list+dict literals / setindex value & key):
 //     TRANSFER (don't release the inserted temp); the runtime owns + frees it
 //     later. (List indices are ints, so transferring the index is a no-op.)
-//   - borrowing ops (arithmetic/compare operands, print, conditions, index
-//     target+index, call args): release each operand temp after the op.
-//   - scope / function exit: release all locals.
-// Step 1 emits these naively (release at scope end); precision (last-use),
-// borrowed params, and reuse (drop-reuse) follow — see MEMORY_MANAGEMENT.md.
-// NOT YET WIRED: the emitter currently relies on run-to-completion arena reset.
+//   - borrowing ops (arithmetic/compare operands, unary, print, conditions,
+//     len, index target+index, method receiver): release each operand temp
+//     after the op consumes it.
+//   - TRANSFER sites (no release — ownership moves in): assignment store (after
+//     releasing the OLD slot value), container insert (list append, dict/list
+//     literal elems, setindex value & key), method args, CALL ARGS (the callee
+//     owns its params), and the returned value.
+//   - every variable slot owns +1; a function exit (every `ret`) releases all
+//     slots and any pending loop temps (`cleanups`). Slots are zero-initialized
+//     so releasing a never-assigned slot is a safe no-op.
+// Loop temps that outlive one iteration (the iterator + its sequence; a counted
+// loop's end bound) are pushed on `cleanups`, released after the loop on the
+// normal path and at every early `return`. Per-iteration: a loop variable that
+// can hold a heap value (for-each) releases its previous value before storing
+// the next, exactly like assignment.
+// WIRED (step 1, naive — release at scope end, no last-use precision). Validated
+// by tools/native_run.sh with GATE_LEAKS=1 (every case ends live==0). Precision
+// (last-use), borrowed params, and reuse (drop-reuse) follow — see MEMORY_MANAGEMENT.md.
 
 /// Per-function emission state. Values are tagged `i32`; variables are
 /// entry-block `alloca`s; control flow uses labelled basic blocks.
@@ -203,6 +218,9 @@ struct FuncEmitter<'a> {
     vars: Vec<String>,
     /// (continue-target, break-target) for each enclosing loop.
     loops: Vec<(String, String)>,
+    /// Owned temps that outlive a single statement (loop iterators/sequences,
+    /// counted-loop bounds) and must be released at every function exit.
+    cleanups: Vec<String>,
     terminated: bool,
 }
 
@@ -219,7 +237,34 @@ impl<'a> FuncEmitter<'a> {
             next_label: 0,
             vars: Vec::new(),
             loops: Vec::new(),
+            cleanups: Vec::new(),
             terminated: false,
+        }
+    }
+
+    /// Release a heap value (no-op at runtime for inline ints/bools/None).
+    fn release(&mut self, v: &str) {
+        self.line(&format!("call void @p2w_release(i32 {v})"));
+    }
+
+    /// Retain a heap value, turning a borrowed reference into an owned one.
+    fn retain(&mut self, v: &str) {
+        self.line(&format!("call void @p2w_retain(i32 {v})"));
+    }
+
+    /// Release everything this function owns — pending loop temps and every
+    /// variable slot — emitted before each `ret`. Slots are zero-initialized, so
+    /// releasing a slot that was never assigned is a safe no-op.
+    fn emit_exit_releases(&mut self) {
+        let cleanups = self.cleanups.clone();
+        for c in cleanups {
+            self.release(&c);
+        }
+        let vars = self.vars.clone();
+        for name in vars {
+            let t = self.temp();
+            self.line(&format!("{t} = load i32, ptr %v_{name}"));
+            self.release(&t);
         }
     }
 
@@ -269,6 +314,9 @@ impl<'a> FuncEmitter<'a> {
         let ptr = format!("%v_{name}");
         if !self.vars.iter().any(|v| v == name) {
             self.allocas.push_str(&format!("  {ptr} = alloca i32\n"));
+            // Zero-init so the exit-release of a never-assigned slot is a no-op
+            // (0 isn't a heap value, so p2w_release ignores it).
+            self.allocas.push_str(&format!("  store i32 0, ptr {ptr}\n"));
             self.vars.push(name.to_string());
         }
         ptr
@@ -311,8 +359,11 @@ impl<'a> FuncEmitter<'a> {
         };
         match &s.kind {
             StmtKind::Assign(name, value) => {
-                let v = self.expr(value)?;
+                let v = self.expr(value)?; // owned (transferred into the slot)
                 let ptr = self.var_slot(name);
+                let old = self.temp();
+                self.line(&format!("{old} = load i32, ptr {ptr}"));
+                self.release(&old); // drop the previous binding (no-op if 0/inline)
                 self.line(&format!("store i32 {v}, ptr {ptr}"));
                 Ok(())
             }
@@ -323,12 +374,15 @@ impl<'a> FuncEmitter<'a> {
                     }
                     let v = self.expr(&args[0])?;
                     self.line(&format!("call void @p2w_print(i32 {v})"));
+                    self.release(&v); // print borrows; drop the operand temp
                     Ok(())
                 }
                 // Any other expression statement (a call, a method call like
-                // xs.append(1), ...) runs for its side effects.
+                // xs.append(1), ...) runs for its side effects; its owned result
+                // is discarded, so release it.
                 _ => {
-                    self.expr(e)?;
+                    let v = self.expr(e)?;
+                    self.release(&v);
                     Ok(())
                 }
             },
@@ -340,9 +394,14 @@ impl<'a> FuncEmitter<'a> {
                 // The target is a reference value, so the runtime mutates the
                 // shared heap object in place — no variable-slot special-casing.
                 let t = self.expr(target)?;
-                let i = self.expr(index)?;
-                let v = self.expr(value)?;
+                let i = self.expr(index)?; // dict: key transferred to the runtime
+                let v = self.expr(value)?; //       value transferred too
                 self.line(&format!("call void @p2w_setindex(i32 {t}, i32 {i}, i32 {v})"));
+                // Only the container is borrowed. The index/key is NOT released
+                // here: for a list it's an inline int position; for a dict the
+                // runtime takes ownership of the key (storing it, or releasing it
+                // as redundant on update) — releasing it here would double-free.
+                self.release(&t);
                 Ok(())
             }
             StmtKind::ForEach {
@@ -351,10 +410,14 @@ impl<'a> FuncEmitter<'a> {
                 body,
             } => self.emit_foreach(var, iterable, body),
             StmtKind::Return(value) => {
+                // The returned value is owned and transferred out, so release all
+                // locals/cleanups *after* computing it (releasing a slot it was
+                // loaded from is fine — the retained temp keeps its own ref).
                 let v = match value {
                     Some(e) => self.expr(e)?,
                     None => self.call_value("call i32 @p2w_none()"),
                 };
+                self.emit_exit_releases();
                 self.terminator(&format!("ret i32 {v}"));
                 Ok(())
             }
@@ -456,8 +519,14 @@ impl<'a> FuncEmitter<'a> {
         }
         let start_v = self.expr(start)?;
         let end_v = self.expr(end_expr)?;
+        // end_v is read every iteration, so it must outlive the loop; release it
+        // after the loop (and on early return) via cleanups.
+        self.cleanups.push(end_v.clone());
         let step_v = self.call_value(&format!("call i32 @p2w_int(i32 {step_lit})"));
         let slot = self.var_slot(var);
+        let old = self.temp();
+        self.line(&format!("{old} = load i32, ptr {slot}"));
+        self.release(&old); // drop any prior binding of this name
         self.line(&format!("store i32 {start_v}, ptr {slot}"));
 
         let head = self.fresh_label("fhead");
@@ -490,14 +559,19 @@ impl<'a> FuncEmitter<'a> {
         self.br_to(&head);
 
         self.place_label(&end);
+        self.cleanups.pop();
+        self.release(&end_v); // counter + step are ints; the bound may not be
         Ok(())
     }
 
     /// `for var in iterable:` over the runtime iteration protocol
     /// (`p2w_iter` / `p2w_iter_has` / `p2w_iter_next`).
     fn emit_foreach(&mut self, var: &str, iterable: &Expr, body: &[Stmt]) -> Result<(), String> {
-        let seq = self.expr(iterable)?;
+        let seq = self.expr(iterable)?; // owned; the iterator borrows it
         let it = self.call_value(&format!("call i32 @p2w_iter(i32 {seq})"));
+        // Both outlive the loop and must survive an early return — track them.
+        self.cleanups.push(seq.clone());
+        self.cleanups.push(it.clone());
         let slot = self.var_slot(var);
 
         let head = self.fresh_label("ehead");
@@ -511,6 +585,10 @@ impl<'a> FuncEmitter<'a> {
         self.terminator(&format!("br i1 {has}, label %{body_l}, label %{end}"));
 
         self.place_label(&body_l);
+        // Drop the previous element before binding the next (iter_next is owned).
+        let prev = self.temp();
+        self.line(&format!("{prev} = load i32, ptr {slot}"));
+        self.release(&prev);
         let cur = self.call_value(&format!("call i32 @p2w_iter_next(i32 {it})"));
         self.line(&format!("store i32 {cur}, ptr {slot}"));
         self.loops.push((head.clone(), end.clone()));
@@ -519,6 +597,11 @@ impl<'a> FuncEmitter<'a> {
         self.br_to(&head);
 
         self.place_label(&end);
+        // Pop in reverse push order; release the iterator then its sequence.
+        self.cleanups.pop();
+        self.cleanups.pop();
+        self.release(&it);
+        self.release(&seq);
         Ok(())
     }
 
@@ -527,6 +610,7 @@ impl<'a> FuncEmitter<'a> {
         let v = self.expr(cond)?;
         let t = self.temp();
         self.line(&format!("{t} = call i1 @p2w_truthy(i32 {v})"));
+        self.release(&v); // truthiness borrows the condition value
         Ok(t)
     }
 
@@ -557,16 +641,22 @@ impl<'a> FuncEmitter<'a> {
                 if !self.vars.iter().any(|v| v == name) {
                     return Err(format!("line {}: name '{name}' is not defined", e.line));
                 }
-                let ptr = format!("%v_{name}");
-                Ok(self.call_value(&format!("load i32, ptr {ptr}")))
+                // A load is borrowed; retain to hand back an owned reference.
+                let t = self.call_value(&format!("load i32, ptr %v_{name}"));
+                self.retain(&t);
+                Ok(t)
             }
             ExprKind::Unary(UnOp::Neg, inner) => {
                 let v = self.expr(inner)?;
-                Ok(self.call_value(&format!("call i32 @p2w_neg(i32 {v})")))
+                let r = self.call_value(&format!("call i32 @p2w_neg(i32 {v})"));
+                self.release(&v);
+                Ok(r)
             }
             ExprKind::Unary(UnOp::Not, inner) => {
                 let v = self.expr(inner)?;
-                Ok(self.call_value(&format!("call i32 @p2w_not(i32 {v})")))
+                let r = self.call_value(&format!("call i32 @p2w_not(i32 {v})"));
+                self.release(&v);
+                Ok(r)
             }
             ExprKind::Bin(op, a, b) => self.bin(*op, a, b),
             ExprKind::Call(name, args) => {
@@ -576,7 +666,9 @@ impl<'a> FuncEmitter<'a> {
                         return nope("len() with other than one argument");
                     }
                     let v = self.expr(&args[0])?;
-                    return Ok(self.call_value(&format!("call i32 @p2w_len(i32 {v})")));
+                    let r = self.call_value(&format!("call i32 @p2w_len(i32 {v})"));
+                    self.release(&v); // len borrows its argument
+                    return Ok(r);
                 }
                 if !self.funcs.contains(name) {
                     return nope("calling this function (only your own functions, len, + print)");
@@ -609,7 +701,10 @@ impl<'a> FuncEmitter<'a> {
             ExprKind::Index(obj, idx) => {
                 let o = self.expr(obj)?;
                 let i = self.expr(idx)?;
-                Ok(self.call_value(&format!("call i32 @p2w_index(i32 {o}, i32 {i})")))
+                let r = self.call_value(&format!("call i32 @p2w_index(i32 {o}, i32 {i})"));
+                self.release(&o); // target + index are borrowed; result is owned
+                self.release(&i);
+                Ok(r)
             }
             ExprKind::MethodCall(obj, method, args) => self.method_call(obj, method, args),
             _ => nope("this expression"),
@@ -636,10 +731,14 @@ impl<'a> FuncEmitter<'a> {
             .iter()
             .map(|v| format!(", i32 {v}"))
             .collect();
-        Ok(self.call_value(&format!(
+        let r = self.call_value(&format!(
             "call i32 @p2w_method{}(i32 {recv}, ptr {name_g}, i32 {nlen}{extra})",
             args.len()
-        )))
+        ));
+        // The receiver is borrowed; method args are transferred (the runtime
+        // method owns them — e.g. append stores its arg), so they aren't released.
+        self.release(&recv);
+        Ok(r)
     }
 
     fn bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<String, String> {
@@ -669,7 +768,10 @@ impl<'a> FuncEmitter<'a> {
         };
         let va = self.expr(a)?;
         let vb = self.expr(b)?;
-        Ok(self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})")))
+        let r = self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})"));
+        self.release(&va); // operands are borrowed; the result is a new owned value
+        self.release(&vb);
+        Ok(r)
     }
 
     /// `and`/`or` with Python semantics: short-circuit, and the result is the
@@ -697,11 +799,15 @@ impl<'a> FuncEmitter<'a> {
         }
 
         self.place_label(&rhs);
+        // The left operand isn't the result on this path — drop it. (On the other
+        // path it stays in the slot and becomes the owned result.)
+        self.release(&va);
         let vb = self.expr(b)?;
         self.line(&format!("store i32 {vb}, ptr {slot}"));
         self.br_to(&end);
 
         self.place_label(&end);
+        // The kept operand is loaded back as a single owned reference.
         Ok(self.call_value(&format!("load i32, ptr {slot}")))
     }
 }
@@ -781,6 +887,16 @@ mod tests {
         assert!(ir("print(2 ** 10)\n").contains("call i32 @p2w_pow(i32"));
         assert!(ir("x = 1 < 2\n").contains("call i32 @p2w_lt(i32"));
         assert!(ir("y = not 0\n").contains("call i32 @p2w_not(i32"));
+    }
+
+    #[test]
+    fn rc_pass_emits_retain_and_release() {
+        // A program touching heap values must retain on load and release temps.
+        // (Full memory-correctness is validated by tools/native_run.sh; this just
+        // guards the wiring from accidental removal.)
+        let out = ir("x = [1, 2]\nprint(x)\n");
+        assert!(out.contains("call void @p2w_retain(i32"), "retain on load: {out}");
+        assert!(out.contains("call void @p2w_release(i32"), "release temps: {out}");
     }
 
     #[test]

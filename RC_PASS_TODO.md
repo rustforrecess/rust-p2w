@@ -1,14 +1,16 @@
-# Emitter RC Pass — Resume Plan
+# Emitter RC Pass — Status: DONE (step 1), validated on host
 
-**Status: UNBLOCKED on host (updated 2026-06-23).** Originally paused for "needs a
-board to validate." That assumption was wrong: `clang` compiles our emitted LLVM
-IR and — because our values are i32 *offsets* into a static arena, not machine
-pointers — the IR + `p2w-rt` link and **run on the host**. `tools/native_run.sh`
-is the working run-oracle (7 cases pass, output matches CPython). So the RC pass
-can be validated offline after all; a board is only needed for *on-device*
-confirmation, not for proving memory correctness. The one missing piece for the
-RC oracle is alloc/free *accounting* (step 0 below) — then the safety-critical
-emitter insertion has a real pass/fail gate without hardware.
+**Status: RC PASS LANDED (2026-06-23).** The emitter now emits `retain`/`release`
+per the transfer ownership model, and it's **validated on the host** (no board):
+`clang` compiles our IR, links `p2w-rt`, and `tools/native_run.sh` runs 21 cases
+with **`live_objects == 0`** at exit (the leak gate is on by default). The gate
+caught a real double-free (dict-update released a key the runtime already owned)
+during bring-up. Remaining work is *precision/optimization*, not correctness:
+last-use release, borrowed params, drop-reuse (FBIP), and cycles — see below and
+MEMORY_MANAGEMENT.md. A board is still only needed for *on-device* confirmation.
+
+Why this was possible offline: values are i32 *offsets* into a static arena, not
+machine pointers, so the emitted IR + runtime are host-portable.
 
 See also: `MEMORY_MANAGEMENT.md` (model + research), `PICO_BACKEND.md` (phases),
 the ownership-contract comment in `src/llvm.rs` (above `struct FuncEmitter`).
@@ -62,20 +64,25 @@ Every `expr()` result is an **owned** (+1) reference.
       `llc`/`picotool` + `thumbv8m.main-none-eabihf` → ELF → UF2; flash + run over
       USB-CDC. This confirms *on-device*, but host accounting already proves the RC.
 
-### 1. Emitter insertion pass (the big one — gated on step 0)
-Implement the contract in `src/llvm.rs`. Naive first (release at scope end; no
-last-use precision). Touch points:
-- [ ] `Name` load path → emit `p2w_retain` (make loads owned).
-- [ ] Assignment → release old slot value before store; transfer RHS.
-- [ ] Operand-temp release after arithmetic/compare/`not`/truthy/print.
-- [ ] Call args: release argument temps after the call returns.
-- [ ] Container inserts: ensure NO release of the inserted temp (transfer).
-- [ ] Scope/function exit: release all live locals (track a per-scope owned set).
-- [ ] **Structural tests:** assert emitted IR contains retain/release at the
-      expected sites (string-match on the IR). These prove *shape*, not safety.
-- [ ] **Validation gate:** run the alloc/free balance harness from step 0 on a
-      suite of programs (scalars, lists, dicts, nested, loops, functions,
-      reassignment, early return, break/continue) → all must finish `live == 0`.
+### 1. Emitter insertion pass — DONE (naive, validated)
+
+Implemented in `src/llvm.rs` (release at scope end; no last-use precision yet).
+- [x] `Name` load → `p2w_retain` (loads become owned).
+- [x] Assignment → release old slot value before store; transfer RHS.
+- [x] Operand-temp release after arithmetic/compare/unary/truthy/print/len/index.
+- [x] **Call args transferred to the callee** (callee owns params, releases at
+      exit) — not released by the caller. Method args transferred; receiver borrowed.
+- [x] Container inserts (append, list/dict literals, setindex value & key): NO
+      release of the inserted temp (transfer). Read-index key IS released (borrowed).
+- [x] Scope/function exit: release all slots (zero-initialized so a never-assigned
+      slot is a no-op) + pending loop temps (`cleanups`), at every `ret`.
+- [x] Loop temps (iterator + sequence; counted bound) on `cleanups`, released
+      after the loop and at early `return`. For-each releases the previous loop
+      value each iteration. Short-circuit releases the discarded operand.
+- [x] Structural test (`rc_pass_emits_retain_and_release`) guards the wiring.
+- [x] **Validation gate passed:** `tools/native_run.sh` (GATE_LEAKS=1 default) —
+      21 cases incl. reassignment, nesting, dicts+update, loops, functions,
+      early return, foreach-over-strings, short-circuit, pop → all `live == 0`.
 
 ### 2. Perceus-style precision (after 1 is proven safe)
 - [ ] **Last-use analysis:** release at last use, not scope end (shorter lifetimes).

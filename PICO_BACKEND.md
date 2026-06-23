@@ -138,9 +138,12 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    (first-fit free list) + **strings, lists, dicts** (literals, subscript get/set,
    `len`, concat, structural eq, print), the **iteration protocol**, **methods**
    (append/pop), and ref-count primitives (`p2w_retain`/`release`, buffers freed).
-   **Still to do:** float (which `/` and `**` need), `p2w_putc` over USB-CDC,
-   Perceus-style RC reuse + emitter `dup`/`drop` wiring (see MEMORY_MANAGEMENT.md),
-   then the toolchain spike (phase 1) to link + run on a board.
+   **The emitter RC pass is in and host-validated:** the emitter emits
+   retain/release (transfer ownership model), and `tools/native_run.sh` runs 21
+   programs ending `live==0` (see RC_PASS_TODO.md). **Still to do:** Perceus-style
+   precision (last-use, borrowed params) + drop-reuse (FBIP) + cycles,
+   real device `p2w_putc` over USB-CDC, then the on-device toolchain spike
+   (phase 1: `llc`/`picotool` → `.uf2`) to flash + run on a board.
 4. **I/O + peripherals:** USB-CDC `print`, the temp sensor, GPIO.
 5. **Debug transports:** USB stub, then SWD/probe-rs + DWARF.
 6. **RISC-V** target variant.
