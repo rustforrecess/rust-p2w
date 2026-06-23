@@ -174,8 +174,9 @@ fn emit_function(
         // (boxed) or a raw 0 for an `-> int` function that fell off the end.
         f.emit_exit_releases();
         let r = match f.ret_repr {
-            Repr::Boxed => f.call_value("call i32 @p2w_none()"),
             Repr::Int => "0".to_string(),
+            // Boxed (and any future non-Int return) falls through as None.
+            _ => f.call_value("call i32 @p2w_none()"),
         };
         f.body.push_str(&format!("  ret i32 {r}\n"));
     }
@@ -260,6 +261,9 @@ fn fmt_double(f: f64) -> String {
 enum Repr {
     Boxed,
     Int,
+    /// An unboxed `i1` — produced by native integer comparisons; used directly as
+    /// a branch condition, boxed to True/False (`p2w_bool`) at a dynamic sink.
+    Bool,
 }
 
 /// Per-function emission state. Values are tagged `i32`; variables are
@@ -435,13 +439,20 @@ impl<'a> FuncEmitter<'a> {
     }
 
     /// Coerce a value from `from` to `to`, emitting a box/unbox only when needed.
+    /// Slot/param/return targets are only `Boxed` or `Int` today.
     fn coerce(&mut self, op: String, from: Repr, to: Repr) -> String {
-        match (from, to) {
-            (Repr::Boxed, Repr::Int) => {
-                self.call_value(&format!("call i32 @p2w_unbox_int(i32 {op})"))
+        if from == to {
+            return op;
+        }
+        match to {
+            Repr::Boxed => self.as_boxed(op, from),
+            Repr::Int => {
+                // Box any non-boxed source, then unbox to a raw int. (For an
+                // already-boxed source as_boxed is the identity.)
+                let boxed = self.as_boxed(op, from);
+                self.call_value(&format!("call i32 @p2w_unbox_int(i32 {boxed})"))
             }
-            (Repr::Int, Repr::Boxed) => self.as_boxed(op, Repr::Int),
-            _ => op, // same repr
+            Repr::Bool => self.as_boxed(op, from), // no Bool targets yet
         }
     }
 
@@ -754,10 +765,17 @@ impl<'a> FuncEmitter<'a> {
 
     /// Evaluate a condition to an `i1` via the runtime's truthiness.
     fn cond_i1(&mut self, cond: &Expr) -> Result<String, String> {
-        let (v, o) = self.expr_borrow(cond)?;
+        let (v, repr, owned) = self.expr_borrow_typed(cond)?;
+        // A native comparison is already an i1 — branch on it directly, no
+        // boxing and no p2w_truthy.
+        if repr == Repr::Bool {
+            return Ok(v);
+        }
+        let boxed = self.as_boxed(v, repr);
         let t = self.temp();
-        self.line(&format!("{t} = call i1 @p2w_truthy(i32 {v})"));
-        self.release_if_owned(&v, o); // truthiness borrows the condition value
+        self.line(&format!("{t} = call i1 @p2w_truthy(i32 {boxed})"));
+        // Release the operand if it was owned, or if boxing it made a temp.
+        self.release_if_owned(&boxed, owned || repr == Repr::Int);
         Ok(t)
     }
 
@@ -916,6 +934,7 @@ impl<'a> FuncEmitter<'a> {
         match repr {
             Repr::Boxed => op,
             Repr::Int => self.call_value(&format!("call i32 @p2w_int(i32 {op})")),
+            Repr::Bool => self.call_value(&format!("call i32 @p2w_bool(i1 {op})")),
         }
     }
 
@@ -963,8 +982,8 @@ impl<'a> FuncEmitter<'a> {
     fn expr_borrow(&mut self, e: &Expr) -> Result<(String, bool), String> {
         let (op, repr, owned) = self.expr_borrow_typed(e)?;
         let boxed = self.as_boxed(op, repr);
-        // Boxing an unboxed Int makes a fresh owned temp the caller must release.
-        let owned = owned || repr == Repr::Int;
+        // Boxing an unboxed value makes a fresh temp the caller must release.
+        let owned = owned || repr != Repr::Boxed;
         Ok((boxed, owned))
     }
 
@@ -1007,6 +1026,12 @@ impl<'a> FuncEmitter<'a> {
             let r = self.temp();
             self.line(&format!("{r} = {instr} i32 {va}, {vb}"));
             return Ok((r, Repr::Int));
+        }
+        // Native integer comparison: a raw `icmp` yielding an unboxed Bool (i1).
+        if let (Some(pred), Repr::Int, Repr::Int) = (int_cmp_pred(op), ar, br) {
+            let r = self.temp();
+            self.line(&format!("{r} = icmp {pred} i32 {va}, {vb}"));
+            return Ok((r, Repr::Bool));
         }
 
         // Boxed fallback: box each operand, call the runtime, release temps.
@@ -1216,6 +1241,19 @@ fn int_native_op(op: BinOp) -> Option<&'static str> {
     }
 }
 
+/// The LLVM `icmp` predicate for a native integer comparison (signed), or `None`.
+fn int_cmp_pred(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Lt => Some("slt"),
+        BinOp::Le => Some("sle"),
+        BinOp::Gt => Some("sgt"),
+        BinOp::Ge => Some("sge"),
+        BinOp::Eq => Some("eq"),
+        BinOp::Ne => Some("ne"),
+        _ => None,
+    }
+}
+
 /// The integer value of a literal `step` (handling `-1` parsed as `Neg(1)`).
 fn step_literal(e: &Expr) -> Option<i64> {
     match &e.kind {
@@ -1288,12 +1326,17 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_and_comparisons_route_through_runtime() {
+    fn non_native_ops_route_through_runtime() {
+        // /, //, ** and `not` still use the runtime (Python-floor semantics,
+        // non-single-instruction, or not yet native).
         assert!(ir("print(7 / 2)\n").contains("call i32 @p2w_div(i32"));
         assert!(ir("print(7 // 2)\n").contains("call i32 @p2w_floordiv(i32"));
         assert!(ir("print(2 ** 10)\n").contains("call i32 @p2w_pow(i32"));
-        assert!(ir("x = 1 < 2\n").contains("call i32 @p2w_lt(i32"));
         assert!(ir("y = not 0\n").contains("call i32 @p2w_not(i32"));
+        // Integer comparison is now a native icmp boxed to a bool — no p2w_lt.
+        let cmp = ir("x = 1 < 2\n");
+        assert!(cmp.contains("icmp slt i32 1, 2"), "{cmp}");
+        assert!(!cmp.contains("call i32 @p2w_lt"), "{cmp}");
     }
 
     #[test]

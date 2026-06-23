@@ -125,8 +125,12 @@ because the ints that generated them are no longer boxed.
   - *Done so far:* the `(operand, Repr)` plumbing (`expr_typed`/`as_boxed`,
     bit-identical) and **native unboxed integer `+`/`-`/`*`** — `print(2 + 3 * 4)`
     emits raw `add`/`mul i32` and boxes once at `print` (5 runtime calls → 1).
-    `Float`/`Bool` reprs, `//`/`%`/comparisons, and unboxed *variables* (which
-    need Phase B typed slots) remain.
+    `Float`, `//`/`%`, and unboxed *variables* (which need Phase B typed slots)
+    remain. **Native integer comparisons + `Bool` repr also done:** `<`/`<=`/`>`/
+    `>=`/`==`/`!=` on ints emit a raw `icmp` (unboxed `i1`), used directly as a
+    branch condition with no `p2w_truthy`. So `if n < 2:` in a typed function is a
+    single `icmp` — `def fact(n: int)` now has a fully native body (icmp + mul,
+    zero runtime calls).
 - **B — typed function signatures.** Annotated params/returns become unboxed in
   the LLVM signature; callers coerce at the call. (Recursion like `fib(n: int)`
   becomes raw-`i32` throughout.)
