@@ -372,9 +372,9 @@ impl<'a> FuncEmitter<'a> {
                     if args.len() != 1 {
                         return nope("print() with multiple arguments");
                     }
-                    let v = self.expr(&args[0])?;
+                    let (v, o) = self.expr_borrow(&args[0])?;
                     self.line(&format!("call void @p2w_print(i32 {v})"));
-                    self.release(&v); // print borrows; drop the operand temp
+                    self.release_if_owned(&v, o); // print borrows the operand
                     Ok(())
                 }
                 // Any other expression statement (a call, a method call like
@@ -607,10 +607,10 @@ impl<'a> FuncEmitter<'a> {
 
     /// Evaluate a condition to an `i1` via the runtime's truthiness.
     fn cond_i1(&mut self, cond: &Expr) -> Result<String, String> {
-        let v = self.expr(cond)?;
+        let (v, o) = self.expr_borrow(cond)?;
         let t = self.temp();
         self.line(&format!("{t} = call i1 @p2w_truthy(i32 {v})"));
-        self.release(&v); // truthiness borrows the condition value
+        self.release_if_owned(&v, o); // truthiness borrows the condition value
         Ok(t)
     }
 
@@ -647,15 +647,15 @@ impl<'a> FuncEmitter<'a> {
                 Ok(t)
             }
             ExprKind::Unary(UnOp::Neg, inner) => {
-                let v = self.expr(inner)?;
+                let (v, o) = self.expr_borrow(inner)?;
                 let r = self.call_value(&format!("call i32 @p2w_neg(i32 {v})"));
-                self.release(&v);
+                self.release_if_owned(&v, o);
                 Ok(r)
             }
             ExprKind::Unary(UnOp::Not, inner) => {
-                let v = self.expr(inner)?;
+                let (v, o) = self.expr_borrow(inner)?;
                 let r = self.call_value(&format!("call i32 @p2w_not(i32 {v})"));
-                self.release(&v);
+                self.release_if_owned(&v, o);
                 Ok(r)
             }
             ExprKind::Bin(op, a, b) => self.bin(*op, a, b),
@@ -665,9 +665,9 @@ impl<'a> FuncEmitter<'a> {
                     if args.len() != 1 {
                         return nope("len() with other than one argument");
                     }
-                    let v = self.expr(&args[0])?;
+                    let (v, o) = self.expr_borrow(&args[0])?;
                     let r = self.call_value(&format!("call i32 @p2w_len(i32 {v})"));
-                    self.release(&v); // len borrows its argument
+                    self.release_if_owned(&v, o); // len borrows its argument
                     return Ok(r);
                 }
                 if !self.funcs.contains(name) {
@@ -699,11 +699,11 @@ impl<'a> FuncEmitter<'a> {
                 Ok(dict)
             }
             ExprKind::Index(obj, idx) => {
-                let o = self.expr(obj)?;
-                let i = self.expr(idx)?;
+                let (o, oo) = self.expr_borrow(obj)?;
+                let (i, oi) = self.expr_borrow(idx)?;
                 let r = self.call_value(&format!("call i32 @p2w_index(i32 {o}, i32 {i})"));
-                self.release(&o); // target + index are borrowed; result is owned
-                self.release(&i);
+                self.release_if_owned(&o, oo); // target + index borrowed; result owned
+                self.release_if_owned(&i, oi);
                 Ok(r)
             }
             ExprKind::MethodCall(obj, method, args) => self.method_call(obj, method, args),
@@ -720,10 +720,10 @@ impl<'a> FuncEmitter<'a> {
                 obj.line
             ));
         }
-        let recv = self.expr(obj)?;
+        let (recv, recv_owned) = self.expr_borrow(obj)?;
         let mut argvals = Vec::with_capacity(args.len());
         for a in args {
-            argvals.push(self.expr(a)?);
+            argvals.push(self.expr(a)?); // method args are transferred (owned)
         }
         let name_g = self.intern_str(method.as_bytes());
         let nlen = method.len();
@@ -737,8 +737,37 @@ impl<'a> FuncEmitter<'a> {
         ));
         // The receiver is borrowed; method args are transferred (the runtime
         // method owns them — e.g. append stores its arg), so they aren't released.
-        self.release(&recv);
+        self.release_if_owned(&recv, recv_owned);
         Ok(r)
+    }
+
+    /// Evaluate `e` for a *borrowing* use — an operand of an op that reads but
+    /// doesn't keep the reference (arithmetic, compare, print, len, condition,
+    /// read-index, method receiver). Returns `(value, owned)`:
+    ///   - a plain `Name` is borrowed through its variable slot, which already
+    ///     owns it for the duration of this op — no `retain`/`release` at all.
+    ///   - anything else is a freshly owned temp (`owned = true`); the caller
+    ///     must `release` it after the op.
+    /// Borrowing is sound here because a single op evaluates its operands and
+    /// consumes them immediately — no statement runs in between to reassign the
+    /// slot. (This is the practical core of Perceus last-use: the common
+    /// read-then-use never touches a refcount.)
+    fn expr_borrow(&mut self, e: &Expr) -> Result<(String, bool), String> {
+        if let ExprKind::Name(name) = &e.kind {
+            if !self.vars.iter().any(|v| v == name) {
+                return Err(format!("line {}: name '{name}' is not defined", e.line));
+            }
+            let t = self.call_value(&format!("load i32, ptr %v_{name}"));
+            return Ok((t, false));
+        }
+        Ok((self.expr(e)?, true))
+    }
+
+    /// Release a borrowed operand only if it was actually an owned temp.
+    fn release_if_owned(&mut self, v: &str, owned: bool) {
+        if owned {
+            self.release(v);
+        }
     }
 
     fn bin(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<String, String> {
@@ -766,11 +795,12 @@ impl<'a> FuncEmitter<'a> {
                 ));
             }
         };
-        let va = self.expr(a)?;
-        let vb = self.expr(b)?;
+        let (va, oa) = self.expr_borrow(a)?;
+        let (vb, ob) = self.expr_borrow(b)?;
         let r = self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})"));
-        self.release(&va); // operands are borrowed; the result is a new owned value
-        self.release(&vb);
+        // Operands are borrowed; the result is a new owned value.
+        self.release_if_owned(&va, oa);
+        self.release_if_owned(&vb, ob);
         Ok(r)
     }
 
@@ -891,12 +921,23 @@ mod tests {
 
     #[test]
     fn rc_pass_emits_retain_and_release() {
-        // A program touching heap values must retain on load and release temps.
-        // (Full memory-correctness is validated by tools/native_run.sh; this just
-        // guards the wiring from accidental removal.)
-        let out = ir("x = [1, 2]\nprint(x)\n");
-        assert!(out.contains("call void @p2w_retain(i32"), "retain on load: {out}");
-        assert!(out.contains("call void @p2w_release(i32"), "release temps: {out}");
+        // Transferring a *named* value (ys = xs) retains it; the slots are
+        // released at exit. (Full memory-correctness is validated by
+        // tools/native_run.sh; this just guards the wiring from removal.)
+        let out = ir("xs = [1, 2]\nys = xs\nprint(len(ys))\n");
+        assert!(out.contains("call void @p2w_retain(i32"), "retain on transfer: {out}");
+        assert!(out.contains("call void @p2w_release(i32"), "release at exit: {out}");
+    }
+
+    #[test]
+    fn borrow_on_read_skips_refcounting() {
+        // A name read straight into a borrowing op (print) needs NO retain/release:
+        // the slot owns it for the op's duration. This program transfers nothing.
+        let out = ir("x = 5\nprint(x)\nprint(x + 1)\n");
+        assert!(
+            !out.contains("call void @p2w_retain"),
+            "no retain for borrowed reads: {out}"
+        );
     }
 
     #[test]

@@ -85,11 +85,23 @@ Implemented in `src/llvm.rs` (release at scope end; no last-use precision yet).
       early return, foreach-over-strings, short-circuit, pop → all `live == 0`.
 
 ### 2. Perceus-style precision (after 1 is proven safe)
-- [ ] **Last-use analysis:** release at last use, not scope end (shorter lifetimes).
+- [x] **Borrow-on-read (last-use core):** a `Name` read straight into a borrowing
+      op (arith/compare/unary/print/len/condition/read-index/method receiver) is
+      borrowed through its slot — no retain/release at all. `expr_borrow` returns
+      `(value, owned)`; only genuinely-owned temps are released. Validated: all 21
+      oracle cases still `live==0`; a trivial int loop dropped 14→6 RC ops (retain
+      4→0). Tests: `borrow_on_read_skips_refcounting`.
+- [ ] **Full last-use on owned slots:** release an owned variable at its last read
+      rather than at scope end (needs per-block liveness; borrow-on-read already
+      covers the common read-then-use). The leftover scope-end releases are mostly
+      ints (runtime no-ops) — typed-int monomorphization would drop those too.
 - [ ] **Borrowed params:** params that don't escape are borrowed (no retain/release).
+      Needs per-param escape analysis + flipping the call convention (today args
+      are transferred to the callee); defer until escape analysis exists.
 - [ ] **Drop-reuse tokens (FBIP):** when a unique value is dropped and a same-shape
       value is allocated, reuse the buffer in place (the big embedded win — mutate
-      in place vs alloc/free churn). Needs uniqueness (refcount==1) check.
+      in place vs alloc/free churn). Needs a runtime reuse path + uniqueness
+      (refcount==1) check; the accounting/run-oracle can measure the alloc drop.
 
 ### 3. Cycles + flags
 - [ ] No-mutation auto-detect: if a program has no mutating ops it's provably
