@@ -223,6 +223,17 @@ fn fmt_double(f: f64) -> String {
 // by tools/native_run.sh with GATE_LEAKS=1 (every case ends live==0). Precision
 // (last-use), borrowed params, and reuse (drop-reuse) follow — see MEMORY_MANAGEMENT.md.
 
+/// Static representation of a value as the emitter tracks it. `Boxed` is the
+/// universal tagged-`i32` (the dynamic default). Unboxed reprs are raw machine
+/// values produced where the type is statically known; `as_boxed` coerces back
+/// at dynamic sinks. See VALUE_MODEL.md. (Stage 1: `Int` only; `Float`/`Bool`/
+/// packed arrays follow.)
+#[derive(Clone, Copy)]
+enum Repr {
+    Boxed,
+    Int,
+}
+
 /// Per-function emission state. Values are tagged `i32`; variables are
 /// entry-block `alloca`s; control flow uses labelled basic blocks.
 struct FuncEmitter<'a> {
@@ -652,8 +663,11 @@ impl<'a> FuncEmitter<'a> {
         Ok(t)
     }
 
-    /// Evaluate an expression to a tagged-`i32` value operand.
-    fn expr(&mut self, e: &Expr) -> Result<String, String> {
+    /// Evaluate an expression to a typed value `(operand, Repr)`. Most arms are
+    /// `Boxed` (the universal tagged-`i32`); unboxed reprs are produced where the
+    /// static type is known. `as_boxed` coerces back at dynamic sinks. See
+    /// VALUE_MODEL.md.
+    fn expr_typed(&mut self, e: &Expr) -> Result<(String, Repr), String> {
         let nope = |what: &str| {
             Err(format!(
                 "line {}: the native (Pico) backend doesn't handle {what} yet",
@@ -661,19 +675,24 @@ impl<'a> FuncEmitter<'a> {
             ))
         };
         match &e.kind {
-            ExprKind::Int(n) => Ok(self.call_value(&format!("call i32 @p2w_int(i32 {})", *n as i32))),
+            // A raw int literal is unboxed; it only becomes a boxed p2w_int when
+            // it reaches a dynamic sink (via as_boxed).
+            ExprKind::Int(n) => Ok((format!("{}", *n as i32), Repr::Int)),
             ExprKind::Float(f) => {
                 // LLVM wants a portable double constant; hex float is exact.
-                Ok(self.call_value(&format!("call i32 @p2w_float(double {})", fmt_double(*f))))
+                let v = self.call_value(&format!("call i32 @p2w_float(double {})", fmt_double(*f)));
+                Ok((v, Repr::Boxed))
             }
             ExprKind::Bool(b) => {
-                Ok(self.call_value(&format!("call i32 @p2w_bool(i1 {})", if *b { 1 } else { 0 })))
+                let v = self.call_value(&format!("call i32 @p2w_bool(i1 {})", if *b { 1 } else { 0 }));
+                Ok((v, Repr::Boxed))
             }
-            ExprKind::NoneLit => Ok(self.call_value("call i32 @p2w_none()")),
+            ExprKind::NoneLit => Ok((self.call_value("call i32 @p2w_none()"), Repr::Boxed)),
             ExprKind::Str(s) => {
                 let bytes = s.as_bytes();
                 let g = self.intern_str(bytes);
-                Ok(self.call_value(&format!("call i32 @p2w_str(ptr {g}, i32 {})", bytes.len())))
+                let v = self.call_value(&format!("call i32 @p2w_str(ptr {g}, i32 {})", bytes.len()));
+                Ok((v, Repr::Boxed))
             }
             ExprKind::Name(name) => {
                 if !self.vars.iter().any(|v| v == name) {
@@ -682,21 +701,21 @@ impl<'a> FuncEmitter<'a> {
                 // A load is borrowed; retain to hand back an owned reference.
                 let t = self.call_value(&format!("load i32, ptr %v_{name}"));
                 self.retain(&t);
-                Ok(t)
+                Ok((t, Repr::Boxed))
             }
             ExprKind::Unary(UnOp::Neg, inner) => {
                 let (v, o) = self.expr_borrow(inner)?;
                 let r = self.call_value(&format!("call i32 @p2w_neg(i32 {v})"));
                 self.release_if_owned(&v, o);
-                Ok(r)
+                Ok((r, Repr::Boxed))
             }
             ExprKind::Unary(UnOp::Not, inner) => {
                 let (v, o) = self.expr_borrow(inner)?;
                 let r = self.call_value(&format!("call i32 @p2w_not(i32 {v})"));
                 self.release_if_owned(&v, o);
-                Ok(r)
+                Ok((r, Repr::Boxed))
             }
-            ExprKind::Bin(op, a, b) => self.bin(*op, a, b),
+            ExprKind::Bin(op, a, b) => Ok((self.bin(*op, a, b)?, Repr::Boxed)),
             ExprKind::Call(name, args) => {
                 // len() is the one builtin lowered to the runtime so far.
                 if name == "len" {
@@ -706,7 +725,7 @@ impl<'a> FuncEmitter<'a> {
                     let (v, o) = self.expr_borrow(&args[0])?;
                     let r = self.call_value(&format!("call i32 @p2w_len(i32 {v})"));
                     self.release_if_owned(&v, o); // len borrows its argument
-                    return Ok(r);
+                    return Ok((r, Repr::Boxed));
                 }
                 if !self.funcs.contains(name) {
                     return nope("calling this function (only your own functions, len, + print)");
@@ -733,7 +752,7 @@ impl<'a> FuncEmitter<'a> {
                 for v in borrowed_temps {
                     self.release(&v);
                 }
-                Ok(r)
+                Ok((r, Repr::Boxed))
             }
             ExprKind::List(items) => {
                 let list = self.call_value("call i32 @p2w_list_new()");
@@ -741,7 +760,7 @@ impl<'a> FuncEmitter<'a> {
                     let v = self.expr(it)?;
                     self.line(&format!("call i32 @p2w_list_append(i32 {list}, i32 {v})"));
                 }
-                Ok(list)
+                Ok((list, Repr::Boxed))
             }
             ExprKind::Dict(pairs) => {
                 let dict = self.call_value("call i32 @p2w_dict_new()");
@@ -752,7 +771,7 @@ impl<'a> FuncEmitter<'a> {
                         "call void @p2w_setindex(i32 {dict}, i32 {kv}, i32 {vv})"
                     ));
                 }
-                Ok(dict)
+                Ok((dict, Repr::Boxed))
             }
             ExprKind::Index(obj, idx) => {
                 let (o, oo) = self.expr_borrow(obj)?;
@@ -760,10 +779,28 @@ impl<'a> FuncEmitter<'a> {
                 let r = self.call_value(&format!("call i32 @p2w_index(i32 {o}, i32 {i})"));
                 self.release_if_owned(&o, oo); // target + index borrowed; result owned
                 self.release_if_owned(&i, oi);
-                Ok(r)
+                Ok((r, Repr::Boxed))
             }
-            ExprKind::MethodCall(obj, method, args) => self.method_call(obj, method, args),
+            ExprKind::MethodCall(obj, method, args) => {
+                Ok((self.method_call(obj, method, args)?, Repr::Boxed))
+            }
             _ => nope("this expression"),
+        }
+    }
+
+    /// Evaluate an expression to a boxed tagged-`i32` value — the representation
+    /// every runtime ABI call expects. Coerces unboxed reprs at the boundary.
+    fn expr(&mut self, e: &Expr) -> Result<String, String> {
+        let (op, repr) = self.expr_typed(e)?;
+        Ok(self.as_boxed(op, repr))
+    }
+
+    /// Coerce a typed value to the boxed representation, emitting the box only
+    /// when it isn't already boxed.
+    fn as_boxed(&mut self, op: String, repr: Repr) -> String {
+        match repr {
+            Repr::Boxed => op,
+            Repr::Int => self.call_value(&format!("call i32 @p2w_int(i32 {op})")),
         }
     }
 
