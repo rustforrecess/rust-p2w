@@ -2698,7 +2698,7 @@ mod tests {
         let mut vm = Vm::new("xs = [5, 6, 7]\nprint(xs)\n").unwrap();
         vm.step(); // xs = ...
         assert_eq!(vm.eval_watch("xs[1]").unwrap(), "6");
-        assert_eq!(vm.eval_watch("len(xs)").unwrap_err().contains("call-stack"), true);
+        assert!(vm.eval_watch("len(xs)").unwrap_err().contains("call-stack"));
     }
 
     #[test]
