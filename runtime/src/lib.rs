@@ -667,8 +667,8 @@ fn free_object(o: usize) {
                 dealloc(d);
             }
         }
-        T_IARRAY => {
-            // Raw int elements carry no refcount — just free the backing buffer.
+        T_IARRAY | T_FARRAY => {
+            // Raw scalar elements carry no refcount — just free the buffer.
             let d = coll_data(o);
             if d != 0 {
                 dealloc(d);
@@ -714,6 +714,8 @@ const T_ITER: u32 = 4;
 /// A packed `list[int]`: same layout as a list, but elements are raw `i32` (not
 /// boxed Values) and aren't refcounted. See VALUE_MODEL.md (Phase C).
 const T_IARRAY: u32 = 7;
+/// A packed `list[float]`: like `T_IARRAY` but elements are raw `f64` (8 bytes).
+const T_FARRAY: u32 = 8;
 
 fn coll_len(o: usize) -> usize {
     rd(o + 8) as usize
@@ -823,7 +825,7 @@ fn norm_index(index: Value, n: i64) -> i64 {
 /// `len(v)` for any collection (string/list/dict all store len at +8).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_len(v: Value) -> Value {
-    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_IARRAY) {
+    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY) {
         return make_int(coll_len(v as usize) as i64);
     }
     trap("object has no len()")
@@ -913,7 +915,7 @@ pub extern "C" fn p2w_iarray_push(arr: Value, x: i32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_iarray_get(arr: Value, idx: i32) -> i32 {
     let o = arr as usize;
-    let i = iarray_index(o, idx);
+    let i = checked_index(o, idx, T_IARRAY);
     list_get(o, i) as i32
 }
 
@@ -921,14 +923,15 @@ pub extern "C" fn p2w_iarray_get(arr: Value, idx: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_iarray_set(arr: Value, idx: i32, x: i32) {
     let o = arr as usize;
-    let i = iarray_index(o, idx);
+    let i = checked_index(o, idx, T_IARRAY);
     list_set_at(o, i, x as Value);
 }
 
-/// Normalize + bounds-check a raw index against a packed array (traps on OOB).
-fn iarray_index(o: usize, idx: i32) -> usize {
-    if !(is_heap(o as Value) && obj_tag(o as Value) == T_IARRAY) {
-        trap("expected an int array");
+/// Normalize + bounds-check a raw index against a packed array of the given tag
+/// (traps on a wrong type or out-of-range index).
+fn checked_index(o: usize, idx: i32, tag: u32) -> usize {
+    if !(is_heap(o as Value) && obj_tag(o as Value) == tag) {
+        trap("expected an array");
     }
     let n = coll_len(o) as i64;
     let i = if (idx as i64) < 0 { idx as i64 + n } else { idx as i64 };
@@ -936,6 +939,49 @@ fn iarray_index(o: usize, idx: i32) -> usize {
         trap("index out of range");
     }
     i as usize
+}
+
+// --- packed float arrays (list[float]) -------------------------------------
+// Like T_IARRAY but each element is a raw f64 (8-byte slots).
+
+fn farray_get(o: usize, i: usize) -> f64 {
+    unsafe { core::ptr::read_unaligned(heap_base().add(coll_data(o) + i * 8) as *const f64) }
+}
+fn farray_set_at(o: usize, i: usize, x: f64) {
+    unsafe { core::ptr::write_unaligned(heap_base().add(coll_data(o) + i * 8) as *mut f64, x) };
+}
+fn farray_push(o: usize, x: f64) {
+    let len = coll_len(o);
+    ensure_cap(o, len + 1, len, 8);
+    farray_set_at(o, len, x);
+    set_len(o, len + 1);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_farray_new() -> Value {
+    coll_new(T_FARRAY)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_farray_push(arr: Value, x: f64) {
+    if !(is_heap(arr) && obj_tag(arr) == T_FARRAY) {
+        trap("expected a float array");
+    }
+    farray_push(arr as usize, x);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_farray_get(arr: Value, idx: i32) -> f64 {
+    let o = arr as usize;
+    let i = checked_index(o, idx, T_FARRAY);
+    farray_get(o, i)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_farray_set(arr: Value, idx: i32, x: f64) {
+    let o = arr as usize;
+    let i = checked_index(o, idx, T_FARRAY);
+    farray_set_at(o, i, x);
 }
 
 // --- iteration protocol ----------------------------------------------------
@@ -1125,6 +1171,16 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
                     write_bytes(b", ", out);
                 }
                 write_int(list_get(o, i) as i32 as i64, out);
+            }
+            out(b']');
+        }
+        T_FARRAY => {
+            out(b'[');
+            for i in 0..coll_len(o) {
+                if i > 0 {
+                    write_bytes(b", ", out);
+                }
+                write_float(farray_get(o, i), out);
             }
             out(b']');
         }
@@ -1421,6 +1477,23 @@ mod tests {
         assert_eq!(p2w_iarray_get(arr, 1), 99);
         assert_eq!(shown(arr), "[10, 99, -30]");
         // Raw elements carry no refcount; release frees the object + buffer only.
+        p2w_release(arr);
+        assert_eq!(p2w_live(), 0);
+    }
+
+    #[test]
+    fn packed_float_array_stores_raw_doubles() {
+        let _g = heap_guard();
+        let arr = p2w_farray_new();
+        p2w_farray_push(arr, 1.5);
+        p2w_farray_push(arr, 2.0);
+        p2w_farray_push(arr, -0.25);
+        assert_eq!(as_int(p2w_len(arr)), 3);
+        assert_eq!(p2w_farray_get(arr, 0), 1.5);
+        assert_eq!(p2w_farray_get(arr, -1), -0.25); // negative index
+        p2w_farray_set(arr, 1, 9.5);
+        assert_eq!(p2w_farray_get(arr, 1), 9.5);
+        assert_eq!(shown(arr), "[1.5, 9.5, -0.25]");
         p2w_release(arr);
         assert_eq!(p2w_live(), 0);
     }

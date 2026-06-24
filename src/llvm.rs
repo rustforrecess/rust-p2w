@@ -63,6 +63,10 @@ declare i32 @p2w_iarray_new()
 declare void @p2w_iarray_push(i32, i32)
 declare i32 @p2w_iarray_get(i32, i32)
 declare void @p2w_iarray_set(i32, i32, i32)
+declare i32 @p2w_farray_new()
+declare void @p2w_farray_push(i32, double)
+declare double @p2w_farray_get(i32, i32)
+declare void @p2w_farray_set(i32, i32, double)
 declare i32 @p2w_index(i32, i32)
 declare void @p2w_setindex(i32, i32, i32)
 declare i32 @p2w_len(i32)
@@ -280,13 +284,16 @@ enum Repr {
     /// refcounted the same way), but elements are raw ints accessed via the
     /// `p2w_iarray_*` ABI. See VALUE_MODEL.md (Phase C).
     IntArray,
+    /// A `list[float]`: like `IntArray` but elements are raw `double`s
+    /// (`p2w_farray_*` ABI).
+    FloatArray,
 }
 
-/// True if a value of this repr is a heap reference (`Boxed`/`IntArray`) that
-/// participates in reference counting — retained on owned load, released at
-/// scope exit. Unboxed scalars (Int/Float/Bool) are not.
+/// True if a value of this repr is a heap reference (`Boxed`/`IntArray`/
+/// `FloatArray`) that participates in reference counting — retained on owned
+/// load, released at scope exit. Unboxed scalars (Int/Float/Bool) are not.
 fn is_heap_repr(r: Repr) -> bool {
-    matches!(r, Repr::Boxed | Repr::IntArray)
+    matches!(r, Repr::Boxed | Repr::IntArray | Repr::FloatArray)
 }
 
 /// True if boxing this repr (`as_boxed`) allocates a fresh owned temp — i.e. an
@@ -499,9 +506,9 @@ impl<'a> FuncEmitter<'a> {
             },
             Repr::Float => self.promote_double(op, from),
             Repr::Bool => self.as_boxed(op, from), // no Bool targets yet
-            // A list[int] slot is only ever fed an IntArray (identity) or built
-            // directly from a literal (build_iarray, which bypasses coerce).
-            Repr::IntArray => op,
+            // A packed-array slot is only ever fed a matching array (identity) or
+            // built directly from a literal (build_*array, which bypasses coerce).
+            Repr::IntArray | Repr::FloatArray => op,
         }
     }
 
@@ -518,12 +525,27 @@ impl<'a> FuncEmitter<'a> {
             }
             Repr::Bool => self.coerce(v, Repr::Bool, Repr::Int), // rare; i1, no RC
             Repr::Float => self.coerce(v, Repr::Float, Repr::Int), // fptosi (rare)
-            Repr::IntArray => {
+            Repr::IntArray | Repr::FloatArray => {
                 // An array where an int is expected — coerce traps at runtime.
-                let raw = self.coerce(v.clone(), Repr::IntArray, Repr::Int);
+                let raw = self.coerce(v.clone(), vr, Repr::Int);
                 self.release(&v);
                 raw
             }
+        })
+    }
+
+    /// Evaluate `e` to a raw unboxed `double` (int → `sitofp`, float as-is, boxed
+    /// → `p2w_unbox_float` + release). Used for packed float-array elements.
+    fn expr_double(&mut self, e: &Expr) -> Result<String, String> {
+        let (v, vr) = self.expr_typed(e)?;
+        Ok(match vr {
+            Repr::Float => v,
+            Repr::Boxed => {
+                let raw = self.promote_double(v.clone(), Repr::Boxed);
+                self.release(&v); // drop the boxed temp we unboxed
+                raw
+            }
+            _ => self.promote_double(v, vr), // Int -> sitofp; others trap at runtime
         })
     }
 
@@ -538,14 +560,27 @@ impl<'a> FuncEmitter<'a> {
         Ok(arr)
     }
 
-    /// Evaluate `value` for assignment into a slot of representation `slot`. An
-    /// `IntArray` slot fed a list literal is built packed; everything else is the
-    /// usual typed evaluation.
+    /// Build a packed `list[float]` from literal elements (each lowered to a raw
+    /// double). Returns an owned `FloatArray` reference.
+    fn build_farray(&mut self, items: &[Expr]) -> Result<String, String> {
+        let arr = self.call_value("call i32 @p2w_farray_new()");
+        for it in items {
+            let raw = self.expr_double(it)?;
+            self.line(&format!("call void @p2w_farray_push(i32 {arr}, double {raw})"));
+        }
+        Ok(arr)
+    }
+
+    /// Evaluate `value` for assignment into a slot of representation `slot`. A
+    /// packed-array slot fed a list literal is built packed; everything else is
+    /// the usual typed evaluation.
     fn eval_for_slot(&mut self, slot: Repr, value: &Expr) -> Result<(String, Repr), String> {
-        if slot == Repr::IntArray
-            && let ExprKind::List(items) = &value.kind
-        {
-            return Ok((self.build_iarray(items)?, Repr::IntArray));
+        if let ExprKind::List(items) = &value.kind {
+            match slot {
+                Repr::IntArray => return Ok((self.build_iarray(items)?, Repr::IntArray)),
+                Repr::FloatArray => return Ok((self.build_farray(items)?, Repr::FloatArray)),
+                _ => {}
+            }
         }
         self.expr_typed(value)
     }
@@ -665,6 +700,13 @@ impl<'a> FuncEmitter<'a> {
                     let i = self.expr_int(index)?;
                     let val = self.expr_int(value)?;
                     self.line(&format!("call void @p2w_iarray_set(i32 {t}, i32 {i}, i32 {val})"));
+                    self.release_if_owned(&t, towned);
+                    return Ok(());
+                }
+                if trepr == Repr::FloatArray {
+                    let i = self.expr_int(index)?;
+                    let val = self.expr_double(value)?;
+                    self.line(&format!("call void @p2w_farray_set(i32 {t}, i32 {i}, double {val})"));
                     self.release_if_owned(&t, towned);
                     return Ok(());
                 }
@@ -857,7 +899,10 @@ impl<'a> FuncEmitter<'a> {
     fn emit_foreach(&mut self, var: &str, iterable: &Expr, body: &[Stmt]) -> Result<(), String> {
         let (seq, srepr) = self.expr_typed(iterable)?; // owned
         if srepr == Repr::IntArray {
-            return self.emit_foreach_iarray(var, seq, body);
+            return self.emit_foreach_array(var, seq, Repr::Int, "p2w_iarray_get", body);
+        }
+        if srepr == Repr::FloatArray {
+            return self.emit_foreach_array(var, seq, Repr::Float, "p2w_farray_get", body);
         }
         let it = self.call_value(&format!("call i32 @p2w_iter(i32 {seq})"));
         // Both outlive the loop and must survive an early return — track them.
@@ -896,10 +941,18 @@ impl<'a> FuncEmitter<'a> {
         Ok(())
     }
 
-    /// `for var in xs:` over a packed `list[int]` — lowered to a native index
-    /// loop with raw `p2w_iarray_get`, so the loop variable is an unboxed int.
-    fn emit_foreach_iarray(&mut self, var: &str, seq: String, body: &[Stmt]) -> Result<(), String> {
-        // seq is an owned IntArray ref; it must survive the loop and early return.
+    /// `for var in xs:` over a packed array — lowered to a native index loop with
+    /// a raw element getter (`get_fn`), so the loop variable is an unboxed scalar
+    /// of `elem` repr (Int for list[int], Float for list[float]).
+    fn emit_foreach_array(
+        &mut self,
+        var: &str,
+        seq: String,
+        elem: Repr,
+        get_fn: &str,
+        body: &[Stmt],
+    ) -> Result<(), String> {
+        // seq is an owned array ref; it must survive the loop and early return.
         self.cleanups.push(seq.clone());
         let lenb = self.call_value(&format!("call i32 @p2w_len(i32 {seq})"));
         let len = self.call_value(&format!("call i32 @p2w_unbox_int(i32 {lenb})"));
@@ -911,13 +964,18 @@ impl<'a> FuncEmitter<'a> {
         self.allocas
             .push_str(&format!("  {ix} = alloca i32\n  store i32 0, ptr {ix}\n"));
         let existed = self.vars.iter().any(|v| v == var);
-        let slot = self.var_slot(var);
+        let slot = self.ensure_slot(var, elem); // typed loop-var slot (i32 / double)
+        if existed && llvm_ty(self.slot_repr(var)) != llvm_ty(elem) {
+            return Err(format!(
+                "the loop variable '{var}' is reused with an incompatible type"
+            ));
+        }
         if existed && is_heap_repr(self.slot_repr(var)) {
             let old = self.temp();
             self.line(&format!("{old} = load i32, ptr {slot}"));
             self.release(&old);
         }
-        self.var_reprs.insert(var.to_string(), Repr::Int); // loop var is a raw int
+        self.var_reprs.insert(var.to_string(), elem); // loop var is an unboxed scalar
 
         let head = self.fresh_label("ahead");
         let body_l = self.fresh_label("abody");
@@ -935,8 +993,9 @@ impl<'a> FuncEmitter<'a> {
         self.place_label(&body_l);
         let iv = self.temp();
         self.line(&format!("{iv} = load i32, ptr {ix}"));
-        let elem = self.call_value(&format!("call i32 @p2w_iarray_get(i32 {seq}, i32 {iv})"));
-        self.line(&format!("store i32 {elem}, ptr {slot}")); // Int slot: raw, no RC
+        let ety = llvm_ty(elem);
+        let e = self.call_value(&format!("call {ety} @{get_fn}(i32 {seq}, i32 {iv})"));
+        self.line(&format!("store {ety} {e}, ptr {slot}")); // unboxed scalar: no RC
         self.loops.push((cont.clone(), end.clone()));
         self.block(body)?;
         self.loops.pop();
@@ -1114,6 +1173,12 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&o, oo);
                     return Ok((r, Repr::Int));
                 }
+                if orepr == Repr::FloatArray {
+                    let i = self.expr_int(idx)?;
+                    let r = self.call_value(&format!("call double @p2w_farray_get(i32 {o}, i32 {i})"));
+                    self.release_if_owned(&o, oo);
+                    return Ok((r, Repr::Float));
+                }
                 let ob = self.as_boxed(o, orepr);
                 let (i, oi) = self.expr_borrow(idx)?;
                 let r = self.call_value(&format!("call i32 @p2w_index(i32 {ob}, i32 {i})"));
@@ -1143,7 +1208,7 @@ impl<'a> FuncEmitter<'a> {
             Repr::Int => self.call_value(&format!("call i32 @p2w_int(i32 {op})")),
             Repr::Bool => self.call_value(&format!("call i32 @p2w_bool(i1 {op})")),
             Repr::Float => self.call_value(&format!("call i32 @p2w_float(double {op})")),
-            Repr::IntArray => op, // already a heap-ref Value
+            Repr::IntArray | Repr::FloatArray => op, // already a heap-ref Value
         }
     }
 
@@ -1175,6 +1240,12 @@ impl<'a> FuncEmitter<'a> {
         if rrepr == Repr::IntArray && method == "append" && args.len() == 1 {
             let raw = self.expr_int(&args[0])?;
             self.line(&format!("call void @p2w_iarray_push(i32 {recv}, i32 {raw})"));
+            self.release_if_owned(&recv, rowned);
+            return Ok(self.call_value("call i32 @p2w_none()"));
+        }
+        if rrepr == Repr::FloatArray && method == "append" && args.len() == 1 {
+            let raw = self.expr_double(&args[0])?;
+            self.line(&format!("call void @p2w_farray_push(i32 {recv}, double {raw})"));
             self.release_if_owned(&recv, rowned);
             return Ok(self.call_value("call i32 @p2w_none()"));
         }
@@ -1484,6 +1555,12 @@ fn repr_of_ann(ann: &Option<Expr>) -> Repr {
             {
                 Repr::IntArray
             }
+            ExprKind::Index(base, elem)
+                if matches!(&base.kind, ExprKind::Name(n) if n == "list")
+                    && matches!(&elem.kind, ExprKind::Name(n) if n == "float") =>
+            {
+                Repr::FloatArray
+            }
             _ => Repr::Boxed,
         },
         None => Repr::Boxed,
@@ -1496,7 +1573,7 @@ fn llvm_ty(repr: Repr) -> &'static str {
     match repr {
         Repr::Float => "double",
         Repr::Bool => "i1",
-        Repr::Boxed | Repr::Int | Repr::IntArray => "i32",
+        Repr::Boxed | Repr::Int | Repr::IntArray | Repr::FloatArray => "i32",
     }
 }
 
@@ -1674,6 +1751,15 @@ mod tests {
         assert!(out.contains("call i32 @p2w_iarray_new"), "packed construct: {out}");
         assert!(out.contains("call void @p2w_iarray_push"), "raw push: {out}");
         assert!(out.contains("call i32 @p2w_iarray_get"), "raw get: {out}");
+        assert!(!out.contains("call i32 @p2w_list_new"), "not a dynamic list: {out}");
+    }
+
+    #[test]
+    fn list_float_compiles_to_a_packed_double_array() {
+        let out = ir("xs: list[float] = [1.5, 2.5]\nprint(xs[0])\nfor x in xs:\n    print(x)\n");
+        assert!(out.contains("call i32 @p2w_farray_new"), "packed construct: {out}");
+        assert!(out.contains("call void @p2w_farray_push(i32"), "raw push: {out}");
+        assert!(out.contains("call double @p2w_farray_get"), "raw double get: {out}");
         assert!(!out.contains("call i32 @p2w_list_new"), "not a dynamic list: {out}");
     }
 

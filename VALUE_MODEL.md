@@ -167,8 +167,11 @@ because the ints that generated them are no longer boxed.
   the raw `p2w_iarray_*` ABI (bounds-checked); `for x in xs` lowers to a native
   index loop with raw `get`; `list[int]` params transfer (callee releases). Boxes
   only on escape (print handles `T_IARRAY`). Validated: oracle iarray/iarraysum/
-  iarrayappend/iarrayset/iarrayliteralarg, all `live==0`. *`list[float]` remains
-  (adds the f64 element width).*
+  iarrayappend/iarrayset/iarrayliteralarg, all `live==0`. **`list[float]` DONE
+  too** — `Repr::FloatArray` over runtime `T_FARRAY` (flat f64 buffer); same
+  construct/index/append/iterate/param paths, element repr `Float`, int elements
+  promote (`sitofp`). The scalar value model + packed `list[int]`/`list[float]`
+  are now complete.
 
 ## Validation & backward compatibility
 
