@@ -55,6 +55,7 @@ declare void @p2w_print(i32)
 ; reference counting (no-ops for inline int/bool/None at runtime)
 declare void @p2w_retain(i32)
 declare void @p2w_release(i32)
+declare i1 @p2w_unique(i32)
 ; containers
 declare i32 @p2w_list_new()
 declare i32 @p2w_list_append(i32, i32)
@@ -589,6 +590,97 @@ impl<'a> FuncEmitter<'a> {
         self.expr_typed(value)
     }
 
+    /// FBIP drop-reuse: lower `data = [f(x) for x in data]` over a packed array
+    /// to an in-place map *when the array is uniquely owned at runtime*. Emits a
+    /// branch: `if unique(data)` → overwrite each element in place (zero
+    /// allocation); else → build a fresh array and reassign (so an aliased
+    /// original is never mutated). Returns `true` if it handled the assignment.
+    ///
+    /// Only fires for a filterless, single-target self-map whose element doesn't
+    /// read the array — exactly the case where in-place equals copy semantics.
+    fn try_inplace_map(
+        &mut self,
+        name: &str,
+        element: &Expr,
+        clauses: &[CompClause],
+    ) -> Result<bool, String> {
+        if !self.vars.iter().any(|v| v == name) {
+            return Ok(false);
+        }
+        let slot_repr = self.slot_repr(name);
+        let elem_repr = match slot_repr {
+            Repr::IntArray => Repr::Int,
+            Repr::FloatArray => Repr::Float,
+            _ => return Ok(false),
+        };
+        // Exactly `for x in <same name>` — no filters (length-preserving).
+        if clauses.len() != 1 {
+            return Ok(false);
+        }
+        let loopvar = match &clauses[0] {
+            CompClause::For { vars, iter }
+                if vars.len() == 1 && matches!(&iter.kind, ExprKind::Name(n) if n == name) =>
+            {
+                vars[0].clone()
+            }
+            _ => return Ok(false),
+        };
+        // The element must not read the array it overwrites (else in-place would
+        // change values a later iteration reads).
+        if expr_uses_name(element, name) {
+            return Ok(false);
+        }
+
+        let line = element.line;
+        let arr = self.call_value(&format!("load i32, ptr %v_{name}")); // borrow
+        let uniq = self.temp();
+        self.line(&format!("{uniq} = call i1 @p2w_unique(i32 {arr})"));
+        let reuse = self.fresh_label("reuse");
+        let copy = self.fresh_label("copy");
+        let endl = self.fresh_label("mapend");
+        self.terminator(&format!("br i1 {uniq}, label %{reuse}, label %{copy}"));
+
+        // Reuse: for __i in range(len(data)): x = data[__i]; data[__i] = f(x)
+        self.place_label(&reuse);
+        self.ensure_slot(&loopvar, elem_repr); // native typed loop var
+        let id = self.next_label;
+        self.next_label += 1;
+        let iname = format!("__map{id}");
+        let mk = |k: ExprKind| Expr { kind: k, line };
+        let arr_name = || mk(ExprKind::Name(name.to_string()));
+        let idx = || mk(ExprKind::Name(iname.clone()));
+        let body = vec![
+            Stmt {
+                kind: StmtKind::Assign(
+                    loopvar.clone(),
+                    mk(ExprKind::Index(Box::new(arr_name()), Box::new(idx()))),
+                ),
+                line,
+            },
+            Stmt {
+                kind: StmtKind::SetIndex {
+                    target: arr_name(),
+                    index: idx(),
+                    value: element.clone(),
+                },
+                line,
+            },
+        ];
+        let len = mk(ExprKind::Call("len".to_string(), vec![arr_name()]));
+        self.emit_for(&iname, &mk(ExprKind::Int(0)), &len, &mk(ExprKind::Int(1)), &body)?;
+        self.br_to(&endl);
+
+        // Copy: build a fresh array and reassign (releases the old binding).
+        self.place_label(&copy);
+        let new = self.build_comprehension(slot_repr, element, clauses)?;
+        let ptr = format!("%v_{name}");
+        self.store_var(name, &ptr, new, slot_repr);
+        self.br_to(&endl);
+
+        self.place_label(&endl);
+        Ok(true)
+    }
+
     /// Lower `[element for x in iter (if cond)*]` into a fresh result collection
     /// (typed to `result_repr`) plus a for-each that appends each produced
     /// element. Reuses the for-each + typed-`append` machinery, so it works over
@@ -742,6 +834,13 @@ impl<'a> FuncEmitter<'a> {
         };
         match &s.kind {
             StmtKind::Assign(name, value) => {
+                // FBIP: `data = [f(x) for x in data]` over a unique packed array
+                // maps in place (zero allocation); otherwise it falls through.
+                if let ExprKind::ListComp { element, clauses } = &value.kind
+                    && self.try_inplace_map(name, element, clauses)?
+                {
+                    return Ok(());
+                }
                 // Reassigning an existing IntArray slot with a literal rebuilds it
                 // packed; a new/Boxed slot evaluates normally.
                 let slot = if self.vars.iter().any(|x| x == name) {
@@ -1737,6 +1836,29 @@ fn float_cmp_pred(op: BinOp) -> Option<&'static str> {
     }
 }
 
+/// Whether `e` references the variable `name` anywhere. Conservative: an
+/// unrecognized construct returns `true` (assume it might). Used to keep FBIP
+/// in-place map sound — the element mustn't read the array it's overwriting.
+fn expr_uses_name(e: &Expr, name: &str) -> bool {
+    match &e.kind {
+        ExprKind::Name(n) => n == name,
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_)
+        | ExprKind::NoneLit => false,
+        ExprKind::Unary(_, x) => expr_uses_name(x, name),
+        ExprKind::Bin(_, a, b) => expr_uses_name(a, name) || expr_uses_name(b, name),
+        ExprKind::Index(o, i) => expr_uses_name(o, name) || expr_uses_name(i, name),
+        ExprKind::Call(_, args) => args.iter().any(|a| expr_uses_name(a, name)),
+        ExprKind::MethodCall(o, _, args) => {
+            expr_uses_name(o, name) || args.iter().any(|a| expr_uses_name(a, name))
+        }
+        ExprKind::List(items) => items.iter().any(|i| expr_uses_name(i, name)),
+        ExprKind::Dict(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_uses_name(k, name) || expr_uses_name(v, name)),
+        _ => true, // unknown — assume it might reference `name`
+    }
+}
+
 /// The integer value of a literal `step` (handling `-1` parsed as `Neg(1)`).
 fn step_literal(e: &Expr) -> Option<i64> {
     match &e.kind {
@@ -1843,6 +1965,13 @@ mod tests {
         assert!(out.contains("mul i32"), "native mul: {out}");
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         assert!(!out.contains("call void @p2w_retain"), "no refcounting: {out}");
+    }
+
+    #[test]
+    fn fbip_self_map_emits_unique_branch_and_in_place_write() {
+        let out = ir("data: list[int] = [1, 2]\ndata = [x * x for x in data]\nprint(data)\n");
+        assert!(out.contains("call i1 @p2w_unique"), "runtime uniqueness check: {out}");
+        assert!(out.contains("call void @p2w_iarray_set"), "in-place element write: {out}");
     }
 
     #[test]

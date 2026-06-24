@@ -118,6 +118,9 @@ static mut FREELIST: usize = 0; // head block offset, 0 = empty
 // Live heap-object count (births − frees). The RC acceptance gate: a finished
 // program with balanced retain/release must end at 0. See tools/native_run.sh.
 static mut LIVE: i32 = 0;
+// Cumulative allocation count (objects + buffers). Lets the run-oracle measure
+// the FBIP drop-reuse win (an in-place map does zero allocations).
+static mut ALLOCS: i32 = 0;
 
 /// Object type tags (in the header's first word).
 const T_STR: u32 = 1;
@@ -157,6 +160,7 @@ pub fn heap_reset() {
         CURSOR = 4;
         FREELIST = 0;
         LIVE = 0;
+        ALLOCS = 0;
     }
 }
 
@@ -187,6 +191,20 @@ pub extern "C" fn p2w_unbox_int(v: Value) -> i32 {
     as_int(v) as i32
 }
 
+/// Cumulative allocations so far (objects + buffers). Resets with the heap.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_allocs() -> i32 {
+    unsafe { ALLOCS }
+}
+
+/// Whether `v` is a heap object with refcount 1 (uniquely owned) — the FBIP
+/// reuse test: a unique value can be mutated in place since no one else can
+/// observe it. Inline/non-heap values are never "unique" (nothing to reuse).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_unique(v: Value) -> bool {
+    is_heap(v) && rd(v as usize + 4) == 1
+}
+
 /// Extract a raw `f64` from a boxed value (the unbox half for floats). Accepts a
 /// boxed int too (Python int→float promotion); traps otherwise.
 #[unsafe(no_mangle)]
@@ -205,6 +223,7 @@ pub extern "C" fn p2w_unbox_float(v: Value) -> f64 {
 fn alloc(payload: usize) -> usize {
     let need = align4(4 + payload);
     unsafe {
+        ALLOCS += 1;
         // First-fit reuse from the free list (whole block; no splitting).
         let mut prev = 0usize;
         let mut cur = FREELIST;
@@ -1479,6 +1498,19 @@ mod tests {
         // Raw elements carry no refcount; release frees the object + buffer only.
         p2w_release(arr);
         assert_eq!(p2w_live(), 0);
+    }
+
+    #[test]
+    fn unique_reflects_refcount() {
+        let _g = heap_guard();
+        let a = str_val("hi");
+        assert!(p2w_unique(a)); // rc == 1
+        rc_inc(a as usize); // share it
+        assert!(!p2w_unique(a)); // rc == 2
+        rc_dec(a as usize);
+        assert!(p2w_unique(a));
+        assert!(!p2w_unique(make_int(5))); // inline values are never "unique"
+        p2w_release(a);
     }
 
     #[test]

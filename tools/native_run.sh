@@ -35,7 +35,11 @@ cat > "$OUT/putc.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
 extern int p2w_live(void);
-static void report(void) { fprintf(stderr, "P2W_LIVE=%d\n", p2w_live()); }
+extern int p2w_allocs(void);
+static void report(void) {
+  fprintf(stderr, "P2W_LIVE=%d\n", p2w_live());
+  fprintf(stderr, "P2W_ALLOCS=%d\n", p2w_allocs());
+}
 void p2w_putc(unsigned char c) { putchar(c); }
 __attribute__((constructor)) static void init(void) { atexit(report); }
 EOF
@@ -118,6 +122,10 @@ run_case borrowtwice 'def total(xs):\n    s = 0\n    for x in xs:\n        s = s
 run_case escarg    'def echo(xs):\n    return xs\nzs = echo([5, 6])\nprint(zs)\n' '[5, 6]' || fails=$((fails+1))
 run_case borrowstr 'def shout(s):\n    print(s)\nname = "hi"\nshout(name)\nprint(name)\n' 'hi\nhi' || fails=$((fails+1))
 
+# --- FBIP drop-reuse: in-place map over a unique array; copy when aliased ---
+run_case fbip_unique 'data: list[int] = [1, 2, 3]\ndata = [x * x for x in data]\nprint(data)\n' '[1, 4, 9]' || fails=$((fails+1))
+run_case fbip_alias 'data: list[int] = [1, 2, 3]\nalias = data\ndata = [x * x for x in data]\nprint(data)\nprint(alias)\n' '[1, 4, 9]\n[1, 2, 3]' || fails=$((fails+1))
+run_case fbip_float 'd: list[float] = [1.0, 2.0, 3.0]\nd = [v * 2.0 for v in d]\nprint(d)\n' '[2.0, 4.0, 6.0]' || fails=$((fails+1))
 # --- list comprehensions ---
 run_case comp_dyn  'xs: list[int] = [1, 2, 3]\nys = [x * x for x in xs]\nprint(ys)\n' '[1, 4, 9]' || fails=$((fails+1))
 run_case comp_packed 'xs: list[int] = [1, 2, 3, 4]\nsq: list[int] = [x * x for x in xs]\nprint(sq)\nprint(len(sq))\n' '[1, 4, 9, 16]\n4' || fails=$((fails+1))
