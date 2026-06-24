@@ -160,9 +160,15 @@ because the ints that generated them are no longer boxed.
     `typedboxarg`/`typedreassign`, all `live==0`. *Float params (LLVM `double`
     signature) remain.* Note: boxing a >30-bit unboxed int is lossy until the
     heap-int box (decision 3) lands.
-- **C — packed arrays** (`list[int]`/`list[float]`): a raw-element collection;
-  index/append/iterate stay unboxed; box only on escape to a dynamic sink. *The
-  memory win for sensor logs / game state.*
+- **C — packed arrays.** `list[int]` DONE: a `Repr::IntArray` (heap ref, refcounted
+  like Boxed) backed by the runtime `T_IARRAY` (flat i32 buffer, no per-element
+  refcount). `xs: list[int] = [...]` builds packed (target type drives literal
+  construction, incl. as a call arg); `xs[i]` read/write and `xs.append(n)` use
+  the raw `p2w_iarray_*` ABI (bounds-checked); `for x in xs` lowers to a native
+  index loop with raw `get`; `list[int]` params transfer (callee releases). Boxes
+  only on escape (print handles `T_IARRAY`). Validated: oracle iarray/iarraysum/
+  iarrayappend/iarrayset/iarrayliteralarg, all `live==0`. *`list[float]` remains
+  (adds the f64 element width).*
 
 ## Validation & backward compatibility
 

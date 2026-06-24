@@ -118,6 +118,13 @@ run_case borrowtwice 'def total(xs):\n    s = 0\n    for x in xs:\n        s = s
 run_case escarg    'def echo(xs):\n    return xs\nzs = echo([5, 6])\nprint(zs)\n' '[5, 6]' || fails=$((fails+1))
 run_case borrowstr 'def shout(s):\n    print(s)\nname = "hi"\nshout(name)\nprint(name)\n' 'hi\nhi' || fails=$((fails+1))
 
+# --- packed int arrays (list[int]) ---
+run_case iarray    'xs: list[int] = [10, 20, 30]\nprint(xs)\nprint(xs[1])\nprint(len(xs))\n' '[10, 20, 30]\n20\n3' || fails=$((fails+1))
+run_case iarraysum 'def total(xs: list[int]) -> int:\n    s: int = 0\n    for x in xs:\n        s = s + x\n    return s\nys: list[int] = [1, 2, 3, 4]\nprint(total(ys))\nprint(len(ys))\n' '10\n4' || fails=$((fails+1))
+run_case iarrayappend 'xs: list[int] = [1]\nxs.append(2)\nxs.append(3)\nprint(xs)\nprint(len(xs))\n' '[1, 2, 3]\n3' || fails=$((fails+1))
+run_case iarrayset 'xs: list[int] = [5, 6, 7]\nxs[1] = 99\nprint(xs)\nprint(xs[-1])\n' '[5, 99, 7]\n7' || fails=$((fails+1))
+run_case iarrayliteralarg 'def first(xs: list[int]) -> int:\n    return xs[0]\nprint(first([42, 7]))\n' '42' || fails=$((fails+1))
+
 echo "---"
 if [ "$fails" -eq 0 ]; then
   echo "all native-run cases passed"

@@ -59,6 +59,10 @@ declare void @p2w_release(i32)
 declare i32 @p2w_list_new()
 declare i32 @p2w_list_append(i32, i32)
 declare i32 @p2w_dict_new()
+declare i32 @p2w_iarray_new()
+declare void @p2w_iarray_push(i32, i32)
+declare i32 @p2w_iarray_get(i32, i32)
+declare void @p2w_iarray_set(i32, i32, i32)
 declare i32 @p2w_index(i32, i32)
 declare void @p2w_setindex(i32, i32, i32)
 declare i32 @p2w_len(i32)
@@ -272,6 +276,24 @@ enum Repr {
     /// An unboxed `double` — produced by float literals/arithmetic; boxed with
     /// `p2w_float` (a heap f64) at a dynamic sink. Transient (no float slots yet).
     Float,
+    /// A `list[int]`: the value is a heap reference (an `i32`, like `Boxed`, and
+    /// refcounted the same way), but elements are raw ints accessed via the
+    /// `p2w_iarray_*` ABI. See VALUE_MODEL.md (Phase C).
+    IntArray,
+}
+
+/// True if a value of this repr is a heap reference (`Boxed`/`IntArray`) that
+/// participates in reference counting — retained on owned load, released at
+/// scope exit. Unboxed scalars (Int/Float/Bool) are not.
+fn is_heap_repr(r: Repr) -> bool {
+    matches!(r, Repr::Boxed | Repr::IntArray)
+}
+
+/// True if boxing this repr (`as_boxed`) allocates a fresh owned temp — i.e. an
+/// unboxed scalar. `Boxed`/`IntArray` are already Values, so `as_boxed` is a
+/// no-op for them.
+fn boxes_to_new_temp(r: Repr) -> bool {
+    matches!(r, Repr::Int | Repr::Float | Repr::Bool)
 }
 
 /// Per-function emission state. Values are tagged `i32`; variables are
@@ -366,8 +388,9 @@ impl<'a> FuncEmitter<'a> {
             if self.borrowed_params.contains(&name) {
                 continue;
             }
-            // Unboxed scalars carry no refcount — nothing to release.
-            if self.slot_repr(&name) != Repr::Boxed {
+            // Only heap-ref slots (Boxed/IntArray) carry a refcount to release;
+            // unboxed scalars don't.
+            if !is_heap_repr(self.slot_repr(&name)) {
                 continue;
             }
             let t = self.temp();
@@ -476,6 +499,9 @@ impl<'a> FuncEmitter<'a> {
             },
             Repr::Float => self.promote_double(op, from),
             Repr::Bool => self.as_boxed(op, from), // no Bool targets yet
+            // A list[int] slot is only ever fed an IntArray (identity) or built
+            // directly from a literal (build_iarray, which bypasses coerce).
+            Repr::IntArray => op,
         }
     }
 
@@ -492,7 +518,36 @@ impl<'a> FuncEmitter<'a> {
             }
             Repr::Bool => self.coerce(v, Repr::Bool, Repr::Int), // rare; i1, no RC
             Repr::Float => self.coerce(v, Repr::Float, Repr::Int), // fptosi (rare)
+            Repr::IntArray => {
+                // An array where an int is expected — coerce traps at runtime.
+                let raw = self.coerce(v.clone(), Repr::IntArray, Repr::Int);
+                self.release(&v);
+                raw
+            }
         })
+    }
+
+    /// Build a packed `list[int]` from literal elements (each lowered to a raw
+    /// int). Returns an owned `IntArray` reference.
+    fn build_iarray(&mut self, items: &[Expr]) -> Result<String, String> {
+        let arr = self.call_value("call i32 @p2w_iarray_new()");
+        for it in items {
+            let raw = self.expr_int(it)?;
+            self.line(&format!("call void @p2w_iarray_push(i32 {arr}, i32 {raw})"));
+        }
+        Ok(arr)
+    }
+
+    /// Evaluate `value` for assignment into a slot of representation `slot`. An
+    /// `IntArray` slot fed a list literal is built packed; everything else is the
+    /// usual typed evaluation.
+    fn eval_for_slot(&mut self, slot: Repr, value: &Expr) -> Result<(String, Repr), String> {
+        if slot == Repr::IntArray
+            && let ExprKind::List(items) = &value.kind
+        {
+            return Ok((self.build_iarray(items)?, Repr::IntArray));
+        }
+        self.expr_typed(value)
     }
 
     /// Store value `(v, vr)` into the slot for `name`, coercing to the slot's
@@ -500,8 +555,8 @@ impl<'a> FuncEmitter<'a> {
     /// unboxed Int slot stores raw (unboxing a boxed RHS drops that temp).
     fn store_var(&mut self, name: &str, ptr: &str, v: String, vr: Repr) {
         let slot = self.slot_repr(name);
-        if slot == Repr::Boxed {
-            let cv = self.coerce(v, vr, Repr::Boxed);
+        if is_heap_repr(slot) {
+            let cv = self.coerce(v, vr, slot);
             let old = self.temp();
             self.line(&format!("{old} = load i32, ptr {ptr}"));
             self.release(&old); // drop the previous binding (no-op if 0/inline)
@@ -557,16 +612,24 @@ impl<'a> FuncEmitter<'a> {
         };
         match &s.kind {
             StmtKind::Assign(name, value) => {
-                let (v, vr) = self.expr_typed(value)?;
+                // Reassigning an existing IntArray slot with a literal rebuilds it
+                // packed; a new/Boxed slot evaluates normally.
+                let slot = if self.vars.iter().any(|x| x == name) {
+                    self.slot_repr(name)
+                } else {
+                    Repr::Boxed
+                };
+                let (v, vr) = self.eval_for_slot(slot, value)?;
                 let ptr = self.var_slot(name); // new locals are created Boxed
                 self.store_var(name, &ptr, v, vr);
                 Ok(())
             }
             StmtKind::AnnAssign { name, ann, value } => {
-                let (v, vr) = self.expr_typed(value)?;
                 // On first definition the annotation picks the slot's repr (and
-                // alloca type), so `total: int = 0` / `x: float = …` are unboxed.
-                let ptr = self.ensure_slot(name, repr_of_ann(&Some(ann.clone())));
+                // alloca type): `total: int = 0`, `x: float = …`, `xs: list[int] = […]`.
+                let slot_repr = repr_of_ann(&Some(ann.clone()));
+                let (v, vr) = self.eval_for_slot(slot_repr, value)?;
+                let ptr = self.ensure_slot(name, slot_repr);
                 self.store_var(name, &ptr, v, vr);
                 Ok(())
             }
@@ -596,15 +659,24 @@ impl<'a> FuncEmitter<'a> {
             } => {
                 // The target is a reference value, so the runtime mutates the
                 // shared heap object in place — no variable-slot special-casing.
-                let t = self.expr(target)?;
+                let (t, trepr, towned) = self.expr_borrow_typed(target)?;
+                if trepr == Repr::IntArray {
+                    // Packed array: raw index + raw value, bounds-checked set.
+                    let i = self.expr_int(index)?;
+                    let val = self.expr_int(value)?;
+                    self.line(&format!("call void @p2w_iarray_set(i32 {t}, i32 {i}, i32 {val})"));
+                    self.release_if_owned(&t, towned);
+                    return Ok(());
+                }
+                let tb = self.as_boxed(t, trepr);
                 let i = self.expr(index)?; // dict: key transferred to the runtime
                 let v = self.expr(value)?; //       value transferred too
-                self.line(&format!("call void @p2w_setindex(i32 {t}, i32 {i}, i32 {v})"));
+                self.line(&format!("call void @p2w_setindex(i32 {tb}, i32 {i}, i32 {v})"));
                 // Only the container is borrowed. The index/key is NOT released
                 // here: for a list it's an inline int position; for a dict the
                 // runtime takes ownership of the key (storing it, or releasing it
                 // as redundant on update) — releasing it here would double-free.
-                self.release(&t);
+                self.release_if_owned(&tb, towned || boxes_to_new_temp(trepr));
                 Ok(())
             }
             StmtKind::ForEach {
@@ -783,7 +855,10 @@ impl<'a> FuncEmitter<'a> {
     /// `for var in iterable:` over the runtime iteration protocol
     /// (`p2w_iter` / `p2w_iter_has` / `p2w_iter_next`).
     fn emit_foreach(&mut self, var: &str, iterable: &Expr, body: &[Stmt]) -> Result<(), String> {
-        let seq = self.expr(iterable)?; // owned; the iterator borrows it
+        let (seq, srepr) = self.expr_typed(iterable)?; // owned
+        if srepr == Repr::IntArray {
+            return self.emit_foreach_iarray(var, seq, body);
+        }
         let it = self.call_value(&format!("call i32 @p2w_iter(i32 {seq})"));
         // Both outlive the loop and must survive an early return — track them.
         self.cleanups.push(seq.clone());
@@ -821,6 +896,66 @@ impl<'a> FuncEmitter<'a> {
         Ok(())
     }
 
+    /// `for var in xs:` over a packed `list[int]` — lowered to a native index
+    /// loop with raw `p2w_iarray_get`, so the loop variable is an unboxed int.
+    fn emit_foreach_iarray(&mut self, var: &str, seq: String, body: &[Stmt]) -> Result<(), String> {
+        // seq is an owned IntArray ref; it must survive the loop and early return.
+        self.cleanups.push(seq.clone());
+        let lenb = self.call_value(&format!("call i32 @p2w_len(i32 {seq})"));
+        let len = self.call_value(&format!("call i32 @p2w_unbox_int(i32 {lenb})"));
+        self.release(&lenb); // drop the boxed length temp (no-op for a small int)
+        // Hidden index counter (not a user variable).
+        let id = self.next_label;
+        self.next_label += 1;
+        let ix = format!("%ix{id}");
+        self.allocas
+            .push_str(&format!("  {ix} = alloca i32\n  store i32 0, ptr {ix}\n"));
+        let existed = self.vars.iter().any(|v| v == var);
+        let slot = self.var_slot(var);
+        if existed && is_heap_repr(self.slot_repr(var)) {
+            let old = self.temp();
+            self.line(&format!("{old} = load i32, ptr {slot}"));
+            self.release(&old);
+        }
+        self.var_reprs.insert(var.to_string(), Repr::Int); // loop var is a raw int
+
+        let head = self.fresh_label("ahead");
+        let body_l = self.fresh_label("abody");
+        let cont = self.fresh_label("acont");
+        let end = self.fresh_label("aend");
+
+        self.br_to(&head);
+        self.place_label(&head);
+        let i = self.temp();
+        self.line(&format!("{i} = load i32, ptr {ix}"));
+        let c = self.temp();
+        self.line(&format!("{c} = icmp slt i32 {i}, {len}"));
+        self.terminator(&format!("br i1 {c}, label %{body_l}, label %{end}"));
+
+        self.place_label(&body_l);
+        let iv = self.temp();
+        self.line(&format!("{iv} = load i32, ptr {ix}"));
+        let elem = self.call_value(&format!("call i32 @p2w_iarray_get(i32 {seq}, i32 {iv})"));
+        self.line(&format!("store i32 {elem}, ptr {slot}")); // Int slot: raw, no RC
+        self.loops.push((cont.clone(), end.clone()));
+        self.block(body)?;
+        self.loops.pop();
+        self.br_to(&cont);
+
+        self.place_label(&cont);
+        let cur = self.temp();
+        self.line(&format!("{cur} = load i32, ptr {ix}"));
+        let inc = self.temp();
+        self.line(&format!("{inc} = add i32 {cur}, 1"));
+        self.line(&format!("store i32 {inc}, ptr {ix}"));
+        self.br_to(&head);
+
+        self.place_label(&end);
+        self.cleanups.pop();
+        self.release(&seq);
+        Ok(())
+    }
+
     /// Evaluate a condition to an `i1` via the runtime's truthiness.
     fn cond_i1(&mut self, cond: &Expr) -> Result<String, String> {
         let (v, repr, owned) = self.expr_borrow_typed(cond)?;
@@ -833,7 +968,7 @@ impl<'a> FuncEmitter<'a> {
         let t = self.temp();
         self.line(&format!("{t} = call i1 @p2w_truthy(i32 {boxed})"));
         // Release the operand if it was owned, or if boxing it made a temp.
-        self.release_if_owned(&boxed, owned || repr == Repr::Int);
+        self.release_if_owned(&boxed, owned || boxes_to_new_temp(repr));
         Ok(t)
     }
 
@@ -870,9 +1005,9 @@ impl<'a> FuncEmitter<'a> {
                     return Err(format!("line {}: name '{name}' is not defined", e.line));
                 }
                 let (t, repr) = self.load_name(name);
-                // Only a boxed (heap-bearing) load retains to become owned; an
-                // unboxed scalar carries no refcount.
-                if repr == Repr::Boxed {
+                // Only a heap-bearing load (Boxed/IntArray) retains to become
+                // owned; an unboxed scalar carries no refcount.
+                if is_heap_repr(repr) {
                     self.retain(&t);
                 }
                 Ok((t, repr))
@@ -916,10 +1051,13 @@ impl<'a> FuncEmitter<'a> {
                 for (i, a) in args.iter().enumerate() {
                     let prepr = preprs.get(i).copied().unwrap_or(Repr::Boxed);
                     if prepr != Repr::Boxed {
-                        // Unboxed param (Int/Float): coerce the arg to that repr
-                        // (no refcount). Unboxing a boxed arg drops its temp.
-                        let (v, vr) = self.expr_typed(a)?;
-                        let raw = if vr == Repr::Boxed {
+                        // Unboxed/typed param (Int/Float/IntArray): coerce the arg
+                        // to that repr. A list literal for a list[int] param is
+                        // built packed; an unboxed scalar carries no refcount; a
+                        // boxed arg unboxes (dropping its temp). Heap-ref args
+                        // (IntArray) are transferred — the callee releases them.
+                        let (v, vr) = self.eval_for_slot(prepr, a)?;
+                        let raw = if vr == Repr::Boxed && prepr != Repr::Boxed {
                             let r = self.coerce(v.clone(), Repr::Boxed, prepr);
                             self.release(&v);
                             r
@@ -968,10 +1106,18 @@ impl<'a> FuncEmitter<'a> {
                 Ok((dict, Repr::Boxed))
             }
             ExprKind::Index(obj, idx) => {
-                let (o, oo) = self.expr_borrow(obj)?;
+                let (o, orepr, oo) = self.expr_borrow_typed(obj)?;
+                if orepr == Repr::IntArray {
+                    // Packed array: raw bounds-checked get, unboxed Int result.
+                    let i = self.expr_int(idx)?;
+                    let r = self.call_value(&format!("call i32 @p2w_iarray_get(i32 {o}, i32 {i})"));
+                    self.release_if_owned(&o, oo);
+                    return Ok((r, Repr::Int));
+                }
+                let ob = self.as_boxed(o, orepr);
                 let (i, oi) = self.expr_borrow(idx)?;
-                let r = self.call_value(&format!("call i32 @p2w_index(i32 {o}, i32 {i})"));
-                self.release_if_owned(&o, oo); // target + index borrowed; result owned
+                let r = self.call_value(&format!("call i32 @p2w_index(i32 {ob}, i32 {i})"));
+                self.release_if_owned(&ob, oo || boxes_to_new_temp(orepr));
                 self.release_if_owned(&i, oi);
                 Ok((r, Repr::Boxed))
             }
@@ -997,6 +1143,7 @@ impl<'a> FuncEmitter<'a> {
             Repr::Int => self.call_value(&format!("call i32 @p2w_int(i32 {op})")),
             Repr::Bool => self.call_value(&format!("call i32 @p2w_bool(i1 {op})")),
             Repr::Float => self.call_value(&format!("call i32 @p2w_float(double {op})")),
+            Repr::IntArray => op, // already a heap-ref Value
         }
     }
 
@@ -1023,7 +1170,16 @@ impl<'a> FuncEmitter<'a> {
                 obj.line
             ));
         }
-        let (recv, recv_owned) = self.expr_borrow(obj)?;
+        let (recv, rrepr, rowned) = self.expr_borrow_typed(obj)?;
+        // Packed array: xs.append(n) pushes a raw int and returns None.
+        if rrepr == Repr::IntArray && method == "append" && args.len() == 1 {
+            let raw = self.expr_int(&args[0])?;
+            self.line(&format!("call void @p2w_iarray_push(i32 {recv}, i32 {raw})"));
+            self.release_if_owned(&recv, rowned);
+            return Ok(self.call_value("call i32 @p2w_none()"));
+        }
+        let recv = self.as_boxed(recv, rrepr);
+        let recv_owned = rowned || boxes_to_new_temp(rrepr);
         let mut argvals = Vec::with_capacity(args.len());
         for a in args {
             argvals.push(self.expr(a)?); // method args are transferred (owned)
@@ -1058,8 +1214,9 @@ impl<'a> FuncEmitter<'a> {
     fn expr_borrow(&mut self, e: &Expr) -> Result<(String, bool), String> {
         let (op, repr, owned) = self.expr_borrow_typed(e)?;
         let boxed = self.as_boxed(op, repr);
-        // Boxing an unboxed value makes a fresh temp the caller must release.
-        let owned = owned || repr != Repr::Boxed;
+        // Boxing an unboxed scalar makes a fresh owned temp; a heap ref's
+        // as_boxed is a no-op, so its ownership is unchanged.
+        let owned = owned || boxes_to_new_temp(repr);
         Ok((boxed, owned))
     }
 
@@ -1076,7 +1233,7 @@ impl<'a> FuncEmitter<'a> {
             return Ok((t, repr, false));
         }
         let (op, repr) = self.expr_typed(e)?;
-        let owned = matches!(repr, Repr::Boxed);
+        let owned = is_heap_repr(repr); // a fresh heap ref (Boxed/IntArray) is owned
         Ok((op, repr, owned))
     }
 
@@ -1154,10 +1311,10 @@ impl<'a> FuncEmitter<'a> {
                 ));
             }
         };
-        // Boxing any unboxed operand yields a fresh owned temp (must release); a
-        // Boxed operand keeps its borrow/own status.
-        let a_owned = ar != Repr::Boxed || ao;
-        let b_owned = br != Repr::Boxed || bo;
+        // Boxing an unboxed scalar operand yields a fresh owned temp (must
+        // release); a heap-ref operand keeps its borrow/own status.
+        let a_owned = boxes_to_new_temp(ar) || ao;
+        let b_owned = boxes_to_new_temp(br) || bo;
         let va = self.as_boxed(va, ar);
         let vb = self.as_boxed(vb, br);
         let r = self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})"));
@@ -1320,6 +1477,13 @@ fn repr_of_ann(ann: &Option<Expr>) -> Repr {
         Some(e) => match &e.kind {
             ExprKind::Name(n) if n == "int" => Repr::Int,
             ExprKind::Name(n) if n == "float" => Repr::Float,
+            // `list[int]` parses as a subscript of `list`.
+            ExprKind::Index(base, elem)
+                if matches!(&base.kind, ExprKind::Name(n) if n == "list")
+                    && matches!(&elem.kind, ExprKind::Name(n) if n == "int") =>
+            {
+                Repr::IntArray
+            }
             _ => Repr::Boxed,
         },
         None => Repr::Boxed,
@@ -1327,12 +1491,12 @@ fn repr_of_ann(ann: &Option<Expr>) -> Repr {
 }
 
 /// The LLVM type a slot/param/return of this repr uses. Only `Float` is `double`;
-/// `Boxed`/`Int` are the tagged-or-raw `i32`; `Bool` is `i1` (never a slot).
+/// `Bool` is `i1`; everything else (`Boxed`/`Int`/`IntArray` — a heap ref) is `i32`.
 fn llvm_ty(repr: Repr) -> &'static str {
     match repr {
         Repr::Float => "double",
         Repr::Bool => "i1",
-        Repr::Boxed | Repr::Int => "i32",
+        Repr::Boxed | Repr::Int | Repr::IntArray => "i32",
     }
 }
 
@@ -1502,6 +1666,15 @@ mod tests {
         assert!(out.contains("mul i32"), "native mul: {out}");
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         assert!(!out.contains("call void @p2w_retain"), "no refcounting: {out}");
+    }
+
+    #[test]
+    fn list_int_compiles_to_a_packed_array() {
+        let out = ir("xs: list[int] = [10, 20]\nprint(xs[0])\nfor x in xs:\n    print(x)\n");
+        assert!(out.contains("call i32 @p2w_iarray_new"), "packed construct: {out}");
+        assert!(out.contains("call void @p2w_iarray_push"), "raw push: {out}");
+        assert!(out.contains("call i32 @p2w_iarray_get"), "raw get: {out}");
+        assert!(!out.contains("call i32 @p2w_list_new"), "not a dynamic list: {out}");
     }
 
     #[test]
