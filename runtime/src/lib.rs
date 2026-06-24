@@ -45,20 +45,39 @@ const INT_MIN: i64 = -(1 << 29);
 const INT_MAX: i64 = (1 << 29) - 1;
 
 fn is_int(v: Value) -> bool {
-    v & TAG_MASK == TAG_INT
+    v & TAG_MASK == TAG_INT || (is_heap(v) && obj_tag(v) == T_INT)
 }
 
 fn as_int(v: Value) -> i64 {
-    (v >> 2) as i64
+    if v & TAG_MASK == TAG_INT {
+        (v >> 2) as i64 // inline 30-bit small int
+    } else {
+        rd((v as usize) + 8) as i32 as i64 // boxed full-width i32
+    }
 }
 
-/// Encode an integer as a small-int value.
+/// Allocate a boxed full-width `i32` (for values outside the inline range).
+fn int_alloc(n: i32) -> Value {
+    let p = alloc(8 + 4); // [tag][rc][i32]
+    if p == 0 {
+        trap("out of memory");
+    }
+    wr(p, T_INT);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, n as u32);
+    p as Value
+}
+
+/// Encode an integer. Wraps to `i32` (the value model's int width), then uses the
+/// inline 30-bit form when it fits, else a heap box — never truncates the i32.
 fn make_int(n: i64) -> Value {
-    debug_assert!(
-        (INT_MIN..=INT_MAX).contains(&n),
-        "small-int overflow; bignum promotion is a TODO"
-    );
-    ((n as i32) << 2) | TAG_INT
+    let n = n as i32; // i32 wraparound, matching native unboxed-int arithmetic
+    if (INT_MIN..=INT_MAX).contains(&(n as i64)) {
+        ((n) << 2) | TAG_INT
+    } else {
+        int_alloc(n)
+    }
 }
 
 fn make_bool(b: bool) -> Value {
@@ -106,6 +125,10 @@ const T_STR: u32 = 1;
 /// an `f64` doesn't fit a tagged `i32` — so they're heap values, matching the
 /// browser backend's `$FLOAT` struct (the two backends stay at parity).
 const T_FLOAT: u32 = 5;
+/// A boxed full-width `i32`: layout `[tag][rc][i32]`. Used when an int doesn't
+/// fit the 30-bit inline range, so the int type covers the whole `i32` (matching
+/// the value model's unboxed `i32`) instead of silently truncating.
+const T_INT: u32 = 6;
 
 fn heap_base() -> *mut u8 {
     &raw mut HEAP as *mut u8
@@ -1311,6 +1334,30 @@ mod tests {
         assert_eq!(p2w_eq(p2w_int(1), p2w_float(1.0)), V_TRUE); // cross-type ==
         assert!(p2w_truthy(p2w_float(0.1)));
         assert!(!p2w_truthy(p2w_float(0.0)));
+    }
+
+    #[test]
+    fn large_ints_box_on_the_heap_and_round_trip() {
+        let _g = heap_guard();
+        // Inside the inline range: stays an immediate, no heap object.
+        let small = make_int(1000);
+        assert!(is_int(small) && !is_heap(small));
+        assert_eq!(as_int(small), 1000);
+        // Outside ±2^29: heap-boxed full i32, no truncation (the old bug).
+        let big = make_int(2_000_000_000);
+        assert!(is_int(big) && is_heap(big), "large int should be heap-boxed");
+        assert_eq!(as_int(big), 2_000_000_000);
+        let neg = make_int(-2_000_000_000);
+        assert!(is_heap(neg));
+        assert_eq!(as_int(neg), -2_000_000_000);
+        // Arithmetic round-trips through the heap box.
+        let sum = p2w_add(big, make_int(7));
+        assert_eq!(as_int(sum), 2_000_000_007);
+        // Heap ints are real refcounted objects; releasing frees them.
+        p2w_release(big);
+        p2w_release(neg);
+        p2w_release(sum);
+        assert_eq!(p2w_live(), 0);
     }
 
     #[test]

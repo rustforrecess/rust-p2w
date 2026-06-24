@@ -117,10 +117,14 @@ because the ints that generated them are no longer boxed.
    Recommend **wraparound by default** (free, matches the hardware/C mental model)
    with a future `--checked` mode that traps — pedagogically honest when debugging.
    *This is a real divergence from CPython; document it for learners.*
-3. **Boxing a full-width int.** The boxed immediate is only 30-bit, so boxing an
-   unboxed `i32` outside that range needs a **heap int box (`T_INT`)** fallback.
-   Recommend adding it (rare path; keeps boxing total and semantics clean) rather
-   than clamping unboxed ints to 30-bit.
+3. **Boxing a full-width int. DONE.** The inline tagged int is 30-bit, so values
+   outside ±2^29 now box to a heap `T_INT` (`[tag][rc][i32]`) instead of
+   truncating. `make_int` wraps to `i32` (the value model's int width, matching
+   native unboxed arithmetic) then picks inline-or-heap; `is_int`/`as_int` are
+   heap-aware, so the whole numeric tower (arith/compare/print/eq/truthy) and
+   `p2w_unbox_int` cover both forms with no emitter change (a heap int is an
+   ordinary Boxed/refcounted value). `x = 2000000000; print(x)` → `2000000000`
+   (was truncated), `live==0`. Ints are now consistently full `i32`.
 4. **Unboxed unannotated locals.** v1: **no** (boxed). Revisit as a join/liveness
    extension (pairs naturally with Task 2 last-use).
 
