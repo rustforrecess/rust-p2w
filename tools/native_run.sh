@@ -88,6 +88,8 @@ run_case typedreassign 'def bump(n: int) -> int:\n    n = n + 1\n    return n\np
 run_case typedcmp  'def clamp(n: int) -> int:\n    if n < 0:\n        return 0\n    return n\nprint(clamp(-3))\nprint(clamp(5))\n' '0\n5' || fails=$((fails+1))
 run_case annlocal  'x: int = 3 * 4\nprint(x + 1)\n'                              '13'          || fails=$((fails+1))
 run_case whileloop 'def sum_to(n: int) -> int:\n    total: int = 0\n    i: int = 0\n    while i < n:\n        total = total + i\n        i = i + 1\n    return total\nprint(sum_to(5))\n' '10' || fails=$((fails+1))
+run_case forsum    'def fsum(n: int) -> int:\n    total: int = 0\n    for i in range(n):\n        total = total + i\n    return total\nprint(fsum(5))\n' '10' || fails=$((fails+1))
+run_case fordown   'for i in range(3, 0, -1):\n    print(i)\n'                   '3\n2\n1'      || fails=$((fails+1))
 run_case lists     'xs = [1, 2, 3]\nxs.append(4)\nprint(xs)\nprint(len(xs))\n' '[1, 2, 3, 4]\n4' || fails=$((fails+1))
 run_case strcat    'print("py" + "thon")\n'                                    'python'      || fails=$((fails+1))
 # --- RC stress: reassignment, nesting, dicts, early return, short-circuit, etc.

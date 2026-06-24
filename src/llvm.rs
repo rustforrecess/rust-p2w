@@ -456,6 +456,21 @@ impl<'a> FuncEmitter<'a> {
         }
     }
 
+    /// Evaluate `e` to a raw unboxed `i32`, unboxing (and releasing) a boxed
+    /// result. Used for native loop bounds/counters.
+    fn expr_int(&mut self, e: &Expr) -> Result<String, String> {
+        let (v, vr) = self.expr_typed(e)?;
+        Ok(match vr {
+            Repr::Int => v,
+            Repr::Boxed => {
+                let raw = self.coerce(v.clone(), Repr::Boxed, Repr::Int);
+                self.release(&v); // drop the boxed temp we unboxed
+                raw
+            }
+            Repr::Bool => self.coerce(v, Repr::Bool, Repr::Int), // rare; i1, no RC
+        })
+    }
+
     /// Store value `(v, vr)` into the slot for `name`, coercing to the slot's
     /// repr. A Boxed slot releases its previous binding then transfers in; an
     /// unboxed Int slot stores raw (unboxing a boxed RHS drops that temp).
@@ -691,16 +706,21 @@ impl<'a> FuncEmitter<'a> {
         if step_lit == 0 {
             return Err("range() step must not be zero".to_string());
         }
-        let start_v = self.expr(start)?;
-        let end_v = self.expr(end_expr)?;
-        // end_v is read every iteration, so it must outlive the loop; release it
-        // after the loop (and on early return) via cleanups.
-        self.cleanups.push(end_v.clone());
-        let step_v = self.call_value(&format!("call i32 @p2w_int(i32 {step_lit})"));
+        // A counted range loop is fully native: a raw i32 counter, an `icmp`
+        // guard, and a raw `add` increment — no boxing, no runtime calls. The
+        // bound is a raw i32 held across the loop (no refcount, so no cleanup).
+        let start_v = self.expr_int(start)?;
+        let end_v = self.expr_int(end_expr)?;
+        // Only an existing boxed binding of this name needs releasing before we
+        // repurpose the slot as a native int counter; a fresh counter does not.
+        let existed = self.vars.iter().any(|v| v == var);
         let slot = self.var_slot(var);
-        let old = self.temp();
-        self.line(&format!("{old} = load i32, ptr {slot}"));
-        self.release(&old); // drop any prior binding of this name
+        if existed && self.slot_repr(var) == Repr::Boxed {
+            let old = self.temp();
+            self.line(&format!("{old} = load i32, ptr {slot}"));
+            self.release(&old);
+        }
+        self.var_reprs.insert(var.to_string(), Repr::Int);
         self.line(&format!("store i32 {start_v}, ptr {slot}"));
 
         let head = self.fresh_label("fhead");
@@ -713,10 +733,9 @@ impl<'a> FuncEmitter<'a> {
         let iv = self.temp();
         self.line(&format!("{iv} = load i32, ptr {slot}"));
         // Ascending loops compare with `<`, descending with `>` (Python range).
-        let cmp_fn = if step_lit > 0 { "p2w_lt" } else { "p2w_gt" };
-        let cmpv = self.call_value(&format!("call i32 @{cmp_fn}(i32 {iv}, i32 {end_v})"));
+        let pred = if step_lit > 0 { "slt" } else { "sgt" };
         let cond = self.temp();
-        self.line(&format!("{cond} = call i1 @p2w_truthy(i32 {cmpv})"));
+        self.line(&format!("{cond} = icmp {pred} i32 {iv}, {end_v}"));
         self.terminator(&format!("br i1 {cond}, label %{body_l}, label %{end}"));
 
         self.place_label(&body_l);
@@ -728,13 +747,12 @@ impl<'a> FuncEmitter<'a> {
         self.place_label(&cont);
         let cur = self.temp();
         self.line(&format!("{cur} = load i32, ptr {slot}"));
-        let inc = self.call_value(&format!("call i32 @p2w_add(i32 {cur}, i32 {step_v})"));
+        let inc = self.temp();
+        self.line(&format!("{inc} = add i32 {cur}, {step_lit}"));
         self.line(&format!("store i32 {inc}, ptr {slot}"));
         self.br_to(&head);
 
         self.place_label(&end);
-        self.cleanups.pop();
-        self.release(&end_v); // counter + step are ints; the bound may not be
         Ok(())
     }
 
@@ -1440,12 +1458,16 @@ mod tests {
     }
 
     #[test]
-    fn for_range_uses_value_ops() {
+    fn for_range_is_a_native_counter() {
+        // The range counter is an unboxed i32: native icmp guard + raw add
+        // increment, no p2w_lt/p2w_add/p2w_truthy for the loop control.
         let out = ir("for i in range(1, 5):\n    print(i)\n");
-        assert!(out.contains("call i32 @p2w_lt(i32"), "ascending: {out}");
-        assert!(out.contains("call i32 @p2w_add(i32"), "increment: {out}");
+        assert!(out.contains("icmp slt i32"), "ascending: {out}");
+        assert!(out.contains("add i32"), "increment: {out}");
+        assert!(!out.contains("call i32 @p2w_lt"), "no boxed compare: {out}");
         let out = ir("for i in range(5, 0, -1):\n    print(i)\n");
-        assert!(out.contains("call i32 @p2w_gt(i32"), "descending: {out}");
+        assert!(out.contains("icmp sgt i32"), "descending: {out}");
+        assert!(out.contains("add i32 %", ), "decrement via add: {out}");
     }
 
     #[test]

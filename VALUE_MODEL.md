@@ -55,6 +55,11 @@ analysis in v1.**
   `def s(n: int): total: int = 0; i: int = 0; while i < n: total = total + i;
   i = i + 1; return total` → a tight `icmp`/`add` loop. (Bare `x: int` without a
   value, and unboxing *unannotated* locals via inference, remain future work.)
+- **Native counted-`for` — DONE.** `for i in range(...)` now uses an unboxed i32
+  counter: native `icmp` guard + raw `add` increment (ascending `slt`/`+step`,
+  descending `sgt`/`+negstep`), bound held as a raw i32. So `for i in range(n):
+  total = total + i` with `total: int` is a fully native loop (zero runtime calls
+  in the body).
 - **Operators propagate** the obvious result repr: `Int op Int → Int`,
   `Int +-*/ Float → Float` (promotion; `/` is always `Float`), comparisons →
   `Bool`, etc. If any operand is `Boxed`, the result is `Boxed` (fall back).
