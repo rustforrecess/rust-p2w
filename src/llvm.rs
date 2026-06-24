@@ -31,6 +31,7 @@ const RUNTIME_DECLS: &str = "\
 declare i32 @p2w_int(i32)
 declare i32 @p2w_unbox_int(i32)
 declare i32 @p2w_float(double)
+declare double @p2w_unbox_float(i32)
 declare i32 @p2w_bool(i1)
 declare i32 @p2w_none()
 declare i32 @p2w_str(ptr, i32)
@@ -264,6 +265,9 @@ enum Repr {
     /// An unboxed `i1` — produced by native integer comparisons; used directly as
     /// a branch condition, boxed to True/False (`p2w_bool`) at a dynamic sink.
     Bool,
+    /// An unboxed `double` — produced by float literals/arithmetic; boxed with
+    /// `p2w_float` (a heap f64) at a dynamic sink. Transient (no float slots yet).
+    Float,
 }
 
 /// Per-function emission state. Values are tagged `i32`; variables are
@@ -446,12 +450,19 @@ impl<'a> FuncEmitter<'a> {
         }
         match to {
             Repr::Boxed => self.as_boxed(op, from),
-            Repr::Int => {
-                // Box any non-boxed source, then unbox to a raw int. (For an
-                // already-boxed source as_boxed is the identity.)
-                let boxed = self.as_boxed(op, from);
-                self.call_value(&format!("call i32 @p2w_unbox_int(i32 {boxed})"))
-            }
+            Repr::Int => match from {
+                Repr::Float => {
+                    let t = self.temp();
+                    self.line(&format!("{t} = fptosi double {op} to i32"));
+                    t
+                }
+                _ => {
+                    // Box any non-boxed source, then unbox to a raw int.
+                    let boxed = self.as_boxed(op, from);
+                    self.call_value(&format!("call i32 @p2w_unbox_int(i32 {boxed})"))
+                }
+            },
+            Repr::Float => self.promote_double(op, from),
             Repr::Bool => self.as_boxed(op, from), // no Bool targets yet
         }
     }
@@ -468,6 +479,7 @@ impl<'a> FuncEmitter<'a> {
                 raw
             }
             Repr::Bool => self.coerce(v, Repr::Bool, Repr::Int), // rare; i1, no RC
+            Repr::Float => self.coerce(v, Repr::Float, Repr::Int), // fptosi (rare)
         })
     }
 
@@ -828,11 +840,8 @@ impl<'a> FuncEmitter<'a> {
             // A raw int literal is unboxed; it only becomes a boxed p2w_int when
             // it reaches a dynamic sink (via as_boxed).
             ExprKind::Int(n) => Ok((format!("{}", *n as i32), Repr::Int)),
-            ExprKind::Float(f) => {
-                // LLVM wants a portable double constant; hex float is exact.
-                let v = self.call_value(&format!("call i32 @p2w_float(double {})", fmt_double(*f)));
-                Ok((v, Repr::Boxed))
-            }
+            // An unboxed double literal (hex form is exact); boxed only at a sink.
+            ExprKind::Float(f) => Ok((fmt_double(*f), Repr::Float)),
             ExprKind::Bool(b) => {
                 let v = self.call_value(&format!("call i32 @p2w_bool(i1 {})", if *b { 1 } else { 0 }));
                 Ok((v, Repr::Boxed))
@@ -969,6 +978,21 @@ impl<'a> FuncEmitter<'a> {
             Repr::Boxed => op,
             Repr::Int => self.call_value(&format!("call i32 @p2w_int(i32 {op})")),
             Repr::Bool => self.call_value(&format!("call i32 @p2w_bool(i1 {op})")),
+            Repr::Float => self.call_value(&format!("call i32 @p2w_float(double {op})")),
+        }
+    }
+
+    /// Coerce a numeric operand to a raw `double` (int → `sitofp`, float as-is,
+    /// boxed → `p2w_unbox_float`). Used by native float arithmetic.
+    fn promote_double(&mut self, op: String, from: Repr) -> String {
+        match from {
+            Repr::Float => op,
+            Repr::Int => {
+                let t = self.temp();
+                self.line(&format!("{t} = sitofp i32 {op} to double"));
+                t
+            }
+            _ => self.call_value(&format!("call double @p2w_unbox_float(i32 {op})")),
         }
     }
 
@@ -1067,6 +1091,28 @@ impl<'a> FuncEmitter<'a> {
             self.line(&format!("{r} = icmp {pred} i32 {va}, {vb}"));
             return Ok((r, Repr::Bool));
         }
+        // Native float arithmetic/comparison: when an operand is Float (or `/`,
+        // which is always float), and both are statically numeric (Int/Float).
+        // Ints are promoted to double (sitofp). // % ** fall back to the runtime
+        // (Python's float floor/mod/pow are special).
+        let numeric = |r: Repr| matches!(r, Repr::Int | Repr::Float);
+        let float_op = float_native_op(op).is_some() || float_cmp_pred(op).is_some();
+        if float_op
+            && (matches!(op, BinOp::Div) || ar == Repr::Float || br == Repr::Float)
+            && numeric(ar)
+            && numeric(br)
+        {
+            let a_f = self.promote_double(va, ar);
+            let b_f = self.promote_double(vb, br);
+            let r = self.temp();
+            if let Some(instr) = float_native_op(op) {
+                self.line(&format!("{r} = {instr} double {a_f}, {b_f}"));
+                return Ok((r, Repr::Float));
+            }
+            let pred = float_cmp_pred(op).unwrap();
+            self.line(&format!("{r} = fcmp {pred} double {a_f}, {b_f}"));
+            return Ok((r, Repr::Bool));
+        }
 
         // Boxed fallback: box each operand, call the runtime, release temps.
         let rt = match op {
@@ -1090,10 +1136,10 @@ impl<'a> FuncEmitter<'a> {
                 ));
             }
         };
-        // Boxing an Int yields a fresh owned temp (must release); a Boxed operand
-        // keeps its borrow/own status.
-        let a_owned = matches!(ar, Repr::Int) || ao;
-        let b_owned = matches!(br, Repr::Int) || bo;
+        // Boxing any unboxed operand yields a fresh owned temp (must release); a
+        // Boxed operand keeps its borrow/own status.
+        let a_owned = ar != Repr::Boxed || ao;
+        let b_owned = br != Repr::Boxed || bo;
         let va = self.as_boxed(va, ar);
         let vb = self.as_boxed(vb, br);
         let r = self.call_value(&format!("call i32 @{rt}(i32 {va}, i32 {vb})"));
@@ -1288,6 +1334,31 @@ fn int_cmp_pred(op: BinOp) -> Option<&'static str> {
     }
 }
 
+/// The LLVM instruction for native float arithmetic, or `None`. `//`, `%`, `**`
+/// fall back to the runtime (Python's float floor/mod/pow semantics).
+fn float_native_op(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Add => Some("fadd"),
+        BinOp::Sub => Some("fsub"),
+        BinOp::Mul => Some("fmul"),
+        BinOp::Div => Some("fdiv"),
+        _ => None,
+    }
+}
+
+/// The LLVM `fcmp` predicate for a native float comparison (ordered), or `None`.
+fn float_cmp_pred(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Lt => Some("olt"),
+        BinOp::Le => Some("ole"),
+        BinOp::Gt => Some("ogt"),
+        BinOp::Ge => Some("oge"),
+        BinOp::Eq => Some("oeq"),
+        BinOp::Ne => Some("one"),
+        _ => None,
+    }
+}
+
 /// The integer value of a literal `step` (handling `-1` parsed as `Neg(1)`).
 fn step_literal(e: &Expr) -> Option<i64> {
     match &e.kind {
@@ -1361,9 +1432,7 @@ mod tests {
 
     #[test]
     fn non_native_ops_route_through_runtime() {
-        // /, //, ** and `not` still use the runtime (Python-floor semantics,
-        // non-single-instruction, or not yet native).
-        assert!(ir("print(7 / 2)\n").contains("call i32 @p2w_div(i32"));
+        // //, ** and `not` still use the runtime (Python-floor / pow semantics).
         assert!(ir("print(7 // 2)\n").contains("call i32 @p2w_floordiv(i32"));
         assert!(ir("print(2 ** 10)\n").contains("call i32 @p2w_pow(i32"));
         assert!(ir("y = not 0\n").contains("call i32 @p2w_not(i32"));
@@ -1371,6 +1440,10 @@ mod tests {
         let cmp = ir("x = 1 < 2\n");
         assert!(cmp.contains("icmp slt i32 1, 2"), "{cmp}");
         assert!(!cmp.contains("call i32 @p2w_lt"), "{cmp}");
+        // True division `/` is native float now (promote + fdiv), not p2w_div.
+        let div = ir("print(7 / 2)\n");
+        assert!(div.contains("fdiv double"), "{div}");
+        assert!(!div.contains("call i32 @p2w_div"), "{div}");
     }
 
     #[test]

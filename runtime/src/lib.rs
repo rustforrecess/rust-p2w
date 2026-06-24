@@ -164,6 +164,19 @@ pub extern "C" fn p2w_unbox_int(v: Value) -> i32 {
     as_int(v) as i32
 }
 
+/// Extract a raw `f64` from a boxed value (the unbox half for floats). Accepts a
+/// boxed int too (Python int→float promotion); traps otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_unbox_float(v: Value) -> f64 {
+    if is_float(v) {
+        as_f64(v)
+    } else if is_int(v) {
+        as_int(v) as f64
+    } else {
+        trap("expected a float")
+    }
+}
+
 /// Allocate `payload` bytes; returns the payload offset, or 0 on OOM. The block
 /// carries a u32 size header just before the payload (for `free`).
 fn alloc(payload: usize) -> usize {
