@@ -667,6 +667,13 @@ fn free_object(o: usize) {
                 dealloc(d);
             }
         }
+        T_IARRAY => {
+            // Raw int elements carry no refcount — just free the backing buffer.
+            let d = coll_data(o);
+            if d != 0 {
+                dealloc(d);
+            }
+        }
         _ => {}
     }
     dealloc(o);
@@ -704,6 +711,9 @@ pub extern "C" fn p2w_release(v: Value) {
 const T_LIST: u32 = 2;
 const T_DICT: u32 = 3;
 const T_ITER: u32 = 4;
+/// A packed `list[int]`: same layout as a list, but elements are raw `i32` (not
+/// boxed Values) and aren't refcounted. See VALUE_MODEL.md (Phase C).
+const T_IARRAY: u32 = 7;
 
 fn coll_len(o: usize) -> usize {
     rd(o + 8) as usize
@@ -813,7 +823,7 @@ fn norm_index(index: Value, n: i64) -> i64 {
 /// `len(v)` for any collection (string/list/dict all store len at +8).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_len(v: Value) -> Value {
-    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT) {
+    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_IARRAY) {
         return make_int(coll_len(v as usize) as i64);
     }
     trap("object has no len()")
@@ -878,6 +888,54 @@ pub extern "C" fn p2w_list_append(list: Value, v: Value) -> Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_dict_new() -> Value {
     coll_new(T_DICT)
+}
+
+// --- packed int arrays (list[int]) -----------------------------------------
+// A T_IARRAY stores raw i32 elements (no per-element refcount), so a list of
+// ints costs one heap object + a flat i32 buffer instead of boxed elements. The
+// element ABI is raw `i32`, not `Value`. See VALUE_MODEL.md (Phase C).
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_iarray_new() -> Value {
+    coll_new(T_IARRAY)
+}
+
+/// Append a raw int element.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_iarray_push(arr: Value, x: i32) {
+    if !(is_heap(arr) && obj_tag(arr) == T_IARRAY) {
+        trap("expected an int array");
+    }
+    list_push(arr as usize, x as Value);
+}
+
+/// Bounds-checked read of a raw int element (supports Python negative indices).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_iarray_get(arr: Value, idx: i32) -> i32 {
+    let o = arr as usize;
+    let i = iarray_index(o, idx);
+    list_get(o, i) as i32
+}
+
+/// Bounds-checked write of a raw int element.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_iarray_set(arr: Value, idx: i32, x: i32) {
+    let o = arr as usize;
+    let i = iarray_index(o, idx);
+    list_set_at(o, i, x as Value);
+}
+
+/// Normalize + bounds-check a raw index against a packed array (traps on OOB).
+fn iarray_index(o: usize, idx: i32) -> usize {
+    if !(is_heap(o as Value) && obj_tag(o as Value) == T_IARRAY) {
+        trap("expected an int array");
+    }
+    let n = coll_len(o) as i64;
+    let i = if (idx as i64) < 0 { idx as i64 + n } else { idx as i64 };
+    if i < 0 || i >= n {
+        trap("index out of range");
+    }
+    i as usize
 }
 
 // --- iteration protocol ----------------------------------------------------
@@ -1058,6 +1116,17 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
                 write_repr(dict_val(o, i), out);
             }
             out(b'}');
+        }
+        T_IARRAY => {
+            // A packed int array prints like a list; elements are raw ints.
+            out(b'[');
+            for i in 0..coll_len(o) {
+                if i > 0 {
+                    write_bytes(b", ", out);
+                }
+                write_int(list_get(o, i) as i32 as i64, out);
+            }
+            out(b']');
         }
         _ => write_bytes(b"<object>", out),
     }
@@ -1334,6 +1403,26 @@ mod tests {
         assert_eq!(p2w_eq(p2w_int(1), p2w_float(1.0)), V_TRUE); // cross-type ==
         assert!(p2w_truthy(p2w_float(0.1)));
         assert!(!p2w_truthy(p2w_float(0.0)));
+    }
+
+    #[test]
+    fn packed_int_array_stores_raw_elements_and_frees_cleanly() {
+        let _g = heap_guard();
+        let arr = p2w_iarray_new();
+        assert_eq!(p2w_live(), 1); // one heap object (the array)
+        p2w_iarray_push(arr, 10);
+        p2w_iarray_push(arr, 20);
+        p2w_iarray_push(arr, -30);
+        assert_eq!(as_int(p2w_len(arr)), 3);
+        assert_eq!(p2w_iarray_get(arr, 0), 10);
+        assert_eq!(p2w_iarray_get(arr, 2), -30);
+        assert_eq!(p2w_iarray_get(arr, -1), -30); // Python negative index
+        p2w_iarray_set(arr, 1, 99);
+        assert_eq!(p2w_iarray_get(arr, 1), 99);
+        assert_eq!(shown(arr), "[10, 99, -30]");
+        // Raw elements carry no refcount; release frees the object + buffer only.
+        p2w_release(arr);
+        assert_eq!(p2w_live(), 0);
     }
 
     #[test]
