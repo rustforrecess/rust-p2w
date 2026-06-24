@@ -456,6 +456,28 @@ impl<'a> FuncEmitter<'a> {
         }
     }
 
+    /// Store value `(v, vr)` into the slot for `name`, coercing to the slot's
+    /// repr. A Boxed slot releases its previous binding then transfers in; an
+    /// unboxed Int slot stores raw (unboxing a boxed RHS drops that temp).
+    fn store_var(&mut self, name: &str, ptr: &str, v: String, vr: Repr) {
+        if self.slot_repr(name) == Repr::Boxed {
+            let cv = self.coerce(v, vr, Repr::Boxed);
+            let old = self.temp();
+            self.line(&format!("{old} = load i32, ptr {ptr}"));
+            self.release(&old); // drop the previous binding (no-op if 0/inline)
+            self.line(&format!("store i32 {cv}, ptr {ptr}"));
+        } else {
+            let raw = if vr == Repr::Boxed {
+                let r = self.coerce(v.clone(), Repr::Boxed, Repr::Int);
+                self.release(&v); // unboxing drops the boxed temp
+                r
+            } else {
+                self.coerce(v, vr, Repr::Int)
+            };
+            self.line(&format!("store i32 {raw}, ptr {ptr}"));
+        }
+    }
+
     /// Call a runtime function that returns a value, into a fresh temp.
     fn call_value(&mut self, sig: &str) -> String {
         let t = self.temp();
@@ -495,26 +517,20 @@ impl<'a> FuncEmitter<'a> {
             StmtKind::Assign(name, value) => {
                 let (v, vr) = self.expr_typed(value)?;
                 let ptr = self.var_slot(name); // new locals are created Boxed
-                let slot = self.slot_repr(name);
-                if slot == Repr::Boxed {
-                    // Coerce to boxed, release the previous binding, then transfer.
-                    let cv = self.coerce(v, vr, Repr::Boxed);
-                    let old = self.temp();
-                    self.line(&format!("{old} = load i32, ptr {ptr}"));
-                    self.release(&old); // drop the previous binding (no-op if 0/inline)
-                    self.line(&format!("store i32 {cv}, ptr {ptr}"));
-                } else {
-                    // Unboxed Int slot (a reassigned int param): store raw. If the
-                    // RHS was boxed, unboxing drops that owned temp.
-                    let raw = if vr == Repr::Boxed {
-                        let r = self.coerce(v.clone(), Repr::Boxed, Repr::Int);
-                        self.release(&v);
-                        r
-                    } else {
-                        v
-                    };
-                    self.line(&format!("store i32 {raw}, ptr {ptr}"));
+                self.store_var(name, &ptr, v, vr);
+                Ok(())
+            }
+            StmtKind::AnnAssign { name, ann, value } => {
+                let (v, vr) = self.expr_typed(value)?;
+                let is_new = !self.vars.iter().any(|x| x == name);
+                let ptr = self.var_slot(name);
+                // On first definition, the annotation picks the slot's repr (so
+                // `total: int = 0` gives an unboxed Int slot — native hot loops).
+                if is_new {
+                    self.var_reprs
+                        .insert(name.clone(), repr_of_ann(&Some(ann.clone())));
                 }
+                self.store_var(name, &ptr, v, vr);
                 Ok(())
             }
             StmtKind::Expr(e) => match &e.kind {
@@ -1358,6 +1374,17 @@ mod tests {
         assert!(out.contains("mul i32"), "native mul: {out}");
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         assert!(!out.contains("call void @p2w_retain"), "no refcounting: {out}");
+    }
+
+    #[test]
+    fn annotated_local_loop_is_native() {
+        // total:int + i:int + native compare/add => a fully native while loop,
+        // no boxing or runtime calls in the body.
+        let out = ir("def s(n: int) -> int:\n    total: int = 0\n    i: int = 0\n    while i < n:\n        total = total + i\n        i = i + 1\n    return total\n");
+        assert!(out.contains("icmp slt i32"), "native compare: {out}");
+        assert!(out.contains("add i32"), "native add: {out}");
+        assert!(!out.contains("call i32 @p2w_add"), "no boxed add: {out}");
+        assert!(!out.contains("call i32 @p2w_int"), "no boxing: {out}");
     }
 
     #[test]

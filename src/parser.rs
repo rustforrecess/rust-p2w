@@ -415,6 +415,26 @@ impl<'a> Parser<'a> {
                 )),
             };
         }
+        // Annotated assignment `name: T = value`. The native backend uses `T` to
+        // pick an unboxed representation; other backends treat it as a plain
+        // assignment. Only a bare name may be annotated.
+        if matches!(self.peek(), Tok::Colon) {
+            if let ExprKind::Name(name) = e.kind {
+                self.advance(); // ':'
+                let ann = self.type_expr()?;
+                self.expect(&Tok::Eq, "'=' after a type annotation")?;
+                let value = self.expr_list()?;
+                self.expect(&Tok::Newline, "a new line")?;
+                return Ok(Stmt {
+                    kind: StmtKind::AnnAssign { name, ann, value },
+                    line,
+                });
+            }
+            return Err(CompileError::at(
+                line,
+                "a type annotation ':' can only follow a variable name",
+            ));
+        }
         if matches!(self.peek(), Tok::Eq) {
             self.advance();
             let value = self.expr_list()?;
@@ -1704,6 +1724,19 @@ mod tests {
             s.kind,
             StmtKind::Assign("x".into(), bin(BinOp::Add, int(2), int(3)))
         );
+    }
+
+    #[test]
+    fn parses_annotated_assignment() {
+        let s = parse_src("x: int = 5").unwrap().pop().unwrap();
+        match s.kind {
+            StmtKind::AnnAssign { name, ann, value } => {
+                assert_eq!(name, "x");
+                assert_eq!(ann.kind, ExprKind::Name("int".into()));
+                assert_eq!(value.kind, ExprKind::Int(5));
+            }
+            other => panic!("expected AnnAssign, got {other:?}"),
+        }
     }
 
     #[test]

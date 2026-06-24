@@ -5062,7 +5062,7 @@ impl Gen {
 
     fn stmt(&mut self, cx: &mut FuncCx, s: &Stmt, out: &mut Body) -> Result<()> {
         match &s.kind {
-            StmtKind::Assign(name, expr) => {
+            StmtKind::Assign(name, expr) | StmtKind::AnnAssign { name, value: expr, .. } => {
                 self.type_of(cx, expr)?; // surface literal-misuse errors
                 let value = self.value_expr(cx, expr)?;
                 if cx.is_top {

@@ -92,7 +92,9 @@ fn collect_defs(stmts: &[Stmt], defs: &mut Vec<String>) {
 fn walk_stmts(stmts: &[Stmt], known: &[&str], out: &mut Vec<CompileError>) {
     for s in stmts {
         match &s.kind {
-            StmtKind::Expr(e) | StmtKind::Assign(_, e) => walk_expr(e, known, out),
+            StmtKind::Expr(e) | StmtKind::Assign(_, e) | StmtKind::AnnAssign { value: e, .. } => {
+                walk_expr(e, known, out)
+            }
             StmtKind::Return(Some(e)) => walk_expr(e, known, out),
             StmtKind::If {
                 cond,

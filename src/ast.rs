@@ -25,6 +25,14 @@ pub enum StmtKind {
     Expr(Expr),
     /// Assignment to a simple name, e.g. `x = 5`.
     Assign(String, Expr),
+    /// Annotated assignment, e.g. `x: int = 5`. Behaves like `Assign` in every
+    /// backend except the native one, which uses `ann` to pick an unboxed
+    /// representation for the slot (see VALUE_MODEL.md).
+    AnnAssign {
+        name: String,
+        ann: Expr,
+        value: Expr,
+    },
     /// `if cond: ... [elif cond: ...]* [else: ...]`
     If {
         cond: Expr,

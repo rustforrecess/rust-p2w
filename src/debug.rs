@@ -517,7 +517,7 @@ impl Stepper {
     /// chosen branch/loop onto the control stack).
     fn exec(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
-            StmtKind::Assign(name, e) => {
+            StmtKind::Assign(name, e) | StmtKind::AnnAssign { name, value: e, .. } => {
                 let v = self.eval(e)?;
                 self.scope.insert(name.clone(), v);
                 Ok(())
@@ -978,7 +978,7 @@ impl Stepper {
         s: &Stmt,
     ) -> Result<Flow, String> {
         match &s.kind {
-            StmtKind::Assign(name, e) => {
+            StmtKind::Assign(name, e) | StmtKind::AnnAssign { name, value: e, .. } => {
                 let v = Self::eval_in(funcs, scope, out, e)?;
                 scope.insert(name.clone(), v);
                 Ok(Flow::Normal)
@@ -1710,7 +1710,7 @@ impl Vm {
     /// Push the tasks that carry out one statement.
     fn expand_stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
-            StmtKind::Assign(name, e) => {
+            StmtKind::Assign(name, e) | StmtKind::AnnAssign { name, value: e, .. } => {
                 self.push_task(Task::Store(name.clone()));
                 self.push_task(Task::Eval(Rc::new(e.clone())));
             }

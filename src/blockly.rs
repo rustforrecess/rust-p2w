@@ -242,7 +242,7 @@ impl Builder {
             ))
         };
         match &s.kind {
-            StmtKind::Assign(name, value) => {
+            StmtKind::Assign(name, value) | StmtKind::AnnAssign { name, value, .. } => {
                 let id = self.var_id(name);
                 let v = self.value_block(value)?;
                 Ok(block(

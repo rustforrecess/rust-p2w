@@ -47,11 +47,14 @@ analysis in v1.**
   **are already in the AST** (`Def.param_types: Vec<Option<Expr>>` parallel to
   `params`, and `Def.return_type: Option<Expr>`), so Phases A/B can proceed with
   no front-end change.
-- **Annotated locals (`x: int = …`) are NOT yet in the AST** — `Assign` is
-  `(String, Expr)` with no type. Unboxing a hot local like `total` therefore needs
-  a small **front-end prerequisite**: add an optional type to `Assign` (or an
-  `AnnAssign` variant) + parser support. Until then, v1 unboxing is driven by
-  function signatures + literals/operator propagation only.
+- **Annotated locals (`x: int = …`) — DONE.** Added an `AnnAssign` AST variant +
+  parser support (`name: T = value`); other backends treat it like `Assign`, the
+  native one uses the annotation to pick the slot repr. So a hot local like
+  `total: int = 0` is an unboxed Int slot, and a `while` loop with annotated
+  locals + native compare/arith is **fully native** (no boxing, no runtime calls):
+  `def s(n: int): total: int = 0; i: int = 0; while i < n: total = total + i;
+  i = i + 1; return total` → a tight `icmp`/`add` loop. (Bare `x: int` without a
+  value, and unboxing *unannotated* locals via inference, remain future work.)
 - **Operators propagate** the obvious result repr: `Int op Int → Int`,
   `Int +-*/ Float → Float` (promotion; `/` is always `Float`), comparisons →
   `Bool`, etc. If any operand is `Boxed`, the result is `Boxed` (fall back).
