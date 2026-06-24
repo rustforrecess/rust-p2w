@@ -159,11 +159,10 @@ fn emit_function(
     let preprs = param_reprs.get(name).cloned().unwrap_or_default();
     f.ret_repr = ret_reprs.get(name).copied().unwrap_or(Repr::Boxed);
     for (i, p) in params.iter().enumerate() {
-        let ptr = f.var_slot(p);
-        f.line(&format!("store i32 %a{i}, ptr {ptr}"));
         let pr = preprs.get(i).copied().unwrap_or(Repr::Boxed);
-        f.var_reprs.insert(p.clone(), pr);
-        // Only Boxed params carry refcounts; an unboxed Int param is never
+        let ptr = f.ensure_slot(p, pr); // typed slot (double for a float param)
+        f.line(&format!("store {} %a{i}, ptr {ptr}", llvm_ty(pr)));
+        // Only Boxed params carry refcounts; an unboxed param is never
         // retained/released, so borrow-tracking doesn't apply to it.
         if pr == Repr::Boxed && mask.get(i).copied().unwrap_or(false) {
             f.borrowed_params.push(p.clone()); // caller owns it; don't release
@@ -172,18 +171,23 @@ fn emit_function(
     f.block(body)?;
     if !f.terminated {
         // Implicit return on fall-through: release locals, then return None
-        // (boxed) or a raw 0 for an `-> int` function that fell off the end.
+        // (boxed) or a raw zero for an unboxed-return function that fell off.
         f.emit_exit_releases();
         let r = match f.ret_repr {
             Repr::Int => "0".to_string(),
-            // Boxed (and any future non-Int return) falls through as None.
+            Repr::Float => "0.0".to_string(),
             _ => f.call_value("call i32 @p2w_none()"),
         };
-        f.body.push_str(&format!("  ret i32 {r}\n"));
+        f.body.push_str(&format!("  ret {} {r}\n", llvm_ty(f.ret_repr)));
     }
-    let sig: Vec<String> = (0..params.len()).map(|i| format!("i32 %a{i}")).collect();
+    let sig: Vec<String> = params
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("{} %a{i}", llvm_ty(preprs.get(i).copied().unwrap_or(Repr::Boxed))))
+        .collect();
     let def = format!(
-        "define i32 @{name}({}) {{\nentry:\n{}{}}}\n",
+        "define {} @{name}({}) {{\nentry:\n{}{}}}\n",
+        llvm_ty(f.ret_repr),
         sig.join(", "),
         f.allocas,
         f.body
@@ -414,18 +418,26 @@ impl<'a> FuncEmitter<'a> {
         }
     }
 
-    fn var_slot(&mut self, name: &str) -> String {
+    /// Get the slot for `name`, creating it with representation `repr` (and the
+    /// matching LLVM alloca type) on first use. An existing slot keeps its repr.
+    fn ensure_slot(&mut self, name: &str, repr: Repr) -> String {
         let ptr = format!("%v_{name}");
         if !self.vars.iter().any(|v| v == name) {
-            self.allocas.push_str(&format!("  {ptr} = alloca i32\n"));
-            // Zero-init so the exit-release of a never-assigned slot is a no-op
-            // (0 isn't a heap value, so p2w_release ignores it).
-            self.allocas.push_str(&format!("  store i32 0, ptr {ptr}\n"));
+            let ty = llvm_ty(repr);
+            self.allocas.push_str(&format!("  {ptr} = alloca {ty}\n"));
+            // Zero-init so the exit-release of a never-assigned (Boxed) slot is a
+            // no-op (0 isn't a heap value, so p2w_release ignores it).
+            self.allocas
+                .push_str(&format!("  store {ty} {}, ptr {ptr}\n", zero_init(repr)));
             self.vars.push(name.to_string());
-            // Default to Boxed; typed params override this in emit_function.
-            self.var_reprs.entry(name.to_string()).or_insert(Repr::Boxed);
+            self.var_reprs.insert(name.to_string(), repr);
         }
         ptr
+    }
+
+    /// The common case: a Boxed slot (plain `x = …` locals).
+    fn var_slot(&mut self, name: &str) -> String {
+        self.ensure_slot(name, Repr::Boxed)
     }
 
     /// The representation a variable slot holds (default `Boxed`).
@@ -438,7 +450,7 @@ impl<'a> FuncEmitter<'a> {
     /// caller decides whether to retain (owned use) or borrow.
     fn load_name(&mut self, name: &str) -> (String, Repr) {
         let repr = self.slot_repr(name);
-        let t = self.call_value(&format!("load i32, ptr %v_{name}"));
+        let t = self.call_value(&format!("load {}, ptr %v_{name}", llvm_ty(repr)));
         (t, repr)
     }
 
@@ -487,21 +499,24 @@ impl<'a> FuncEmitter<'a> {
     /// repr. A Boxed slot releases its previous binding then transfers in; an
     /// unboxed Int slot stores raw (unboxing a boxed RHS drops that temp).
     fn store_var(&mut self, name: &str, ptr: &str, v: String, vr: Repr) {
-        if self.slot_repr(name) == Repr::Boxed {
+        let slot = self.slot_repr(name);
+        if slot == Repr::Boxed {
             let cv = self.coerce(v, vr, Repr::Boxed);
             let old = self.temp();
             self.line(&format!("{old} = load i32, ptr {ptr}"));
             self.release(&old); // drop the previous binding (no-op if 0/inline)
             self.line(&format!("store i32 {cv}, ptr {ptr}"));
         } else {
+            // Unboxed slot (Int or Float): coerce to the slot's repr and store
+            // with its LLVM type — no refcount. Unboxing a boxed RHS drops it.
             let raw = if vr == Repr::Boxed {
-                let r = self.coerce(v.clone(), Repr::Boxed, Repr::Int);
-                self.release(&v); // unboxing drops the boxed temp
+                let r = self.coerce(v.clone(), Repr::Boxed, slot);
+                self.release(&v);
                 r
             } else {
-                self.coerce(v, vr, Repr::Int)
+                self.coerce(v, vr, slot)
             };
-            self.line(&format!("store i32 {raw}, ptr {ptr}"));
+            self.line(&format!("store {} {raw}, ptr {ptr}", llvm_ty(slot)));
         }
     }
 
@@ -549,14 +564,9 @@ impl<'a> FuncEmitter<'a> {
             }
             StmtKind::AnnAssign { name, ann, value } => {
                 let (v, vr) = self.expr_typed(value)?;
-                let is_new = !self.vars.iter().any(|x| x == name);
-                let ptr = self.var_slot(name);
-                // On first definition, the annotation picks the slot's repr (so
-                // `total: int = 0` gives an unboxed Int slot — native hot loops).
-                if is_new {
-                    self.var_reprs
-                        .insert(name.clone(), repr_of_ann(&Some(ann.clone())));
-                }
+                // On first definition the annotation picks the slot's repr (and
+                // alloca type), so `total: int = 0` / `x: float = …` are unboxed.
+                let ptr = self.ensure_slot(name, repr_of_ann(&Some(ann.clone())));
                 self.store_var(name, &ptr, v, vr);
                 Ok(())
             }
@@ -611,15 +621,17 @@ impl<'a> FuncEmitter<'a> {
                     None => (self.call_value("call i32 @p2w_none()"), Repr::Boxed),
                 };
                 let ret = self.ret_repr;
-                let r = if vr == Repr::Boxed && ret == Repr::Int {
-                    let raw = self.coerce(v.clone(), Repr::Boxed, Repr::Int);
-                    self.release(&v); // unboxing drops the boxed temp
+                let r = if vr == Repr::Boxed && ret != Repr::Boxed {
+                    // Returning a boxed value as an unboxed type: unbox, then drop
+                    // the boxed temp.
+                    let raw = self.coerce(v.clone(), Repr::Boxed, ret);
+                    self.release(&v);
                     raw
                 } else {
                     self.coerce(v, vr, ret)
                 };
                 self.emit_exit_releases();
-                self.terminator(&format!("ret i32 {r}"));
+                self.terminator(&format!("ret {} {r}", llvm_ty(ret)));
                 Ok(())
             }
             StmtKind::If {
@@ -903,16 +915,18 @@ impl<'a> FuncEmitter<'a> {
                 let mut to_release = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     let prepr = preprs.get(i).copied().unwrap_or(Repr::Boxed);
-                    if prepr == Repr::Int {
+                    if prepr != Repr::Boxed {
+                        // Unboxed param (Int/Float): coerce the arg to that repr
+                        // (no refcount). Unboxing a boxed arg drops its temp.
                         let (v, vr) = self.expr_typed(a)?;
                         let raw = if vr == Repr::Boxed {
-                            let r = self.coerce(v.clone(), Repr::Boxed, Repr::Int);
-                            self.release(&v); // drop the boxed temp we unboxed
+                            let r = self.coerce(v.clone(), Repr::Boxed, prepr);
+                            self.release(&v);
                             r
                         } else {
-                            v
+                            self.coerce(v, vr, prepr)
                         };
-                        ops.push(format!("i32 {raw}"));
+                        ops.push(format!("{} {raw}", llvm_ty(prepr)));
                     } else if mask.get(i).copied().unwrap_or(false) {
                         let (v, owned) = self.expr_borrow(a)?;
                         if owned {
@@ -923,7 +937,11 @@ impl<'a> FuncEmitter<'a> {
                         ops.push(format!("i32 {}", self.expr(a)?)); // transferred
                     }
                 }
-                let r = self.call_value(&format!("call i32 @{name}({})", ops.join(", ")));
+                let r = self.call_value(&format!(
+                    "call {} @{name}({})",
+                    llvm_ty(ret_repr),
+                    ops.join(", ")
+                ));
                 // Release borrowed args that were owned temps (a Name borrow isn't).
                 for v in to_release {
                     self.release(&v);
@@ -1301,9 +1319,28 @@ fn repr_of_ann(ann: &Option<Expr>) -> Repr {
     match ann {
         Some(e) => match &e.kind {
             ExprKind::Name(n) if n == "int" => Repr::Int,
+            ExprKind::Name(n) if n == "float" => Repr::Float,
             _ => Repr::Boxed,
         },
         None => Repr::Boxed,
+    }
+}
+
+/// The LLVM type a slot/param/return of this repr uses. Only `Float` is `double`;
+/// `Boxed`/`Int` are the tagged-or-raw `i32`; `Bool` is `i1` (never a slot).
+fn llvm_ty(repr: Repr) -> &'static str {
+    match repr {
+        Repr::Float => "double",
+        Repr::Bool => "i1",
+        Repr::Boxed | Repr::Int => "i32",
+    }
+}
+
+/// The zero-initializer literal for a slot of this repr.
+fn zero_init(repr: Repr) -> &'static str {
+    match repr {
+        Repr::Float => "0.0",
+        _ => "0",
     }
 }
 
@@ -1465,6 +1502,15 @@ mod tests {
         assert!(out.contains("mul i32"), "native mul: {out}");
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         assert!(!out.contains("call void @p2w_retain"), "no refcounting: {out}");
+    }
+
+    #[test]
+    fn typed_float_param_is_a_native_double_function() {
+        let out = ir("def dbl(x: float) -> float:\n    return x * 2.0\nprint(dbl(2.5))\n");
+        assert!(out.contains("define double @dbl(double %a0)"), "double sig: {out}");
+        assert!(out.contains("alloca double"), "double slot: {out}");
+        assert!(out.contains("fmul double"), "native fmul: {out}");
+        assert!(out.contains("ret double"), "double return: {out}");
     }
 
     #[test]

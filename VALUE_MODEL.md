@@ -141,7 +141,13 @@ because the ints that generated them are no longer boxed.
     zero runtime calls).
 - **B — typed function signatures.** Annotated params/returns become unboxed in
   the LLVM signature; callers coerce at the call. (Recursion like `fib(n: int)`
-  becomes raw-`i32` throughout.)
+  becomes raw-`i32` throughout.) **Int AND float DONE:** `Repr` now drives the
+  LLVM slot/param/return type via `llvm_ty` (`Float`→`double`, else `i32`).
+  `def dbl(x: float) -> float: return x * 2.0` is a native `double @dbl(double)`
+  (alloca double / fmul / ret double); int args promote to float params (`sitofp`).
+  Float locals (`total: float = 0.0`) get `alloca double` slots. The full scalar
+  story (int + float: literals, arithmetic, comparisons, params, returns, locals,
+  both loops) is now native, boxing only at dynamic sinks.
   - *Done (Int):* `: int` params get raw slots and `-> int` returns raw; the body
     runs native (`def sq(n: int) -> int: return n*n` emits just `load`/`mul`/`ret`
     — **zero** runtime calls). Coercions at the boundaries via `coerce` (box =
