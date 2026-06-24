@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 
 /// The runtime ABI the emitted module depends on (implemented by the device
 /// runtime). Declared at the top of every module.
@@ -572,17 +572,112 @@ impl<'a> FuncEmitter<'a> {
     }
 
     /// Evaluate `value` for assignment into a slot of representation `slot`. A
-    /// packed-array slot fed a list literal is built packed; everything else is
-    /// the usual typed evaluation.
+    /// packed-array slot fed a list literal is built packed; a comprehension is
+    /// built to match the slot; everything else is the usual typed evaluation.
     fn eval_for_slot(&mut self, slot: Repr, value: &Expr) -> Result<(String, Repr), String> {
-        if let ExprKind::List(items) = &value.kind {
-            match slot {
+        match &value.kind {
+            ExprKind::List(items) => match slot {
                 Repr::IntArray => return Ok((self.build_iarray(items)?, Repr::IntArray)),
                 Repr::FloatArray => return Ok((self.build_farray(items)?, Repr::FloatArray)),
                 _ => {}
+            },
+            ExprKind::ListComp { element, clauses } => {
+                return Ok((self.build_comprehension(slot, element, clauses)?, slot));
             }
+            _ => {}
         }
         self.expr_typed(value)
+    }
+
+    /// Lower `[element for x in iter (if cond)*]` into a fresh result collection
+    /// (typed to `result_repr`) plus a for-each that appends each produced
+    /// element. Reuses the for-each + typed-`append` machinery, so it works over
+    /// dynamic lists and packed `list[int]`/`list[float]` alike. Returns an owned
+    /// reference to the result. (Single loop clause for now.)
+    fn build_comprehension(
+        &mut self,
+        result_repr: Repr,
+        element: &Expr,
+        clauses: &[CompClause],
+    ) -> Result<String, String> {
+        let line = element.line;
+        let (loopvar, iter) = match clauses.first() {
+            Some(CompClause::For { vars, iter }) if vars.len() == 1 => (vars[0].clone(), iter.clone()),
+            _ => {
+                return Err(format!(
+                    "line {line}: the native backend handles `[e for x in it (if c)*]` (one loop, one target) yet"
+                ));
+            }
+        };
+        let mut conds = Vec::new();
+        for c in &clauses[1..] {
+            match c {
+                CompClause::If(e) => conds.push(e.clone()),
+                CompClause::For { .. } => {
+                    return Err(format!(
+                        "line {line}: nested comprehension loops aren't in the native backend yet"
+                    ));
+                }
+            }
+        }
+
+        // Hidden result variable, seeded with an empty collection of the target type.
+        let id = self.next_label;
+        self.next_label += 1;
+        let rname = format!("__comp{id}");
+        let ptr = self.ensure_slot(&rname, result_repr);
+        let empty = match result_repr {
+            Repr::IntArray => self.call_value("call i32 @p2w_iarray_new()"),
+            Repr::FloatArray => self.call_value("call i32 @p2w_farray_new()"),
+            _ => self.call_value("call i32 @p2w_list_new()"),
+        };
+        self.store_var(&rname, &ptr, empty, result_repr);
+
+        // Synthetic body: `__comp.append(element)`, wrapped in each `if` clause.
+        let mk = |k: ExprKind| Expr { kind: k, line };
+        let mut body = vec![Stmt {
+            kind: StmtKind::Expr(mk(ExprKind::MethodCall(
+                Box::new(mk(ExprKind::Name(rname.clone()))),
+                "append".to_string(),
+                vec![element.clone()],
+            ))),
+            line,
+        }];
+        for cond in conds.into_iter().rev() {
+            body = vec![Stmt {
+                kind: StmtKind::If {
+                    cond,
+                    body,
+                    elifs: vec![],
+                    else_body: None,
+                },
+                line,
+            }];
+        }
+        // `range(...)` isn't an iterable object — lower it to a counted loop, the
+        // same way a `for i in range(...)` statement is. Otherwise iterate.
+        match &iter.kind {
+            ExprKind::Call(n, args) if n == "range" => {
+                let lit = |v: i64| Expr {
+                    kind: ExprKind::Int(v),
+                    line,
+                };
+                let (start, end, step) = match args.len() {
+                    1 => (lit(0), args[0].clone(), lit(1)),
+                    2 => (args[0].clone(), args[1].clone(), lit(1)),
+                    3 => (args[0].clone(), args[1].clone(), args[2].clone()),
+                    _ => return Err(format!("line {line}: range() takes 1-3 arguments")),
+                };
+                self.emit_for(&loopvar, &start, &end, &step, &body)?;
+            }
+            _ => self.emit_foreach(&loopvar, &iter, &body)?,
+        }
+
+        // The slot owns the result; hand back an owned reference (released by the
+        // consumer; the slot's own ref is released at scope exit).
+        let (t, _) = self.load_name(&rname);
+        self.retain(&t);
+        Ok(t)
     }
 
     /// Store value `(v, vr)` into the slot for `name`, coercing to the slot's
@@ -1189,6 +1284,11 @@ impl<'a> FuncEmitter<'a> {
             ExprKind::MethodCall(obj, method, args) => {
                 Ok((self.method_call(obj, method, args)?, Repr::Boxed))
             }
+            // A comprehension with no typing context builds a dynamic list;
+            // eval_for_slot builds a packed one when the target is list[int/float].
+            ExprKind::ListComp { element, clauses } => {
+                Ok((self.build_comprehension(Repr::Boxed, element, clauses)?, Repr::Boxed))
+            }
             _ => nope("this expression"),
         }
     }
@@ -1743,6 +1843,22 @@ mod tests {
         assert!(out.contains("mul i32"), "native mul: {out}");
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         assert!(!out.contains("call void @p2w_retain"), "no refcounting: {out}");
+    }
+
+    #[test]
+    fn list_comprehension_into_packed_array() {
+        let out = ir("xs: list[int] = [1, 2]\nys: list[int] = [x * x for x in xs]\nprint(ys)\n");
+        assert!(out.contains("call i32 @p2w_iarray_new"), "packed result: {out}");
+        assert!(out.contains("mul i32"), "native element compute: {out}");
+        assert!(out.contains("call void @p2w_iarray_push"), "raw append: {out}");
+    }
+
+    #[test]
+    fn list_comprehension_with_filter_and_range() {
+        // `if` clause + range source both lower without a runtime iterator.
+        let out = ir("ev: list[int] = [n for n in range(6) if n % 2 == 0]\nprint(ev)\n");
+        assert!(out.contains("icmp slt i32"), "counted range loop: {out}");
+        assert!(out.contains("call i32 @p2w_iarray_push") || out.contains("call void @p2w_iarray_push"), "{out}");
     }
 
     #[test]
