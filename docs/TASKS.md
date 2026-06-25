@@ -40,7 +40,9 @@ The **value model is complete** — typed code lowers to native register/buffer 
   in data]` over a unique array maps **in place, zero allocation**, guarded by a
   runtime `rc==1` check (`p2w_unique`); aliased arrays fall back to copy.
 - **RC**: precise transfer-ownership insertion + `borrow-on-read` + borrowed
-  params (a conservative syntactic escape analysis, `param_escapes`).
+  params — a conservative syntactic escape analysis (`param_escapes`) lets a
+  read-only param (Boxed *or* a packed array) be borrowed, so passing a named
+  array to a helper costs zero refcount traffic.
 
 So the tasks below now sit on a finished base; pick any (Task 1 — last-use — is
 the enabler for fuller reuse, but they're largely independent).
@@ -138,8 +140,8 @@ behavioral change to the emitter.
   currently handles one `for x in it`).
 - **Comprehension in a typed `return`** (`return [..]` into `-> list[int]` builds
   dynamic today; route through `eval_for_slot`).
-- **Borrowed packed-array params** (`list[int]` params currently always transfer;
-  a read-only one could borrow, like Boxed params do).
+- **Borrow the for-each iterable** (a `for x in xs` over a borrowed array param
+  still retains/releases `xs` per loop; a read-only loop could borrow it).
 - **Cycle handling / `--no-mutation` mode** (RC leaks cycles; auto-detect the
   cycle-free fast path — see `MEMORY_MANAGEMENT.md`).
 
