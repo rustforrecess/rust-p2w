@@ -178,10 +178,11 @@ fn emit_function(
         let pr = preprs.get(i).copied().unwrap_or(Repr::Boxed);
         let ptr = f.ensure_slot(p, pr); // typed slot (double for a float param)
         f.line(&format!("store {} %a{i}, ptr {ptr}", llvm_ty(pr)));
-        // Only Boxed params carry refcounts; an unboxed param is never
-        // retained/released, so borrow-tracking doesn't apply to it.
-        if pr == Repr::Boxed && mask.get(i).copied().unwrap_or(false) {
-            f.borrowed_params.push(p.clone()); // caller owns it; don't release
+        // A heap-ref param (Boxed or a packed array) that doesn't escape is
+        // borrowed: the caller keeps ownership, so we don't release it at exit.
+        // Unboxed scalars carry no refcount, so borrow-tracking doesn't apply.
+        if is_heap_repr(pr) && mask.get(i).copied().unwrap_or(false) {
+            f.borrowed_params.push(p.clone());
         }
     }
     f.block(body)?;
@@ -1385,14 +1386,12 @@ impl<'a> FuncEmitter<'a> {
                 let mut to_release = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     let prepr = preprs.get(i).copied().unwrap_or(Repr::Boxed);
-                    if prepr != Repr::Boxed {
-                        // Unboxed/typed param (Int/Float/IntArray): coerce the arg
-                        // to that repr. A list literal for a list[int] param is
-                        // built packed; an unboxed scalar carries no refcount; a
-                        // boxed arg unboxes (dropping its temp). Heap-ref args
-                        // (IntArray) are transferred — the callee releases them.
+                    let borrowable = mask.get(i).copied().unwrap_or(false);
+                    if !is_heap_repr(prepr) {
+                        // Unboxed scalar param (Int/Float): pass by value, no
+                        // refcount. A boxed arg unboxes (dropping its temp).
                         let (v, vr) = self.eval_for_slot(prepr, a)?;
-                        let raw = if vr == Repr::Boxed && prepr != Repr::Boxed {
+                        let raw = if vr == Repr::Boxed {
                             let r = self.coerce(v.clone(), Repr::Boxed, prepr);
                             self.release(&v);
                             r
@@ -1400,14 +1399,23 @@ impl<'a> FuncEmitter<'a> {
                             self.coerce(v, vr, prepr)
                         };
                         ops.push(format!("{} {raw}", llvm_ty(prepr)));
-                    } else if mask.get(i).copied().unwrap_or(false) {
-                        let (v, owned) = self.expr_borrow(a)?;
-                        if owned {
-                            to_release.push(v.clone()); // a temp we still own
-                        }
+                    } else if borrowable && matches!(&a.kind, ExprKind::Name(_)) {
+                        // Borrowed heap param (Boxed/array) fed a named value:
+                        // load it without retaining and don't release — the
+                        // caller keeps ownership, the callee won't free it.
+                        let (v, _, _) = self.expr_borrow_typed(a)?;
                         ops.push(format!("i32 {v}"));
                     } else {
-                        ops.push(format!("i32 {}", self.expr(a)?)); // transferred
+                        // Transfer (callee releases), or a borrowed param fed a
+                        // fresh temp (the caller releases after the call). Either
+                        // way build an owned value; coerce is identity among heap
+                        // reprs and builds a packed array from a literal.
+                        let (v, vr) = self.eval_for_slot(prepr, a)?;
+                        let v = self.coerce(v, vr, prepr);
+                        if borrowable {
+                            to_release.push(v.clone());
+                        }
+                        ops.push(format!("i32 {v}"));
                     }
                 }
                 let r = self.call_value(&format!(
@@ -1748,6 +1756,7 @@ fn stmt_escapes(s: &Stmt, p: &str) -> bool {
         // Reassigning the name (`p = …`, or a loop var shadowing it) means the
         // slot no longer holds the borrowed value — treat as an escape.
         StmtKind::Assign(name, value) => name == p || expr_escapes(value, true, p),
+        StmtKind::AnnAssign { name, value, .. } => name == p || expr_escapes(value, true, p),
         StmtKind::Return(Some(e)) => expr_escapes(e, true, p),
         StmtKind::Return(None) => false,
         StmtKind::Expr(e) => match &e.kind {
@@ -2198,6 +2207,21 @@ mod tests {
         assert!(
             !out.contains("call void @p2w_retain"),
             "no retain for borrowed reads: {out}"
+        );
+    }
+
+    #[test]
+    fn borrowed_list_int_param_is_not_retained_at_the_call() {
+        // A read-only list[int] param is borrowed — even with an annotated local
+        // (`s: int`) in the body, which the escape analysis must look through.
+        // The call passes the named array with no retain in main.
+        let out = ir(
+            "def total(xs: list[int]) -> int:\n    s: int = 0\n    for x in xs:\n        s = s + x\n    return s\nys: list[int] = [1, 2, 3]\nprint(total(ys))\n",
+        );
+        let main = out.split("define i32 @main").nth(1).unwrap_or("");
+        assert!(
+            !main.contains("call void @p2w_retain"),
+            "borrowed array param should not be retained at the call: {main}"
         );
     }
 
