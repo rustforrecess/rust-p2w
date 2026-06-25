@@ -64,6 +64,8 @@ bash tools/native_run.sh            # the host run-oracle (needs clang); GATE_LE
 
 ## Docs
 
+- `docs/PYTHON_COMPAT.md` — the supported Python subset and where it differs from
+  CPython (sets, integers, cycles, current gaps).
 - `docs/PITCH.md` — one-page technical pitch (audience: PL / compiler engineers).
 - `docs/TASKS.md` — scoped frontier tasks for a contributor, each with the
   `live==0` oracle as acceptance gate.
