@@ -1043,8 +1043,49 @@ impl<'a> FuncEmitter<'a> {
                 self.terminator(&format!("br label %{cont}"));
                 Ok(())
             }
+            StmtKind::UnpackAssign { targets, value } => self.emit_unpack(targets, value, s.line),
             _ => nope("this statement"),
         }
+    }
+
+    /// `a, b = value` (and `a, b = b, a`): evaluate the right-hand tuple/list once
+    /// into a hidden slot, then assign each target from `__unpack[i]`.
+    fn emit_unpack(&mut self, targets: &[Expr], value: &Expr, line: usize) -> Result<(), String> {
+        let (v, vr) = self.expr_typed(value)?;
+        let id = self.next_label;
+        self.next_label += 1;
+        let uname = format!("__unpack{id}");
+        let ptr = self.ensure_slot(&uname, vr);
+        self.store_var(&uname, &ptr, v, vr);
+
+        let mk = |k: ExprKind| Expr { kind: k, line };
+        for (i, target) in targets.iter().enumerate() {
+            let elem = mk(ExprKind::Index(
+                Box::new(mk(ExprKind::Name(uname.clone()))),
+                Box::new(mk(ExprKind::Int(i as i64))),
+            ));
+            let stmt = match &target.kind {
+                ExprKind::Name(n) => Stmt {
+                    kind: StmtKind::Assign(n.clone(), elem),
+                    line,
+                },
+                ExprKind::Index(o, idx) => Stmt {
+                    kind: StmtKind::SetIndex {
+                        target: (**o).clone(),
+                        index: (**idx).clone(),
+                        value: elem,
+                    },
+                    line,
+                },
+                _ => {
+                    return Err(format!(
+                        "line {line}: an unpacking target must be a variable or an index"
+                    ));
+                }
+            };
+            self.stmt(&stmt)?;
+        }
+        Ok(())
     }
 
     fn emit_if(
@@ -1457,6 +1498,16 @@ impl<'a> FuncEmitter<'a> {
                     self.line(&format!("call i32 @p2w_list_append(i32 {list}, i32 {v})"));
                 }
                 Ok((list, Repr::Boxed))
+            }
+            // A tuple is lowered to a (boxed, immutable-by-convention) list — same
+            // heterogeneous storage; unpacking and indexing reuse the list path.
+            ExprKind::Tuple(items) => {
+                let tup = self.call_value("call i32 @p2w_list_new()");
+                for it in items {
+                    let v = self.expr(it)?;
+                    self.line(&format!("call i32 @p2w_list_append(i32 {tup}, i32 {v})"));
+                }
+                Ok((tup, Repr::Boxed))
             }
             ExprKind::Dict(pairs) => {
                 let dict = self.call_value("call i32 @p2w_dict_new()");
@@ -2448,11 +2499,25 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_are_clean_errors() {
-        // Tuples/comprehensions are still pending.
+        // Classes aren't in the native backend yet.
         assert!(
-            emit_llvm_ir(&parse("t = (1, 2)\n"))
+            emit_llvm_ir(&parse("class C:\n    x = 1\n"))
                 .unwrap_err()
                 .contains("native")
+        );
+    }
+
+    #[test]
+    fn tuples_and_unpacking_lower_to_lists() {
+        // A tuple builds a (boxed) list; `a, b = t` indexes it back out.
+        let out = ir("t = (1, 2)\na, b = t\nprint(a)\nprint(b)\n");
+        assert!(
+            out.contains("call i32 @p2w_list_new"),
+            "tuple as list: {out}"
+        );
+        assert!(
+            out.contains("call i32 @p2w_index"),
+            "unpack via index: {out}"
         );
     }
 }

@@ -148,6 +148,12 @@ run_case farray    'xs: list[float] = [1.5, 2.5, 3.0]\nprint(xs)\nprint(xs[1])\n
 run_case farraysum 'def total(xs: list[float]) -> float:\n    s: float = 0.0\n    for x in xs:\n        s = s + x\n    return s\nys: list[float] = [1.5, 2.5]\nprint(total(ys))\n' '4.0' || fails=$((fails+1))
 run_case farraymix 'xs: list[float] = [1.0, 2.0]\nxs.append(3)\nxs[0] = 9.5\nprint(xs)\n' '[9.5, 2.0, 3.0]' || fails=$((fails+1))
 
+# --- tuples (lowered to lists) ---
+run_case tuple_unpack 't = (1, 2, 3)\na, b, c = t\nprint(a)\nprint(c)\n' '1\n3' || fails=$((fails+1))
+run_case tuple_swap 'a = 1\nb = 2\na, b = b, a\nprint(a)\nprint(b)\n' '2\n1' || fails=$((fails+1))
+run_case tuple_return 'def minmax(x: int, y: int):\n    if x < y:\n        return x, y\n    return y, x\nlo, hi = minmax(5, 3)\nprint(lo)\nprint(hi)\n' '3\n5' || fails=$((fails+1))
+run_case tuple_index 'pt = (10, 20, 30)\nprint(pt[1])\nprint(len(pt))\n' '20\n3' || fails=$((fails+1))
+
 echo "---"
 if [ "$fails" -eq 0 ]; then
   echo "all native-run cases passed"
