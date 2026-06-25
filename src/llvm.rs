@@ -71,6 +71,7 @@ declare void @p2w_farray_set(i32, i32, double)
 declare i32 @p2w_index(i32, i32)
 declare void @p2w_setindex(i32, i32, i32)
 declare i32 @p2w_len(i32)
+declare i32 @p2w_str_of(i32)
 ; method dispatch by name (runtime resolves on the receiver's type)
 declare i32 @p2w_method0(i32, ptr, i32)
 declare i32 @p2w_method1(i32, ptr, i32, i32)
@@ -1452,8 +1453,21 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&v, o); // len borrows its argument
                     return Ok((r, Repr::Boxed));
                 }
+                // str(x): the value's display form as a fresh string. This is also
+                // what f-strings desugar to (`f"{x}"` -> str(x) concatenation).
+                if name == "str" {
+                    if args.len() != 1 {
+                        return nope("str() with other than one argument");
+                    }
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let r = self.call_value(&format!("call i32 @p2w_str_of(i32 {v})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
                 if !self.funcs.contains(name) {
-                    return nope("calling this function (only your own functions, len, + print)");
+                    return nope(
+                        "calling this function (only your own functions, len, str, + print)",
+                    );
                 }
                 // Coerce each argument to the callee's parameter repr and match
                 // its ownership convention. An `Int` param takes a raw value (no
@@ -2532,6 +2546,20 @@ mod tests {
         assert!(
             out.contains("call i32 @p2w_index"),
             "unpack via index: {out}"
+        );
+    }
+
+    #[test]
+    fn str_builtin_and_fstrings() {
+        let out = ir("x = 5\nprint(str(x))\nprint(f\"v={x}\")\n");
+        assert!(
+            out.contains("call i32 @p2w_str_of"),
+            "str() lowers to p2w_str_of: {out}"
+        );
+        // The f-string desugars to str(...) + concat.
+        assert!(
+            out.contains("call i32 @p2w_add"),
+            "f-string concatenates: {out}"
         );
     }
 

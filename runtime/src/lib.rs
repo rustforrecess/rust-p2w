@@ -205,6 +205,28 @@ pub extern "C" fn p2w_unique(v: Value) -> bool {
     is_heap(v) && rd(v as usize + 4) == 1
 }
 
+/// `str(v)` — the value's display form as a fresh heap string. Runs the print
+/// formatter twice: once to size the buffer, once to fill it (no_std, no Vec).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_str_of(v: Value) -> Value {
+    let mut n = 0usize;
+    write_value(v, &mut |_| n += 1);
+    let p = alloc(12 + n);
+    if p == 0 {
+        trap("out of memory");
+    }
+    wr(p, T_STR);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, n as u32);
+    let mut i = 0usize;
+    write_value(v, &mut |b| {
+        wr_byte(p + 12 + i, b);
+        i += 1;
+    });
+    p as Value
+}
+
 /// Extract a raw `f64` from a boxed value (the unbox half for floats). Accepts a
 /// boxed int too (Python int→float promotion); traps otherwise.
 #[unsafe(no_mangle)]

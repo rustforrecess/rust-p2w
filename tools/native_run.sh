@@ -101,6 +101,10 @@ run_case forsum    'def fsum(n: int) -> int:\n    total: int = 0\n    for i in r
 run_case fordown   'for i in range(3, 0, -1):\n    print(i)\n'                   '3\n2\n1'      || fails=$((fails+1))
 run_case lists     'xs = [1, 2, 3]\nxs.append(4)\nprint(xs)\nprint(len(xs))\n' '[1, 2, 3, 4]\n4' || fails=$((fails+1))
 run_case strcat    'print("py" + "thon")\n'                                    'python'      || fails=$((fails+1))
+run_case str_builtin 'print(str(42))\nprint(str([1, 2, 3]))\nprint(str(3.5))\n' '42\n[1, 2, 3]\n3.5' || fails=$((fails+1))
+run_case fstring   'name = "world"\nn = 3\nprint(f"hi {name}, n={n}")\n'        'hi world, n=3' || fails=$((fails+1))
+run_case fstring_expr 'x = 5\nprint(f"x*2 = {x * 2}")\n'                        'x*2 = 10'    || fails=$((fails+1))
+run_case fstring_typed 'def sq(n: int) -> int:\n    return n * n\nprint(f"sq(4)={sq(4)}")\n' 'sq(4)=16' || fails=$((fails+1))
 # --- RC stress: reassignment, nesting, dicts, early return, short-circuit, etc.
 run_case reassign  'xs = [1, 2]\nxs = [3, 4, 5]\nprint(len(xs))\n'              '3'           || fails=$((fails+1))
 run_case strreassign 's = "ab"\ns = s + "c"\nprint(s)\n'                        'abc'         || fails=$((fails+1))
