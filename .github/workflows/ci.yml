@@ -8,12 +8,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      # python3 is preinstalled on the runner, so the differential tests
-      # compare against real CPython rather than skipping.
+      # Main crate. python3 is preinstalled on the runner, so the differential
+      # tests compare against real CPython rather than skipping.
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
+      # Native runtime crate (p2w-rt) — a separate crate, not a workspace member,
+      # so it needs its own invocations.
+      - run: cargo test --manifest-path runtime/Cargo.toml
+      - run: cargo clippy --manifest-path runtime/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path runtime/Cargo.toml --check
