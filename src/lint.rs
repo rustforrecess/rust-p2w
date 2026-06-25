@@ -256,6 +256,109 @@ fn walk_clauses(clauses: &[CompClause], known: &[&str], out: &mut Vec<CompileErr
     }
 }
 
+// --- cycle-freedom analysis ------------------------------------------------
+//
+// Plain reference counting frees everything *except* reference cycles. A cycle
+// needs an already-built heap container to be mutated so it (transitively) holds
+// a reference reaching back to itself — pure construction (literals,
+// comprehensions) can't do it, and storing a scalar (number/bool/string, none of
+// which hold references) can't either. So we soundly over-approximate: the
+// program "may form a cycle" if it ever mutates a container (`append`/`insert`/
+// `extend`, subscript-set, attribute-set) with a value that isn't provably
+// cycle-safe. A `false` result is a guarantee — plain RC is leak-complete — and
+// is the seam for a `--no-mutation` fast path / cycle collector (see
+// MEMORY_MANAGEMENT.md).
+
+/// Whether the program could create a reference cycle (and thus leak under RC).
+/// Sound and conservative; `false` means provably cycle-free.
+pub fn may_form_cycle(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_may_cycle)
+}
+
+/// A value that can't (transitively) hold a reference: numbers, bools, strings,
+/// None, and arithmetic over them. A `Name` is unknown (could be a container), so
+/// it's conservatively unsafe.
+fn expr_is_cycle_safe(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
+        | ExprKind::NoneLit => true,
+        ExprKind::Unary(_, x) => expr_is_cycle_safe(x),
+        ExprKind::Bin(_, a, b) => expr_is_cycle_safe(a) && expr_is_cycle_safe(b),
+        _ => false,
+    }
+}
+
+fn stmt_may_cycle(s: &Stmt) -> bool {
+    let block = |b: &[Stmt]| b.iter().any(stmt_may_cycle);
+    match &s.kind {
+        StmtKind::Expr(e) => expr_may_cycle(e),
+        StmtKind::Assign(_, e)
+        | StmtKind::AnnAssign { value: e, .. }
+        | StmtKind::Return(Some(e)) => expr_may_cycle(e),
+        // Storing a non-scalar into a container/attribute is the cycle source.
+        StmtKind::SetIndex { value, .. } | StmtKind::SetAttr { value, .. } => {
+            !expr_is_cycle_safe(value)
+        }
+        StmtKind::If {
+            cond,
+            body,
+            elifs,
+            else_body,
+        } => {
+            expr_may_cycle(cond)
+                || block(body)
+                || elifs.iter().any(|(c, b)| expr_may_cycle(c) || block(b))
+                || else_body.as_deref().is_some_and(block)
+        }
+        StmtKind::While { cond, body } => expr_may_cycle(cond) || block(body),
+        StmtKind::For { body, .. }
+        | StmtKind::ForEach { body, .. }
+        | StmtKind::Def { body, .. } => block(body),
+        StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => false,
+        // ClassDef (mutable attributes), tuple-unpacking, and anything else: be
+        // conservative and assume a cycle is possible.
+        _ => true,
+    }
+}
+
+fn expr_may_cycle(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::MethodCall(obj, m, args) => {
+            (matches!(m.as_str(), "append" | "insert" | "extend")
+                && args.iter().any(|a| !expr_is_cycle_safe(a)))
+                || expr_may_cycle(obj)
+                || args.iter().any(expr_may_cycle)
+        }
+        ExprKind::Bin(_, a, b) => expr_may_cycle(a) || expr_may_cycle(b),
+        ExprKind::Unary(_, x) => expr_may_cycle(x),
+        ExprKind::Index(o, i) => expr_may_cycle(o) || expr_may_cycle(i),
+        ExprKind::Call(_, args) => args.iter().any(expr_may_cycle),
+        ExprKind::List(items) => items.iter().any(expr_may_cycle),
+        ExprKind::Dict(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_may_cycle(k) || expr_may_cycle(v)),
+        ExprKind::ListComp { element, clauses } => {
+            expr_may_cycle(element) || clauses_may_cycle(clauses)
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => expr_may_cycle(key) || expr_may_cycle(value) || clauses_may_cycle(clauses),
+        _ => false,
+    }
+}
+
+fn clauses_may_cycle(clauses: &[CompClause]) -> bool {
+    clauses.iter().any(|c| match c {
+        CompClause::For { iter, .. } => expr_may_cycle(iter),
+        CompClause::If(e) => expr_may_cycle(e),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +370,29 @@ mod tests {
             .iter()
             .map(|e| e.to_string())
             .collect()
+    }
+
+    fn cycles(src: &str) -> bool {
+        let toks = crate::lexer::lex(src).unwrap();
+        may_form_cycle(&crate::parser::parse(&toks).unwrap())
+    }
+
+    #[test]
+    fn cycle_free_programs_are_recognized() {
+        // Construction + scalar mutation + comprehensions can't cycle.
+        assert!(!cycles(
+            "xs = [1, 2, 3]\nxs.append(4)\nys = [x * x for x in xs]\n"
+        ));
+        assert!(!cycles("xs = [1, 2]\nxs[0] = 99\n"));
+        assert!(!cycles("d = {n: n * n for n in range(3)}\n"));
+    }
+
+    #[test]
+    fn container_holding_a_reference_may_cycle() {
+        // Appending/storing a (possibly heap) value is the cycle source.
+        assert!(cycles("a = []\nb = a\na.append(b)\n")); // self-reference
+        assert!(cycles("a = []\nd = {}\nd[0] = a\n")); // dict holds a list
+        assert!(cycles("xs = []\nys = [1]\nxs.append(ys)\n")); // list of lists
     }
 
     #[test]

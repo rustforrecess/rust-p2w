@@ -49,6 +49,18 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String, String> {
     llvm::emit_llvm_ir(&stmts)
 }
 
+/// Whether `source` could create a reference cycle — and so leak under plain
+/// reference counting. A `false` result is a guarantee that the program is
+/// cycle-free (RC frees everything); unparseable source is conservatively `true`.
+/// This is the seam for a `--no-mutation` fast path and for surfacing a
+/// "leak-free" signal in the editor. See `MEMORY_MANAGEMENT.md`.
+pub fn may_form_cycle(source: &str) -> bool {
+    match lexer::lex(source).and_then(|t| parser::parse(&t)) {
+        Ok(stmts) => lint::may_form_cycle(&stmts),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
