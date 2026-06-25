@@ -681,23 +681,21 @@ impl<'a> FuncEmitter<'a> {
         Ok(true)
     }
 
-    /// Lower `[element for x in iter (if cond)*]` into a fresh result collection
-    /// (typed to `result_repr`) plus a for-each that appends each produced
-    /// element. Reuses the for-each + typed-`append` machinery, so it works over
-    /// dynamic lists and packed `list[int]`/`list[float]` alike. Returns an owned
-    /// reference to the result. (Single loop clause for now.)
-    fn build_comprehension(
-        &mut self,
-        result_repr: Repr,
-        element: &Expr,
+    /// Validate a comprehension's clauses: one `for x in it` then zero or more
+    /// `if`s. Returns (loop var, iterable, conditions). Nested fors / tuple
+    /// targets aren't handled yet.
+    fn comp_clauses(
+        &self,
         clauses: &[CompClause],
-    ) -> Result<String, String> {
-        let line = element.line;
+        line: usize,
+    ) -> Result<(String, Expr, Vec<Expr>), String> {
         let (loopvar, iter) = match clauses.first() {
-            Some(CompClause::For { vars, iter }) if vars.len() == 1 => (vars[0].clone(), iter.clone()),
+            Some(CompClause::For { vars, iter }) if vars.len() == 1 => {
+                (vars[0].clone(), iter.clone())
+            }
             _ => {
                 return Err(format!(
-                    "line {line}: the native backend handles `[e for x in it (if c)*]` (one loop, one target) yet"
+                    "line {line}: comprehensions handle one `for x in it (if c)*` clause yet"
                 ));
             }
         };
@@ -712,42 +710,18 @@ impl<'a> FuncEmitter<'a> {
                 }
             }
         }
+        Ok((loopvar, iter, conds))
+    }
 
-        // Hidden result variable, seeded with an empty collection of the target type.
-        let id = self.next_label;
-        self.next_label += 1;
-        let rname = format!("__comp{id}");
-        let ptr = self.ensure_slot(&rname, result_repr);
-        let empty = match result_repr {
-            Repr::IntArray => self.call_value("call i32 @p2w_iarray_new()"),
-            Repr::FloatArray => self.call_value("call i32 @p2w_farray_new()"),
-            _ => self.call_value("call i32 @p2w_list_new()"),
-        };
-        self.store_var(&rname, &ptr, empty, result_repr);
-
-        // Synthetic body: `__comp.append(element)`, wrapped in each `if` clause.
-        let mk = |k: ExprKind| Expr { kind: k, line };
-        let mut body = vec![Stmt {
-            kind: StmtKind::Expr(mk(ExprKind::MethodCall(
-                Box::new(mk(ExprKind::Name(rname.clone()))),
-                "append".to_string(),
-                vec![element.clone()],
-            ))),
-            line,
-        }];
-        for cond in conds.into_iter().rev() {
-            body = vec![Stmt {
-                kind: StmtKind::If {
-                    cond,
-                    body,
-                    elifs: vec![],
-                    else_body: None,
-                },
-                line,
-            }];
-        }
-        // `range(...)` isn't an iterable object — lower it to a counted loop, the
-        // same way a `for i in range(...)` statement is. Otherwise iterate.
+    /// Run a comprehension's loop body over `iter`. `range(...)` lowers to a
+    /// counted loop (it isn't an iterable object); anything else iterates.
+    fn emit_comp_loop(
+        &mut self,
+        loopvar: &str,
+        iter: &Expr,
+        body: &[Stmt],
+    ) -> Result<(), String> {
+        let line = iter.line;
         match &iter.kind {
             ExprKind::Call(n, args) if n == "range" => {
                 let lit = |v: i64| Expr {
@@ -760,13 +734,98 @@ impl<'a> FuncEmitter<'a> {
                     3 => (args[0].clone(), args[1].clone(), args[2].clone()),
                     _ => return Err(format!("line {line}: range() takes 1-3 arguments")),
                 };
-                self.emit_for(&loopvar, &start, &end, &step, &body)?;
+                self.emit_for(loopvar, &start, &end, &step, body)
             }
-            _ => self.emit_foreach(&loopvar, &iter, &body)?,
+            _ => self.emit_foreach(loopvar, iter, body),
         }
+    }
 
-        // The slot owns the result; hand back an owned reference (released by the
-        // consumer; the slot's own ref is released at scope exit).
+    /// Wrap a comprehension body in its `if` clauses (innermost-first list).
+    fn wrap_conds(conds: Vec<Expr>, inner: Stmt, line: usize) -> Vec<Stmt> {
+        let mut body = vec![inner];
+        for cond in conds.into_iter().rev() {
+            body = vec![Stmt {
+                kind: StmtKind::If {
+                    cond,
+                    body,
+                    elifs: vec![],
+                    else_body: None,
+                },
+                line,
+            }];
+        }
+        body
+    }
+
+    /// Lower `[element for x in iter (if cond)*]` into a fresh result collection
+    /// (typed to `result_repr`) plus a loop that appends each produced element.
+    /// Reuses the loop + typed-`append` machinery, so it works over dynamic lists
+    /// and packed `list[int]`/`list[float]` alike. Returns an owned reference.
+    fn build_comprehension(
+        &mut self,
+        result_repr: Repr,
+        element: &Expr,
+        clauses: &[CompClause],
+    ) -> Result<String, String> {
+        let line = element.line;
+        let (loopvar, iter, conds) = self.comp_clauses(clauses, line)?;
+        let id = self.next_label;
+        self.next_label += 1;
+        let rname = format!("__comp{id}");
+        let ptr = self.ensure_slot(&rname, result_repr);
+        let empty = match result_repr {
+            Repr::IntArray => self.call_value("call i32 @p2w_iarray_new()"),
+            Repr::FloatArray => self.call_value("call i32 @p2w_farray_new()"),
+            _ => self.call_value("call i32 @p2w_list_new()"),
+        };
+        self.store_var(&rname, &ptr, empty, result_repr);
+
+        let mk = |k: ExprKind| Expr { kind: k, line };
+        let append = Stmt {
+            kind: StmtKind::Expr(mk(ExprKind::MethodCall(
+                Box::new(mk(ExprKind::Name(rname.clone()))),
+                "append".to_string(),
+                vec![element.clone()],
+            ))),
+            line,
+        };
+        let body = Self::wrap_conds(conds, append, line);
+        self.emit_comp_loop(&loopvar, &iter, &body)?;
+
+        let (t, _) = self.load_name(&rname);
+        self.retain(&t);
+        Ok(t)
+    }
+
+    /// Lower `{key: value for x in iter (if cond)*}` into a fresh (dynamic) dict,
+    /// setting each key/value pair. Returns an owned reference.
+    fn build_dict_comprehension(
+        &mut self,
+        key: &Expr,
+        value: &Expr,
+        clauses: &[CompClause],
+    ) -> Result<String, String> {
+        let line = key.line;
+        let (loopvar, iter, conds) = self.comp_clauses(clauses, line)?;
+        let id = self.next_label;
+        self.next_label += 1;
+        let rname = format!("__comp{id}");
+        let ptr = self.ensure_slot(&rname, Repr::Boxed); // dicts are dynamic
+        let empty = self.call_value("call i32 @p2w_dict_new()");
+        self.store_var(&rname, &ptr, empty, Repr::Boxed);
+
+        let mk = |k: ExprKind| Expr { kind: k, line };
+        let set = Stmt {
+            kind: StmtKind::SetIndex {
+                target: mk(ExprKind::Name(rname.clone())),
+                index: key.clone(),
+                value: value.clone(),
+            },
+            line,
+        };
+        let body = Self::wrap_conds(conds, set, line);
+        self.emit_comp_loop(&loopvar, &iter, &body)?;
+
         let (t, _) = self.load_name(&rname);
         self.retain(&t);
         Ok(t)
@@ -1388,6 +1447,11 @@ impl<'a> FuncEmitter<'a> {
             ExprKind::ListComp { element, clauses } => {
                 Ok((self.build_comprehension(Repr::Boxed, element, clauses)?, Repr::Boxed))
             }
+            ExprKind::DictComp {
+                key,
+                value,
+                clauses,
+            } => Ok((self.build_dict_comprehension(key, value, clauses)?, Repr::Boxed)),
             _ => nope("this expression"),
         }
     }
@@ -1980,6 +2044,13 @@ mod tests {
         assert!(out.contains("call i32 @p2w_iarray_new"), "packed result: {out}");
         assert!(out.contains("mul i32"), "native element compute: {out}");
         assert!(out.contains("call void @p2w_iarray_push"), "raw append: {out}");
+    }
+
+    #[test]
+    fn dict_comprehension_builds_a_dict() {
+        let out = ir("d = {x: x * x for x in range(3)}\nprint(d[2])\n");
+        assert!(out.contains("call i32 @p2w_dict_new"), "dict result: {out}");
+        assert!(out.contains("call void @p2w_setindex"), "key/value set: {out}");
     }
 
     #[test]
