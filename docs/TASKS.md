@@ -11,63 +11,48 @@ The native backend is validated **without hardware**: values are i32 arena
 offsets (not machine pointers), so emitted LLVM IR + the `p2w-rt` runtime compile
 with `clang` and **run on a normal host**.
 
-`tools/native_run.sh` is the gate. For each case it: emits IR → `clang` → links
-`p2w-rt` (built `--crate-type staticlib -- -C panic=abort`) + a `p2w_putc` stub →
-runs → diffs stdout against the expected (CPython) output → asserts
-**`p2w_live() == 0`** at exit (`GATE_LEAKS=1`, the default). A leak (`live > 0`) or
-a double-free (`live < 0`, or a trap that spin-loops → the per-case timeout fires)
-**fails the build**.
+`tools/native_run.sh` is the gate (61 cases today). For each case it: emits IR →
+`clang` → links `p2w-rt` (built `--crate-type staticlib -- -C panic=abort`) + a
+`p2w_putc` stub → runs → diffs stdout against the expected (CPython) output →
+asserts **`p2w_live() == 0`** at exit (`GATE_LEAKS=1`, the default). A leak
+(`live > 0`) or double-free (`live < 0`, or a trap that spin-loops → the per-case
+timeout fires) **fails the build**. It also reports `p2w_allocs()` so reuse wins
+are *measured*, not asserted.
 
 **Definition of done for every task:** all existing oracle cases stay green; new
 cases covering the feature are added and green; `cargo test` (lib + runtime)
 green; `cargo clippy` clean. Where the task claims a speed/size/alloc win, add a
-before/after number from the oracle (it can report alloc and RC-op counts).
+before/after number from the oracle.
 
-Dependency order: **Task 1 is the foundation; 2–4 sit on top of it.** Do not start
-2–4 before 1 lands — they target the IR shape Task 1 produces.
+## What's already shipped (the foundation you build on)
 
----
+The **value model is complete** — typed code lowers to native register/buffer code:
 
-## Task 1 — Type-driven monomorphization (the foundation)
+- **Type-driven monomorphization** (was Task 1): `: int`/`: float` scalars are
+  unboxed (`i32`/`double`); native `add`/`mul`/`fdiv`/`icmp`/`fcmp`, int↔float
+  promotion, typed params/returns/locals, both loop forms. `box`/`unbox` only at
+  the dynamic boundary. Unannotated code is the unchanged dynamic tagged-i32 path.
+- **Packed arrays** `list[int]`/`list[float]` (`T_IARRAY`/`T_FARRAY`): flat
+  i32/f64 buffers; construct/index/append/iterate/param, bounds-checked.
+- **List & dict comprehensions**: dynamic or packed (target-typed), `if` filters,
+  `range` sources.
+- **FBIP drop-reuse for the self-map** (part of was-Task-3): `data = [f(x) for x
+  in data]` over a unique array maps **in place, zero allocation**, guarded by a
+  runtime `rc==1` check (`p2w_unique`); aliased arrays fall back to copy.
+- **RC**: precise transfer-ownership insertion + `borrow-on-read` + borrowed
+  params (a conservative syntactic escape analysis, `param_escapes`).
 
-**Goal.** Stop boxing everything. Use the type annotations the parser already
-accepts (`x: int`, `-> T`) to represent annotated scalars **unboxed** (raw
-`i32/i64/i16/i8`/`double`) and homogeneous collections as **packed arrays**; box
-only at the **dynamic boundary** (a typed value flowing into a dynamic context —
-`print`, a heterogeneous list, an un-annotated call).
-
-**Why first.** On a 520 KB Cortex-M33 the per-integer box+arena-bump dominates the
-loop-heavy code this language runs. Unboxing is the largest single speed/RAM win
-and it erases most remaining RC traffic (boxed-int releases are already no-ops;
-this removes the boxes entirely).
-
-**Design before code (write a short note, like the RC contract).** The real work
-is the **typed ↔ boxed coexistence contract**: where boxing/unboxing happens, how
-typed values cross into dynamic positions, how mixed expressions are typed. Keep
-it annotation-driven — *not* a full inference engine. Unannotated code keeps
-today's tagged-i32 path unchanged.
-
-**Interface / touch points.**
-- A per-expression "representation" (boxed vs a concrete unboxed type), threaded
-  through `expr()` in `src/llvm.rs`.
-- `box`/`unbox` emission helpers at boundaries; the runtime ABI gains typed
-  constructors/extractors as needed.
-- RC interacts cleanly: unboxed scalars are never retained/released (no-ops today,
-  absent tomorrow); heap values keep the existing model.
-
-**Acceptance.** Oracle green; new typed cases (annotated int loop, packed array
-sum, typed→dynamic `print`) green and `live==0`; report the alloc-count and
-RC-op drop on an annotated loop vs the unannotated version.
+So the tasks below now sit on a finished base; pick any (Task 1 — last-use — is
+the enabler for fuller reuse, but they're largely independent).
 
 ---
 
-## Task 2 — Full last-use release (Perceus precision)
+## Task 1 — Full last-use release (Perceus precision)
 
-**Goal.** Release an owned variable at its **last use**, not at scope end. Today
+**Goal.** Release an owned heap variable at its **last use**, not at scope end.
 `borrow-on-read` already avoids RC for reads-into-borrowing-ops; this handles the
-owned-slot case (a heap local last read mid-function is freed there, shrinking
-peak live set). It is also the **enabler for Task 3** (reuse needs "unique and
-dead here").
+owned-slot case (a heap local last read mid-function is freed there, shrinking the
+peak live set), and is the **enabler for general reuse** (Task 2 needs "dead here").
 
 **Spec.** Perceus (PLDI 2021), §ownership/last-use. Per-block liveness over the
 CFG the emitter already builds (labelled basic blocks, `loops`, `cleanups`).
@@ -79,65 +64,90 @@ correct across branches, loops, break/continue, and early return.
 
 **Acceptance.** Oracle green incl. all control-flow cases; `live==0` preserved; a
 case where a large heap local is dead before function end shows reduced peak live
-(extend the runtime counter with a high-water mark if useful).
+(add a high-water-mark counter to the runtime if useful).
 
 ---
 
-## Task 3 — Drop-reuse / FBIP over comprehensions (the headline)
+## Task 2 — General Perceus reuse (FBIP in full)
 
-**Goal.** When a unique (`rc==1`), dead value is dropped and a **same-shape** value
-is allocated nearby, **reuse the buffer in place** instead of free+alloc. The
-canonical target is the in-place comprehension `data = [f(x) for x in data]`:
-zero steady-state allocation in a sensor/data loop.
+**Goal.** Generalize the shipped self-map reuse into proper drop/reuse tokens: at
+any point where a unique value is dropped and a same-shape value is constructed,
+reuse the buffer — not just the `data = [f(x) for x in data]` special case.
 
-**Prerequisites (must exist first).**
-- Comprehensions in the front-end + emitter, lowered so the
-  "construct-new-collection-by-iterating-a-source" pattern is **legible in the
-  IR** (not desugared into an opaque append-loop) — so reuse has a hook.
-- A runtime **uniqueness query** (`rc==1`, cheap) — add this seam early even
-  before the optimization.
-- Task 2 (last-use) to establish "dead here."
+**What exists.** The runtime `p2w_unique` seam + `p2w_allocs` counter, and the
+self-map lowering (`try_inplace_map` in `src/llvm.rs`) as a worked example of the
+unique-vs-copy branch. Generalizing means a reuse-token dataflow rather than a
+syntactic pattern match.
 
 **Spec.** Perceus reuse analysis / FBIP; "drop-guided reuse" (the simpler,
-stronger successor) and "Reference Counting with Frame Limited Reuse" (MSR).
+stronger successor); "Reference Counting with Frame Limited Reuse" (MSR).
 
-**Interface / touch points.** A reuse-token dataflow: a drop site that may be
-unique yields a token; a matching same-size allocation consumes it (runtime
-`alloc`/`free` gain a reuse fast path). Falls back to normal free+alloc when not
-unique.
+**Interface / touch points.** A drop site that may be unique yields a reuse token;
+a matching same-size allocation consumes it (the runtime `alloc`/`free` gain a
+reuse fast path). Falls back to normal free+alloc when not unique. Builds on
+Task 1's last-use info.
 
-**Acceptance.** Oracle green and `live==0`; an in-place comprehension over a
-unique list shows a **measured drop in alloc count** vs the naive build (criterion
-#4 in `RC_PASS_TODO.md`); correctness holds when the source is *not* unique
-(aliased) — must NOT reuse then.
+**Acceptance.** Oracle green and `live==0`; measured alloc-count drop on reuse-
+heavy programs beyond the self-map; correctness when the source is aliased (must
+NOT reuse) — mirror the `fbip_alias` test.
 
 ---
 
-## Task 4 — Reachability-type escape inference
+## Task 3 — Reachability-type escape inference
 
 **Goal.** Replace today's conservative *syntactic* borrowed-param analysis
 (`param_escapes` in `src/llvm.rs`) with proper **flow-sensitive escape / ownership
 inference**, so more params (and locals) are provably borrowed/non-escaping —
-fewer retains, more reuse opportunities, and a principled basis for the static
-tier of the memory model.
+fewer retains, more reuse, a principled static tier.
 
 **Spec.** Reachability types: "Free to Move" (2025, flow-sensitive effects for
 safe dealloc + ownership transfer), Polymorphic Reachability Types (OOPSLA 2024).
 
 **Interface / touch points.** A per-function analysis producing escape/reachability
 facts consumed by the emitter's ownership decisions (generalizes the borrow masks
-already threaded through `FuncEmitter`). Stay sound: unknown ⇒ escapes.
+threaded through `FuncEmitter`). Stay sound: unknown ⇒ escapes.
 
 **Acceptance.** Oracle green and `live==0`; strictly more params classified
-borrowable than the syntactic analysis on a representative suite, with no
-regressions; report the RC-op reduction.
+borrowable than the syntactic analysis on a representative suite, no regressions;
+report the RC-op reduction.
 
 ---
 
+## Task 4 — Verified RC pass (the "saved by the compiler" angle)
+
+**Goal.** Prove the retain/release insertion sound, turning the oracle's
+*test-assured* memory safety into *proof-assured* safety. This is the project's
+thesis literalized: the source language can't state the invariant; a verified
+compiler guarantees it.
+
+**Spec.** RustBelt / Iris lineage; VerusBelt (PLDI 2026); "Endangered by the
+Language but Saved by the Compiler" (POPL 2026). See `MEMORY_MANAGEMENT.md`.
+
+**Interface / touch points.** Formalize the transfer-ownership contract (already
+documented above `FuncEmitter`) and the runtime RC ABI; mechanize the proof for
+the insertion pass. Largest/most-open task; highest research payoff.
+
+**Acceptance.** A machine-checked soundness argument for the cycle-free subset; no
+behavioral change to the emitter.
+
+---
+
+## Smaller polish (good first contributions)
+
+- **Nested / multi-target comprehension `for`s** and tuple targets (`comp_clauses`
+  currently handles one `for x in it`).
+- **Comprehension in a typed `return`** (`return [..]` into `-> list[int]` builds
+  dynamic today; route through `eval_for_slot`).
+- **Borrowed packed-array params** (`list[int]` params currently always transfer;
+  a read-only one could borrow, like Boxed params do).
+- **Cycle handling / `--no-mutation` mode** (RC leaks cycles; auto-detect the
+  cycle-free fast path — see `MEMORY_MANAGEMENT.md`).
+
 ## Pointers
 
-- Ownership contract + emitter: `src/llvm.rs` (see the comment above `FuncEmitter`).
+- Value model + ownership contract: `VALUE_MODEL.md`; `src/llvm.rs` (above
+  `FuncEmitter`).
 - Runtime + RC primitives + accounting: `runtime/src/lib.rs`.
 - Memory model + research/citations: `MEMORY_MANAGEMENT.md`.
-- Native backend plan + status: `PICO_BACKEND.md`; RC roadmap: `RC_PASS_TODO.md`.
+- Native backend plan + status: `PICO_BACKEND.md`.
 - The gate: `tools/native_run.sh` (set `GATE_LEAKS=0` only to diagnose).
