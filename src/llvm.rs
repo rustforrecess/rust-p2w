@@ -703,9 +703,14 @@ impl<'a> FuncEmitter<'a> {
     /// Build the nested loop/filter body of a comprehension: each `for` clause
     /// becomes a loop (counted `range` or iterating) wrapping the rest, each `if`
     /// a guard around it. `inner` is the innermost statement (the append or
-    /// dict-set). Supports multiple `for`s — nested comprehensions. Tuple targets
-    /// (`for a, b in ...`) aren't handled yet.
-    fn comp_body(clauses: &[CompClause], inner: Stmt, line: usize) -> Result<Vec<Stmt>, String> {
+    /// dict-set). Supports multiple `for`s (nested comprehensions) and tuple
+    /// targets (`for a, b in pairs` — bound via a hidden var + unpack).
+    fn comp_body(
+        &mut self,
+        clauses: &[CompClause],
+        inner: Stmt,
+        line: usize,
+    ) -> Result<Vec<Stmt>, String> {
         let Some((first, rest)) = clauses.split_first() else {
             return Ok(vec![inner]);
         };
@@ -713,28 +718,41 @@ impl<'a> FuncEmitter<'a> {
             CompClause::If(cond) => Ok(vec![Stmt {
                 kind: StmtKind::If {
                     cond: cond.clone(),
-                    body: Self::comp_body(rest, inner, line)?,
+                    body: self.comp_body(rest, inner, line)?,
                     elifs: vec![],
                     else_body: None,
                 },
                 line,
             }]),
             CompClause::For { vars, iter } => {
-                if vars.len() != 1 {
-                    return Err(format!(
-                        "line {line}: tuple targets in comprehensions aren't in the native backend yet"
-                    ));
-                }
-                let var = vars[0].clone();
-                let body = Self::comp_body(rest, inner, line)?;
+                let mut body = self.comp_body(rest, inner, line)?;
+                let mk = |k: ExprKind| Expr { kind: k, line };
+                // A tuple target loops over a hidden element var and unpacks it at
+                // the top of the body. (`range` can't be tuple-unpacked.)
+                let var = if vars.len() == 1 {
+                    vars[0].clone()
+                } else {
+                    if matches!(&iter.kind, ExprKind::Call(n, _) if n == "range") {
+                        return Err(format!("line {line}: can't unpack range() elements"));
+                    }
+                    let id = self.next_label;
+                    self.next_label += 1;
+                    let ev = format!("__elem{id}");
+                    let unpack = Stmt {
+                        kind: StmtKind::UnpackAssign {
+                            targets: vars.iter().map(|v| mk(ExprKind::Name(v.clone()))).collect(),
+                            value: mk(ExprKind::Name(ev.clone())),
+                        },
+                        line,
+                    };
+                    body.insert(0, unpack);
+                    ev
+                };
                 // `range(...)` isn't an iterable object — lower it to a counted
                 // loop, like a `for i in range(...)` statement; else iterate.
                 let kind = match &iter.kind {
                     ExprKind::Call(n, args) if n == "range" => {
-                        let lit = |v: i64| Expr {
-                            kind: ExprKind::Int(v),
-                            line,
-                        };
+                        let lit = |v: i64| mk(ExprKind::Int(v));
                         let (start, end, step) = match args.len() {
                             1 => (lit(0), args[0].clone(), lit(1)),
                             2 => (args[0].clone(), args[1].clone(), lit(1)),
@@ -791,7 +809,7 @@ impl<'a> FuncEmitter<'a> {
             ))),
             line,
         };
-        let body = Self::comp_body(clauses, append, line)?;
+        let body = self.comp_body(clauses, append, line)?;
         self.block(&body)?;
 
         let (t, _) = self.load_name(&rname);
@@ -824,7 +842,7 @@ impl<'a> FuncEmitter<'a> {
             },
             line,
         };
-        let body = Self::comp_body(clauses, set, line)?;
+        let body = self.comp_body(clauses, set, line)?;
         self.block(&body)?;
 
         let (t, _) = self.load_name(&rname);
@@ -2504,6 +2522,16 @@ mod tests {
             emit_llvm_ir(&parse("class C:\n    x = 1\n"))
                 .unwrap_err()
                 .contains("native")
+        );
+    }
+
+    #[test]
+    fn comprehension_tuple_target_unpacks() {
+        // `for a, b in pairs` binds a hidden element var and unpacks it (index reads).
+        let out = ir("pairs = [(1, 2)]\nr: list[int] = [a + b for a, b in pairs]\nprint(r)\n");
+        assert!(
+            out.contains("call i32 @p2w_index"),
+            "unpack via index: {out}"
         );
     }
 

@@ -136,8 +136,6 @@ behavioral change to the emitter.
 
 ## Smaller polish (good first contributions)
 
-- **Tuple targets in comprehensions** (`for a, b in pairs` — needs tuple
-  iteration/unpacking; nested single-target `for`s already work via `comp_body`).
 - **Cycle collector / `--no-mutation` enforcement.** Detection already exists —
   `lint::may_form_cycle` (and `rust_p2w::may_form_cycle(source)`) soundly decides
   whether a program is cycle-free, so RC is leak-complete for the common case.
@@ -147,7 +145,8 @@ behavioral change to the emitter.
 *(Recently shipped from this list: native int+float scalars, packed
 `list[int]`/`list[float]`, list/dict comprehensions, nested comprehension `for`s,
 typed-return comprehensions, FBIP self-map reuse, borrowed array params,
-borrowed for-each iterables, cycle-freedom detection.)*
+borrowed for-each iterables, cycle-freedom detection, tuples + unpacking
+(incl. comprehension tuple targets).)*
 
 ## Pointers
 

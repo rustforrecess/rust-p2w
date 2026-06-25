@@ -153,6 +153,7 @@ run_case tuple_unpack 't = (1, 2, 3)\na, b, c = t\nprint(a)\nprint(c)\n' '1\n3' 
 run_case tuple_swap 'a = 1\nb = 2\na, b = b, a\nprint(a)\nprint(b)\n' '2\n1' || fails=$((fails+1))
 run_case tuple_return 'def minmax(x: int, y: int):\n    if x < y:\n        return x, y\n    return y, x\nlo, hi = minmax(5, 3)\nprint(lo)\nprint(hi)\n' '3\n5' || fails=$((fails+1))
 run_case tuple_index 'pt = (10, 20, 30)\nprint(pt[1])\nprint(len(pt))\n' '20\n3' || fails=$((fails+1))
+run_case comp_tuple_target 'pairs = [(1, 10), (2, 20), (3, 30)]\nsums: list[int] = [a + b for a, b in pairs]\nprint(sums)\n' '[11, 22, 33]' || fails=$((fails+1))
 
 echo "---"
 if [ "$fails" -eq 0 ]; then
