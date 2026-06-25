@@ -227,6 +227,80 @@ pub extern "C" fn p2w_str_of(v: Value) -> Value {
     p as Value
 }
 
+/// `obj[start:stop:step]` for lists and strings — Python slice semantics: each
+/// bound is `V_NONE` when omitted, indices may be negative, and a negative step
+/// reverses. Returns a fresh list/string (owning retained elements for a list).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_slice(obj: Value, start_v: Value, stop_v: Value, step_v: Value) -> Value {
+    if !(is_heap(obj) && matches!(obj_tag(obj), T_STR | T_LIST)) {
+        trap("only lists and strings can be sliced");
+    }
+    let o = obj as usize;
+    let len = rd(o + 8) as i64; // element/byte count (same offset for str and list)
+    let step = if step_v == V_NONE { 1 } else { as_int(step_v) };
+    if step == 0 {
+        trap("slice step cannot be zero");
+    }
+    // CPython's PySlice_AdjustIndices for an explicit bound.
+    let adjust = |raw: i64| -> i64 {
+        let mut i = raw;
+        if i < 0 {
+            i += len;
+            if i < 0 {
+                i = if step < 0 { -1 } else { 0 };
+            }
+        } else if i >= len {
+            i = if step < 0 { len - 1 } else { len };
+        }
+        i
+    };
+    let start = if start_v == V_NONE {
+        if step < 0 { len - 1 } else { 0 }
+    } else {
+        adjust(as_int(start_v))
+    };
+    let stop = if stop_v == V_NONE {
+        if step < 0 { -1 } else { len }
+    } else {
+        adjust(as_int(stop_v))
+    };
+    let take = |i: i64| if step > 0 { i < stop } else { i > stop };
+
+    if obj_tag(obj) == T_STR {
+        // Two passes (no_std, no Vec): size the result, then fill it.
+        let mut n = 0usize;
+        let mut i = start;
+        while take(i) {
+            n += 1;
+            i += step;
+        }
+        let p = alloc(12 + n);
+        if p == 0 {
+            trap("out of memory");
+        }
+        wr(p, T_STR);
+        wr(p + 4, 1);
+        live_inc();
+        wr(p + 8, n as u32);
+        let mut j = 0usize;
+        let mut i = start;
+        while take(i) {
+            wr_byte(p + 12 + j, str_byte(obj, i as usize));
+            j += 1;
+            i += step;
+        }
+        p as Value
+    } else {
+        let result = coll_new(T_LIST);
+        let mut i = start;
+        while take(i) {
+            list_push(result as usize, owned(list_get(o, i as usize)));
+            i += step;
+        }
+        result
+    }
+}
+
 /// Extract a raw `f64` from a boxed value (the unbox half for floats). Accepts a
 /// boxed int too (Python int→float promotion); traps otherwise.
 #[unsafe(no_mangle)]

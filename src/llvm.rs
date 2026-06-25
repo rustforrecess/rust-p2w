@@ -72,6 +72,7 @@ declare i32 @p2w_index(i32, i32)
 declare void @p2w_setindex(i32, i32, i32)
 declare i32 @p2w_len(i32)
 declare i32 @p2w_str_of(i32)
+declare i32 @p2w_slice(i32, i32, i32, i32)
 ; method dispatch by name (runtime resolves on the receiver's type)
 declare i32 @p2w_method0(i32, ptr, i32)
 declare i32 @p2w_method1(i32, ptr, i32, i32)
@@ -1575,6 +1576,27 @@ impl<'a> FuncEmitter<'a> {
                 self.release_if_owned(&i, oi);
                 Ok((r, Repr::Boxed))
             }
+            ExprKind::Slice {
+                obj,
+                start,
+                stop,
+                step,
+            } => {
+                // obj[start:stop:step] for a (boxed) list or string. Omitted bounds
+                // are passed as None; the runtime applies Python slice semantics.
+                let (o, oo) = self.expr_borrow(obj)?;
+                let (s, so) = self.opt_arg(start)?;
+                let (e, eo) = self.opt_arg(stop)?;
+                let (st, sto) = self.opt_arg(step)?;
+                let r = self.call_value(&format!(
+                    "call i32 @p2w_slice(i32 {o}, i32 {s}, i32 {e}, i32 {st})"
+                ));
+                self.release_if_owned(&o, oo); // all four are borrowed by the runtime
+                self.release_if_owned(&s, so);
+                self.release_if_owned(&e, eo);
+                self.release_if_owned(&st, sto);
+                Ok((r, Repr::Boxed))
+            }
             ExprKind::MethodCall(obj, method, args) => {
                 Ok((self.method_call(obj, method, args)?, Repr::Boxed))
             }
@@ -1716,6 +1738,15 @@ impl<'a> FuncEmitter<'a> {
     fn release_if_owned(&mut self, v: &str, owned: bool) {
         if owned {
             self.release(v);
+        }
+    }
+
+    /// An optional slice bound: the boxed expression (owned) if present, else
+    /// `None`. Returns `(value, owned)`.
+    fn opt_arg(&mut self, e: &Option<Box<Expr>>) -> Result<(String, bool), String> {
+        match e {
+            Some(x) => Ok((self.expr(x)?, true)),
+            None => Ok((self.call_value("call i32 @p2w_none()"), false)),
         }
     }
 
@@ -2546,6 +2577,16 @@ mod tests {
         assert!(
             out.contains("call i32 @p2w_index"),
             "unpack via index: {out}"
+        );
+    }
+
+    #[test]
+    fn slices_lower_to_the_runtime() {
+        let out = ir("xs = [1, 2, 3]\nprint(xs[1:])\nprint(xs[::-1])\n");
+        assert!(out.contains("call i32 @p2w_slice"), "slice call: {out}");
+        assert!(
+            out.contains("call i32 @p2w_none"),
+            "omitted bound is None: {out}"
         );
     }
 

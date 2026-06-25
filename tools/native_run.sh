@@ -105,6 +105,10 @@ run_case str_builtin 'print(str(42))\nprint(str([1, 2, 3]))\nprint(str(3.5))\n' 
 run_case fstring   'name = "world"\nn = 3\nprint(f"hi {name}, n={n}")\n'        'hi world, n=3' || fails=$((fails+1))
 run_case fstring_expr 'x = 5\nprint(f"x*2 = {x * 2}")\n'                        'x*2 = 10'    || fails=$((fails+1))
 run_case fstring_typed 'def sq(n: int) -> int:\n    return n * n\nprint(f"sq(4)={sq(4)}")\n' 'sq(4)=16' || fails=$((fails+1))
+run_case slice_list 'xs = [1, 2, 3, 4, 5]\nprint(xs[1:4])\nprint(xs[:2])\nprint(xs[3:])\n' '[2, 3, 4]\n[1, 2]\n[4, 5]' || fails=$((fails+1))
+run_case slice_str 's = "hello"\nprint(s[1:4])\nprint(s[::-1])\n'               'ell\nolleh'    || fails=$((fails+1))
+run_case slice_step 'xs = [0, 1, 2, 3, 4, 5]\nprint(xs[::2])\nprint(xs[::-1])\n' '[0, 2, 4]\n[5, 4, 3, 2, 1, 0]' || fails=$((fails+1))
+run_case slice_neg 'xs = [1, 2, 3, 4]\nprint(xs[-2:])\nprint(xs[:-1])\n'         '[3, 4]\n[1, 2, 3]' || fails=$((fails+1))
 # --- RC stress: reassignment, nesting, dicts, early return, short-circuit, etc.
 run_case reassign  'xs = [1, 2]\nxs = [3, 4, 5]\nprint(len(xs))\n'              '3'           || fails=$((fails+1))
 run_case strreassign 's = "ab"\ns = s + "c"\nprint(s)\n'                        'abc'         || fails=$((fails+1))
