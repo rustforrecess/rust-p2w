@@ -1157,20 +1157,43 @@ impl<'a> FuncEmitter<'a> {
         Ok(())
     }
 
+    /// Evaluate a for-each iterable. A *named* iterable the loop body never
+    /// reassigns is **borrowed** (loaded, not retained) — the variable slot keeps
+    /// it alive across the loop, so no refcount traffic. Otherwise it's an owned
+    /// temp. Returns `(value, repr, owned)`.
+    fn eval_iterable(
+        &mut self,
+        iterable: &Expr,
+        body: &[Stmt],
+    ) -> Result<(String, Repr, bool), String> {
+        if let ExprKind::Name(n) = &iterable.kind
+            && self.vars.iter().any(|v| v == n)
+            && !body_reassigns(body, n)
+        {
+            let (t, repr) = self.load_name(n); // borrowed: no retain
+            return Ok((t, repr, false));
+        }
+        let (t, repr) = self.expr_typed(iterable)?; // owned (a Name here retains)
+        Ok((t, repr, is_heap_repr(repr)))
+    }
+
     /// `for var in iterable:` over the runtime iteration protocol
     /// (`p2w_iter` / `p2w_iter_has` / `p2w_iter_next`).
     fn emit_foreach(&mut self, var: &str, iterable: &Expr, body: &[Stmt]) -> Result<(), String> {
-        let (seq, srepr) = self.expr_typed(iterable)?; // owned
+        let (seq, srepr, owned) = self.eval_iterable(iterable, body)?;
         if srepr == Repr::IntArray {
-            return self.emit_foreach_array(var, seq, Repr::Int, "p2w_iarray_get", body);
+            return self.emit_foreach_array(var, seq, owned, Repr::Int, "p2w_iarray_get", body);
         }
         if srepr == Repr::FloatArray {
-            return self.emit_foreach_array(var, seq, Repr::Float, "p2w_farray_get", body);
+            return self.emit_foreach_array(var, seq, owned, Repr::Float, "p2w_farray_get", body);
         }
         let it = self.call_value(&format!("call i32 @p2w_iter(i32 {seq})"));
-        // Both outlive the loop and must survive an early return — track them.
-        self.cleanups.push(seq.clone());
+        // The iterator is owned (release at exit); the sequence is tracked only if
+        // we own it (a borrowed named sequence is kept alive by its slot).
         self.cleanups.push(it.clone());
+        if owned {
+            self.cleanups.push(seq.clone());
+        }
         let slot = self.var_slot(var);
 
         let head = self.fresh_label("ehead");
@@ -1196,11 +1219,13 @@ impl<'a> FuncEmitter<'a> {
         self.br_to(&head);
 
         self.place_label(&end);
-        // Pop in reverse push order; release the iterator then its sequence.
-        self.cleanups.pop();
+        // Reverse push order: the (owned) sequence, then the iterator.
+        if owned {
+            self.cleanups.pop();
+            self.release(&seq);
+        }
         self.cleanups.pop();
         self.release(&it);
-        self.release(&seq);
         Ok(())
     }
 
@@ -1211,12 +1236,16 @@ impl<'a> FuncEmitter<'a> {
         &mut self,
         var: &str,
         seq: String,
+        seq_owned: bool,
         elem: Repr,
         get_fn: &str,
         body: &[Stmt],
     ) -> Result<(), String> {
-        // seq is an owned array ref; it must survive the loop and early return.
-        self.cleanups.push(seq.clone());
+        // Track the array for release only if we own it (a borrowed named array is
+        // kept alive by its slot, which the loop body never reassigns).
+        if seq_owned {
+            self.cleanups.push(seq.clone());
+        }
         let lenb = self.call_value(&format!("call i32 @p2w_len(i32 {seq})"));
         let len = self.call_value(&format!("call i32 @p2w_unbox_int(i32 {lenb})"));
         self.release(&lenb); // drop the boxed length temp (no-op for a small int)
@@ -1273,8 +1302,10 @@ impl<'a> FuncEmitter<'a> {
         self.br_to(&head);
 
         self.place_label(&end);
-        self.cleanups.pop();
-        self.release(&seq);
+        if seq_owned {
+            self.cleanups.pop();
+            self.release(&seq);
+        }
         Ok(())
     }
 
@@ -1954,6 +1985,45 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
     }
 }
 
+/// Whether any statement in `body` rebinds the variable `name` (a plain or
+/// annotated assignment, a loop variable, or — conservatively — any construct we
+/// don't recognize as binding-neutral). Used to decide whether a for-each can
+/// *borrow* its named iterable: if the body never reassigns it, the variable slot
+/// keeps it alive for the whole loop, so no retain/release is needed.
+fn body_reassigns(body: &[Stmt], name: &str) -> bool {
+    body.iter().any(|s| stmt_reassigns(s, name))
+}
+
+fn stmt_reassigns(s: &Stmt, name: &str) -> bool {
+    match &s.kind {
+        StmtKind::Assign(n, _) | StmtKind::AnnAssign { name: n, .. } => n == name,
+        StmtKind::For { var, body, .. } | StmtKind::ForEach { var, body, .. } => {
+            var == name || body_reassigns(body, name)
+        }
+        StmtKind::If {
+            body,
+            elifs,
+            else_body,
+            ..
+        } => {
+            body_reassigns(body, name)
+                || elifs.iter().any(|(_, b)| body_reassigns(b, name))
+                || else_body
+                    .as_deref()
+                    .is_some_and(|b| body_reassigns(b, name))
+        }
+        StmtKind::While { body, .. } => body_reassigns(body, name),
+        StmtKind::Expr(_)
+        | StmtKind::Return(_)
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::SetIndex { .. }
+        | StmtKind::SetAttr { .. } => false,
+        // Def/ClassDef/UnpackAssign/Import, etc.: assume it might rebind `name`.
+        _ => true,
+    }
+}
+
 /// The integer value of a literal `step` (handling `-1` parsed as `Neg(1)`).
 fn step_literal(e: &Expr) -> Option<i64> {
     match &e.kind {
@@ -2215,6 +2285,17 @@ mod tests {
         assert!(
             !out.contains("call void @p2w_retain"),
             "no retain for borrowed reads: {out}"
+        );
+    }
+
+    #[test]
+    fn for_each_borrows_a_named_iterable() {
+        // Iterating a named collection the loop body never reassigns needs no
+        // retain/release on it — the slot keeps it alive.
+        let out = ir("names: list[int] = [1, 2, 3]\nfor n in names:\n    print(n)\n");
+        assert!(
+            !out.contains("call void @p2w_retain"),
+            "borrowed iterable should not be retained: {out}"
         );
     }
 
