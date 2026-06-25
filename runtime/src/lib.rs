@@ -951,7 +951,12 @@ fn norm_index(index: Value, n: i64) -> i64 {
 /// `len(v)` for any collection (string/list/dict all store len at +8).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_len(v: Value) -> Value {
-    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY | T_SET) {
+    if is_heap(v)
+        && matches!(
+            obj_tag(v),
+            T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY | T_SET
+        )
+    {
         return make_int(coll_len(v as usize) as i64);
     }
     trap("object has no len()")
