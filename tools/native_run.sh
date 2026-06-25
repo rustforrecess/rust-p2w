@@ -135,6 +135,9 @@ run_case comp_float 'data: list[float] = [x / 2 for x in range(4)]\nprint(data)\
 run_case dictcomp  'd = {x: x * x for x in range(4)}\nprint(d[2])\nprint(len(d))\n' '4\n4' || fails=$((fails+1))
 run_case dictcomp_filter 'd = {n: n + 1 for n in range(6) if n % 2 == 0}\nprint(len(d))\nprint(d[4])\n' '3\n5' || fails=$((fails+1))
 run_case dictcomp_str 'names = ["amy", "bo"]\nd = {n: len(n) for n in names}\nprint(d["amy"])\nprint(d["bo"])\n' '3\n2' || fails=$((fails+1))
+run_case comp_typed_return 'def squares(n: int) -> list[int]:\n    return [i * i for i in range(n)]\nys: list[int] = squares(4)\nprint(ys)\nprint(len(ys))\n' '[0, 1, 4, 9]\n4' || fails=$((fails+1))
+run_case comp_nested 'pairs: list[int] = [x * 10 + y for x in range(2) for y in range(3)]\nprint(pairs)\n' '[0, 1, 2, 10, 11, 12]' || fails=$((fails+1))
+run_case comp_nested_filter 'd: list[int] = [x + y for x in range(3) for y in range(3) if x < y]\nprint(d)\n' '[1, 2, 3]' || fails=$((fails+1))
 # --- packed int arrays (list[int]) ---
 run_case iarray    'xs: list[int] = [10, 20, 30]\nprint(xs)\nprint(xs[1])\nprint(len(xs))\n' '[10, 20, 30]\n20\n3' || fails=$((fails+1))
 run_case iarraysum 'def total(xs: list[int]) -> int:\n    s: int = 0\n    for x in xs:\n        s = s + x\n    return s\nys: list[int] = [1, 2, 3, 4]\nprint(total(ys))\nprint(len(ys))\n' '10\n4' || fails=$((fails+1))
