@@ -156,6 +156,16 @@ run_case farray    'xs: list[float] = [1.5, 2.5, 3.0]\nprint(xs)\nprint(xs[1])\n
 run_case farraysum 'def total(xs: list[float]) -> float:\n    s: float = 0.0\n    for x in xs:\n        s = s + x\n    return s\nys: list[float] = [1.5, 2.5]\nprint(total(ys))\n' '4.0' || fails=$((fails+1))
 run_case farraymix 'xs: list[float] = [1.0, 2.0]\nxs.append(3)\nxs[0] = 9.5\nprint(xs)\n' '[9.5, 2.0, 3.0]' || fails=$((fails+1))
 
+# --- sets + set theory (A = B & C) ---
+run_case set_intersect 'B = {1, 2, 3, 4}\nC = {3, 4, 5, 6}\nA = B & C\nprint(A)\n' '{3, 4}' || fails=$((fails+1))
+run_case set_union 'print({1, 2} | {2, 3})\n'                                   '{1, 2, 3}'   || fails=$((fails+1))
+run_case set_diff  'print({1, 2, 3} - {2})\n'                                   '{1, 3}'      || fails=$((fails+1))
+run_case set_symdiff 'print({1, 2, 3} ^ {2, 3, 4})\n'                           '{1, 4}'      || fails=$((fails+1))
+run_case set_member 's = {1, 2, 3}\nprint(2 in s)\nprint(9 not in s)\n'         'True\nTrue'  || fails=$((fails+1))
+run_case set_dedup 'print(len({1, 1, 2, 3, 3, 3}))\n'                           '3'           || fails=$((fails+1))
+run_case set_iter 'total = 0\nfor x in {10, 20, 30}:\n    total = total + x\nprint(total)\n' '60' || fails=$((fails+1))
+run_case substr_in 'print("ll" in "hello")\nprint("z" in "hello")\n'           'True\nFalse' || fails=$((fails+1))
+run_case int_bitwise 'print(6 & 3)\nprint(5 | 2)\n'                             '2\n7'        || fails=$((fails+1))
 # --- tuples (lowered to lists) ---
 run_case tuple_unpack 't = (1, 2, 3)\na, b, c = t\nprint(a)\nprint(c)\n' '1\n3' || fails=$((fails+1))
 run_case tuple_swap 'a = 1\nb = 2\na, b = b, a\nprint(a)\nprint(b)\n' '2\n1' || fails=$((fails+1))

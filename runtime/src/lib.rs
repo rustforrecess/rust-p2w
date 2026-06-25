@@ -513,6 +513,9 @@ pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_sub(a: Value, b: Value) -> Value {
+    if both_sets(a, b) {
+        return set_difference(a as usize, b as usize); // set difference `a - b`
+    }
     arith(a, b, |x, y| x - y, |x, y| x - y)
 }
 
@@ -686,6 +689,11 @@ fn value_eq(a: Value, b: Value) -> bool {
                     }
                 });
             }
+            T_SET => {
+                // Order-independent: same size and every element of `a` is in `b`.
+                let n = coll_len(oa);
+                return n == coll_len(ob) && (0..n).all(|i| coll_contains(ob, list_get(oa, i)));
+            }
             _ => {}
         }
     }
@@ -763,7 +771,7 @@ fn free_object(o: usize) {
     // children (ownership model: insert transfers the value's ref in; free
     // releases it). This is the cascading free the RTOS note wants to bound.
     match rd(o) {
-        T_LIST => {
+        T_LIST | T_SET => {
             for i in 0..coll_len(o) {
                 p2w_release(list_get(o, i));
             }
@@ -831,6 +839,9 @@ const T_ITER: u32 = 4;
 const T_IARRAY: u32 = 7;
 /// A packed `list[float]`: like `T_IARRAY` but elements are raw `f64` (8 bytes).
 const T_FARRAY: u32 = 8;
+/// A set: list-backed with dedup-on-insert (linear membership). Elements are
+/// boxed Values, like a list, but unique. Equality is order-independent.
+const T_SET: u32 = 9;
 
 fn coll_len(o: usize) -> usize {
     rd(o + 8) as usize
@@ -940,7 +951,7 @@ fn norm_index(index: Value, n: i64) -> i64 {
 /// `len(v)` for any collection (string/list/dict all store len at +8).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_len(v: Value) -> Value {
-    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY) {
+    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY | T_SET) {
         return make_int(coll_len(v as usize) as i64);
     }
     trap("object has no len()")
@@ -1103,6 +1114,185 @@ pub extern "C" fn p2w_farray_set(arr: Value, idx: i32, x: f64) {
     farray_set_at(o, i, x);
 }
 
+// --- sets ------------------------------------------------------------------
+// A set reuses the list storage but keeps elements unique. Membership and the
+// set operators (& | ^ -) are linear scans — fine for the small sets a teaching
+// program builds. Set equality (in value_eq) is order-independent.
+
+/// Whether the set/list at offset `o` already contains an element equal to `v`.
+fn coll_contains(o: usize, v: Value) -> bool {
+    (0..coll_len(o)).any(|i| value_eq(list_get(o, i), v))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_set_new() -> Value {
+    coll_new(T_SET)
+}
+
+/// `set(iterable)` — a new set of the iterable's (deduplicated) elements.
+/// Borrows the iterable; the set takes its own (retained) refs.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_set_of(iterable: Value) -> Value {
+    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET)) {
+        trap("set() needs an iterable");
+    }
+    let r = p2w_set_new();
+    for i in 0..container_len(iterable) {
+        // element_at returns an owned element; set_add transfers it (or releases
+        // it as a duplicate).
+        p2w_set_add(r, element_at(iterable, i));
+    }
+    r
+}
+
+/// Add `v` (transferred); a duplicate is dropped (its ref released).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_set_add(set: Value, v: Value) {
+    if !(is_heap(set) && obj_tag(set) == T_SET) {
+        trap("expected a set");
+    }
+    if coll_contains(set as usize, v) {
+        p2w_release(v); // redundant — the set already owns an equal element
+    } else {
+        list_push(set as usize, v);
+    }
+}
+
+/// `value in container` — membership for sets/lists (by equality), dict keys, and
+/// substrings. Returns a boxed bool.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_in(value: Value, container: Value) -> Value {
+    if !is_heap(container) {
+        trap("argument to `in` is not a container");
+    }
+    let o = container as usize;
+    let found = match obj_tag(container) {
+        T_SET | T_LIST => coll_contains(o, value),
+        T_DICT => dict_find(o, value).is_some(),
+        T_STR => str_contains(container, value),
+        _ => trap("argument to `in` is not a container"),
+    };
+    make_bool(found)
+}
+
+/// `value not in container`.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_notin(value: Value, container: Value) -> Value {
+    make_bool(!p2w_truthy(p2w_in(value, container)))
+}
+
+/// New set of the elements common to both (intersection, `a & b`).
+fn set_intersect(a: usize, b: usize) -> Value {
+    let r = coll_new(T_SET);
+    for i in 0..coll_len(a) {
+        let e = list_get(a, i);
+        if coll_contains(b, e) {
+            list_push(r as usize, owned(e));
+        }
+    }
+    r
+}
+
+/// New set of all elements from either (union, `a | b`).
+fn set_union(a: usize, b: usize) -> Value {
+    let r = coll_new(T_SET);
+    for i in 0..coll_len(a) {
+        list_push(r as usize, owned(list_get(a, i)));
+    }
+    for i in 0..coll_len(b) {
+        let e = list_get(b, i);
+        if !coll_contains(r as usize, e) {
+            list_push(r as usize, owned(e));
+        }
+    }
+    r
+}
+
+/// New set of elements in exactly one (symmetric difference, `a ^ b`).
+fn set_symdiff(a: usize, b: usize) -> Value {
+    let r = coll_new(T_SET);
+    for i in 0..coll_len(a) {
+        let e = list_get(a, i);
+        if !coll_contains(b, e) {
+            list_push(r as usize, owned(e));
+        }
+    }
+    for i in 0..coll_len(b) {
+        let e = list_get(b, i);
+        if !coll_contains(a, e) {
+            list_push(r as usize, owned(e));
+        }
+    }
+    r
+}
+
+/// New set of elements in `a` but not `b` (difference, `a - b`).
+fn set_difference(a: usize, b: usize) -> Value {
+    let r = coll_new(T_SET);
+    for i in 0..coll_len(a) {
+        let e = list_get(a, i);
+        if !coll_contains(b, e) {
+            list_push(r as usize, owned(e));
+        }
+    }
+    r
+}
+
+fn both_sets(a: Value, b: Value) -> bool {
+    is_heap(a) && obj_tag(a) == T_SET && is_heap(b) && obj_tag(b) == T_SET
+}
+
+/// Whether the string `needle` occurs in the string `hay` (naive search).
+fn str_contains(hay: Value, needle: Value) -> bool {
+    if !(is_heap(needle) && obj_tag(needle) == T_STR) {
+        trap("the left operand of `in` on a string must be a string");
+    }
+    let (hl, nl) = (str_len(hay), str_len(needle));
+    if nl == 0 {
+        return true;
+    }
+    if nl > hl {
+        return false;
+    }
+    (0..=(hl - nl)).any(|start| (0..nl).all(|j| str_byte(hay, start + j) == str_byte(needle, j)))
+}
+
+/// `a & b` — set intersection, or integer bitwise-and.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_band(a: Value, b: Value) -> Value {
+    if both_sets(a, b) {
+        return set_intersect(a as usize, b as usize);
+    }
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => make_int(x & y),
+        _ => trap("& expects two ints or two sets"),
+    }
+}
+
+/// `a | b` — set union, or integer bitwise-or.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_bor(a: Value, b: Value) -> Value {
+    if both_sets(a, b) {
+        return set_union(a as usize, b as usize);
+    }
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => make_int(x | y),
+        _ => trap("| expects two ints or two sets"),
+    }
+}
+
+/// `a ^ b` — set symmetric difference, or integer bitwise-xor.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_bxor(a: Value, b: Value) -> Value {
+    if both_sets(a, b) {
+        return set_symdiff(a as usize, b as usize);
+    }
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => make_int(x ^ y),
+        _ => trap("^ expects two ints or two sets"),
+    }
+}
+
 // --- iteration protocol ----------------------------------------------------
 
 /// Number of elements a for-each yields over `c`.
@@ -1111,11 +1301,11 @@ fn container_len(c: Value) -> usize {
 }
 
 /// The element at position `i` of a for-each over `c` (list element, string
-/// char, or dict key).
+/// char, dict key, or set member).
 fn element_at(c: Value, i: usize) -> Value {
     match obj_tag(c) {
         T_STR => str_alloc(&[str_byte(c, i)]), // freshly allocated -> already owned
-        T_LIST => owned(list_get(c as usize, i)),
+        T_LIST | T_SET => owned(list_get(c as usize, i)),
         T_DICT => owned(dict_key(c as usize, i)),
         _ => trap("object is not iterable"),
     }
@@ -1123,7 +1313,7 @@ fn element_at(c: Value, i: usize) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_iter(c: Value) -> Value {
-    if !(is_heap(c) && matches!(obj_tag(c), T_STR | T_LIST | T_DICT)) {
+    if !(is_heap(c) && matches!(obj_tag(c), T_STR | T_LIST | T_DICT | T_SET)) {
         trap("object is not iterable");
     }
     let o = alloc(16);
@@ -1279,6 +1469,16 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
                 write_repr(dict_key(o, i), out);
                 write_bytes(b": ", out);
                 write_repr(dict_val(o, i), out);
+            }
+            out(b'}');
+        }
+        T_SET => {
+            out(b'{');
+            for i in 0..coll_len(o) {
+                if i > 0 {
+                    write_bytes(b", ", out);
+                }
+                write_repr(list_get(o, i), out);
             }
             out(b'}');
         }

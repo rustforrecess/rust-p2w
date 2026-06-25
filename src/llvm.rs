@@ -73,6 +73,14 @@ declare void @p2w_setindex(i32, i32, i32)
 declare i32 @p2w_len(i32)
 declare i32 @p2w_str_of(i32)
 declare i32 @p2w_slice(i32, i32, i32, i32)
+; sets + set/bitwise operators + membership
+declare i32 @p2w_set_new()
+declare i32 @p2w_set_of(i32)
+declare i32 @p2w_band(i32, i32)
+declare i32 @p2w_bor(i32, i32)
+declare i32 @p2w_bxor(i32, i32)
+declare i32 @p2w_in(i32, i32)
+declare i32 @p2w_notin(i32, i32)
 ; method dispatch by name (runtime resolves on the receiver's type)
 declare i32 @p2w_method0(i32, ptr, i32)
 declare i32 @p2w_method1(i32, ptr, i32, i32)
@@ -1465,9 +1473,23 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }
+                // set() / set(iterable). `{1, 2}` desugars to set([1, 2]).
+                if name == "set" {
+                    let r = match args.len() {
+                        0 => self.call_value("call i32 @p2w_set_new()"),
+                        1 => {
+                            let (v, o) = self.expr_borrow(&args[0])?;
+                            let r = self.call_value(&format!("call i32 @p2w_set_of(i32 {v})"));
+                            self.release_if_owned(&v, o);
+                            r
+                        }
+                        _ => return nope("set() with more than one argument"),
+                    };
+                    return Ok((r, Repr::Boxed));
+                }
                 if !self.funcs.contains(name) {
                     return nope(
-                        "calling this function (only your own functions, len, str, + print)",
+                        "calling this function (only your own functions, len, str, set, + print)",
                     );
                 }
                 // Coerce each argument to the callee's parameter repr and match
@@ -1810,6 +1832,14 @@ impl<'a> FuncEmitter<'a> {
             BinOp::Ge => "p2w_ge",
             BinOp::Eq => "p2w_eq",
             BinOp::Ne => "p2w_ne",
+            // Set/bitwise operators and membership. `&`/`|`/`^` dispatch at
+            // runtime (two sets → set op, two ints → bitwise). `in`/`not in`
+            // take (value, container) — matching the (left, right) operand order.
+            BinOp::BitAnd => "p2w_band",
+            BinOp::BitOr => "p2w_bor",
+            BinOp::BitXor => "p2w_bxor",
+            BinOp::In => "p2w_in",
+            BinOp::NotIn => "p2w_notin",
             _ => {
                 return Err(format!(
                     "line {}: the native (Pico) backend doesn't handle this operator yet",
@@ -2578,6 +2608,18 @@ mod tests {
             out.contains("call i32 @p2w_index"),
             "unpack via index: {out}"
         );
+    }
+
+    #[test]
+    fn sets_and_set_theory_operators() {
+        // `{1, 2}` desugars to set([...]); &/|/^ and `in` lower to set ops.
+        let out = ir("B = {1, 2}\nC = {2, 3}\nA = B & C\nprint(A)\nprint(2 in B)\n");
+        assert!(out.contains("call i32 @p2w_set_of"), "set literal: {out}");
+        assert!(
+            out.contains("call i32 @p2w_band"),
+            "& is intersection: {out}"
+        );
+        assert!(out.contains("call i32 @p2w_in"), "in is membership: {out}");
     }
 
     #[test]
