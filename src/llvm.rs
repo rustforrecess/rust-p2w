@@ -133,8 +133,15 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
                     s.line
                 ));
             }
-            let (def, g) =
-                emit_function(name, params, body, &funcs, &borrow_masks, &param_reprs, &ret_reprs)?;
+            let (def, g) = emit_function(
+                name,
+                params,
+                body,
+                &funcs,
+                &borrow_masks,
+                &param_reprs,
+                &ret_reprs,
+            )?;
             defs.push_str(&def);
             defs.push('\n');
             globals.push_str(&g);
@@ -187,12 +194,18 @@ fn emit_function(
             Repr::Float => "0.0".to_string(),
             _ => f.call_value("call i32 @p2w_none()"),
         };
-        f.body.push_str(&format!("  ret {} {r}\n", llvm_ty(f.ret_repr)));
+        f.body
+            .push_str(&format!("  ret {} {r}\n", llvm_ty(f.ret_repr)));
     }
     let sig: Vec<String> = params
         .iter()
         .enumerate()
-        .map(|(i, _)| format!("{} %a{i}", llvm_ty(preprs.get(i).copied().unwrap_or(Repr::Boxed))))
+        .map(|(i, _)| {
+            format!(
+                "{} %a{i}",
+                llvm_ty(preprs.get(i).copied().unwrap_or(Repr::Boxed))
+            )
+        })
         .collect();
     let def = format!(
         "define {} @{name}({}) {{\nentry:\n{}{}}}\n",
@@ -220,10 +233,7 @@ fn emit_main(
         f.emit_exit_releases();
         f.body.push_str("  ret i32 0\n");
     }
-    let def = format!(
-        "define i32 @main() {{\nentry:\n{}{}}}\n",
-        f.allocas, f.body
-    );
+    let def = format!("define i32 @main() {{\nentry:\n{}{}}}\n", f.allocas, f.body);
     Ok((def, f.globals))
 }
 
@@ -567,7 +577,9 @@ impl<'a> FuncEmitter<'a> {
         let arr = self.call_value("call i32 @p2w_farray_new()");
         for it in items {
             let raw = self.expr_double(it)?;
-            self.line(&format!("call void @p2w_farray_push(i32 {arr}, double {raw})"));
+            self.line(&format!(
+                "call void @p2w_farray_push(i32 {arr}, double {raw})"
+            ));
         }
         Ok(arr)
     }
@@ -667,7 +679,13 @@ impl<'a> FuncEmitter<'a> {
             },
         ];
         let len = mk(ExprKind::Call("len".to_string(), vec![arr_name()]));
-        self.emit_for(&iname, &mk(ExprKind::Int(0)), &len, &mk(ExprKind::Int(1)), &body)?;
+        self.emit_for(
+            &iname,
+            &mk(ExprKind::Int(0)),
+            &len,
+            &mk(ExprKind::Int(1)),
+            &body,
+        )?;
         self.br_to(&endl);
 
         // Copy: build a fresh array and reassign (releases the old binding).
@@ -715,12 +733,7 @@ impl<'a> FuncEmitter<'a> {
 
     /// Run a comprehension's loop body over `iter`. `range(...)` lowers to a
     /// counted loop (it isn't an iterable object); anything else iterates.
-    fn emit_comp_loop(
-        &mut self,
-        loopvar: &str,
-        iter: &Expr,
-        body: &[Stmt],
-    ) -> Result<(), String> {
+    fn emit_comp_loop(&mut self, loopvar: &str, iter: &Expr, body: &[Stmt]) -> Result<(), String> {
         let line = iter.line;
         match &iter.kind {
             ExprKind::Call(n, args) if n == "range" => {
@@ -952,21 +965,27 @@ impl<'a> FuncEmitter<'a> {
                     // Packed array: raw index + raw value, bounds-checked set.
                     let i = self.expr_int(index)?;
                     let val = self.expr_int(value)?;
-                    self.line(&format!("call void @p2w_iarray_set(i32 {t}, i32 {i}, i32 {val})"));
+                    self.line(&format!(
+                        "call void @p2w_iarray_set(i32 {t}, i32 {i}, i32 {val})"
+                    ));
                     self.release_if_owned(&t, towned);
                     return Ok(());
                 }
                 if trepr == Repr::FloatArray {
                     let i = self.expr_int(index)?;
                     let val = self.expr_double(value)?;
-                    self.line(&format!("call void @p2w_farray_set(i32 {t}, i32 {i}, double {val})"));
+                    self.line(&format!(
+                        "call void @p2w_farray_set(i32 {t}, i32 {i}, double {val})"
+                    ));
                     self.release_if_owned(&t, towned);
                     return Ok(());
                 }
                 let tb = self.as_boxed(t, trepr);
                 let i = self.expr(index)?; // dict: key transferred to the runtime
                 let v = self.expr(value)?; //       value transferred too
-                self.line(&format!("call void @p2w_setindex(i32 {tb}, i32 {i}, i32 {v})"));
+                self.line(&format!(
+                    "call void @p2w_setindex(i32 {tb}, i32 {i}, i32 {v})"
+                ));
                 // Only the container is borrowed. The index/key is NOT released
                 // here: for a list it's an inline int position; for a dict the
                 // runtime takes ownership of the key (storing it, or releasing it
@@ -1302,14 +1321,18 @@ impl<'a> FuncEmitter<'a> {
             // An unboxed double literal (hex form is exact); boxed only at a sink.
             ExprKind::Float(f) => Ok((fmt_double(*f), Repr::Float)),
             ExprKind::Bool(b) => {
-                let v = self.call_value(&format!("call i32 @p2w_bool(i1 {})", if *b { 1 } else { 0 }));
+                let v = self.call_value(&format!(
+                    "call i32 @p2w_bool(i1 {})",
+                    if *b { 1 } else { 0 }
+                ));
                 Ok((v, Repr::Boxed))
             }
             ExprKind::NoneLit => Ok((self.call_value("call i32 @p2w_none()"), Repr::Boxed)),
             ExprKind::Str(s) => {
                 let bytes = s.as_bytes();
                 let g = self.intern_str(bytes);
-                let v = self.call_value(&format!("call i32 @p2w_str(ptr {g}, i32 {})", bytes.len()));
+                let v =
+                    self.call_value(&format!("call i32 @p2w_str(ptr {g}, i32 {})", bytes.len()));
                 Ok((v, Repr::Boxed))
             }
             ExprKind::Name(name) => {
@@ -1428,7 +1451,8 @@ impl<'a> FuncEmitter<'a> {
                 }
                 if orepr == Repr::FloatArray {
                     let i = self.expr_int(idx)?;
-                    let r = self.call_value(&format!("call double @p2w_farray_get(i32 {o}, i32 {i})"));
+                    let r =
+                        self.call_value(&format!("call double @p2w_farray_get(i32 {o}, i32 {i})"));
                     self.release_if_owned(&o, oo);
                     return Ok((r, Repr::Float));
                 }
@@ -1444,14 +1468,18 @@ impl<'a> FuncEmitter<'a> {
             }
             // A comprehension with no typing context builds a dynamic list;
             // eval_for_slot builds a packed one when the target is list[int/float].
-            ExprKind::ListComp { element, clauses } => {
-                Ok((self.build_comprehension(Repr::Boxed, element, clauses)?, Repr::Boxed))
-            }
+            ExprKind::ListComp { element, clauses } => Ok((
+                self.build_comprehension(Repr::Boxed, element, clauses)?,
+                Repr::Boxed,
+            )),
             ExprKind::DictComp {
                 key,
                 value,
                 clauses,
-            } => Ok((self.build_dict_comprehension(key, value, clauses)?, Repr::Boxed)),
+            } => Ok((
+                self.build_dict_comprehension(key, value, clauses)?,
+                Repr::Boxed,
+            )),
             _ => nope("this expression"),
         }
     }
@@ -1502,13 +1530,17 @@ impl<'a> FuncEmitter<'a> {
         // Packed array: xs.append(n) pushes a raw int and returns None.
         if rrepr == Repr::IntArray && method == "append" && args.len() == 1 {
             let raw = self.expr_int(&args[0])?;
-            self.line(&format!("call void @p2w_iarray_push(i32 {recv}, i32 {raw})"));
+            self.line(&format!(
+                "call void @p2w_iarray_push(i32 {recv}, i32 {raw})"
+            ));
             self.release_if_owned(&recv, rowned);
             return Ok(self.call_value("call i32 @p2w_none()"));
         }
         if rrepr == Repr::FloatArray && method == "append" && args.len() == 1 {
             let raw = self.expr_double(&args[0])?;
-            self.line(&format!("call void @p2w_farray_push(i32 {recv}, double {raw})"));
+            self.line(&format!(
+                "call void @p2w_farray_push(i32 {recv}, double {raw})"
+            ));
             self.release_if_owned(&recv, rowned);
             return Ok(self.call_value("call i32 @p2w_none()"));
         }
@@ -1520,10 +1552,7 @@ impl<'a> FuncEmitter<'a> {
         }
         let name_g = self.intern_str(method.as_bytes());
         let nlen = method.len();
-        let extra: String = argvals
-            .iter()
-            .map(|v| format!(", i32 {v}"))
-            .collect();
+        let extra: String = argvals.iter().map(|v| format!(", i32 {v}")).collect();
         let r = self.call_value(&format!(
             "call i32 @p2w_method{}(i32 {recv}, ptr {name_g}, i32 {nlen}{extra})",
             args.len()
@@ -1906,7 +1935,10 @@ fn float_cmp_pred(op: BinOp) -> Option<&'static str> {
 fn expr_uses_name(e: &Expr, name: &str) -> bool {
     match &e.kind {
         ExprKind::Name(n) => n == name,
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_)
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
         | ExprKind::NoneLit => false,
         ExprKind::Unary(_, x) => expr_uses_name(x, name),
         ExprKind::Bin(_, a, b) => expr_uses_name(a, name) || expr_uses_name(b, name),
@@ -1971,7 +2003,10 @@ mod tests {
         assert!(out.contains("mul i32 6, 7"), "native mul: {out}");
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         // the native result is boxed exactly once, at the dynamic sink (print).
-        assert!(out.contains("call i32 @p2w_int(i32 %"), "box result for print: {out}");
+        assert!(
+            out.contains("call i32 @p2w_int(i32 %"),
+            "box result for print: {out}"
+        );
         assert!(out.contains("call void @p2w_print(i32"), "{out}");
         assert!(out.contains("ret i32 0"), "main exit: {out}");
     }
@@ -1980,7 +2015,10 @@ mod tests {
     fn strings_become_global_constants() {
         let out = ir("print(\"hi\")\n");
         assert!(out.contains("constant [2 x i8] c\"hi\""), "{out}");
-        assert!(out.contains("call i32 @p2w_str(ptr @.str.main.0, i32 2)"), "{out}");
+        assert!(
+            out.contains("call i32 @p2w_str(ptr @.str.main.0, i32 2)"),
+            "{out}"
+        );
         // String concatenation goes through p2w_add (the runtime dispatches).
         let out = ir("x = \"a\" + \"b\"\n");
         assert!(out.contains("call i32 @p2w_add(i32"), "{out}");
@@ -2016,8 +2054,14 @@ mod tests {
         // released at exit. (Full memory-correctness is validated by
         // tools/native_run.sh; this just guards the wiring from removal.)
         let out = ir("xs = [1, 2]\nys = xs\nprint(len(ys))\n");
-        assert!(out.contains("call void @p2w_retain(i32"), "retain on transfer: {out}");
-        assert!(out.contains("call void @p2w_release(i32"), "release at exit: {out}");
+        assert!(
+            out.contains("call void @p2w_retain(i32"),
+            "retain on transfer: {out}"
+        );
+        assert!(
+            out.contains("call void @p2w_release(i32"),
+            "release at exit: {out}"
+        );
     }
 
     #[test]
@@ -2028,29 +2072,47 @@ mod tests {
         assert!(out.contains("define i32 @sq(i32 %a0)"), "{out}");
         assert!(out.contains("mul i32"), "native mul: {out}");
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
-        assert!(!out.contains("call void @p2w_retain"), "no refcounting: {out}");
+        assert!(
+            !out.contains("call void @p2w_retain"),
+            "no refcounting: {out}"
+        );
     }
 
     #[test]
     fn fbip_self_map_emits_unique_branch_and_in_place_write() {
         let out = ir("data: list[int] = [1, 2]\ndata = [x * x for x in data]\nprint(data)\n");
-        assert!(out.contains("call i1 @p2w_unique"), "runtime uniqueness check: {out}");
-        assert!(out.contains("call void @p2w_iarray_set"), "in-place element write: {out}");
+        assert!(
+            out.contains("call i1 @p2w_unique"),
+            "runtime uniqueness check: {out}"
+        );
+        assert!(
+            out.contains("call void @p2w_iarray_set"),
+            "in-place element write: {out}"
+        );
     }
 
     #[test]
     fn list_comprehension_into_packed_array() {
         let out = ir("xs: list[int] = [1, 2]\nys: list[int] = [x * x for x in xs]\nprint(ys)\n");
-        assert!(out.contains("call i32 @p2w_iarray_new"), "packed result: {out}");
+        assert!(
+            out.contains("call i32 @p2w_iarray_new"),
+            "packed result: {out}"
+        );
         assert!(out.contains("mul i32"), "native element compute: {out}");
-        assert!(out.contains("call void @p2w_iarray_push"), "raw append: {out}");
+        assert!(
+            out.contains("call void @p2w_iarray_push"),
+            "raw append: {out}"
+        );
     }
 
     #[test]
     fn dict_comprehension_builds_a_dict() {
         let out = ir("d = {x: x * x for x in range(3)}\nprint(d[2])\n");
         assert!(out.contains("call i32 @p2w_dict_new"), "dict result: {out}");
-        assert!(out.contains("call void @p2w_setindex"), "key/value set: {out}");
+        assert!(
+            out.contains("call void @p2w_setindex"),
+            "key/value set: {out}"
+        );
     }
 
     #[test]
@@ -2058,31 +2120,58 @@ mod tests {
         // `if` clause + range source both lower without a runtime iterator.
         let out = ir("ev: list[int] = [n for n in range(6) if n % 2 == 0]\nprint(ev)\n");
         assert!(out.contains("icmp slt i32"), "counted range loop: {out}");
-        assert!(out.contains("call i32 @p2w_iarray_push") || out.contains("call void @p2w_iarray_push"), "{out}");
+        assert!(
+            out.contains("call i32 @p2w_iarray_push") || out.contains("call void @p2w_iarray_push"),
+            "{out}"
+        );
     }
 
     #[test]
     fn list_int_compiles_to_a_packed_array() {
         let out = ir("xs: list[int] = [10, 20]\nprint(xs[0])\nfor x in xs:\n    print(x)\n");
-        assert!(out.contains("call i32 @p2w_iarray_new"), "packed construct: {out}");
-        assert!(out.contains("call void @p2w_iarray_push"), "raw push: {out}");
+        assert!(
+            out.contains("call i32 @p2w_iarray_new"),
+            "packed construct: {out}"
+        );
+        assert!(
+            out.contains("call void @p2w_iarray_push"),
+            "raw push: {out}"
+        );
         assert!(out.contains("call i32 @p2w_iarray_get"), "raw get: {out}");
-        assert!(!out.contains("call i32 @p2w_list_new"), "not a dynamic list: {out}");
+        assert!(
+            !out.contains("call i32 @p2w_list_new"),
+            "not a dynamic list: {out}"
+        );
     }
 
     #[test]
     fn list_float_compiles_to_a_packed_double_array() {
         let out = ir("xs: list[float] = [1.5, 2.5]\nprint(xs[0])\nfor x in xs:\n    print(x)\n");
-        assert!(out.contains("call i32 @p2w_farray_new"), "packed construct: {out}");
-        assert!(out.contains("call void @p2w_farray_push(i32"), "raw push: {out}");
-        assert!(out.contains("call double @p2w_farray_get"), "raw double get: {out}");
-        assert!(!out.contains("call i32 @p2w_list_new"), "not a dynamic list: {out}");
+        assert!(
+            out.contains("call i32 @p2w_farray_new"),
+            "packed construct: {out}"
+        );
+        assert!(
+            out.contains("call void @p2w_farray_push(i32"),
+            "raw push: {out}"
+        );
+        assert!(
+            out.contains("call double @p2w_farray_get"),
+            "raw double get: {out}"
+        );
+        assert!(
+            !out.contains("call i32 @p2w_list_new"),
+            "not a dynamic list: {out}"
+        );
     }
 
     #[test]
     fn typed_float_param_is_a_native_double_function() {
         let out = ir("def dbl(x: float) -> float:\n    return x * 2.0\nprint(dbl(2.5))\n");
-        assert!(out.contains("define double @dbl(double %a0)"), "double sig: {out}");
+        assert!(
+            out.contains("define double @dbl(double %a0)"),
+            "double sig: {out}"
+        );
         assert!(out.contains("alloca double"), "double slot: {out}");
         assert!(out.contains("fmul double"), "native fmul: {out}");
         assert!(out.contains("ret double"), "double return: {out}");
@@ -2092,7 +2181,9 @@ mod tests {
     fn annotated_local_loop_is_native() {
         // total:int + i:int + native compare/add => a fully native while loop,
         // no boxing or runtime calls in the body.
-        let out = ir("def s(n: int) -> int:\n    total: int = 0\n    i: int = 0\n    while i < n:\n        total = total + i\n        i = i + 1\n    return total\n");
+        let out = ir(
+            "def s(n: int) -> int:\n    total: int = 0\n    i: int = 0\n    while i < n:\n        total = total + i\n        i = i + 1\n    return total\n",
+        );
         assert!(out.contains("icmp slt i32"), "native compare: {out}");
         assert!(out.contains("add i32"), "native add: {out}");
         assert!(!out.contains("call i32 @p2w_add"), "no boxed add: {out}");
@@ -2161,7 +2252,7 @@ mod tests {
         assert!(!out.contains("call i32 @p2w_lt"), "no boxed compare: {out}");
         let out = ir("for i in range(5, 0, -1):\n    print(i)\n");
         assert!(out.contains("icmp sgt i32"), "descending: {out}");
-        assert!(out.contains("add i32 %", ), "decrement via add: {out}");
+        assert!(out.contains("add i32 %",), "decrement via add: {out}");
     }
 
     #[test]
@@ -2195,17 +2286,29 @@ mod tests {
 
         let out = ir("d = {\"a\": 1, \"b\": 2}\nprint(d[\"a\"])\n");
         assert!(out.contains("call i32 @p2w_dict_new()"), "{out}");
-        assert!(out.contains("call void @p2w_setindex(i32"), "dict build: {out}");
+        assert!(
+            out.contains("call void @p2w_setindex(i32"),
+            "dict build: {out}"
+        );
         assert!(out.contains("call i32 @p2w_index(i32"), "dict read: {out}");
     }
 
     #[test]
     fn methods_dispatch_by_name() {
         let out = ir("xs = [1]\nxs.append(2)\nlast = xs.pop()\n");
-        assert!(out.contains("constant [6 x i8] c\"append\""), "method name: {out}");
-        assert!(out.contains("call i32 @p2w_method1(i32"), "1-arg method: {out}");
+        assert!(
+            out.contains("constant [6 x i8] c\"append\""),
+            "method name: {out}"
+        );
+        assert!(
+            out.contains("call i32 @p2w_method1(i32"),
+            "1-arg method: {out}"
+        );
         assert!(out.contains("constant [3 x i8] c\"pop\""), "{out}");
-        assert!(out.contains("call i32 @p2w_method0(i32"), "0-arg method: {out}");
+        assert!(
+            out.contains("call i32 @p2w_method0(i32"),
+            "0-arg method: {out}"
+        );
     }
 
     #[test]

@@ -953,7 +953,11 @@ fn checked_index(o: usize, idx: i32, tag: u32) -> usize {
         trap("expected an array");
     }
     let n = coll_len(o) as i64;
-    let i = if (idx as i64) < 0 { idx as i64 + n } else { idx as i64 };
+    let i = if (idx as i64) < 0 {
+        idx as i64 + n
+    } else {
+        idx as i64
+    };
     if i < 0 || i >= n {
         trap("index out of range");
     }
@@ -1539,7 +1543,10 @@ mod tests {
         assert_eq!(as_int(small), 1000);
         // Outside ±2^29: heap-boxed full i32, no truncation (the old bug).
         let big = make_int(2_000_000_000);
-        assert!(is_int(big) && is_heap(big), "large int should be heap-boxed");
+        assert!(
+            is_int(big) && is_heap(big),
+            "large int should be heap-boxed"
+        );
         assert_eq!(as_int(big), 2_000_000_000);
         let neg = make_int(-2_000_000_000);
         assert!(is_heap(neg));
@@ -1564,7 +1571,11 @@ mod tests {
         assert_eq!(p2w_live(), 2);
         p2w_list_append(xs, s); // transfers s into the list
         p2w_release(xs); // frees the list AND its string child
-        assert_eq!(p2w_live(), 0, "releasing a container must free its children");
+        assert_eq!(
+            p2w_live(),
+            0,
+            "releasing a container must free its children"
+        );
     }
 
     #[test]

@@ -4,7 +4,9 @@ use std::io::Read;
 
 fn main() {
     let mut src = String::new();
-    std::io::stdin().read_to_string(&mut src).expect("read stdin");
+    std::io::stdin()
+        .read_to_string(&mut src)
+        .expect("read stdin");
     match rust_p2w::compile_to_llvm_ir(&src) {
         Ok(ir) => print!("{ir}"),
         Err(e) => {

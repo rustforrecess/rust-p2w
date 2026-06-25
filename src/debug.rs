@@ -161,7 +161,10 @@ enum Cont {
 
 impl Cont {
     fn is_loop(&self) -> bool {
-        matches!(self, Cont::While { .. } | Cont::ForRange { .. } | Cont::ForEach { .. })
+        matches!(
+            self,
+            Cont::While { .. } | Cont::ForRange { .. } | Cont::ForEach { .. }
+        )
     }
 }
 
@@ -174,7 +177,10 @@ pub enum Status {
     Finished,
     /// Stopped on an error (a runtime error, or a construct the debugger doesn't
     /// support yet). `line` is where it happened, when known.
-    Error { line: Option<usize>, message: String },
+    Error {
+        line: Option<usize>,
+        message: String,
+    },
 }
 
 /// A resumable interpreter over the AST. Build with [`Stepper::new`], then drive
@@ -289,8 +295,11 @@ impl Stepper {
         if self.watchpoints.is_empty() {
             return false;
         }
-        let curs: Vec<Option<String>> =
-            self.watchpoints.iter().map(|w| self.eval_repr(&w.expr)).collect();
+        let curs: Vec<Option<String>> = self
+            .watchpoints
+            .iter()
+            .map(|w| self.eval_repr(&w.expr))
+            .collect();
         let mut hit = None;
         for (w, cur) in self.watchpoints.iter().zip(&curs) {
             if *cur != w.last {
@@ -449,10 +458,14 @@ impl Stepper {
                     let Some(Cont::While { cond, body }) = self.stack.pop() else {
                         unreachable!()
                     };
-                    let truthy =
-                        Self::eval_in(&self.funcs, &mut self.scope, &mut Some(&mut self.output), &cond)
-                            .map_err(|m| (None, m))?
-                            .truthy();
+                    let truthy = Self::eval_in(
+                        &self.funcs,
+                        &mut self.scope,
+                        &mut Some(&mut self.output),
+                        &cond,
+                    )
+                    .map_err(|m| (None, m))?
+                    .truthy();
                     if truthy {
                         self.stack.push(Cont::While {
                             cond,
@@ -1046,7 +1059,8 @@ impl Stepper {
                 step,
                 body,
             } => {
-                let int = |v: Value, what: &str| as_int(&v).ok_or(format!("{what} must be an integer"));
+                let int =
+                    |v: Value, what: &str| as_int(&v).ok_or(format!("{what} must be an integer"));
                 let mut next = int(Self::eval_in(funcs, scope, out, start)?, "range() start")?;
                 let stop = int(Self::eval_in(funcs, scope, out, end)?, "range() stop")?;
                 let step = int(Self::eval_in(funcs, scope, out, step)?, "range() step")?;
@@ -1094,9 +1108,9 @@ impl Stepper {
                 };
                 Ok(Flow::Return(v))
             }
-            StmtKind::Def { .. } => {
-                Err("a nested function definition isn't in the step debugger yet — use Run".to_string())
-            }
+            StmtKind::Def { .. } => Err(
+                "a nested function definition isn't in the step debugger yet — use Run".to_string(),
+            ),
             StmtKind::ClassDef { .. }
             | StmtKind::SetAttr { .. }
             | StmtKind::UnpackAssign { .. }
@@ -1190,7 +1204,10 @@ fn contains(haystack: &Value, needle: &Value) -> Result<bool, String> {
             Value::Str(sub) => Ok(s.contains(sub.as_str())),
             _ => Err("'in <string>' requires a string".to_string()),
         },
-        _ => Err(format!("argument of type {} is not iterable", type_name(haystack))),
+        _ => Err(format!(
+            "argument of type {} is not iterable",
+            type_name(haystack)
+        )),
     }
 }
 
@@ -1744,7 +1761,10 @@ impl Vm {
                 self.push_task(Task::IfChain(Rc::new(branches), 0));
             }
             StmtKind::While { cond, body } => {
-                self.push_task(Task::WhileHead(Rc::new(cond.clone()), Rc::new(body.clone())));
+                self.push_task(Task::WhileHead(
+                    Rc::new(cond.clone()),
+                    Rc::new(body.clone()),
+                ));
             }
             StmtKind::For {
                 var,
@@ -2228,18 +2248,22 @@ impl Vm {
             ExprKind::Unary(op, inner) => apply_unary(*op, self.watch_eval(inner)?),
             ExprKind::Bin(BinOp::And, a, b) => {
                 let l = self.watch_eval(a)?;
-                if l.truthy() { self.watch_eval(b) } else { Ok(l) }
+                if l.truthy() {
+                    self.watch_eval(b)
+                } else {
+                    Ok(l)
+                }
             }
             ExprKind::Bin(BinOp::Or, a, b) => {
                 let l = self.watch_eval(a)?;
-                if l.truthy() { Ok(l) } else { self.watch_eval(b) }
+                if l.truthy() {
+                    Ok(l)
+                } else {
+                    self.watch_eval(b)
+                }
             }
-            ExprKind::Bin(op, a, b) => {
-                apply_bin(*op, &self.watch_eval(a)?, &self.watch_eval(b)?)
-            }
-            ExprKind::Index(obj, idx) => {
-                index_get(&self.watch_eval(obj)?, &self.watch_eval(idx)?)
-            }
+            ExprKind::Bin(op, a, b) => apply_bin(*op, &self.watch_eval(a)?, &self.watch_eval(b)?),
+            ExprKind::Index(obj, idx) => index_get(&self.watch_eval(obj)?, &self.watch_eval(idx)?),
             ExprKind::List(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
@@ -2440,7 +2464,10 @@ mod tests {
 
     #[test]
     fn lists_dicts_indexing_and_methods() {
-        assert_eq!(run_to_end("xs = [1, 2, 3]\nxs[0] = 9\nprint(xs[0])\n"), "9\n");
+        assert_eq!(
+            run_to_end("xs = [1, 2, 3]\nxs[0] = 9\nprint(xs[0])\n"),
+            "9\n"
+        );
         assert_eq!(
             run_to_end("xs = [1]\nxs.append(2)\nprint(xs)\n"),
             "[1, 2]\n"
@@ -2458,7 +2485,10 @@ mod tests {
         s.step(); // x = 10
         s.step(); // y = 20
         let vars = s.variables();
-        assert_eq!(vars, vec![("x".into(), "10".into()), ("y".into(), "20".into())]);
+        assert_eq!(
+            vars,
+            vec![("x".into(), "10".into()), ("y".into(), "20".into())]
+        );
     }
 
     #[test]
@@ -2610,7 +2640,12 @@ mod tests {
             guard += 1;
             assert!(guard < 100_000, "ran away");
         }
-        assert_eq!(*vm.status(), Status::Finished, "did not finish: {:?}", vm.status());
+        assert_eq!(
+            *vm.status(),
+            Status::Finished,
+            "did not finish: {:?}",
+            vm.status()
+        );
         vm.output().to_string()
     }
 
@@ -2621,15 +2656,21 @@ mod tests {
         assert_eq!(vm_run("print(2 and 0 or 9)\n"), "9\n");
         let src = "total = 0\nfor i in range(1, 6):\n    total = total + i\nprint(total)\n";
         assert_eq!(vm_run(src), "15\n");
-        let src = "i = 0\nwhile i < 5:\n    i = i + 1\n    if i == 3:\n        continue\n    print(i)\n";
+        let src =
+            "i = 0\nwhile i < 5:\n    i = i + 1\n    if i == 3:\n        continue\n    print(i)\n";
         assert_eq!(vm_run(src), "1\n2\n4\n5\n");
     }
 
     #[test]
     fn vm_runs_functions_with_recursion_and_defaults() {
-        assert_eq!(vm_run("def double(n):\n    return n * 2\nprint(double(21))\n"), "42\n");
         assert_eq!(
-            vm_run("def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\nprint(fact(5))\n"),
+            vm_run("def double(n):\n    return n * 2\nprint(double(21))\n"),
+            "42\n"
+        );
+        assert_eq!(
+            vm_run(
+                "def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\nprint(fact(5))\n"
+            ),
             "120\n"
         );
         assert_eq!(
@@ -2671,7 +2712,10 @@ mod tests {
             vm.step();
         }
         // module + down(3)+down(2)+down(1)+down(0) = 5 frames at the deepest.
-        assert!(max_depth >= 5, "recursion should deepen the stack, got {max_depth}");
+        assert!(
+            max_depth >= 5,
+            "recursion should deepen the stack, got {max_depth}"
+        );
     }
 
     #[test]
@@ -2688,7 +2732,9 @@ mod tests {
         );
         // A function that builds and returns a list, stepped over by Continue.
         assert_eq!(
-            vm_run("def squares(n):\n    out = []\n    for i in range(n):\n        out.append(i * i)\n    return out\nprint(squares(4))\n"),
+            vm_run(
+                "def squares(n):\n    out = []\n    for i in range(n):\n        out.append(i * i)\n    return out\nprint(squares(4))\n"
+            ),
             "[0, 1, 4, 9]\n"
         );
     }
@@ -2708,7 +2754,11 @@ mod tests {
         assert_eq!(vm.current_line(), Some(3));
         vm.step_over(); // run f(10) atomically -> line 4 (print), still top-level
         assert_eq!(vm.current_line(), Some(4));
-        assert_eq!(vm.call_stack().len(), 1, "step-over must not descend into f");
+        assert_eq!(
+            vm.call_stack().len(),
+            1,
+            "step-over must not descend into f"
+        );
         while vm.is_paused() {
             vm.step();
         }
@@ -2724,7 +2774,11 @@ mod tests {
         assert_eq!(vm.call_stack().len(), 2);
         assert_eq!(vm.current_line(), Some(2));
         vm.step_out(); // finish f, back in the caller -> line 5 (print)
-        assert_eq!(vm.call_stack().len(), 1, "step-out should return to <module>");
+        assert_eq!(
+            vm.call_stack().len(),
+            1,
+            "step-out should return to <module>"
+        );
         assert_eq!(vm.current_line(), Some(5));
         assert_eq!(vm.last_return().as_deref(), Some("6"), "f returned 6");
         while vm.is_paused() {

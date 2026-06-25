@@ -669,7 +669,13 @@ impl Builder {
             "python_call_value"
         };
         let extra = format!("{{\"argCount\":{}}}", args.len());
-        Ok(block(ty, &field("NAME", &jstr(name)), &ins.join(","), &extra, next))
+        Ok(block(
+            ty,
+            &field("NAME", &jstr(name)),
+            &ins.join(","),
+            &extra,
+            next,
+        ))
     }
 
     /// A method call `obj.method(args)` — `python_method_statement` (void, e.g.
@@ -701,7 +707,13 @@ impl Builder {
             "python_method_value"
         };
         let extra = format!("{{\"argCount\":{}}}", args.len());
-        Ok(block(ty, &field("METHOD", &jstr(method)), &ins.join(","), &extra, next))
+        Ok(block(
+            ty,
+            &field("METHOD", &jstr(method)),
+            &ins.join(","),
+            &extra,
+            next,
+        ))
     }
 }
 
@@ -978,8 +990,7 @@ mod tests {
     fn function_def_call_and_return() {
         // def with a body and a return value -> python_def + python_return,
         // PARAMS is the comma-joined name list.
-        let json =
-            to_blockly_json("def double(n):\n    return n * 2").unwrap();
+        let json = to_blockly_json("def double(n):\n    return n * 2").unwrap();
         assert!(json.contains("\"type\":\"python_def\""), "{json}");
         assert!(json.contains("\"NAME\":\"double\""), "{json}");
         assert!(json.contains("\"PARAMS\":\"n\""), "{json}");
@@ -999,7 +1010,10 @@ mod tests {
 
         // A void call statement -> python_call_statement.
         let json = to_blockly_json("greet(\"Bo\", 3)").unwrap();
-        assert!(json.contains("\"type\":\"python_call_statement\""), "{json}");
+        assert!(
+            json.contains("\"type\":\"python_call_statement\""),
+            "{json}"
+        );
         assert!(json.contains("\"argCount\":2"), "{json}");
         assert!(json.contains("\"ARG1\""), "{json}");
     }
@@ -1024,7 +1038,10 @@ mod tests {
         // A subscripted type (list[int]) and a param-only annotation also work.
         let json = to_blockly_json("def total(xs: list[int]):\n    return xs").unwrap();
         assert!(json.contains("\"PARAMS\":\"xs: list[int]\""), "{json}");
-        assert!(!json.contains("\"returns\""), "no return annotation: {json}");
+        assert!(
+            !json.contains("\"returns\""),
+            "no return annotation: {json}"
+        );
 
         // The untyped form is unchanged (no regression).
         let json = to_blockly_json("def double(n):\n    return n * 2").unwrap();
@@ -1100,7 +1117,10 @@ mod tests {
     fn method_calls_statement_and_value() {
         // Void method call `xs.append(5)` -> python_method_statement.
         let json = to_blockly_json("xs.append(5)").unwrap();
-        assert!(json.contains("\"type\":\"python_method_statement\""), "{json}");
+        assert!(
+            json.contains("\"type\":\"python_method_statement\""),
+            "{json}"
+        );
         assert!(json.contains("\"METHOD\":\"append\""), "{json}");
         assert!(json.contains("\"OBJECT\""), "{json}");
         assert!(json.contains("\"argCount\":1"), "{json}");

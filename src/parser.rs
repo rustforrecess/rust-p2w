@@ -1648,8 +1648,8 @@ mod tests {
     #[test]
     fn def_parses_param_and_return_annotations() {
         // `: T` per param (parallel to params, None when absent) and `-> T`.
-        let stmts =
-            parse_src("def greet(name: str, loud: bool, times=2) -> str:\n    return name").unwrap();
+        let stmts = parse_src("def greet(name: str, loud: bool, times=2) -> str:\n    return name")
+            .unwrap();
         let StmtKind::Def {
             params,
             param_types,
