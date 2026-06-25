@@ -112,7 +112,7 @@ Grounding: Perceus (PLDI 2021) and drop-guided reuse; reachability types /
 Native backend covers the teaching subset (ints, floats, strings, lists, dicts,
 packed `list[int/float]`, control flow, functions+recursion, iteration, methods,
 list/dict comprehensions) with a **complete value model**, precise validated RC,
-and FBIP in-place reuse. Host run-oracle green: **61 cases, `live == 0`**; 157 lib
-+ 27 runtime + 163 integration tests. **Next hardware milestone:** on-device
+and FBIP in-place reuse. Host run-oracle green: **61 cases, `live == 0`**; tests:
+157 lib, 27 runtime, 163 integration. **Next hardware milestone:** on-device
 flash/run (`.uf2`) + the on-chip temperature sensor — the toolchain (`clang`/
 `lld`) is in hand; it's gated on the board.
