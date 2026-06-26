@@ -7,6 +7,37 @@
 > to `GRAMMAR_ARCHITECTURE.md` (one front-end, multiple backends) and
 > `DEBUGGER_ARCHITECTURE.md` (the on-device debug transports).
 
+## Status (verified, Jun 2026)
+The compile-and-link path to the real board's CPU is **proven end to end**, off
+the host with no board:
+
+- **IR → Cortex-M33 machine code.** The same LLVM IR the host run-oracle uses
+  cross-compiles with `clang --target=thumbv8m.main-none-eabi -mcpu=cortex-m33`.
+  Typed paths lower to native instructions with no boxing — `def sq(n: int): return
+  n * n` becomes a single `mul r0, r0, r0`.
+- **Runtime builds for the device.** `p2w-rt` compiles for
+  `thumbv8m.main-none-eabi` (`rustup target add` once) — `core` + compiler-builtins
+  resolve, no `std`.
+- **Full image links.** Program + runtime + bare-metal glue (`device/boot.c`
+  vector table/reset + UART `p2w_putc`, `device/rp2350.ld` flash/RAM map) link with
+  `ld.lld` into a complete Cortex-M33 ELF. Footprint is **~8–9 KB** of flash
+  (code + data); the 64 KB arena is NOBITS BSS in RAM.
+- Repeatable via **`tools/pico_build.sh`** (skips cleanly without clang/lld or the
+  Rust target). The device-build counterpart of `tools/native_run.sh`.
+
+### Remaining hardware-gated work (needs a board + picotool to validate)
+The ELF is a valid Cortex-M33 image but not yet a *bootable* Pico 2 artifact:
+1. **RP2350 bootrom IMAGE_DEF block** — the bootrom scans flash for a metadata
+   block; without it the image won't be launched. (RP2350-specific; RP2040 didn't
+   need this.)
+2. **Clock + UART pin init** in `boot.c` before `p2w_putc` actually emits (today it
+   pokes UART0 directly, correct only once clocks/pins are set up).
+3. **`.uf2` packaging** (family ID + 256-byte blocks) for drag-to-Pico, and
+   on-device **flash + run** of a real program (LED blink / the on-chip temperature
+   sensor as the first demo).
+These can't be validated in CI/here (no board, no picotool/Renode/QEMU), so they're
+the next step once hardware is in hand.
+
 ## Why native, not MicroPython
 We own the AST, so we can emit real machine code with DWARF debug info — which is
 exactly what lets the *same* source-level debugger follow onto the board. Shipping
