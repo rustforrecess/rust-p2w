@@ -166,6 +166,11 @@ run_case set_dedup 'print(len({1, 1, 2, 3, 3, 3}))\n'                           
 run_case set_iter 'total = 0\nfor x in {10, 20, 30}:\n    total = total + x\nprint(total)\n' '60' || fails=$((fails+1))
 run_case substr_in 'print("ll" in "hello")\nprint("z" in "hello")\n'           'True\nFalse' || fails=$((fails+1))
 run_case int_bitwise 'print(6 & 3)\nprint(5 | 2)\n'                             '2\n7'        || fails=$((fails+1))
+run_case set_add   's = {1, 2}\ns.add(3)\ns.add(2)\nprint(len(s))\nprint(3 in s)\n' '3\nTrue' || fails=$((fails+1))
+run_case set_remove 's = {1, 2, 3}\ns.remove(2)\ns.discard(9)\nprint(len(s))\nprint(2 in s)\n' '2\nFalse' || fails=$((fails+1))
+run_case set_methods 'a = {1, 2, 3}\nb = {2, 3, 4}\nprint(len(a.union(b)))\nprint(len(a.intersection(b)))\nprint(a.issubset({1, 2, 3, 4}))\n' '4\n2\nTrue' || fails=$((fails+1))
+run_case set_copy_clear 's = {1, 2, 3}\nt = s.copy()\ns.clear()\nprint(len(s))\nprint(len(t))\n' '0\n3' || fails=$((fails+1))
+run_case set_pop   's = {5}\nx = s.pop()\nprint(x)\nprint(len(s))\n'             '5\n0'        || fails=$((fails+1))
 # --- tuples (lowered to lists) ---
 run_case tuple_unpack 't = (1, 2, 3)\na, b, c = t\nprint(a)\nprint(c)\n' '1\n3' || fails=$((fails+1))
 run_case tuple_swap 'a = 1\nb = 2\na, b = b, a\nprint(a)\nprint(b)\n' '2\n1' || fails=$((fails+1))

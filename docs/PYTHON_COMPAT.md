@@ -35,9 +35,11 @@ Differences:
 - **Element types aren't restricted to hashable values.** We compare elements
   structurally, so a set may contain a list; CPython raises `TypeError`. We're
   more permissive, not less.
-- **Set methods are pending.** `.add()`, `.remove()`, `.union()`,
-  `.intersection()`, `.issubset()`, etc. aren't implemented yet — use the
-  operators (`s | {x}`, `a & b`, …) for now.
+- **Set methods take a set argument.** `.add()`, `.remove()`, `.discard()`,
+  `.pop()`, `.clear()`, `.copy()`, `.union()`, `.intersection()`, `.difference()`,
+  `.symmetric_difference()`, `.issubset()`, `.issuperset()` all work; the
+  binary-operation methods require a *set* argument, whereas CPython also accepts
+  any iterable (`s.union([1, 2])`). Use a set literal or `set(...)` for the arg.
 
 ## Integers
 

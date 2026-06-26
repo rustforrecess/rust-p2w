@@ -2611,6 +2611,13 @@ mod tests {
     }
 
     #[test]
+    fn set_methods_dispatch_through_the_runtime() {
+        // Set methods are name-dispatched like any method (p2w_method0/1).
+        let out = ir("s = {1, 2}\ns.add(3)\nprint(s.issubset({1, 2, 3}))\n");
+        assert!(out.contains("@p2w_method1"), "method dispatch: {out}");
+    }
+
+    #[test]
     fn sets_and_set_theory_operators() {
         // `{1, 2}` desugars to set([...]); &/|/^ and `in` lower to set ops.
         let out = ir("B = {1, 2}\nC = {2, 3}\nA = B & C\nprint(A)\nprint(2 in B)\n");

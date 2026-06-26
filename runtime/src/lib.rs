@@ -1247,6 +1247,28 @@ fn both_sets(a: Value, b: Value) -> bool {
     is_heap(a) && obj_tag(a) == T_SET && is_heap(b) && obj_tag(b) == T_SET
 }
 
+/// Remove the element equal to `v` from the set at `o` (releasing it and shifting
+/// the tail down). Returns whether it was present. Does not touch `v` itself.
+fn set_remove(o: usize, v: Value) -> bool {
+    let n = coll_len(o);
+    for i in 0..n {
+        if value_eq(list_get(o, i), v) {
+            p2w_release(list_get(o, i)); // the set owned this element
+            for j in i..(n - 1) {
+                list_set_at(o, j, list_get(o, j + 1));
+            }
+            set_len(o, n - 1);
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether every element of set `a` is in set `b` (a ⊆ b).
+fn set_subset(a: usize, b: usize) -> bool {
+    (0..coll_len(a)).all(|i| coll_contains(b, list_get(a, i)))
+}
+
 /// Whether the string `needle` occurs in the string `hay` (naive search).
 fn str_contains(hay: Value, needle: Value) -> bool {
     if !(is_heap(needle) && obj_tag(needle) == T_STR) {
@@ -1376,6 +1398,28 @@ pub unsafe extern "C" fn p2w_method0(recv: Value, name: *const u8, name_len: i32
         set_len(o, len - 1);
         return v;
     }
+    if is_heap(recv) && obj_tag(recv) == T_SET {
+        let o = recv as usize;
+        if unsafe { name_eq(name, name_len, b"clear") } {
+            for i in 0..coll_len(o) {
+                p2w_release(list_get(o, i));
+            }
+            set_len(o, 0);
+            return V_NONE;
+        }
+        if unsafe { name_eq(name, name_len, b"copy") } {
+            return p2w_set_of(recv); // fresh set, elements retained
+        }
+        if unsafe { name_eq(name, name_len, b"pop") } {
+            let len = coll_len(o);
+            if len == 0 {
+                trap("pop from an empty set");
+            }
+            let v = list_get(o, len - 1); // arbitrary element, transferred out
+            set_len(o, len - 1);
+            return v;
+        }
+    }
     trap("method not supported in the native backend yet")
 }
 
@@ -1406,6 +1450,59 @@ pub unsafe extern "C" fn p2w_method1(
             }
             set_len(o, coll_len(o) - 1);
             return v;
+        }
+    }
+    // Set methods. The argument `a` is transferred to us; `add` stores it (or
+    // releases a duplicate), the rest read it and release it before returning.
+    if is_heap(recv) && obj_tag(recv) == T_SET {
+        let o = recv as usize;
+        if unsafe { name_eq(name, name_len, b"add") } {
+            p2w_set_add(recv, a);
+            return V_NONE;
+        }
+        if unsafe { name_eq(name, name_len, b"discard") } {
+            set_remove(o, a);
+            p2w_release(a);
+            return V_NONE;
+        }
+        if unsafe { name_eq(name, name_len, b"remove") } {
+            let found = set_remove(o, a);
+            p2w_release(a);
+            if !found {
+                trap("set.remove(x): x not in set");
+            }
+            return V_NONE;
+        }
+        // other-set operations: new set, then release the argument.
+        let op: Option<fn(usize, usize) -> Value> = if unsafe { name_eq(name, name_len, b"union") }
+        {
+            Some(set_union)
+        } else if unsafe { name_eq(name, name_len, b"intersection") } {
+            Some(set_intersect)
+        } else if unsafe { name_eq(name, name_len, b"difference") } {
+            Some(set_difference)
+        } else if unsafe { name_eq(name, name_len, b"symmetric_difference") } {
+            Some(set_symdiff)
+        } else {
+            None
+        };
+        if let Some(f) = op {
+            if !(is_heap(a) && obj_tag(a) == T_SET) {
+                trap("set method expects a set argument");
+            }
+            let r = f(o, a as usize);
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"issubset") } {
+            let r = make_bool(is_heap(a) && obj_tag(a) == T_SET && set_subset(o, a as usize));
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"issuperset") } {
+            let r = make_bool(is_heap(a) && obj_tag(a) == T_SET && set_subset(a as usize, o));
+            p2w_release(a);
+            return r;
         }
     }
     trap("method not supported in the native backend yet")
