@@ -85,7 +85,11 @@ impl Value {
             // Empty set prints `set()` (Python) — `{}` is an empty dict.
             Value::Set(v) if v.is_empty() => "set()".to_string(),
             Value::Set(v) => {
-                let items: Vec<String> = v.iter().map(Value::py_repr).collect();
+                // Canonical *sorted* display when elements are homogeneously
+                // orderable; mixed-type sets fall back to insertion order. Display
+                // only — storage/iteration keep insertion order. Matches the WASM
+                // backend's `$print_set`.
+                let items: Vec<String> = sorted_set_view(v).iter().map(|x| x.py_repr()).collect();
                 format!("{{{}}}", items.join(", "))
             }
             Value::Dict(d) => {
@@ -97,6 +101,27 @@ impl Value {
             }
         }
     }
+}
+
+/// A set's elements in display order: sorted when all are numbers or all are
+/// strings (the canonical written form), else original (insertion) order — so a
+/// mixed-type set never tries to order incomparable values.
+fn sorted_set_view(items: &[Value]) -> Vec<&Value> {
+    let mut view: Vec<&Value> = items.iter().collect();
+    if items.iter().all(|x| as_num(x).is_some()) {
+        view.sort_by(|a, b| {
+            as_num(a)
+                .unwrap()
+                .partial_cmp(&as_num(b).unwrap())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    } else if items.iter().all(|x| matches!(x, Value::Str(_))) {
+        view.sort_by(|a, b| match (a, b) {
+            (Value::Str(x), Value::Str(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+    }
+    view
 }
 
 /// Python equality across the numeric tower (int == float, bool == int), plus
@@ -2834,11 +2859,17 @@ mod tests {
 
     #[test]
     fn both_engines_support_sets() {
-        // Literal dedup + len + membership + print (insertion order, like Run).
+        // Literal dedup + len + membership + print (sorted display, like Run).
         let basics = "s = {3, 1, 2, 1}\nprint(s)\nprint(len(s))\nprint(2 in s)\nprint(9 in s)\n";
-        let want = "{3, 1, 2}\n3\nTrue\nFalse\n";
+        let want = "{1, 2, 3}\n3\nTrue\nFalse\n";
         assert_eq!(run_to_end(basics), want);
         assert_eq!(vm_run(basics), want);
+        // Strings sort lexicographically; mixed types keep insertion order.
+        assert_eq!(
+            vm_run("print({\"c\", \"a\", \"b\"})\n"),
+            "{'a', 'b', 'c'}\n"
+        );
+        assert_eq!(vm_run("print({2, \"a\", 1})\n"), "{2, 'a', 1}\n");
 
         // Set theory operators.
         let ops = "a = {1, 2, 3}\nb = {2, 3, 4}\n\

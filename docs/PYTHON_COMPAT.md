@@ -20,14 +20,15 @@ integer bitwise operators, exactly like CPython (`6 & 3 == 2`).
 
 Differences:
 
-- **Iteration / print order is insertion order**, not CPython's hash order.
-  Python sets are *unordered* — relying on their order is already non-portable —
-  so correct programs are unaffected, but the *printed text* of a set can differ
-  (`{3, 1, 2}` prints as `{3, 1, 2}` here, often `{1, 2, 3}` in CPython). Ours is
-  deterministic, which is friendlier for learning and testing. (We deliberately
-  do **not** chase hash-based ordering: a different hash table would give a
-  different *unspecified* order, still not matching CPython, while costing
-  predictability and memory.)
+- **Print/`str()` order is sorted (canonical), not CPython's hash order.** When a
+  set's elements are homogeneously orderable (all numbers, or all strings), it
+  *displays* in sorted order — the canonical written form (`print({3, 1, 2})` →
+  `{1, 2, 3}`), which is deterministic (stable answer keys) and reinforces that
+  sets are unordered. Mixed-type sets (e.g. `{1, "a"}`) fall back to insertion
+  order. This is display only: **iteration order is unspecified** (currently
+  insertion order) — don't rely on it, exactly as in CPython. (On the native
+  Pico backend, set *display* is still insertion order pending a `no_std` sort;
+  the browser Run/Debug paths are sorted.)
 - **Membership and set ops are O(n)** (a small, list-backed set), vs CPython's
   O(1) hashing. Same answers; only matters for large sets, which a teaching
   program on a microcontroller doesn't build. The backing store can be swapped

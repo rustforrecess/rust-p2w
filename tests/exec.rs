@@ -1288,9 +1288,12 @@ fn str_of_collections() {
 }
 
 #[test]
-fn str_of_set_insertion_order_and_repr() {
-    // Our sets are insertion-ordered (direct test, not differential).
-    assert_output("print(str(set([3, 1, 2])))", "{3, 1, 2}\n");
+fn set_display_is_sorted_when_orderable() {
+    // Sets display in canonical sorted order when homogeneously orderable (all
+    // numbers, or all strings); mixed-type sets fall back to insertion order.
+    assert_output("print(str(set([3, 1, 2])))", "{1, 2, 3}\n");
+    assert_output("print(set([\"c\", \"a\", \"b\"]))", "{'a', 'b', 'c'}\n");
+    assert_output("print(set([2, \"a\", 1]))", "{2, 'a', 1}\n"); // mixed -> insertion
     assert_output("print(repr(\"hi\"), repr(5))", "'hi' 5\n");
 }
 

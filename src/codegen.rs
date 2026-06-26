@@ -1219,7 +1219,50 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $print_set: `{e1, e2}` (insertion order); empty prints `set()`.
+    // $set_display_seq: the elements to *display*, in canonical sorted order when
+    // homogeneously orderable (all numbers, or all strings), else the set itself
+    // (insertion order). Mixed-type sets must NOT be sorted — `$sort_lt` would
+    // unbox a string as f64 and trap. Returns a value readable by `$py_index`
+    // (a sorted `$LIST`, or the original `$SET`). Display only — storage and
+    // iteration keep insertion order. Shared by `$print_set` and `$set_to_str`.
+    let mut b = Body::new();
+    b.push("(local.set $n (struct.get $SET 0 (local.get $s)))");
+    b.push("(local.set $all_str (i32.const 1))");
+    b.push("(local.set $all_num (i32.const 1))");
+    b.push("(local.set $i (i32.const 0))");
+    b.push("(block $sd (loop $sl");
+    b.push_in(1, "(br_if $sd (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(local.set $e (array.get $ITEMS (struct.get $SET 1 (local.get $s)) (local.get $i)))",
+    );
+    b.push_in(
+        1,
+        "(if (i32.eqz (ref.test (ref $STR) (local.get $e))) (then (local.set $all_str (i32.const 0))))",
+    );
+    b.push_in(
+        1,
+        "(if (i32.eqz (i32.or (i32.or (ref.test (ref i31) (local.get $e)) (ref.test (ref $INT) (local.get $e))) (i32.or (ref.test (ref $FLOAT) (local.get $e)) (ref.test (ref $BOOL) (local.get $e))))) (then (local.set $all_num (i32.const 0))))",
+    );
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $sl)))");
+    b.push("(if (result (ref null eq)) (i32.or (local.get $all_str) (local.get $all_num))");
+    b.push_in(1, "(then (call $py_sorted (local.get $s)))");
+    b.push_in(1, "(else (local.get $s)))");
+    fs.push(Func {
+        signature: "(func $set_display_seq (param $s (ref null $SET)) (result (ref null eq))"
+            .into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $all_str i32)".into(),
+            "(local $all_num i32)".into(),
+            "(local $e (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
+    // $print_set: `{e1, e2}` (sorted display via $set_display_seq); empty -> `set()`.
     let mut b = Body::new();
     b.push("(local.set $n (struct.get $SET 0 (local.get $s)))");
     b.push("(if (i32.eqz (local.get $n))");
@@ -1228,6 +1271,7 @@ fn runtime_helpers() -> Vec<Func> {
         b.push_in(2, format!("(call $write_char (i32.const {c}))"));
     }
     b.push_in(2, "(return)))");
+    b.push("(local.set $seq (call $set_display_seq (local.get $s)))");
     b.push("(call $write_char (i32.const 123))"); // {
     b.push("(block $done (loop $next");
     b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
@@ -1237,14 +1281,18 @@ fn runtime_helpers() -> Vec<Func> {
     );
     b.push_in(
         2,
-        "(call $print_repr (array.get $ITEMS (struct.get $SET 1 (local.get $s)) (local.get $i)))",
+        "(call $print_repr (call $py_index (local.get $seq) (local.get $i)))",
     );
     b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(2, "(br $next)))");
     b.push("(call $write_char (i32.const 125))"); // }
     fs.push(Func {
         signature: "(func $print_set (param $s (ref null $SET))".into(),
-        locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $seq (ref null eq))".into(),
+        ],
         body: b,
     });
 
@@ -1957,6 +2005,8 @@ fn runtime_helpers() -> Vec<Func> {
                 "(if (i32.eqz (local.get $n)) (then (return {})))",
                 str_lit("set()")
             ));
+            // Canonical sorted display when orderable (see $set_display_seq).
+            b.push("(local.set $seq (call $set_display_seq (local.get $s)))");
         }
         b.push(format!("(local.set $res {})", str_lit(open)));
         b.push("(block $done (loop $next");
@@ -1968,9 +2018,15 @@ fn runtime_helpers() -> Vec<Func> {
                 str_lit(", ")
             ),
         );
+        // Sets read through $seq (sorted); lists/tuples read their array directly.
+        let elem = if ty == "$SET" {
+            "(call $py_index (local.get $seq) (local.get $i))".to_string()
+        } else {
+            format!("(array.get $ITEMS (struct.get {ty} 1 (local.get $s)) (local.get $i))")
+        };
         b.push_in(
             2,
-            format!("(local.set $res (call $py_add (local.get $res) (call $repr_str (array.get $ITEMS (struct.get {ty} 1 (local.get $s)) (local.get $i)))))"),
+            format!("(local.set $res (call $py_add (local.get $res) (call $repr_str {elem})))"),
         );
         b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
         b.push_in(2, "(br $next)))");
@@ -1985,13 +2041,17 @@ fn runtime_helpers() -> Vec<Func> {
             "(call $py_add (local.get $res) {})",
             str_lit(close)
         ));
+        let mut locals = vec![
+            "(local $n i32)".to_string(),
+            "(local $i i32)".to_string(),
+            "(local $res (ref null eq))".to_string(),
+        ];
+        if ty == "$SET" {
+            locals.push("(local $seq (ref null eq))".to_string());
+        }
         fs.push(Func {
             signature: format!("(func {fname} (param $s (ref null {ty})) (result (ref null eq))"),
-            locals: vec![
-                "(local $n i32)".into(),
-                "(local $i i32)".into(),
-                "(local $res (ref null eq))".into(),
-            ],
+            locals,
             body: b,
         });
     }
