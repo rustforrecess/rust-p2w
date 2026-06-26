@@ -372,12 +372,18 @@ fn clauses_may_cycle(clauses: &[CompClause]) -> bool {
 /// Names that are bound to a set somewhere in the program. See
 /// `acornstem-ide/SET_NOTATION_SPEC.md` (Part 2).
 pub fn set_typed_names(stmts: &[Stmt]) -> Vec<String> {
+    let mut out: Vec<String> = infer_set_names(stmts).into_iter().collect();
+    out.sort();
+    out
+}
+
+/// The fixed-point set-name inference shared by `set_typed_names` and
+/// `set_operator_spans`. `c = a & b` only resolves once a and b are known, so we
+/// iterate until nothing new is learned (bounded by the number of names).
+fn infer_set_names(stmts: &[Stmt]) -> HashSet<String> {
     let mut assigns: Vec<(String, &Expr)> = Vec::new();
     let mut sets: HashSet<String> = HashSet::new();
     collect_assigns(stmts, &mut assigns, &mut sets);
-
-    // `c = a & b` only resolves once a and b are known — iterate to a fixed
-    // point. Bounded by the number of names, so it always terminates.
     loop {
         let mut changed = false;
         for (name, rhs) in &assigns {
@@ -390,9 +396,196 @@ pub fn set_typed_names(stmts: &[Stmt]) -> Vec<String> {
             break;
         }
     }
-    let mut out: Vec<String> = sets.into_iter().collect();
-    out.sort();
+    sets
+}
+
+/// Byte spans of the `& | - ^` operators that are *set* operations (both
+/// operands are sets), so the IDE can render exactly those as set-theory glyphs
+/// (∩ ∪ ∖ ∆) — leaving int bitwise / subtraction alone. Because this works on
+/// the real AST, it is precedence- and parenthesis-correct: `(A | B) & C`, a
+/// `set(...)` result, or nested set ops all classify properly. See
+/// `acornstem-ide/SET_NOTATION_SPEC.md` (Part 2). Spans are `[start, end)` byte
+/// offsets into the source.
+pub fn set_operator_spans(stmts: &[Stmt]) -> Vec<crate::ast::Span> {
+    let sets = infer_set_names(stmts);
+    let mut out: Vec<crate::ast::Span> = Vec::new();
+    spans_in_stmts(stmts, &sets, &mut out);
+    out.sort_unstable(); // source order (tree walk visits outer-then-inner)
     out
+}
+
+fn spans_in_stmts(stmts: &[Stmt], sets: &HashSet<String>, out: &mut Vec<crate::ast::Span>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Expr(e)
+            | StmtKind::Assign(_, e)
+            | StmtKind::AnnAssign { value: e, .. }
+            | StmtKind::Return(Some(e)) => spans_in_expr(e, sets, out),
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                spans_in_expr(cond, sets, out);
+                spans_in_stmts(body, sets, out);
+                for (c, b) in elifs {
+                    spans_in_expr(c, sets, out);
+                    spans_in_stmts(b, sets, out);
+                }
+                if let Some(b) = else_body {
+                    spans_in_stmts(b, sets, out);
+                }
+            }
+            StmtKind::For {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                spans_in_expr(start, sets, out);
+                spans_in_expr(end, sets, out);
+                spans_in_expr(step, sets, out);
+                spans_in_stmts(body, sets, out);
+            }
+            StmtKind::ForEach { iterable, body, .. } => {
+                spans_in_expr(iterable, sets, out);
+                spans_in_stmts(body, sets, out);
+            }
+            StmtKind::While { cond, body } => {
+                spans_in_expr(cond, sets, out);
+                spans_in_stmts(body, sets, out);
+            }
+            StmtKind::Def { defaults, body, .. } => {
+                for d in defaults {
+                    spans_in_expr(d, sets, out);
+                }
+                spans_in_stmts(body, sets, out);
+            }
+            StmtKind::ClassDef {
+                methods,
+                class_vars,
+                ..
+            } => {
+                for (_, e) in class_vars {
+                    spans_in_expr(e, sets, out);
+                }
+                for m in methods {
+                    spans_in_stmts(&m.body, sets, out);
+                }
+            }
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                spans_in_expr(target, sets, out);
+                spans_in_expr(index, sets, out);
+                spans_in_expr(value, sets, out);
+            }
+            StmtKind::SetAttr { obj, value, .. } => {
+                spans_in_expr(obj, sets, out);
+                spans_in_expr(value, sets, out);
+            }
+            StmtKind::UnpackAssign { targets, value } => {
+                for t in targets {
+                    spans_in_expr(t, sets, out);
+                }
+                spans_in_expr(value, sets, out);
+            }
+            StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue | StmtKind::Import(_) => {
+            }
+        }
+    }
+}
+
+fn spans_in_expr(e: &Expr, sets: &HashSet<String>, out: &mut Vec<crate::ast::Span>) {
+    if let ExprKind::Bin(op, a, b) = &e.kind
+        && matches!(
+            op,
+            BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor | BinOp::Sub
+        )
+        && is_set_expr(a, sets)
+        && is_set_expr(b, sets)
+    {
+        out.push(e.span);
+    }
+    // Recurse into every child expression.
+    match &e.kind {
+        ExprKind::Unary(_, x) | ExprKind::Attr(x, _) | ExprKind::Kwarg(_, x) => {
+            spans_in_expr(x, sets, out)
+        }
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {
+            spans_in_expr(a, sets, out);
+            spans_in_expr(b, sets, out);
+        }
+        ExprKind::Call(_, args) => {
+            for a in args {
+                spans_in_expr(a, sets, out);
+            }
+        }
+        ExprKind::MethodCall(recv, _, args) => {
+            spans_in_expr(recv, sets, out);
+            for a in args {
+                spans_in_expr(a, sets, out);
+            }
+        }
+        ExprKind::List(xs) | ExprKind::Tuple(xs) => {
+            for x in xs {
+                spans_in_expr(x, sets, out);
+            }
+        }
+        ExprKind::Dict(pairs) => {
+            for (k, v) in pairs {
+                spans_in_expr(k, sets, out);
+                spans_in_expr(v, sets, out);
+            }
+        }
+        ExprKind::Slice {
+            obj,
+            start,
+            stop,
+            step,
+        } => {
+            spans_in_expr(obj, sets, out);
+            for o in [start, stop, step].into_iter().flatten() {
+                spans_in_expr(o, sets, out);
+            }
+        }
+        ExprKind::ListComp { element, clauses } => {
+            spans_in_expr(element, sets, out);
+            spans_in_clauses(clauses, sets, out);
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => {
+            spans_in_expr(key, sets, out);
+            spans_in_expr(value, sets, out);
+            spans_in_clauses(clauses, sets, out);
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::NoneLit
+        | ExprKind::Str(_)
+        | ExprKind::Name(_) => {}
+    }
+}
+
+fn spans_in_clauses(
+    clauses: &[CompClause],
+    sets: &HashSet<String>,
+    out: &mut Vec<crate::ast::Span>,
+) {
+    for c in clauses {
+        match c {
+            CompClause::For { iter, .. } => spans_in_expr(iter, sets, out),
+            CompClause::If(e) => spans_in_expr(e, sets, out),
+        }
+    }
 }
 
 /// Gather every `name = rhs` assignment (for the fixed point) and seed `sets`
@@ -573,5 +766,49 @@ mod tests {
         );
         // A `: set` annotation marks it even if the rhs is opaque (a param, say).
         assert_eq!(sets("s: set = make_it()\n"), vec!["s"]);
+    }
+
+    /// The operator chars at the returned spans, for readable assertions.
+    fn op_chars(src: &str) -> Vec<char> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        set_operator_spans(&stmts)
+            .into_iter()
+            .map(|(s, _)| src[s..].chars().next().unwrap())
+            .collect()
+    }
+
+    fn spans(src: &str) -> Vec<(usize, usize)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        set_operator_spans(&stmts)
+    }
+
+    #[test]
+    fn operator_spans_point_at_set_operators_only() {
+        // a=10, b={1,2}, c={3}; only the `&` is a set op (a&b would be int — but
+        // a is not a set, so excluded). Here b & c both sets → the `&` spans.
+        let src = "b = {1, 2}\nc = {3}\nx = b & c\n";
+        assert_eq!(op_chars(src), vec!['&']);
+        // The span actually lands on the `&` character.
+        let (s, e) = spans(src)[0];
+        assert_eq!(&src[s..e], "&");
+    }
+
+    #[test]
+    fn operator_spans_are_precedence_and_paren_correct() {
+        // (A | B) & C with all sets: both operators are set ops.
+        let src = "A = {1}\nB = {2}\nC = {3}\nx = (A | B) & C\n";
+        assert_eq!(op_chars(src), vec!['|', '&']);
+        // Set literal operand and set(...) result, no set-typed names needed.
+        assert_eq!(op_chars("x = {1, 2} - set([2])\n"), vec!['-']);
+    }
+
+    #[test]
+    fn non_set_operators_have_no_spans() {
+        // Int bitwise / subtraction, and a set mixed with a non-set, are excluded.
+        assert!(op_chars("x = 6 & 3\n").is_empty());
+        assert!(op_chars("n = 10 - 1\n").is_empty());
+        assert!(op_chars("s = {1}\nx = s - 1\n").is_empty());
     }
 }

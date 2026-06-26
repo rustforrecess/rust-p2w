@@ -669,7 +669,11 @@ impl<'a> FuncEmitter<'a> {
         let id = self.next_label;
         self.next_label += 1;
         let iname = format!("__map{id}");
-        let mk = |k: ExprKind| Expr { kind: k, line };
+        let mk = |k: ExprKind| Expr {
+            kind: k,
+            line,
+            span: (0, 0),
+        };
         let arr_name = || mk(ExprKind::Name(name.to_string()));
         let idx = || mk(ExprKind::Name(iname.clone()));
         let body = vec![
@@ -736,7 +740,11 @@ impl<'a> FuncEmitter<'a> {
             }]),
             CompClause::For { vars, iter } => {
                 let mut body = self.comp_body(rest, inner, line)?;
-                let mk = |k: ExprKind| Expr { kind: k, line };
+                let mk = |k: ExprKind| Expr {
+                    kind: k,
+                    line,
+                    span: (0, 0),
+                };
                 // A tuple target loops over a hidden element var and unpacks it at
                 // the top of the body. (`range` can't be tuple-unpacked.)
                 let var = if vars.len() == 1 {
@@ -810,7 +818,11 @@ impl<'a> FuncEmitter<'a> {
         };
         self.store_var(&rname, &ptr, empty, result_repr);
 
-        let mk = |k: ExprKind| Expr { kind: k, line };
+        let mk = |k: ExprKind| Expr {
+            kind: k,
+            line,
+            span: (0, 0),
+        };
         let append = Stmt {
             kind: StmtKind::Expr(mk(ExprKind::MethodCall(
                 Box::new(mk(ExprKind::Name(rname.clone()))),
@@ -843,7 +855,11 @@ impl<'a> FuncEmitter<'a> {
         let empty = self.call_value("call i32 @p2w_dict_new()");
         self.store_var(&rname, &ptr, empty, Repr::Boxed);
 
-        let mk = |k: ExprKind| Expr { kind: k, line };
+        let mk = |k: ExprKind| Expr {
+            kind: k,
+            line,
+            span: (0, 0),
+        };
         let set = Stmt {
             kind: StmtKind::SetIndex {
                 target: mk(ExprKind::Name(rname.clone())),
@@ -1086,7 +1102,11 @@ impl<'a> FuncEmitter<'a> {
         let ptr = self.ensure_slot(&uname, vr);
         self.store_var(&uname, &ptr, v, vr);
 
-        let mk = |k: ExprKind| Expr { kind: k, line };
+        let mk = |k: ExprKind| Expr {
+            kind: k,
+            line,
+            span: (0, 0),
+        };
         for (i, target) in targets.iter().enumerate() {
             let elem = mk(ExprKind::Index(
                 Box::new(mk(ExprKind::Name(uname.clone()))),

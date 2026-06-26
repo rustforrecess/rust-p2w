@@ -114,13 +114,22 @@ pub struct Method {
     pub body: Vec<Stmt>,
 }
 
+/// Byte range `[start, end)` of a node in the source, when tracked. Currently
+/// populated only for binary-operator nodes (the *operator token's* range), to
+/// support IDE features like set-notation glyphing; `(0, 0)` everywhere else.
+/// Populating it for more node kinds (e.g. span-level error underlining) is a
+/// future extension.
+pub type Span = (usize, usize);
+
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
     pub line: usize,
+    pub span: Span,
 }
 
 impl PartialEq for Expr {
+    // Structure only — line and span are positional metadata, not meaning.
     fn eq(&self, other: &Self) -> bool {
         self.kind == other.kind
     }

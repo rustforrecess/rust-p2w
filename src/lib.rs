@@ -76,6 +76,22 @@ pub fn set_typed_names(source: &str) -> Vec<String> {
     }
 }
 
+/// Byte spans `[start, end)` of the `& | - ^` operators that are *set* operations
+/// (both operands are sets), so the IDE can render exactly those as set-theory
+/// glyphs (∩ ∪ ∖ ∆) while leaving int bitwise / subtraction as ASCII. Unlike a
+/// token heuristic this is precedence- and parenthesis-correct (`(A | B) & C`,
+/// `set(...)` results, nested set ops). Offsets index into `source`. See
+/// `acornstem-ide/SET_NOTATION_SPEC.md` (Part 2). Empty when `source` doesn't lex.
+pub fn set_operator_spans(source: &str) -> Vec<(usize, usize)> {
+    match lexer::lex(source) {
+        Ok(toks) => {
+            let (stmts, _) = parser::parse_recovering(&toks);
+            lint::set_operator_spans(&stmts)
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

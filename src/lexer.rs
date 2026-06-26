@@ -68,10 +68,25 @@ pub enum Tok {
 pub struct Token {
     pub tok: Tok,
     pub line: usize,
+    /// Byte offset of the token's first character in the source. Used to give
+    /// AST nodes source spans (e.g. for IDE set-notation glyphing).
+    pub start: usize,
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
     let chars: Vec<char> = src.chars().collect();
+    // Byte offset of each char index (plus the end), so tokens can record where
+    // they start in the source. `byte_of[k]` is the byte offset of `chars[k]`.
+    let byte_of: Vec<usize> = {
+        let mut v = Vec::with_capacity(chars.len() + 1);
+        let mut b = 0usize;
+        for c in &chars {
+            v.push(b);
+            b += c.len_utf8();
+        }
+        v.push(b);
+        v
+    };
     let mut out: Vec<Token> = Vec::new();
     let mut i = 0usize;
     let mut line = 1usize;
@@ -114,6 +129,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::Indent,
                     line,
+                    start: byte_of[i],
                 });
             } else if col < top {
                 while col < *indent_stack.last().unwrap() {
@@ -121,6 +137,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     out.push(Token {
                         tok: Tok::Dedent,
                         line,
+                        start: byte_of[i],
                     });
                 }
                 if col != *indent_stack.last().unwrap() {
@@ -130,6 +147,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
             at_line_start = false;
         }
 
+        let tok_start = byte_of[i];
         let c = chars[i];
         match c {
             ' ' | '\t' | '\r' => {
@@ -150,6 +168,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                         out.push(Token {
                             tok: Tok::Newline,
                             line,
+                            start: tok_start,
                         });
                     }
                     at_line_start = true;
@@ -163,7 +182,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
             }
             '+' => {
                 let (tok, w) = aug_or(&chars, i, Tok::Plus, BinOp::Add);
-                out.push(Token { tok, line });
+                out.push(Token {
+                    tok,
+                    line,
+                    start: tok_start,
+                });
                 i += w;
             }
             '-' => {
@@ -172,11 +195,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     out.push(Token {
                         tok: Tok::Arrow,
                         line,
+                        start: tok_start,
                     });
                     i += 2;
                 } else {
                     let (tok, w) = aug_or(&chars, i, Tok::Minus, BinOp::Sub);
-                    out.push(Token { tok, line });
+                    out.push(Token {
+                        tok,
+                        line,
+                        start: tok_start,
+                    });
                     i += w;
                 }
             }
@@ -187,18 +215,24 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                         out.push(Token {
                             tok: Tok::AugAssign(BinOp::Pow),
                             line,
+                            start: tok_start,
                         });
                         i += 3;
                     } else {
                         out.push(Token {
                             tok: Tok::DoubleStar,
                             line,
+                            start: tok_start,
                         });
                         i += 2;
                     }
                 } else {
                     let (tok, w) = aug_or(&chars, i, Tok::Star, BinOp::Mul);
-                    out.push(Token { tok, line });
+                    out.push(Token {
+                        tok,
+                        line,
+                        start: tok_start,
+                    });
                     i += w;
                 }
             }
@@ -209,56 +243,94 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                         out.push(Token {
                             tok: Tok::AugAssign(BinOp::FloorDiv),
                             line,
+                            start: tok_start,
                         });
                         i += 3;
                     } else {
                         out.push(Token {
                             tok: Tok::SlashSlash,
                             line,
+                            start: tok_start,
                         });
                         i += 2;
                     }
                 } else {
                     let (tok, w) = aug_or(&chars, i, Tok::Slash, BinOp::Div);
-                    out.push(Token { tok, line });
+                    out.push(Token {
+                        tok,
+                        line,
+                        start: tok_start,
+                    });
                     i += w;
                 }
             }
             '%' => {
                 let (tok, w) = aug_or(&chars, i, Tok::Percent, BinOp::Mod);
-                out.push(Token { tok, line });
+                out.push(Token {
+                    tok,
+                    line,
+                    start: tok_start,
+                });
                 i += w;
             }
             '|' => {
                 let (tok, w) = aug_or(&chars, i, Tok::Pipe, BinOp::BitOr);
-                out.push(Token { tok, line });
+                out.push(Token {
+                    tok,
+                    line,
+                    start: tok_start,
+                });
                 i += w;
             }
             '&' => {
                 let (tok, w) = aug_or(&chars, i, Tok::Amp, BinOp::BitAnd);
-                out.push(Token { tok, line });
+                out.push(Token {
+                    tok,
+                    line,
+                    start: tok_start,
+                });
                 i += w;
             }
             '^' => {
                 let (tok, w) = aug_or(&chars, i, Tok::Caret, BinOp::BitXor);
-                out.push(Token { tok, line });
+                out.push(Token {
+                    tok,
+                    line,
+                    start: tok_start,
+                });
                 i += w;
             }
             '<' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    out.push(Token { tok: Tok::Le, line });
+                    out.push(Token {
+                        tok: Tok::Le,
+                        line,
+                        start: tok_start,
+                    });
                     i += 2;
                 } else {
-                    out.push(Token { tok: Tok::Lt, line });
+                    out.push(Token {
+                        tok: Tok::Lt,
+                        line,
+                        start: tok_start,
+                    });
                     i += 1;
                 }
             }
             '>' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    out.push(Token { tok: Tok::Ge, line });
+                    out.push(Token {
+                        tok: Tok::Ge,
+                        line,
+                        start: tok_start,
+                    });
                     i += 2;
                 } else {
-                    out.push(Token { tok: Tok::Gt, line });
+                    out.push(Token {
+                        tok: Tok::Gt,
+                        line,
+                        start: tok_start,
+                    });
                     i += 1;
                 }
             }
@@ -267,10 +339,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     out.push(Token {
                         tok: Tok::EqEq,
                         line,
+                        start: tok_start,
                     });
                     i += 2;
                 } else {
-                    out.push(Token { tok: Tok::Eq, line });
+                    out.push(Token {
+                        tok: Tok::Eq,
+                        line,
+                        start: tok_start,
+                    });
                     i += 1;
                 }
             }
@@ -279,6 +356,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     out.push(Token {
                         tok: Tok::BangEq,
                         line,
+                        start: tok_start,
                     });
                     i += 2;
                 } else {
@@ -289,6 +367,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::Colon,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -297,6 +376,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::LParen,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -308,6 +388,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::RParen,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -318,6 +399,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::LBracket,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -329,6 +411,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::RBracket,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -336,6 +419,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::Dot,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -344,6 +428,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::LBrace,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -355,6 +440,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::RBrace,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -362,6 +448,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::Comma,
                     line,
+                    start: tok_start,
                 });
                 i += 1;
             }
@@ -370,12 +457,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::Str(s),
                     line,
+                    start: tok_start,
                 });
                 i = ni;
             }
             c if c.is_ascii_digit() => {
                 let (tok, ni) = lex_number(&chars, i, line)?;
-                out.push(Token { tok, line });
+                out.push(Token {
+                    tok,
+                    line,
+                    start: tok_start,
+                });
                 i = ni;
             }
             c if c.is_alphabetic() || c == '_' => {
@@ -393,6 +485,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     out.push(Token {
                         tok: Tok::FStr(parts),
                         line,
+                        start: tok_start,
                     });
                     i = ni;
                     continue;
@@ -400,6 +493,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 out.push(Token {
                     tok: Tok::Name(name),
                     line,
+                    start: tok_start,
                 });
             }
             other => {
@@ -425,6 +519,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
         out.push(Token {
             tok: Tok::Newline,
             line,
+            start: byte_of[chars.len()],
         });
     }
     while *indent_stack.last().unwrap() > 0 {
@@ -432,11 +527,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
         out.push(Token {
             tok: Tok::Dedent,
             line,
+            start: byte_of[chars.len()],
         });
     }
     out.push(Token {
         tok: Tok::Eof,
         line,
+        start: byte_of[chars.len()],
     });
     Ok(out)
 }

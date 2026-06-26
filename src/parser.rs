@@ -88,6 +88,11 @@ impl<'a> Parser<'a> {
         self.toks[self.pos].line
     }
 
+    /// Byte offset of the current token's first character (for AST node spans).
+    fn byte(&self) -> usize {
+        self.toks[self.pos].start
+    }
+
     fn advance(&mut self) -> &Tok {
         let t = &self.toks[self.pos].tok;
         if self.pos + 1 < self.toks.len() {
@@ -369,12 +374,14 @@ impl<'a> Parser<'a> {
             let combined = |read: Expr, rhs: Expr| Expr {
                 kind: ExprKind::Bin(op, Box::new(read), Box::new(rhs)),
                 line,
+                span: (0, 0),
             };
             return match e.kind {
                 ExprKind::Name(name) => {
                     let read = Expr {
                         kind: ExprKind::Name(name.clone()),
                         line,
+                        span: (0, 0),
                     };
                     Ok(Stmt {
                         kind: StmtKind::Assign(name, combined(read, rhs)),
@@ -385,6 +392,7 @@ impl<'a> Parser<'a> {
                     let read = Expr {
                         kind: ExprKind::Index(target.clone(), index.clone()),
                         line,
+                        span: (0, 0),
                     };
                     Ok(Stmt {
                         kind: StmtKind::SetIndex {
@@ -399,6 +407,7 @@ impl<'a> Parser<'a> {
                     let read = Expr {
                         kind: ExprKind::Attr(obj.clone(), attr.clone()),
                         line,
+                        span: (0, 0),
                     };
                     Ok(Stmt {
                         kind: StmtKind::SetAttr {
@@ -753,6 +762,7 @@ impl<'a> Parser<'a> {
             let int = |n: i64| Expr {
                 kind: ExprKind::Int(n),
                 line,
+                span: (0, 0),
             };
             let (start, end, step) = match args.len() {
                 1 => (int(0), args[0].clone(), int(1)),
@@ -795,11 +805,13 @@ impl<'a> Parser<'a> {
                         .map(|n| Expr {
                             kind: ExprKind::Name(n),
                             line,
+                            span: (0, 0),
                         })
                         .collect(),
                     value: Expr {
                         kind: ExprKind::Name(tmp.clone()),
                         line,
+                        span: (0, 0),
                     },
                 },
                 line,
@@ -868,6 +880,7 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             kind: ExprKind::Tuple(items),
             line,
+            span: (0, 0),
         })
     }
 
@@ -879,6 +892,9 @@ impl<'a> Parser<'a> {
                 break;
             }
             let op_line = self.line();
+            // Span of the operator token itself (single-char for the set ops
+            // `& | - ^`), so the IDE can locate exactly which character to glyph.
+            let op_byte = self.byte();
             self.advance();
             if op == BinOp::NotIn {
                 self.advance(); // the `in` of `not in`
@@ -890,6 +906,7 @@ impl<'a> Parser<'a> {
                 lhs = Expr {
                     kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs)),
                     line: op_line,
+                    span: (op_byte, op_byte + 1),
                 };
             }
         }
@@ -903,6 +920,7 @@ impl<'a> Parser<'a> {
         let mut chain = Expr {
             kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs.clone())),
             line,
+            span: (0, 0),
         };
         let mut prev = rhs;
         while let Some((next_op, _, r_bp)) = self.peek_infix() {
@@ -924,10 +942,12 @@ impl<'a> Parser<'a> {
             let pair = Expr {
                 kind: ExprKind::Bin(next_op, Box::new(prev), Box::new(next.clone())),
                 line: op_line,
+                span: (0, 0),
             };
             chain = Expr {
                 kind: ExprKind::Bin(BinOp::And, Box::new(chain), Box::new(pair)),
                 line: op_line,
+                span: (0, 0),
             };
             prev = next;
         }
@@ -942,6 +962,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr {
                 kind: ExprKind::Unary(UnOp::Neg, Box::new(operand)),
                 line,
+                span: (0, 0),
             });
         }
         if self.is_keyword("not") {
@@ -951,6 +972,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr {
                 kind: ExprKind::Unary(UnOp::Not, Box::new(operand)),
                 line,
+                span: (0, 0),
             });
         }
         let atom = self.primary()?;
@@ -998,6 +1020,7 @@ impl<'a> Parser<'a> {
                                 step,
                             },
                             line,
+                            span: (0, 0),
                         };
                     } else {
                         let index = first.ok_or_else(|| {
@@ -1010,6 +1033,7 @@ impl<'a> Parser<'a> {
                         e = Expr {
                             kind: ExprKind::Index(Box::new(e), index),
                             line,
+                            span: (0, 0),
                         };
                     }
                 }
@@ -1036,11 +1060,13 @@ impl<'a> Parser<'a> {
                         e = Expr {
                             kind: ExprKind::MethodCall(Box::new(e), name, args),
                             line,
+                            span: (0, 0),
                         };
                     } else {
                         e = Expr {
                             kind: ExprKind::Attr(Box::new(e), name),
                             line,
+                            span: (0, 0),
                         };
                     }
                 }
@@ -1051,7 +1077,11 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self) -> Result<Expr> {
         let line = self.line();
-        let expr = |kind| Expr { kind, line };
+        let expr = |kind| Expr {
+            kind,
+            line,
+            span: (0, 0),
+        };
         match self.peek().clone() {
             Tok::Int(n) => {
                 self.advance();
@@ -1085,6 +1115,7 @@ impl<'a> Parser<'a> {
                                     Expr {
                                         kind: ExprKind::Str(spec),
                                         line,
+                                        span: (0, 0),
                                     },
                                 ],
                             ))
@@ -1202,6 +1233,7 @@ impl<'a> Parser<'a> {
                 let set_of = |arg: Expr| Expr {
                     kind: ExprKind::Call("set".into(), vec![arg]),
                     line,
+                    span: (0, 0),
                 };
                 if self.is_keyword("for") {
                     let clauses = self.comp_clauses()?;
@@ -1212,6 +1244,7 @@ impl<'a> Parser<'a> {
                             clauses,
                         },
                         line,
+                        span: (0, 0),
                     }));
                 }
                 let mut elements = vec![first];
@@ -1226,6 +1259,7 @@ impl<'a> Parser<'a> {
                 Ok(set_of(Expr {
                     kind: ExprKind::List(elements),
                     line,
+                    span: (0, 0),
                 }))
             }
             Tok::Name(name) => {
@@ -1266,6 +1300,7 @@ impl<'a> Parser<'a> {
                 args.push(Expr {
                     kind: ExprKind::Kwarg(k, Box::new(value)),
                     line,
+                    span: (0, 0),
                 });
                 seen_kwarg = true;
                 match self.peek() {
@@ -1303,6 +1338,7 @@ impl<'a> Parser<'a> {
                         clauses,
                     },
                     line,
+                    span: (0, 0),
                 }]);
             }
             args.push(e);
@@ -1594,7 +1630,11 @@ mod tests {
 
     /// Build an expectation node; line is irrelevant (PartialEq ignores it).
     fn e(kind: ExprKind) -> Expr {
-        Expr { kind, line: 0 }
+        Expr {
+            kind,
+            line: 0,
+            span: (0, 0),
+        }
     }
 
     fn bin(op: BinOp, a: Expr, b: Expr) -> Expr {

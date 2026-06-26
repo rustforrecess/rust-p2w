@@ -1787,6 +1787,7 @@ impl Vm {
                     None => Expr {
                         kind: ExprKind::NoneLit,
                         line: s.line,
+                        span: (0, 0),
                     },
                 };
                 self.push_task(Task::Eval(Rc::new(e)));
@@ -2059,6 +2060,7 @@ impl Vm {
                 let target = Expr {
                     kind: ExprKind::Name(name),
                     line: 0,
+                    span: (0, 0),
                 };
                 assign_index_in(&mut self.top().scope, &target, index, value)?;
             }
