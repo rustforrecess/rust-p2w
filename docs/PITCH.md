@@ -35,7 +35,12 @@ the same tree:
   program+runtime (~6.5× smaller than comparable Python-subset-in-WASM efforts).
 - **Native (Pico):** AST → textual **LLVM IR** → `clang`/`lld` → RP2350. Values
   are tagged **i32 offsets into a static arena** (not machine pointers), which has
-  a useful consequence below.
+  a useful consequence below. **This cross-compiles and links to a real Cortex-M33
+  image today** (see the next section) — not a plan, a built artifact.
+
+Plus a third execution path off the same AST — a **step-debugger interpreter**
+(`p2w-rt`-independent) kept at parity with the compiled backends, so Run (WASM),
+Debug (interpreter), and the native target agree on semantics (sets, tuples, …).
 
 **The native value model is complete — typed code lowers to register-and-buffer
 code, no boxing, no refcount traffic:**
@@ -53,11 +58,37 @@ code, no boxing, no refcount traffic:**
   truncation). Unannotated code stays a dynamic tagged-`i32` path, byte-identical
   to before; the whole thing is opt-in via annotations.
 
+The subset is broad and **consistent across all three execution paths**: ints,
+floats, strings, lists, dicts, packed arrays, control flow, functions+recursion,
+iteration, methods, list/dict comprehensions, slices, f-strings, **sets** (full
+set theory + methods, sorted canonical display), and **real tuples** — a distinct
+*immutable* type (item-assignment is an error), which also lets sets reject
+mutable members (`{[1,2]}` → "use a tuple") exactly like CPython.
+
 Memory management is **precise and validated**: the emitter inserts retain/release
 under a documented transfer-ownership model (with borrow-on-read and borrowed
 parameters as landed optimizations); a small `no_std` runtime (`p2w-rt`)
 implements the value rep + arena + strings/lists/dicts/packed-arrays/iteration +
-RC. 27 runtime + 157 lib + 163 integration tests.
+RC. 27 runtime + 185 lib + 165 integration tests.
+
+### It compiles to the board's actual CPU — shown, not promised
+
+The same LLVM IR the host oracle runs **cross-compiles to Cortex-M33** with
+`clang --target=thumbv8m.main-none-eabi -mcpu=cortex-m33`, the `p2w-rt` runtime
+builds for that target, and program + runtime + bare-metal glue **link with
+`ld.lld` into a complete Cortex-M33 ELF** — repeatably, via `tools/pico_build.sh`,
+with no board. Two things worth seeing:
+
+- A typed `def sq(n: int): return n * n` lowers to a **single `mul r0, r0, r0`** —
+  no boxing, no runtime call. The value model isn't just "no GC"; on typed paths
+  it's *no runtime at all*.
+- The whole image is **~8–9 KB of flash** (code + initialised data); the arena is
+  zero-init BSS in RAM.
+
+What's left is genuinely hardware-gated and honestly scoped (`PICO_BACKEND.md`):
+the RP2350 bootrom metadata block, clock/UART init, `.uf2` packaging, and the
+on-device flash/run — each needs a board + `picotool` to validate, not more
+compiler work.
 
 ### The part compiler people tend to like
 
@@ -69,7 +100,7 @@ live-object counter (`p2w_live()`) and an allocation counter (`p2w_allocs()`), s
 each program through real LLVM, runs it, diffs stdout against CPython, asserts
 **`live_objects == 0`** at exit, and lets us *measure* the reuse win in allocations.
 
-**61 cases pass that gate**, all ending `live == 0`. It caught a real double-free
+**95 cases pass that gate**, all ending `live == 0`. It caught a real double-free
 during bring-up (a dict-update freeing a key the runtime already owned). Memory-
 safety work here is **verifiable, offline, in seconds** — not "looks right in
 review."
@@ -111,8 +142,9 @@ Grounding: Perceus (PLDI 2021) and drop-guided reuse; reachability types /
 
 Native backend covers the teaching subset (ints, floats, strings, lists, dicts,
 packed `list[int/float]`, control flow, functions+recursion, iteration, methods,
-list/dict comprehensions) with a **complete value model**, precise validated RC,
-and FBIP in-place reuse. Host run-oracle green: **61 cases, `live == 0`**; tests:
-157 lib, 27 runtime, 163 integration. **Next hardware milestone:** on-device
-flash/run (`.uf2`) + the on-chip temperature sensor — the toolchain (`clang`/
-`lld`) is in hand; it's gated on the board.
+list/dict comprehensions, slices, f-strings, sets, immutable tuples) with a
+**complete value model**, precise validated RC, and FBIP in-place reuse. Host
+run-oracle green: **95 cases, `live == 0`**; tests: 185 lib, 27 runtime, 165
+integration. **Cross-compiles + links to a Cortex-M33 image** (`tools/pico_build.sh`,
+~8–9 KB). **Next hardware milestone:** on-device flash/run (`.uf2`) + the on-chip
+temperature sensor — toolchain in hand, gated only on the board.

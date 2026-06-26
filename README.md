@@ -34,6 +34,9 @@ with no boxing and no refcount traffic:
 - FBIP in-place reuse for the self-map; full-`i32` ints (no silent truncation)
 - precise, validated RC (transfer-ownership insertion, borrow-on-read, borrowed
   params for read-only Boxed/array params)
+- the broader subset too — slices, f-strings, **sets** (set theory + methods,
+  sorted display) and **real immutable tuples** (so sets reject mutable members,
+  like CPython) — all consistent across the WASM, native, and step-debugger paths
 
 Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-in.
 
@@ -41,8 +44,13 @@ Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-i
 pointers), the emitted IR + runtime compile with `clang` and run on the host.
 `tools/native_run.sh` is a mechanical oracle: it runs each program through real
 LLVM, diffs stdout against CPython, and asserts `p2w_live() == 0` (no leaks) at
-exit — 60+ cases green. On-device flash/run (`.uf2`) + the temperature sensor is
-the next hardware milestone.
+exit — **95 cases green**.
+
+**Compiles to the board's CPU.** That same IR cross-compiles to **Cortex-M33**
+(`clang --target=thumbv8m.main-none-eabi`), the runtime builds for the target, and
+they link into a complete ~8–9 KB Cortex-M33 ELF — `tools/pico_build.sh`, no board
+needed (a typed `n * n` becomes a single `mul r0, r0, r0`). On-device flash/run
+(`.uf2` + bootrom block) + the temperature sensor is the next, hardware-gated step.
 
 ## Quick start
 
@@ -50,6 +58,7 @@ the next hardware milestone.
 cargo test                          # front-end + both emitters (lib + integration)
 cargo run --example demo            # compile a sample program to WAT
 bash tools/native_run.sh            # the host run-oracle (needs clang); GATE_LEAKS=1
+bash tools/pico_build.sh            # cross-compile+link to a Cortex-M33 ELF (clang/lld)
 (cd runtime && cargo test)          # the native runtime (p2w-rt)
 ```
 
