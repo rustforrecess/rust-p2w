@@ -37,6 +37,9 @@ pub enum Value {
     Bool(bool),
     Str(String),
     List(Vec<Value>),
+    /// Insertion-ordered unique elements (matches the compiled backends; sets are
+    /// conceptually unordered, so equality below ignores order).
+    Set(Vec<Value>),
     /// Insertion-ordered key/value pairs, like Python dicts.
     Dict(Vec<(Value, Value)>),
     None,
@@ -51,6 +54,7 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Str(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
+            Value::Set(v) => !v.is_empty(),
             Value::Dict(d) => !d.is_empty(),
             Value::None => false,
         }
@@ -78,6 +82,12 @@ impl Value {
                 let items: Vec<String> = v.iter().map(Value::py_repr).collect();
                 format!("[{}]", items.join(", "))
             }
+            // Empty set prints `set()` (Python) — `{}` is an empty dict.
+            Value::Set(v) if v.is_empty() => "set()".to_string(),
+            Value::Set(v) => {
+                let items: Vec<String> = v.iter().map(Value::py_repr).collect();
+                format!("{{{}}}", items.join(", "))
+            }
             Value::Dict(d) => {
                 let items: Vec<String> = d
                     .iter()
@@ -97,6 +107,10 @@ fn py_eq(a: &Value, b: &Value) -> bool {
         (Value::None, Value::None) => true,
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
+        }
+        // Sets are unordered: equal iff same size and every element is in both.
+        (Value::Set(x), Value::Set(y)) => {
+            x.len() == y.len() && x.iter().all(|p| y.iter().any(|q| py_eq(p, q)))
         }
         (Value::Dict(x), Value::Dict(y)) => {
             x.len() == y.len()
@@ -703,7 +717,7 @@ impl Stepper {
 
     fn iterable_items(&mut self, e: &Expr) -> Result<Vec<Value>, String> {
         match self.eval(e)? {
-            Value::List(v) => Ok(v),
+            Value::List(v) | Value::Set(v) => Ok(v),
             Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
             Value::Dict(d) => Ok(d.into_iter().map(|(k, _)| k).collect()),
             other => Err(format!("can't loop over {}", type_name(&other))),
@@ -818,9 +832,7 @@ impl Stepper {
                 arith(op, &l, &r)
             }
             BinOp::And | BinOp::Or => unreachable!("handled above"),
-            BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => {
-                Err("set operators aren't in the step debugger yet — use Run".to_string())
-            }
+            BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => bitwise_or_set(op, &l, &r),
         }
     }
 
@@ -842,7 +854,7 @@ impl Stepper {
         match (name, vals.as_slice()) {
             ("len", [v]) => match v {
                 Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-                Value::List(l) => Ok(Value::Int(l.len() as i64)),
+                Value::List(l) | Value::Set(l) => Ok(Value::Int(l.len() as i64)),
                 Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
                 _ => Err(format!("object of type {} has no len()", type_name(v))),
             },
@@ -872,6 +884,8 @@ impl Stepper {
                 })
                 .ok_or_else(|| format!("can't convert {} to float", type_name(v))),
             ("bool", [v]) => Ok(Value::Bool(v.truthy())),
+            ("set", []) => Ok(Value::Set(Vec::new())),
+            ("set", [v]) => make_set(v),
             ("print", _) => {
                 // print used as a value: write, return None.
                 if let Some(sink) = out {
@@ -899,29 +913,40 @@ impl Stepper {
         for a in args {
             vals.push(Self::eval_in(funcs, scope, out, a)?);
         }
-        // Mutating list methods need the variable itself, so require a Name.
-        if let ExprKind::Name(name) = &obj.kind
-            && let Some(Value::List(items)) = scope.get_mut(name)
-        {
-            match (method, vals.as_slice()) {
-                ("append", [v]) => {
-                    items.push(v.clone());
-                    return Ok(Value::None);
-                }
-                ("pop", []) => {
-                    return items.pop().ok_or_else(|| "pop from empty list".to_string());
-                }
-                ("pop", [i]) => {
-                    let i = as_int(i).ok_or("pop index must be an integer")?;
-                    let n = items.len() as i64;
-                    let real = if i < 0 { i + n } else { i };
-                    if real < 0 || real >= n {
-                        return Err("pop index out of range".to_string());
+        // Mutating list/set methods need the variable itself, so require a Name.
+        if let ExprKind::Name(name) = &obj.kind {
+            match scope.get_mut(name) {
+                Some(Value::List(items)) => match (method, vals.as_slice()) {
+                    ("append", [v]) => {
+                        items.push(v.clone());
+                        return Ok(Value::None);
                     }
-                    return Ok(items.remove(real as usize));
+                    ("pop", []) => {
+                        return items.pop().ok_or_else(|| "pop from empty list".to_string());
+                    }
+                    ("pop", [i]) => {
+                        let i = as_int(i).ok_or("pop index must be an integer")?;
+                        let n = items.len() as i64;
+                        let real = if i < 0 { i + n } else { i };
+                        if real < 0 || real >= n {
+                            return Err("pop index out of range".to_string());
+                        }
+                        return Ok(items.remove(real as usize));
+                    }
+                    _ => {}
+                },
+                Some(Value::Set(items)) => {
+                    if let Some(res) = set_method_mut(items, method, &vals) {
+                        return res;
+                    }
                 }
                 _ => {}
             }
+        }
+        // Non-mutating set methods (union/intersection/issubset/copy/…).
+        let recv = Self::eval_in(funcs, scope, out, obj)?;
+        if let Some(res) = set_method_val(&recv, method, &vals) {
+            return res;
         }
         Err(format!(
             ".{method}() isn't in the step debugger yet — use Run for that"
@@ -1198,7 +1223,7 @@ fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
 /// keys.
 fn contains(haystack: &Value, needle: &Value) -> Result<bool, String> {
     match haystack {
-        Value::List(items) => Ok(items.iter().any(|v| py_eq(v, needle))),
+        Value::List(items) | Value::Set(items) => Ok(items.iter().any(|v| py_eq(v, needle))),
         Value::Dict(pairs) => Ok(pairs.iter().any(|(k, _)| py_eq(k, needle))),
         Value::Str(s) => match needle {
             Value::Str(sub) => Ok(s.contains(sub.as_str())),
@@ -1258,6 +1283,10 @@ fn add(l: &Value, r: &Value) -> Result<Value, String> {
 /// Numeric arithmetic with Python semantics: `/` is always float, `//` floors,
 /// `%` follows the divisor's sign, mixed int/float promotes to float.
 fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    // `set - set` is set difference, not arithmetic.
+    if op == BinOp::Sub && matches!((l, r), (Value::Set(_), Value::Set(_))) {
+        return set_binop(BinOp::Sub, l, r);
+    }
     let (x, y) = match (as_num(l), as_num(r)) {
         (Some(x), Some(y)) => (x, y),
         _ => {
@@ -1322,6 +1351,7 @@ fn type_name(v: &Value) -> &'static str {
         Value::Bool(_) => "bool",
         Value::Str(_) => "str",
         Value::List(_) => "list",
+        Value::Set(_) => "set",
         Value::Dict(_) => "dict",
         Value::None => "NoneType",
     }
@@ -2025,7 +2055,7 @@ impl Vm {
             }
             Task::ForEachSetup(var, body) => {
                 let items = match self.pop_op()? {
-                    Value::List(v) => v,
+                    Value::List(v) | Value::Set(v) => v,
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                     Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
                     other => return Err(format!("can't loop over {}", type_name(&other))),
@@ -2285,6 +2315,149 @@ impl Vm {
     }
 }
 
+/// Build a set from any iterable value, de-duplicating by Python equality and
+/// keeping first-seen (insertion) order — matching the compiled backends.
+fn make_set(v: &Value) -> Result<Value, String> {
+    let items: Vec<Value> = match v {
+        Value::List(x) | Value::Set(x) => x.clone(),
+        Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+        Value::Dict(d) => d.iter().map(|(k, _)| k.clone()).collect(),
+        _ => return Err(format!("{} object is not iterable", type_name(v))),
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for it in items {
+        if !out.iter().any(|y| py_eq(y, &it)) {
+            out.push(it);
+        }
+    }
+    Ok(Value::Set(out))
+}
+
+/// A set-theory operation on two sets: `|` union, `&` intersection, `^`
+/// symmetric difference, `-` difference. Insertion-order preserving.
+fn set_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    let (Value::Set(a), Value::Set(b)) = (l, r) else {
+        return Err(format!(
+            "unsupported operand type for a set operation: {} and {}",
+            type_name(l),
+            type_name(r)
+        ));
+    };
+    let in_set = |set: &[Value], v: &Value| set.iter().any(|y| py_eq(y, v));
+    let res: Vec<Value> = match op {
+        BinOp::BitOr => {
+            let mut v = a.clone();
+            for x in b {
+                if !in_set(&v, x) {
+                    v.push(x.clone());
+                }
+            }
+            v
+        }
+        BinOp::BitAnd => a.iter().filter(|x| in_set(b, x)).cloned().collect(),
+        BinOp::Sub => a.iter().filter(|x| !in_set(b, x)).cloned().collect(),
+        BinOp::BitXor => a
+            .iter()
+            .filter(|x| !in_set(b, x))
+            .chain(b.iter().filter(|x| !in_set(a, x)))
+            .cloned()
+            .collect(),
+        _ => unreachable!("non-set-op passed to set_binop"),
+    };
+    Ok(Value::Set(res))
+}
+
+/// `&`/`|`/`^`: a set operation when both sides are sets, else integer bitwise
+/// (matching Python and the native backend).
+fn bitwise_or_set(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    if matches!((l, r), (Value::Set(_), Value::Set(_))) {
+        return set_binop(op, l, r);
+    }
+    match (as_int(l), as_int(r)) {
+        (Some(x), Some(y)) => {
+            let z = match op {
+                BinOp::BitOr => x | y,
+                BinOp::BitAnd => x & y,
+                BinOp::BitXor => x ^ y,
+                _ => unreachable!(),
+            };
+            Ok(Value::Int(z))
+        }
+        _ => Err(format!(
+            "unsupported operand type for {}: {} and {}",
+            op_symbol(op),
+            type_name(l),
+            type_name(r)
+        )),
+    }
+}
+
+/// Whether every element of `a` is in `b` (both must be sets).
+fn set_subset(a: &Value, b: &Value) -> Result<bool, String> {
+    match (a, b) {
+        (Value::Set(x), Value::Set(y)) => Ok(x.iter().all(|e| y.iter().any(|f| py_eq(f, e)))),
+        _ => Err("issubset/issuperset need a set argument".to_string()),
+    }
+}
+
+/// Mutating set methods on the set's elements (the receiver is a set variable).
+/// Returns `None` if `method` isn't a mutating set method.
+fn set_method_mut(
+    items: &mut Vec<Value>,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, String>> {
+    let r = match (method, args) {
+        ("add", [v]) => {
+            if !items.iter().any(|y| py_eq(y, v)) {
+                items.push(v.clone());
+            }
+            Ok(Value::None)
+        }
+        ("discard", [v]) => {
+            items.retain(|y| !py_eq(y, v));
+            Ok(Value::None)
+        }
+        ("remove", [v]) => match items.iter().position(|y| py_eq(y, v)) {
+            Some(i) => {
+                items.remove(i);
+                Ok(Value::None)
+            }
+            None => Err(format!("{} is not in the set", v.py_repr())),
+        },
+        // Our sets are insertion-ordered, so pop removes the last element.
+        ("pop", []) => items
+            .pop()
+            .ok_or_else(|| "pop from an empty set".to_string()),
+        ("clear", []) => {
+            items.clear();
+            Ok(Value::None)
+        }
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// Non-mutating set methods on a set value. Returns `None` if `recv` isn't a set
+/// or `method` isn't a non-mutating set method. Binary-op methods require a set
+/// argument (matching the compiled backends).
+fn set_method_val(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    if !matches!(recv, Value::Set(_)) {
+        return None;
+    }
+    let r = match (method, args) {
+        ("union", [o]) => set_binop(BinOp::BitOr, recv, o),
+        ("intersection", [o]) => set_binop(BinOp::BitAnd, recv, o),
+        ("difference", [o]) => set_binop(BinOp::Sub, recv, o),
+        ("symmetric_difference", [o]) => set_binop(BinOp::BitXor, recv, o),
+        ("issubset", [o]) => set_subset(recv, o).map(Value::Bool),
+        ("issuperset", [o]) => set_subset(o, recv).map(Value::Bool),
+        ("copy", []) => Ok(recv.clone()),
+        _ => return None,
+    };
+    Some(r)
+}
+
 /// Apply a binary operator to two evaluated values (shared by the VM).
 fn apply_bin(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     match op {
@@ -2298,9 +2471,7 @@ fn apply_bin(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             arith(op, l, r)
         }
         BinOp::And | BinOp::Or => unreachable!("short-circuited before apply"),
-        BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => {
-            Err("set operators aren't in the step debugger yet — use Run".to_string())
-        }
+        BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => bitwise_or_set(op, l, r),
     }
 }
 
@@ -2334,7 +2505,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args) {
         ("len", [v]) => match v {
             Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-            Value::List(l) => Ok(Value::Int(l.len() as i64)),
+            Value::List(l) | Value::Set(l) => Ok(Value::Int(l.len() as i64)),
             Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
             _ => Err(format!("object of type {} has no len()", type_name(v))),
         },
@@ -2364,6 +2535,8 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             })
             .ok_or_else(|| format!("can't convert {} to float", type_name(v))),
         ("bool", [v]) => Ok(Value::Bool(v.truthy())),
+        ("set", []) => Ok(Value::Set(Vec::new())),
+        ("set", [v]) => make_set(v),
         _ => Err(format!(
             "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
         )),
@@ -2379,23 +2552,31 @@ fn list_method(
 ) -> Result<Value, String> {
     let unsupported =
         || format!(".{method}() isn't in the step debugger's call-stack mode yet — use Run");
-    let Some(Value::List(items)) = frame.scope.get_mut(name) else {
-        return Err(unsupported());
-    };
-    match (method, args.as_slice()) {
-        ("append", [v]) => {
-            items.push(v.clone());
-            Ok(Value::None)
-        }
-        ("pop", []) => items.pop().ok_or_else(|| "pop from empty list".to_string()),
-        ("pop", [i]) => {
-            let i = as_int(i).ok_or("pop index must be an integer")?;
-            let n = items.len() as i64;
-            let real = if i < 0 { i + n } else { i };
-            if real < 0 || real >= n {
-                return Err("pop index out of range".to_string());
+    match frame.scope.get_mut(name) {
+        Some(Value::List(items)) => match (method, args.as_slice()) {
+            ("append", [v]) => {
+                items.push(v.clone());
+                Ok(Value::None)
             }
-            Ok(items.remove(real as usize))
+            ("pop", []) => items.pop().ok_or_else(|| "pop from empty list".to_string()),
+            ("pop", [i]) => {
+                let i = as_int(i).ok_or("pop index must be an integer")?;
+                let n = items.len() as i64;
+                let real = if i < 0 { i + n } else { i };
+                if real < 0 || real >= n {
+                    return Err("pop index out of range".to_string());
+                }
+                Ok(items.remove(real as usize))
+            }
+            _ => Err(unsupported()),
+        },
+        Some(Value::Set(items)) => {
+            if let Some(res) = set_method_mut(items, method, &args) {
+                return res;
+            }
+            // Non-mutating methods need the value; clone the set and dispatch.
+            let recv = Value::Set(items.clone());
+            set_method_val(&recv, method, &args).unwrap_or_else(|| Err(unsupported()))
         }
         _ => Err(unsupported()),
     }
@@ -2649,6 +2830,48 @@ mod tests {
             vm.status()
         );
         vm.output().to_string()
+    }
+
+    #[test]
+    fn both_engines_support_sets() {
+        // Literal dedup + len + membership + print (insertion order, like Run).
+        let basics = "s = {3, 1, 2, 1}\nprint(s)\nprint(len(s))\nprint(2 in s)\nprint(9 in s)\n";
+        let want = "{3, 1, 2}\n3\nTrue\nFalse\n";
+        assert_eq!(run_to_end(basics), want);
+        assert_eq!(vm_run(basics), want);
+
+        // Set theory operators.
+        let ops = "a = {1, 2, 3}\nb = {2, 3, 4}\n\
+                   print(len(a & b))\nprint(len(a | b))\nprint(len(a - b))\nprint(len(a ^ b))\n";
+        assert_eq!(run_to_end(ops), "2\n4\n1\n2\n");
+        assert_eq!(vm_run(ops), "2\n4\n1\n2\n");
+
+        // Iteration, empty set, set()/set-from-list, and int bitwise (not a set op).
+        assert_eq!(
+            vm_run("s = {1, 2, 3}\nt = 0\nfor x in s:\n    t = t + x\nprint(t)\n"),
+            "6\n"
+        );
+        assert_eq!(vm_run("print(set())\n"), "set()\n");
+        assert_eq!(vm_run("print(len(set([1, 1, 2])))\n"), "2\n");
+        assert_eq!(vm_run("print(6 & 3)\n"), "2\n");
+    }
+
+    #[test]
+    fn both_engines_support_set_methods() {
+        // add / discard / remove / len, then membership.
+        let m = "s = {1, 2}\ns.add(3)\ns.add(2)\ns.discard(1)\nprint(len(s))\nprint(2 in s)\nprint(1 in s)\n";
+        assert_eq!(run_to_end(m), "2\nTrue\nFalse\n");
+        assert_eq!(vm_run(m), "2\nTrue\nFalse\n");
+        // union / intersection / issubset (non-mutating, set arg).
+        let n = "a = {1, 2}\nb = {2, 3}\nprint(len(a.union(b)))\nprint(len(a.intersection(b)))\nprint(a.issubset({1, 2, 3}))\n";
+        assert_eq!(run_to_end(n), "3\n1\nTrue\n");
+        assert_eq!(vm_run(n), "3\n1\nTrue\n");
+        // pop shrinks; clear empties.
+        assert_eq!(
+            vm_run("s = {7}\nx = s.pop()\nprint(x)\nprint(len(s))\n"),
+            "7\n0\n"
+        );
+        assert_eq!(vm_run("s = {1, 2}\ns.clear()\nprint(len(s))\n"), "0\n");
     }
 
     #[test]
