@@ -182,10 +182,14 @@ fn walk_expr(e: &Expr, known: &[&str], out: &mut Vec<CompileError>) {
             if !known.contains(&name.as_str())
                 && let Some(sugg) = did_you_mean(name, known)
             {
-                out.push(CompileError::at(
-                    e.line,
-                    format!("`{name}` isn't defined — did you mean `{sugg}`?"),
-                ));
+                let message = format!("`{name}` isn't defined — did you mean `{sugg}`?");
+                // The parser records the callee name's span on Call nodes, so the
+                // editor can squiggle exactly the misspelled name. `(0, 0)` means
+                // unset (e.g. a desugared call) — fall back to line-only.
+                out.push(match e.span {
+                    (0, 0) => CompileError::at(e.line, message),
+                    span => CompileError::at_span(e.line, span, message),
+                });
             }
             for a in args {
                 walk_expr(a, known, out);
@@ -694,6 +698,17 @@ mod tests {
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].contains("did you mean `print`"), "{}", d[0]);
         assert!(d[0].contains("line 1"));
+    }
+
+    #[test]
+    fn typo_diagnostic_spans_the_misspelled_name() {
+        let src = "x = 1\nresult = pint(x)\n";
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        let d = typo_diagnostics(&stmts);
+        assert_eq!(d.len(), 1, "{d:?}");
+        let (s, e) = d[0].span.expect("typo should carry the name's span");
+        assert_eq!(&src[s..e], "pint"); // squiggles exactly the bad name
     }
 
     #[test]

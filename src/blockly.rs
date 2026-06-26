@@ -952,6 +952,19 @@ mod tests {
     }
 
     #[test]
+    fn to_blocks_surfaces_a_typo_span() {
+        // A misspelled call → error_spans carries the byte range of the name, so
+        // the editor squiggles exactly `pint`.
+        let src = "pint(\"hi\")\n";
+        let out = to_blocks(src);
+        assert!(
+            out.error_spans.iter().any(|&(s, e)| &src[s..e] == "pint"),
+            "spans: {:?}",
+            out.error_spans
+        );
+    }
+
+    #[test]
     fn booleans_and_logic() {
         let json = to_blockly_json("ok = True and not False").unwrap();
         assert!(json.contains("\"type\":\"logic_boolean\""));

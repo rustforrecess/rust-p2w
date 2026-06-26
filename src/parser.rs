@@ -1070,6 +1070,7 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self) -> Result<Expr> {
         let line = self.line();
+        let start = self.byte();
         let expr = |kind| Expr {
             kind,
             line,
@@ -1262,9 +1263,16 @@ impl<'a> Parser<'a> {
                     "False" => Ok(expr(ExprKind::Bool(false))),
                     "None" => Ok(expr(ExprKind::NoneLit)),
                     _ if matches!(self.peek(), Tok::LParen) => {
+                        // Span covers the callee name, so a "did you mean…?" typo
+                        // squiggles exactly the misspelled name.
+                        let name_span = (start, start + name.len());
                         self.advance();
                         let args = self.call_args()?;
-                        Ok(expr(ExprKind::Call(name, args)))
+                        Ok(Expr {
+                            kind: ExprKind::Call(name, args),
+                            line,
+                            span: name_span,
+                        })
                     }
                     _ => Ok(expr(ExprKind::Name(name))),
                 }
