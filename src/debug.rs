@@ -37,6 +37,9 @@ pub enum Value {
     Bool(bool),
     Str(String),
     List(Vec<Value>),
+    /// An immutable tuple `(a, b)`. A distinct type from `List`: it has no item
+    /// assignment and isn't equal to a list with the same elements.
+    Tuple(Vec<Value>),
     /// Insertion-ordered unique elements (matches the compiled backends; sets are
     /// conceptually unordered, so equality below ignores order).
     Set(Vec<Value>),
@@ -54,6 +57,7 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Str(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
+            Value::Tuple(v) => !v.is_empty(),
             Value::Set(v) => !v.is_empty(),
             Value::Dict(d) => !d.is_empty(),
             Value::None => false,
@@ -81,6 +85,15 @@ impl Value {
             Value::List(v) => {
                 let items: Vec<String> = v.iter().map(Value::py_repr).collect();
                 format!("[{}]", items.join(", "))
+            }
+            // A 1-tuple keeps its trailing comma: `(1,)`. Empty is `()`.
+            Value::Tuple(v) => {
+                let items: Vec<String> = v.iter().map(Value::py_repr).collect();
+                if items.len() == 1 {
+                    format!("({},)", items[0])
+                } else {
+                    format!("({})", items.join(", "))
+                }
             }
             // Empty set prints `set()` (Python) — `{}` is an empty dict.
             Value::Set(v) if v.is_empty() => "set()".to_string(),
@@ -130,7 +143,7 @@ fn py_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::None, Value::None) => true,
-        (Value::List(x), Value::List(y)) => {
+        (Value::List(x), Value::List(y)) | (Value::Tuple(x), Value::Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
         }
         // Sets are unordered: equal iff same size and every element is in both.
@@ -742,7 +755,7 @@ impl Stepper {
 
     fn iterable_items(&mut self, e: &Expr) -> Result<Vec<Value>, String> {
         match self.eval(e)? {
-            Value::List(v) | Value::Set(v) => Ok(v),
+            Value::List(v) | Value::Set(v) | Value::Tuple(v) => Ok(v),
             Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
             Value::Dict(d) => Ok(d.into_iter().map(|(k, _)| k).collect()),
             other => Err(format!("can't loop over {}", type_name(&other))),
@@ -791,6 +804,13 @@ impl Stepper {
                     out_items.push(Self::eval_in(funcs, scope, out, it)?);
                 }
                 Ok(Value::List(out_items))
+            }
+            ExprKind::Tuple(items) => {
+                let mut out_items = Vec::with_capacity(items.len());
+                for it in items {
+                    out_items.push(Self::eval_in(funcs, scope, out, it)?);
+                }
+                Ok(Value::Tuple(out_items))
             }
             ExprKind::Dict(pairs) => {
                 let mut out_pairs = Vec::with_capacity(pairs.len());
@@ -879,7 +899,7 @@ impl Stepper {
         match (name, vals.as_slice()) {
             ("len", [v]) => match v {
                 Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-                Value::List(l) | Value::Set(l) => Ok(Value::Int(l.len() as i64)),
+                Value::List(l) | Value::Set(l) | Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
                 Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
                 _ => Err(format!("object of type {} has no len()", type_name(v))),
             },
@@ -1208,6 +1228,9 @@ fn assign_index_in(
             }
             Ok(())
         }
+        Value::Tuple(_) => {
+            Err("a tuple is immutable — you can't change its items (use a list)".to_string())
+        }
         _ => Err("only lists and dicts support item assignment".to_string()),
     }
 }
@@ -1216,7 +1239,7 @@ fn assign_index_in(
 /// string), and dicts (any key).
 fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
     match target {
-        Value::List(items) => {
+        Value::List(items) | Value::Tuple(items) => {
             let i = as_int(index).ok_or("list indices must be integers")?;
             let n = items.len() as i64;
             let real = if i < 0 { i + n } else { i };
@@ -1248,7 +1271,9 @@ fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
 /// keys.
 fn contains(haystack: &Value, needle: &Value) -> Result<bool, String> {
     match haystack {
-        Value::List(items) | Value::Set(items) => Ok(items.iter().any(|v| py_eq(v, needle))),
+        Value::List(items) | Value::Set(items) | Value::Tuple(items) => {
+            Ok(items.iter().any(|v| py_eq(v, needle)))
+        }
         Value::Dict(pairs) => Ok(pairs.iter().any(|(k, _)| py_eq(k, needle))),
         Value::Str(s) => match needle {
             Value::Str(sub) => Ok(s.contains(sub.as_str())),
@@ -1376,6 +1401,7 @@ fn type_name(v: &Value) -> &'static str {
         Value::Bool(_) => "bool",
         Value::Str(_) => "str",
         Value::List(_) => "list",
+        Value::Tuple(_) => "tuple",
         Value::Set(_) => "set",
         Value::Dict(_) => "dict",
         Value::None => "NoneType",
@@ -1491,6 +1517,8 @@ enum Task {
     Return,
     /// Pop `n` values and build a list.
     BuildList(usize),
+    /// Pop `n` values and build a tuple.
+    BuildTuple(usize),
     /// Pop `2n` values (key/value interleaved) and build a dict.
     BuildDict(usize),
     /// Pop index then target; push `target[index]`.
@@ -2050,6 +2078,14 @@ impl Vm {
                 items.reverse();
                 self.push_op(Value::List(items));
             }
+            Task::BuildTuple(n) => {
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.pop_op()?);
+                }
+                items.reverse();
+                self.push_op(Value::Tuple(items));
+            }
             Task::BuildDict(n) => {
                 let mut flat = Vec::with_capacity(2 * n);
                 for _ in 0..(2 * n) {
@@ -2080,7 +2116,7 @@ impl Vm {
             }
             Task::ForEachSetup(var, body) => {
                 let items = match self.pop_op()? {
-                    Value::List(v) | Value::Set(v) => v,
+                    Value::List(v) | Value::Set(v) | Value::Tuple(v) => v,
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                     Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
                     other => return Err(format!("can't loop over {}", type_name(&other))),
@@ -2162,6 +2198,12 @@ impl Vm {
             }
             ExprKind::List(items) => {
                 self.push_task(Task::BuildList(items.len()));
+                for it in items.iter().rev() {
+                    self.push_task(Task::Eval(Rc::new(it.clone())));
+                }
+            }
+            ExprKind::Tuple(items) => {
+                self.push_task(Task::BuildTuple(items.len()));
                 for it in items.iter().rev() {
                     self.push_task(Task::Eval(Rc::new(it.clone())));
                 }
@@ -2328,6 +2370,13 @@ impl Vm {
                 }
                 Ok(Value::List(out))
             }
+            ExprKind::Tuple(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(self.watch_eval(it)?);
+                }
+                Ok(Value::Tuple(out))
+            }
             ExprKind::Dict(pairs) => {
                 let mut out = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
@@ -2344,7 +2393,7 @@ impl Vm {
 /// keeping first-seen (insertion) order — matching the compiled backends.
 fn make_set(v: &Value) -> Result<Value, String> {
     let items: Vec<Value> = match v {
-        Value::List(x) | Value::Set(x) => x.clone(),
+        Value::List(x) | Value::Set(x) | Value::Tuple(x) => x.clone(),
         Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
         Value::Dict(d) => d.iter().map(|(k, _)| k.clone()).collect(),
         _ => return Err(format!("{} object is not iterable", type_name(v))),
@@ -2530,7 +2579,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args) {
         ("len", [v]) => match v {
             Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-            Value::List(l) | Value::Set(l) => Ok(Value::Int(l.len() as i64)),
+            Value::List(l) | Value::Set(l) | Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
             Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
             _ => Err(format!("object of type {} has no len()", type_name(v))),
         },
@@ -2885,6 +2934,45 @@ mod tests {
         assert_eq!(vm_run("print(set())\n"), "set()\n");
         assert_eq!(vm_run("print(len(set([1, 1, 2])))\n"), "2\n");
         assert_eq!(vm_run("print(6 & 3)\n"), "2\n");
+    }
+
+    /// Run to completion, returning the error message if it stopped on one.
+    fn vm_err(src: &str) -> Option<String> {
+        let mut vm = Vm::new(src).expect("parse");
+        let mut guard = 0;
+        while vm.is_paused() {
+            vm.step();
+            guard += 1;
+            assert!(guard < 100_000, "ran away");
+        }
+        match vm.status() {
+            Status::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn both_engines_support_real_tuples() {
+        // Build, print (parens), len, index-read, membership, iteration.
+        let t = "t = (1, 2, 3)\nprint(t)\nprint(len(t))\nprint(t[0])\nprint(2 in t)\n";
+        assert_eq!(run_to_end(t), "(1, 2, 3)\n3\n1\nTrue\n");
+        assert_eq!(vm_run(t), "(1, 2, 3)\n3\n1\nTrue\n");
+        // 1-tuple keeps its comma; empty is ().
+        assert_eq!(vm_run("print((5,))\nprint(())\n"), "(5,)\n()\n");
+        // A tuple is NOT equal to a list with the same elements.
+        assert_eq!(vm_run("print((1, 2) == [1, 2])\n"), "False\n");
+        // Sum a tuple via iteration.
+        assert_eq!(
+            vm_run("t = (1, 2, 3)\ns = 0\nfor x in t:\n    s = s + x\nprint(s)\n"),
+            "6\n"
+        );
+    }
+
+    #[test]
+    fn tuples_are_immutable() {
+        // Item assignment to a tuple is an error, not a silent mutation.
+        let err = vm_err("t = (1, 2)\nt[0] = 9\n").expect("should error");
+        assert!(err.contains("immutable"), "{err}");
     }
 
     #[test]
