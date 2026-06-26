@@ -403,6 +403,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 });
             }
             other => {
+                // Math/set-theory glyphs (often pasted from a textbook) aren't
+                // valid Python — point at the ASCII operator that runs.
+                if let Some(hint) = set_glyph_hint(other) {
+                    return Err(CompileError::at(line, hint));
+                }
                 return Err(CompileError::at(
                     line,
                     format!("unexpected character '{other}'"),
@@ -434,6 +439,33 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
         line,
     });
     Ok(out)
+}
+
+/// If `c` is a set-theory / math glyph, return a "did you mean ...?" message
+/// naming the ASCII operator that compiles. These glyphs are *not* valid Python;
+/// the IDE rewrites them to ASCII on paste, but a hand-typed one should still get
+/// a helpful pointer rather than a bare "unexpected character".
+fn set_glyph_hint(c: char) -> Option<String> {
+    let (ascii, meaning) = match c {
+        '∩' => ("&", "set intersection"),
+        '∪' => ("|", "set union"),
+        '∖' | '⧵' => ("-", "set difference"),
+        '∆' | '△' | '⊕' => ("^", "symmetric difference"),
+        '∈' => ("in", "membership"),
+        '∉' => ("not in", "non-membership"),
+        '⊆' => ("<=", "subset"),
+        '⊇' => (">=", "superset"),
+        '⊂' => ("<", "proper subset"),
+        '⊃' => (">", "proper superset"),
+        '∅' => ("set()", "the empty set"),
+        '≤' => ("<=", "less-than-or-equal"),
+        '≥' => (">=", "greater-than-or-equal"),
+        '≠' => ("!=", "not-equal"),
+        _ => return None,
+    };
+    Some(format!(
+        "'{c}' isn't Python — did you mean '{ascii}' ({meaning})?"
+    ))
 }
 
 /// A single-char operator at `i`: `AugAssign(op)` (width 2) if followed by
@@ -720,5 +752,24 @@ mod tests {
     #[test]
     fn unterminated_string_errors() {
         assert!(lex("\"oops").is_err());
+    }
+
+    #[test]
+    fn set_glyphs_suggest_the_ascii_operator() {
+        // Pasted math notation isn't valid Python — the error names the operator
+        // that runs, rather than a bare "unexpected character".
+        let msg = lex("A = B ∩ C\n").unwrap_err().message;
+        assert!(msg.contains("'&'"), "{msg}");
+        assert!(msg.contains("intersection"), "{msg}");
+
+        let msg = lex("x = a ∪ b\n").unwrap_err().message;
+        assert!(msg.contains("'|'"), "{msg}");
+
+        let msg = lex("print(x ∈ s)\n").unwrap_err().message;
+        assert!(msg.contains("'in'"), "{msg}");
+
+        // A genuinely unknown char still gets the generic message.
+        let msg = lex("x = `y`\n").unwrap_err().message;
+        assert!(msg.contains("unexpected character"), "{msg}");
     }
 }
