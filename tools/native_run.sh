@@ -171,7 +171,12 @@ run_case set_remove 's = {1, 2, 3}\ns.remove(2)\ns.discard(9)\nprint(len(s))\npr
 run_case set_methods 'a = {1, 2, 3}\nb = {2, 3, 4}\nprint(len(a.union(b)))\nprint(len(a.intersection(b)))\nprint(a.issubset({1, 2, 3, 4}))\n' '4\n2\nTrue' || fails=$((fails+1))
 run_case set_copy_clear 's = {1, 2, 3}\nt = s.copy()\ns.clear()\nprint(len(s))\nprint(len(t))\n' '0\n3' || fails=$((fails+1))
 run_case set_pop   's = {5}\nx = s.pop()\nprint(x)\nprint(len(s))\n'             '5\n0'        || fails=$((fails+1))
-# --- tuples (lowered to lists) ---
+# --- tuples (a distinct, immutable type) ---
+run_case tuple_print 't = (1, 2, 3)\nprint(t)\n' '(1, 2, 3)' || fails=$((fails+1))
+run_case tuple_single 't = (5,)\nprint(t)\n' '(5,)' || fails=$((fails+1))
+run_case tuple_membership 't = (1, 2, 3)\nprint(2 in t)\nprint(9 in t)\n' 'True\nFalse' || fails=$((fails+1))
+run_case tuple_iter 't = (1, 2, 3)\ns = 0\nfor x in t:\n    s = s + x\nprint(s)\n' '6' || fails=$((fails+1))
+run_case tuple_in_list 'xs = [(1, 2), (3, 4)]\nprint(xs)\n' '[(1, 2), (3, 4)]' || fails=$((fails+1))
 run_case tuple_unpack 't = (1, 2, 3)\na, b, c = t\nprint(a)\nprint(c)\n' '1\n3' || fails=$((fails+1))
 run_case tuple_swap 'a = 1\nb = 2\na, b = b, a\nprint(a)\nprint(b)\n' '2\n1' || fails=$((fails+1))
 run_case tuple_return 'def minmax(x: int, y: int):\n    if x < y:\n        return x, y\n    return y, x\nlo, hi = minmax(5, 3)\nprint(lo)\nprint(hi)\n' '3\n5' || fails=$((fails+1))

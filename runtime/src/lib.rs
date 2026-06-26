@@ -671,7 +671,9 @@ fn value_eq(a: Value, b: Value) -> bool {
                 let n = coll_len(oa);
                 return n == coll_len(ob) && (0..n).all(|i| str_byte(a, i) == str_byte(b, i));
             }
-            T_LIST => {
+            // Tuples compare elementwise like lists; the tag guard above already
+            // makes a tuple != a list with the same elements.
+            T_LIST | T_TUPLE => {
                 let n = coll_len(oa);
                 return n == coll_len(ob)
                     && (0..n).all(|i| value_eq(list_get(oa, i), list_get(ob, i)));
@@ -708,8 +710,8 @@ pub extern "C" fn p2w_truthy(v: Value) -> bool {
     if is_float(v) {
         return as_f64(v) != 0.0; // 0.0 and -0.0 are falsy
     }
-    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT) {
-        return coll_len(v as usize) != 0; // empty string/list/dict is falsy
+    if is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_TUPLE) {
+        return coll_len(v as usize) != 0; // empty string/list/dict/tuple is falsy
     }
     v != V_NONE // None is falsy; other heap values are truthy
 }
@@ -771,7 +773,7 @@ fn free_object(o: usize) {
     // children (ownership model: insert transfers the value's ref in; free
     // releases it). This is the cascading free the RTOS note wants to bound.
     match rd(o) {
-        T_LIST | T_SET => {
+        T_LIST | T_SET | T_TUPLE => {
             for i in 0..coll_len(o) {
                 p2w_release(list_get(o, i));
             }
@@ -842,6 +844,10 @@ const T_FARRAY: u32 = 8;
 /// A set: list-backed with dedup-on-insert (linear membership). Elements are
 /// boxed Values, like a list, but unique. Equality is order-independent.
 const T_SET: u32 = 9;
+/// An immutable tuple: identical layout to a list, but a distinct tag — item
+/// assignment is rejected, it prints with parentheses, and it isn't equal to a
+/// list. The emitter builds a list and then `p2w_freeze`s it to this tag.
+const T_TUPLE: u32 = 10;
 
 fn coll_len(o: usize) -> usize {
     rd(o + 8) as usize
@@ -954,7 +960,7 @@ pub extern "C" fn p2w_len(v: Value) -> Value {
     if is_heap(v)
         && matches!(
             obj_tag(v),
-            T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY | T_SET
+            T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY | T_SET | T_TUPLE
         )
     {
         return make_int(coll_len(v as usize) as i64);
@@ -974,7 +980,7 @@ pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
             let i = norm_index(index, coll_len(o) as i64);
             str_alloc(&[str_byte(target, i as usize)])
         }
-        T_LIST => {
+        T_LIST | T_TUPLE => {
             let i = norm_index(index, coll_len(o) as i64);
             owned(list_get(o, i as usize)) // hand the caller an owned ref
         }
@@ -1000,6 +1006,7 @@ pub extern "C" fn p2w_setindex(target: Value, index: Value, value: Value) {
             list_set_at(o, i as usize, value); // new value transferred in
         }
         T_DICT => dict_set(o, index, value),
+        T_TUPLE => trap("a tuple is immutable — you can't change its items"),
         _ => trap("object does not support item assignment"),
     }
 }
@@ -1021,6 +1028,17 @@ pub extern "C" fn p2w_list_append(list: Value, v: Value) -> Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_dict_new() -> Value {
     coll_new(T_DICT)
+}
+
+/// Turn a freshly-built list into an (immutable) tuple by re-tagging it in place
+/// — same layout, so no copy. The emitter builds a tuple literal as a list then
+/// freezes it. A no-op on a non-list (defensive).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_freeze(list: Value) -> Value {
+    if is_heap(list) && obj_tag(list) == T_LIST {
+        wr(list as usize, T_TUPLE);
+    }
+    list
 }
 
 // --- packed int arrays (list[int]) -----------------------------------------
@@ -1138,7 +1156,9 @@ pub extern "C" fn p2w_set_new() -> Value {
 /// Borrows the iterable; the set takes its own (retained) refs.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_set_of(iterable: Value) -> Value {
-    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET)) {
+    if !(is_heap(iterable)
+        && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    {
         trap("set() needs an iterable");
     }
     let r = p2w_set_new();
@@ -1172,7 +1192,7 @@ pub extern "C" fn p2w_in(value: Value, container: Value) -> Value {
     }
     let o = container as usize;
     let found = match obj_tag(container) {
-        T_SET | T_LIST => coll_contains(o, value),
+        T_SET | T_LIST | T_TUPLE => coll_contains(o, value),
         T_DICT => dict_find(o, value).is_some(),
         T_STR => str_contains(container, value),
         _ => trap("argument to `in` is not a container"),
@@ -1332,7 +1352,7 @@ fn container_len(c: Value) -> usize {
 fn element_at(c: Value, i: usize) -> Value {
     match obj_tag(c) {
         T_STR => str_alloc(&[str_byte(c, i)]), // freshly allocated -> already owned
-        T_LIST | T_SET => owned(list_get(c as usize, i)),
+        T_LIST | T_SET | T_TUPLE => owned(list_get(c as usize, i)),
         T_DICT => owned(dict_key(c as usize, i)),
         _ => trap("object is not iterable"),
     }
@@ -1340,7 +1360,7 @@ fn element_at(c: Value, i: usize) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_iter(c: Value) -> Value {
-    if !(is_heap(c) && matches!(obj_tag(c), T_STR | T_LIST | T_DICT | T_SET)) {
+    if !(is_heap(c) && matches!(obj_tag(c), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE)) {
         trap("object is not iterable");
     }
     let o = alloc(16);
@@ -1561,6 +1581,20 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
                 write_repr(list_get(o, i), out);
             }
             out(b']');
+        }
+        T_TUPLE => {
+            let n = coll_len(o);
+            out(b'(');
+            for i in 0..n {
+                if i > 0 {
+                    write_bytes(b", ", out);
+                }
+                write_repr(list_get(o, i), out);
+            }
+            if n == 1 {
+                out(b','); // a 1-tuple keeps its trailing comma: (5,)
+            }
+            out(b')');
         }
         T_DICT => {
             out(b'{');

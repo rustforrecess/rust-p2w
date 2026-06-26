@@ -59,6 +59,7 @@ declare i1 @p2w_unique(i32)
 ; containers
 declare i32 @p2w_list_new()
 declare i32 @p2w_list_append(i32, i32)
+declare i32 @p2w_freeze(i32)
 declare i32 @p2w_dict_new()
 declare i32 @p2w_iarray_new()
 declare void @p2w_iarray_push(i32, i32)
@@ -1577,11 +1578,14 @@ impl<'a> FuncEmitter<'a> {
             // A tuple is lowered to a (boxed, immutable-by-convention) list — same
             // heterogeneous storage; unpacking and indexing reuse the list path.
             ExprKind::Tuple(items) => {
-                let tup = self.call_value("call i32 @p2w_list_new()");
+                // Build as a list, then freeze it into an immutable tuple (a
+                // re-tag in place — same layout, no copy).
+                let lst = self.call_value("call i32 @p2w_list_new()");
                 for it in items {
                     let v = self.expr(it)?;
-                    self.line(&format!("call i32 @p2w_list_append(i32 {tup}, i32 {v})"));
+                    self.line(&format!("call i32 @p2w_list_append(i32 {lst}, i32 {v})"));
                 }
+                let tup = self.call_value(&format!("call i32 @p2w_freeze(i32 {lst})"));
                 Ok((tup, Repr::Boxed))
             }
             ExprKind::Dict(pairs) => {
@@ -2635,6 +2639,17 @@ mod tests {
         // Set methods are name-dispatched like any method (p2w_method0/1).
         let out = ir("s = {1, 2}\ns.add(3)\nprint(s.issubset({1, 2, 3}))\n");
         assert!(out.contains("@p2w_method1"), "method dispatch: {out}");
+    }
+
+    #[test]
+    fn tuple_literal_freezes_a_list() {
+        // A tuple builds a list then freezes it into the immutable T_TUPLE.
+        let out = ir("t = (1, 2, 3)\nprint(t[0])\n");
+        assert!(
+            out.contains("call i32 @p2w_list_new"),
+            "builds a list: {out}"
+        );
+        assert!(out.contains("call i32 @p2w_freeze"), "then freezes: {out}");
     }
 
     #[test]
