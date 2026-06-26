@@ -443,6 +443,11 @@ fn raise_helpers() -> Vec<Func> {
             "TypeError: str() of '",
             "' values isn't supported yet",
         ),
+        (
+            "$raise_unhashable",
+            "TypeError: unhashable type: '",
+            "' (a set can't contain it — use a tuple)",
+        ),
     ] {
         let mut b = Body::new();
         b.push("(call $write_char (i32.const 10))");
@@ -936,6 +941,8 @@ fn runtime_helpers() -> Vec<Func> {
 
     // $set_insert: add an element if absent (amortized growth, like list).
     let mut b = Body::new();
+    // Set members must be immutable (hashable): reject list/dict/set elements.
+    b.push("(if (i32.or (i32.or (ref.test (ref $LIST) (local.get $v)) (ref.test (ref $DICT) (local.get $v))) (ref.test (ref $SET) (local.get $v))) (then (call $raise_unhashable (local.get $v))))");
     b.push("(if (i32.ge_s (call $set_find (local.get $s) (local.get $v)) (i32.const 0)) (then (return)))");
     b.push("(local.set $items (struct.get $SET 1 (local.get $s)))");
     b.push("(local.set $len (struct.get $SET 0 (local.get $s)))");

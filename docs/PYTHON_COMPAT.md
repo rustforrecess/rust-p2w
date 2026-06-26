@@ -33,9 +33,11 @@ Differences:
   O(1) hashing. Same answers; only matters for large sets, which a teaching
   program on a microcontroller doesn't build. The backing store can be swapped
   for a hash table behind the same ABI if that ever changes.
-- **Element types aren't restricted to hashable values.** We compare elements
-  structurally, so a set may contain a list; CPython raises `TypeError`. We're
-  more permissive, not less.
+- **Set members must be immutable, like CPython.** A list, dict, or set can't be
+  a set element — it raises a friendly error (`unhashable type … use a tuple`). A
+  **tuple** is allowed (tuples are immutable). We don't yet check a tuple's
+  *contents*, so `{(1, [2])}` is accepted here though CPython rejects it — a minor
+  leniency.
 - **Set methods take a set argument.** `.add()`, `.remove()`, `.discard()`,
   `.pop()`, `.clear()`, `.copy()`, `.union()`, `.intersection()`, `.difference()`,
   `.symmetric_difference()`, `.issubset()`, `.issuperset()` all work; the

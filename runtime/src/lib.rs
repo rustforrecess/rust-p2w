@@ -1176,6 +1176,11 @@ pub extern "C" fn p2w_set_add(set: Value, v: Value) {
     if !(is_heap(set) && obj_tag(set) == T_SET) {
         trap("expected a set");
     }
+    // Set members must be immutable (hashable). A list/dict/set can change, so it
+    // can't be a member — use a tuple. (A tuple is allowed.)
+    if is_heap(v) && matches!(obj_tag(v), T_LIST | T_DICT | T_SET) {
+        trap("a set can't contain a list, dict, or set — use a tuple");
+    }
     if coll_contains(set as usize, v) {
         p2w_release(v); // redundant — the set already owns an equal element
     } else {

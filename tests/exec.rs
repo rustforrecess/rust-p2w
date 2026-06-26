@@ -1147,6 +1147,19 @@ fn tuple_indexing_and_len() {
 }
 
 #[test]
+fn tuple_is_immutable() {
+    // Item assignment to a tuple is a TypeError, not a silent mutation.
+    assert_raises("t = (1, 2)\nt[0] = 9", "does not support item assignment");
+}
+
+#[test]
+fn sets_reject_mutable_elements() {
+    // A list isn't hashable, so it can't be a set member; a tuple can.
+    assert_raises("s = {[1, 2]}", "unhashable type");
+    assert_output("print(len({(1, 2), (3, 4)}))", "2\n");
+}
+
+#[test]
 fn unpacking_and_swap() {
     assert_output("a, b = 1, 2\nprint(a, b)", "1 2\n");
     assert_output("a, b = 1, 2\na, b = b, a\nprint(a, b)", "2 1\n");

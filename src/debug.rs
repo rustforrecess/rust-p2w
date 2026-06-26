@@ -2389,6 +2389,18 @@ impl Vm {
     }
 }
 
+/// Set members must be immutable (hashable). A list/dict/set can change, so it
+/// can't be a member — a tuple can. Mirrors the compiled backends.
+fn check_set_elem(v: &Value) -> Result<(), String> {
+    match v {
+        Value::List(_) | Value::Dict(_) | Value::Set(_) => Err(format!(
+            "a set can't contain a {} — use a tuple",
+            type_name(v)
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Build a set from any iterable value, de-duplicating by Python equality and
 /// keeping first-seen (insertion) order — matching the compiled backends.
 fn make_set(v: &Value) -> Result<Value, String> {
@@ -2400,6 +2412,7 @@ fn make_set(v: &Value) -> Result<Value, String> {
     };
     let mut out: Vec<Value> = Vec::new();
     for it in items {
+        check_set_elem(&it)?;
         if !out.iter().any(|y| py_eq(y, &it)) {
             out.push(it);
         }
@@ -2482,12 +2495,15 @@ fn set_method_mut(
     args: &[Value],
 ) -> Option<Result<Value, String>> {
     let r = match (method, args) {
-        ("add", [v]) => {
-            if !items.iter().any(|y| py_eq(y, v)) {
-                items.push(v.clone());
+        ("add", [v]) => match check_set_elem(v) {
+            Err(e) => Err(e),
+            Ok(()) => {
+                if !items.iter().any(|y| py_eq(y, v)) {
+                    items.push(v.clone());
+                }
+                Ok(Value::None)
             }
-            Ok(Value::None)
-        }
+        },
         ("discard", [v]) => {
             items.retain(|y| !py_eq(y, v));
             Ok(Value::None)
@@ -2966,6 +2982,15 @@ mod tests {
             vm_run("t = (1, 2, 3)\ns = 0\nfor x in t:\n    s = s + x\nprint(s)\n"),
             "6\n"
         );
+    }
+
+    #[test]
+    fn sets_reject_mutable_elements() {
+        // A list/dict/set can't be a set member; a tuple can.
+        assert!(vm_err("s = {[1, 2]}\n").is_some_and(|e| e.contains("tuple")));
+        assert!(vm_err("s = set()\ns.add([1])\n").is_some_and(|e| e.contains("tuple")));
+        // Tuples are valid set elements.
+        assert_eq!(vm_run("s = {(1, 2), (3, 4)}\nprint(len(s))\n"), "2\n");
     }
 
     #[test]
