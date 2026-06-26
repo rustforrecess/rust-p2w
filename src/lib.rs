@@ -61,6 +61,21 @@ pub fn may_form_cycle(source: &str) -> bool {
     }
 }
 
+/// Names bound to a set somewhere in `source` — the seam the IDE uses to decide
+/// when `&`/`|`/`-`/`^` should *display* as set-theory glyphs (∩ ∪ ∖ ∆), since
+/// those are also int/bitwise operators (see `acornstem-ide/SET_NOTATION_SPEC.md`,
+/// Part 2). Uses error-recovering parse so a half-typed program still classifies;
+/// returns empty when nothing lexes.
+pub fn set_typed_names(source: &str) -> Vec<String> {
+    match lexer::lex(source) {
+        Ok(toks) => {
+            let (stmts, _) = parser::parse_recovering(&toks);
+            lint::set_typed_names(&stmts)
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

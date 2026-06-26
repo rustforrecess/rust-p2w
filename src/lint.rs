@@ -6,9 +6,10 @@
 //! itself defines is flagged, so a planned-but-undefined helper (`my_helper()`)
 //! or an unfamiliar name isn't second-guessed.
 
-use crate::ast::{CompClause, Expr, ExprKind, Stmt, StmtKind};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind};
 use crate::error::CompileError;
 use crate::parser::did_you_mean;
+use std::collections::HashSet;
 
 /// Builtins the compiler knows (plus type constructors). A call to a near-miss
 /// of one of these — that isn't itself a known/defined name — is almost
@@ -359,6 +360,105 @@ fn clauses_may_cycle(clauses: &[CompClause]) -> bool {
     })
 }
 
+// --- set-type inference (for IDE glyph display) ----------------------------
+//
+// `&`/`|`/`-`/`^` are *also* the int bitwise / subtraction operators, so the IDE
+// may only render them as set-theory glyphs (∩ ∪ ∖ ∆) when both operands are
+// sets. Deciding that needs to know which *names* hold sets — which this infers.
+// Flow-insensitive: a name assigned a set anywhere counts as a set everywhere.
+// That's deliberately loose (a display hint, never a correctness gate) and keeps
+// the analysis a simple fixed point.
+
+/// Names that are bound to a set somewhere in the program. See
+/// `acornstem-ide/SET_NOTATION_SPEC.md` (Part 2).
+pub fn set_typed_names(stmts: &[Stmt]) -> Vec<String> {
+    let mut assigns: Vec<(String, &Expr)> = Vec::new();
+    let mut sets: HashSet<String> = HashSet::new();
+    collect_assigns(stmts, &mut assigns, &mut sets);
+
+    // `c = a & b` only resolves once a and b are known — iterate to a fixed
+    // point. Bounded by the number of names, so it always terminates.
+    loop {
+        let mut changed = false;
+        for (name, rhs) in &assigns {
+            if !sets.contains(name) && is_set_expr(rhs, &sets) {
+                sets.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out: Vec<String> = sets.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// Gather every `name = rhs` assignment (for the fixed point) and seed `sets`
+/// with any `name: set = …` annotation (a declared set, regardless of the rhs).
+fn collect_assigns<'a>(
+    stmts: &'a [Stmt],
+    assigns: &mut Vec<(String, &'a Expr)>,
+    sets: &mut HashSet<String>,
+) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, value) => assigns.push((name.clone(), value)),
+            StmtKind::AnnAssign { name, ann, value } => {
+                if matches!(&ann.kind, ExprKind::Name(n) if n == "set") {
+                    sets.insert(name.clone());
+                }
+                assigns.push((name.clone(), value));
+            }
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                collect_assigns(body, assigns, sets);
+                for (_, b) in elifs {
+                    collect_assigns(b, assigns, sets);
+                }
+                if let Some(b) = else_body {
+                    collect_assigns(b, assigns, sets);
+                }
+            }
+            StmtKind::For { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::While { body, .. }
+            | StmtKind::Def { body, .. } => collect_assigns(body, assigns, sets),
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    collect_assigns(&m.body, assigns, sets);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `e` evaluates to a set, given the set-typed names known so far. Set
+/// literals and comprehensions desugar to `set(...)` in the parser, so they're
+/// covered by the `Call("set", …)` arm.
+fn is_set_expr(e: &Expr, sets: &HashSet<String>) -> bool {
+    match &e.kind {
+        ExprKind::Call(name, _) => name == "set" || name == "frozenset",
+        ExprKind::Name(n) => sets.contains(n),
+        ExprKind::Bin(BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor | BinOp::Sub, a, b) => {
+            is_set_expr(a, sets) && is_set_expr(b, sets)
+        }
+        ExprKind::MethodCall(recv, m, _) => {
+            matches!(
+                m.as_str(),
+                "union" | "intersection" | "difference" | "symmetric_difference" | "copy"
+            ) && is_set_expr(recv, sets)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +530,48 @@ mod tests {
     fn correct_builtins_are_not_flagged() {
         let d = diags("print(len(range(3)))\n");
         assert!(d.is_empty(), "{d:?}");
+    }
+
+    fn sets(src: &str) -> Vec<String> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        set_typed_names(&stmts)
+    }
+
+    #[test]
+    fn set_literals_and_calls_are_sets() {
+        assert_eq!(sets("a = {1, 2, 3}\n"), vec!["a"]);
+        assert_eq!(sets("a = set([1, 2])\n"), vec!["a"]);
+        assert_eq!(sets("a = set()\n"), vec!["a"]);
+        // Set comprehension desugars to set(<listcomp>).
+        assert_eq!(sets("a = {x for x in range(3)}\n"), vec!["a"]);
+    }
+
+    #[test]
+    fn set_operators_propagate_through_the_fixed_point() {
+        // c depends on a and b, which are sets — the fixed point must catch it
+        // regardless of how the assignment chain is ordered.
+        assert_eq!(
+            sets("a = {1, 2}\nb = {2, 3}\nc = a & b\nd = c | a\n"),
+            vec!["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn non_sets_are_not_flagged() {
+        // Bitwise/arith over ints, lists, and dicts are NOT sets.
+        let s = sets("flags = 6 & 3\nn = 10 - 1\nxs = [1, 2]\nd = {1: 2}\n");
+        assert!(s.is_empty(), "{s:?}");
+    }
+
+    #[test]
+    fn set_methods_and_annotation_count() {
+        assert_eq!(
+            sets("a = {1}\nb = a.union({2})\n"),
+            vec!["a", "b"],
+            "method result is a set"
+        );
+        // A `: set` annotation marks it even if the rhs is opaque (a param, say).
+        assert_eq!(sets("s: set = make_it()\n"), vec!["s"]);
     }
 }
