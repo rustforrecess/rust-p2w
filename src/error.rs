@@ -8,6 +8,10 @@ use std::fmt;
 pub struct CompileError {
     /// 1-based source line, when known.
     pub line: Option<usize>,
+    /// Byte range `[start, end)` of the offending source text, when known — lets
+    /// the editor underline the exact span (a squiggle) rather than the whole
+    /// line. `None` falls back to line-level highlighting.
+    pub span: Option<(usize, usize)>,
     pub message: String,
 }
 
@@ -15,6 +19,17 @@ impl CompileError {
     pub fn at(line: usize, message: impl Into<String>) -> Self {
         Self {
             line: Some(line),
+            span: None,
+            message: message.into(),
+        }
+    }
+
+    /// Like [`at`], but also carries the byte span of the offending text so the
+    /// editor can underline exactly that range.
+    pub fn at_span(line: usize, span: (usize, usize), message: impl Into<String>) -> Self {
+        Self {
+            line: Some(line),
+            span: Some(span),
             message: message.into(),
         }
     }
@@ -23,6 +38,7 @@ impl CompileError {
     pub fn general(message: impl Into<String>) -> Self {
         Self {
             line: None,
+            span: None,
             message: message.into(),
         }
     }

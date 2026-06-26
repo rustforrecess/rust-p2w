@@ -93,6 +93,19 @@ impl<'a> Parser<'a> {
         self.toks[self.pos].start
     }
 
+    /// A located error at the current token, carrying its byte span so the editor
+    /// can underline exactly the offending token (up to the next token's start).
+    fn err(&self, message: impl Into<String>) -> CompileError {
+        let start = self.byte();
+        let end = self
+            .toks
+            .get(self.pos + 1)
+            .map(|t| t.start)
+            .filter(|&e| e > start)
+            .unwrap_or(start + 1);
+        CompileError::at_span(self.line(), (start, end), message)
+    }
+
     fn advance(&mut self) -> &Tok {
         let t = &self.toks[self.pos].tok;
         if self.pos + 1 < self.toks.len() {
@@ -106,10 +119,10 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(())
         } else {
-            Err(CompileError::at(
-                self.line(),
-                format!("expected {what}, but found {}", describe(self.peek())),
-            ))
+            Err(self.err(format!(
+                "expected {what}, but found {}",
+                describe(self.peek())
+            )))
         }
     }
 
@@ -122,14 +135,13 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(())
             }
-            Tok::Newline | Tok::Eof => Err(CompileError::at(
-                self.line(),
-                "did you forget a colon ':' at the end of this line?",
-            )),
-            other => Err(CompileError::at(
-                self.line(),
-                format!("expected a ':' here, but found {}", describe(other)),
-            )),
+            Tok::Newline | Tok::Eof => {
+                Err(self.err("did you forget a colon ':' at the end of this line?"))
+            }
+            other => Err(self.err(format!(
+                "expected a ':' here, but found {}",
+                describe(other)
+            ))),
         }
     }
 
@@ -172,7 +184,7 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(())
         } else {
-            Err(CompileError::at(self.line(), format!("expected '{kw}'")))
+            Err(self.err(format!("expected '{kw}'")))
         }
     }
 
@@ -281,7 +293,7 @@ impl<'a> Parser<'a> {
         // an empty body is fine (the compound still renders). Strict mode still
         // rejects a genuinely empty block.
         if stmts.is_empty() && !self.recovering {
-            return Err(CompileError::at(self.line(), "this block is empty"));
+            return Err(self.err("this block is empty"));
         }
         Ok(stmts)
     }
@@ -313,10 +325,9 @@ impl<'a> Parser<'a> {
                         names.push(m);
                     }
                     other => {
-                        return Err(CompileError::at(
-                            self.line(),
-                            format!("expected a module name after 'import', found {other:?}"),
-                        ));
+                        return Err(self.err(format!(
+                            "expected a module name after 'import', found {other:?}"
+                        )));
                     }
                 }
                 if matches!(self.peek(), Tok::Comma) {
@@ -552,10 +563,9 @@ impl<'a> Parser<'a> {
                 n
             }
             other => {
-                return Err(CompileError::at(
-                    self.line(),
-                    format!("expected a function name after 'def', found {other:?}"),
-                ));
+                return Err(self.err(format!(
+                    "expected a function name after 'def', found {other:?}"
+                )));
             }
         };
         self.expect(&Tok::LParen, "'(' after the function name")?;
@@ -568,10 +578,7 @@ impl<'a> Parser<'a> {
                     Tok::Name(p) => {
                         self.advance();
                         if params.contains(&p) {
-                            return Err(CompileError::at(
-                                self.line(),
-                                format!("duplicate parameter name '{p}'"),
-                            ));
+                            return Err(self.err(format!("duplicate parameter name '{p}'")));
                         }
                         params.push(p);
                         // Optional type annotation (`: T`). A hint only — see
@@ -587,17 +594,13 @@ impl<'a> Parser<'a> {
                             self.advance();
                             defaults.push(self.expr(0)?);
                         } else if !defaults.is_empty() {
-                            return Err(CompileError::at(
-                                self.line(),
+                            return Err(self.err(
                                 "a parameter without a default can't follow one with a default",
                             ));
                         }
                     }
                     other => {
-                        return Err(CompileError::at(
-                            self.line(),
-                            format!("expected a parameter name, found {other:?}"),
-                        ));
+                        return Err(self.err(format!("expected a parameter name, found {other:?}")));
                     }
                 }
                 if matches!(self.peek(), Tok::Comma) {
@@ -650,10 +653,9 @@ impl<'a> Parser<'a> {
                 n
             }
             other => {
-                return Err(CompileError::at(
-                    self.line(),
-                    format!("expected a class name after 'class', found {other:?}"),
-                ));
+                return Err(self.err(format!(
+                    "expected a class name after 'class', found {other:?}"
+                )));
             }
         };
         // Optional single base class: `class Name(Base):`
@@ -667,17 +669,15 @@ impl<'a> Parser<'a> {
                         base = Some(b);
                     }
                     other => {
-                        return Err(CompileError::at(
-                            self.line(),
-                            format!("expected a base class name, found {other:?}"),
-                        ));
+                        return Err(
+                            self.err(format!("expected a base class name, found {other:?}"))
+                        );
                     }
                 }
                 if matches!(self.peek(), Tok::Comma) {
-                    return Err(CompileError::at(
-                        self.line(),
-                        "multiple inheritance isn't supported — one base class only",
-                    ));
+                    return Err(
+                        self.err("multiple inheritance isn't supported — one base class only")
+                    );
                 }
             }
             self.expect(&Tok::RParen, "')'")?;
@@ -769,10 +769,7 @@ impl<'a> Parser<'a> {
                 2 => (args[0].clone(), args[1].clone(), int(1)),
                 3 => (args[0].clone(), args[1].clone(), args[2].clone()),
                 n => {
-                    return Err(CompileError::at(
-                        self.line(),
-                        format!("range() takes 1 to 3 arguments, got {n}"),
-                    ));
+                    return Err(self.err(format!("range() takes 1 to 3 arguments, got {n}")));
                 }
             };
             self.expect_colon()?;
@@ -843,10 +840,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(n)
             }
-            other => Err(CompileError::at(
-                self.line(),
-                format!("expected a loop variable, found {other:?}"),
-            )),
+            other => Err(self.err(format!("expected a loop variable, found {other:?}"))),
         }
     }
 
@@ -1046,10 +1040,9 @@ impl<'a> Parser<'a> {
                             m
                         }
                         other => {
-                            return Err(CompileError::at(
-                                self.line(),
-                                format!("expected a name after '.', found {other:?}"),
-                            ));
+                            return Err(
+                                self.err(format!("expected a name after '.', found {other:?}"))
+                            );
                         }
                     };
                     // `.name(...)` is a method call; bare `.name` is an
@@ -1313,18 +1306,14 @@ impl<'a> Parser<'a> {
                     }
                     Tok::RParen => break,
                     other => {
-                        return Err(CompileError::at(
-                            self.line(),
-                            format!("expected ',' or ')' in call, found {other:?}"),
-                        ));
+                        return Err(
+                            self.err(format!("expected ',' or ')' in call, found {other:?}"))
+                        );
                     }
                 }
             }
             if seen_kwarg {
-                return Err(CompileError::at(
-                    self.line(),
-                    "positional argument can't follow a keyword argument",
-                ));
+                return Err(self.err("positional argument can't follow a keyword argument"));
             }
             let e = self.expr(0)?;
             // A bare generator expression as the sole argument, e.g.
@@ -1351,10 +1340,7 @@ impl<'a> Parser<'a> {
                 }
                 Tok::RParen => break,
                 other => {
-                    return Err(CompileError::at(
-                        self.line(),
-                        format!("expected ',' or ')' in call, found {other:?}"),
-                    ));
+                    return Err(self.err(format!("expected ',' or ')' in call, found {other:?}")));
                 }
             }
         }

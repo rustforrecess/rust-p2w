@@ -45,6 +45,10 @@ pub struct BlocksOutcome {
     /// the editor as mistakes. Deliberately excludes the not-yet-representable
     /// notes, since that code is valid Python and shouldn't be flagged as wrong.
     pub error_lines: Vec<usize>,
+    /// Byte spans `[start, end)` of those same errors that carry one — for
+    /// underlining the exact offending text (a squiggle) instead of the whole
+    /// line. A subset of the errors behind `error_lines` (some are line-only).
+    pub error_spans: Vec<(usize, usize)>,
 }
 
 /// Forgiving Python -> Blockly conversion for the live editor. See
@@ -58,6 +62,7 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
             return BlocksOutcome {
                 json: "{\"blocks\":{\"languageVersion\":0,\"blocks\":[]}}".to_string(),
                 error_lines: e.line.into_iter().collect(),
+                error_spans: e.span.into_iter().collect(),
                 errors: vec![e],
             };
         }
@@ -67,11 +72,13 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
     // (`pint` -> `print`) — both are real errors. The build notes below are for
     // valid-but-unrepresentable code and must NOT flag the editor.
     let mut error_lines: Vec<usize> = parse_errors.iter().filter_map(|e| e.line).collect();
+    let mut error_spans: Vec<(usize, usize)> = parse_errors.iter().filter_map(|e| e.span).collect();
     let mut errors = parse_errors;
 
     let typos = crate::lint::typo_diagnostics(&stmts);
     let typo_lines: Vec<usize> = typos.iter().filter_map(|e| e.line).collect();
     error_lines.extend(typo_lines.iter().copied());
+    error_spans.extend(typos.iter().filter_map(|e| e.span));
     errors.extend(typos);
 
     let mut b = Builder {
@@ -91,12 +98,15 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
 
     error_lines.sort_unstable();
     error_lines.dedup();
+    error_spans.sort_unstable();
+    error_spans.dedup();
     errors.sort_by_key(|e| e.line.unwrap_or(usize::MAX));
 
     BlocksOutcome {
         json,
         errors,
         error_lines,
+        error_spans,
     }
 }
 

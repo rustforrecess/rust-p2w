@@ -497,13 +497,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 });
             }
             other => {
+                let span = (tok_start, tok_start + other.len_utf8());
                 // Math/set-theory glyphs (often pasted from a textbook) aren't
                 // valid Python — point at the ASCII operator that runs.
                 if let Some(hint) = set_glyph_hint(other) {
-                    return Err(CompileError::at(line, hint));
+                    return Err(CompileError::at_span(line, span, hint));
                 }
-                return Err(CompileError::at(
+                return Err(CompileError::at_span(
                     line,
+                    span,
                     format!("unexpected character '{other}'"),
                 ));
             }

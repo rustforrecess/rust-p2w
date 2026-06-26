@@ -126,6 +126,21 @@ mod tests {
     }
 
     #[test]
+    fn errors_carry_a_byte_span_for_underlining() {
+        // Lexer error: the span points exactly at the bad character.
+        let src = "print(3 $ 4)";
+        let err = try_compile(src).unwrap_err();
+        let (s, e) = err.span.expect("lexer error should carry a span");
+        assert_eq!(&src[s..e], "$");
+
+        // Parser error: the span covers the unexpected token.
+        let src = "x = 1 2\n";
+        let err = try_compile(src).unwrap_err();
+        let (s, e) = err.span.expect("parser error should carry a span");
+        assert!(s < e && e <= src.len(), "valid range: {s}..{e}");
+    }
+
+    #[test]
     fn full_program_with_loop_and_if() {
         // A realistic K-12 program should compile to a runnable module.
         let src = "\
