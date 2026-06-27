@@ -58,8 +58,12 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
   and returns the length (`gv_fetch`), WASM allocates a `$STR` and pulls each byte
   (`gv_byte`). So a kid can now read what was typed *and* update the page — full
   forms. Kids drive arbitrary elements by selector.
-- **Layer 4 — more capabilities.** input values, keyboard, timers / animation
-  frame; a small curated kid API + starter templates.
+- **Layer 4 — more capabilities.** *Started:* `every(ms, handler)` — the
+  animation/game loop (numeric args + the dispatch seam; state persists across
+  ticks in module globals since the instance stays alive). Runner uses
+  `setInterval`. Codegen verified; runner wired. Still to do: keyboard/input
+  events (need handler *arguments* — passing event data through `__dispatch`),
+  a curated kid API, starter templates.
 - **Layer 5 (optional).** an HTML/form builder that *emits markup* (a projection,
   like blocks → Python). HTML is the layout IR, so any HTML tool interoperates and
   there's no bespoke designer to build or round-trip.

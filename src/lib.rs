@@ -219,6 +219,13 @@ print(\"sum of evens:\", total)
         assert!(wat.contains(r#"(import "env" "gv_fetch""#), "{wat}");
         assert!(wat.contains("(func $get_value"), "get_value helper: {wat}");
         assert_valid_wasm(gv);
+
+        // every(ms, handler): the animation/game loop (numeric args + dispatch).
+        let ev = "def step():\n    set_attr(\"#b\", \"cx\", \"5\")\nevery(30, step)\n";
+        let wat = compile_to_wat(ev).unwrap();
+        assert!(wat.contains(r#"(import "env" "every""#), "{wat}");
+        assert!(wat.contains(r#"(export "__dispatch")"#), "{wat}");
+        assert_valid_wasm(ev);
         // String ops are gated separately: a flash/beep-only program emits none
         // of the string-marshalling machinery (host stays minimal).
         let noarg = compile_to_wat("def b():\n    flash()\non_click(b)\n").unwrap();

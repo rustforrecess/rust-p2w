@@ -367,6 +367,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             body: b,
         });
     }
+    if g.uses_timer {
+        module
+            .imports
+            .push(r#"(import "env" "every" (func $every (param i32) (param i32)))"#.into());
+    }
     Ok(module.render())
 }
 
@@ -5145,6 +5150,9 @@ struct Gen {
     /// marshalling protocol (`s_begin`/`s_byte`/`s_push`) + `$marshal_str` and
     /// the string-op imports. Layer 3 of `docs/INTERACTIVE_WEB.md`.
     uses_dom_str: bool,
+    /// Set when `every(ms, handler)` is used — gates the `env.every` import (the
+    /// animation/game loop). Layer 4 of `docs/INTERACTIVE_WEB.md`.
+    uses_timer: bool,
 }
 
 impl Gen {
@@ -6966,6 +6974,19 @@ impl Gen {
                             let name = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $marshal_str {name}) (call $play_sound) (global.get $NONE))"
+                            ));
+                        }
+                        // every(ms, handler): run a zero-arg handler repeatedly —
+                        // the animation/game loop. State persists across ticks in
+                        // module globals (the instance stays alive). Numeric args,
+                        // so no string marshalling. See INTERACTIVE_WEB.md.
+                        "every" if args.len() == 2 => {
+                            self.uses_dom = true; // handler dispatch
+                            self.uses_timer = true;
+                            let ms = self.i32_expr(cx, &args[0])?;
+                            let h = self.value_expr(cx, &args[1])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $every {ms} (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         // get_value(selector): read an element's value/text back
