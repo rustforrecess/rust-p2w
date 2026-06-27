@@ -10,6 +10,7 @@
 
 mod ast;
 mod blockly;
+mod builtins;
 mod codegen;
 mod debug;
 mod emit;
@@ -21,6 +22,7 @@ mod parser;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
+pub use builtins::{BUILTINS, Builtin};
 pub use debug::{Status, Stepper, Value, Vm};
 pub use error::CompileError;
 

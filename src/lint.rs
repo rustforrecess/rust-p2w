@@ -11,46 +11,13 @@ use crate::error::CompileError;
 use crate::parser::did_you_mean;
 use std::collections::HashSet;
 
-/// Builtins the compiler knows (plus type constructors). A call to a near-miss
-/// of one of these — that isn't itself a known/defined name — is almost
-/// certainly a typo.
-const BUILTINS: &[&str] = &[
-    "print",
-    "range",
-    "len",
-    "int",
-    "str",
-    "float",
-    "bool",
-    "abs",
-    "min",
-    "max",
-    "sum",
-    "sorted",
-    "input",
-    "round",
-    "any",
-    "all",
-    "enumerate",
-    "zip",
-    "repr",
-    "list",
-    "dict",
-    "set",
-    "tuple",
-    "type",
-    // Host-capability builtins (lower to env.* imports; see ACTIVITY_INTERFACE.md).
-    "seed",
-    "report",
-    "set_field",
-    "get_field",
-];
-
 /// "Did you mean…?" diagnostics for calls to unknown, near-miss function names.
+/// The known-builtins set comes from the central registry ([`crate::builtins`]),
+/// so it can't drift from what codegen/blocks support.
 pub fn typo_diagnostics(stmts: &[Stmt]) -> Vec<CompileError> {
     let mut defs: Vec<String> = Vec::new();
     collect_defs(stmts, &mut defs);
-    let mut known: Vec<&str> = BUILTINS.to_vec();
+    let mut known: Vec<&str> = crate::builtins::names().collect();
     known.extend(defs.iter().map(String::as_str));
 
     let mut out = Vec::new();
