@@ -276,6 +276,32 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             .push(r#"(import "env" "read_char" (func $read_char (result i32)))"#.into());
         module.funcs.push(read_line_helper());
     }
+    if g.uses_dom {
+        // Host capabilities (the runner provides these): register a click
+        // handler by dispatch id, and the demo effects. See INTERACTIVE_WEB.md.
+        module
+            .imports
+            .push(r#"(import "env" "on_click" (func $on_click (param i32)))"#.into());
+        module
+            .imports
+            .push(r#"(import "env" "flash" (func $flash))"#.into());
+        module
+            .imports
+            .push(r#"(import "env" "beep" (func $beep))"#.into());
+        // `__dispatch(id)`: the JS side calls this on an event to run the
+        // registered zero-arg handler. Ids match `handler_id` (sorted defs).
+        let mut b = Body::new();
+        for (id, name) in g.handler_defs().iter().enumerate() {
+            b.push(format!(
+                "(if (i32.eq (local.get $id) (i32.const {id})) (then (drop (call $f_{name}))))"
+            ));
+        }
+        module.funcs.push(Func {
+            signature: r#"(func $__dispatch (export "__dispatch") (param $id i32)"#.into(),
+            locals: vec![],
+            body: b,
+        });
+    }
     Ok(module.render())
 }
 
@@ -5044,6 +5070,11 @@ struct Gen {
     /// Imported module names (only `math` is supported), so `math.sqrt(...)`
     /// and `math.pi` resolve to built-in operations.
     imported: std::collections::HashSet<String>,
+    /// Set when the program uses the interactive-web builtins (`on_click`,
+    /// `flash`, `beep`, …), so the `env` DOM/audio imports and the `__dispatch`
+    /// export are only emitted — and only required of the host — when used. The
+    /// same gating as `uses_input`. See `docs/INTERACTIVE_WEB.md`.
+    uses_dom: bool,
 }
 
 impl Gen {
@@ -5065,6 +5096,28 @@ impl Gen {
 
     fn is_global(&self, name: &str) -> bool {
         self.globals.iter().any(|g| g == name)
+    }
+
+    /// Zero-argument user functions, sorted by name — the event-handler
+    /// candidates. Their index in this list is their stable `__dispatch` id, so
+    /// a bare reference `foo` (function-as-value) and `__dispatch` agree.
+    fn handler_defs(&self) -> Vec<String> {
+        let mut hs: Vec<String> = self
+            .funcs
+            .iter()
+            .filter(|&(_, &arity)| arity == 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        hs.sort();
+        hs
+    }
+
+    /// The `__dispatch` id of a zero-arg function, or `None` if it isn't one.
+    fn handler_id(&self, name: &str) -> Option<i32> {
+        self.handler_defs()
+            .iter()
+            .position(|h| h == name)
+            .map(|i| i as i32)
     }
 }
 
@@ -6106,10 +6159,17 @@ impl Gen {
                     Ok(format!("(local.get ${n})"))
                 } else if self.is_global(n) {
                     Ok(format!("(global.get $g_{n})"))
+                } else if let Some(id) = self.handler_id(n) {
+                    // A bare zero-arg function used as a value (e.g. an event
+                    // handler `on_click(greet)`) becomes its `__dispatch` id,
+                    // boxed like any int. See docs/INTERACTIVE_WEB.md.
+                    Ok(format!("(call $box (i32.const {id}))"))
                 } else if self.funcs.contains_key(n) {
                     Err(CompileError::at(
                         e.line,
-                        format!("'{n}' is a function — call it with {n}(...)"),
+                        format!(
+                            "'{n}' takes arguments — only a no-argument function can be used as an event handler"
+                        ),
                     ))
                 } else {
                     Err(CompileError::at(e.line, format!("unknown name '{n}'")))
@@ -6783,6 +6843,32 @@ impl Gen {
                                 return Ok(format!("(call $py_round2 {x} {nd})"));
                             }
                             return Ok(format!("(call $py_round1 {x})"));
+                        }
+                        // Interactive-web builtins (Layer 1; see
+                        // docs/INTERACTIVE_WEB.md). No-string for now: `flash`/
+                        // `beep` are bare effects; `on_click(handler)` registers
+                        // a zero-arg function (passed as its dispatch id) to run
+                        // on the demo element's click. All return None.
+                        "flash" if args.is_empty() => {
+                            self.uses_dom = true;
+                            return Ok(
+                                "(block (result (ref null eq)) (call $flash) (global.get $NONE))"
+                                    .to_string(),
+                            );
+                        }
+                        "beep" if args.is_empty() => {
+                            self.uses_dom = true;
+                            return Ok(
+                                "(block (result (ref null eq)) (call $beep) (global.get $NONE))"
+                                    .to_string(),
+                            );
+                        }
+                        "on_click" if args.len() == 1 => {
+                            self.uses_dom = true;
+                            let h = self.value_expr(cx, &args[0])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $on_click (call $unbox {h})) (global.get $NONE))"
+                            ));
                         }
                         // input([prompt]) -> a line from stdin (newline
                         // stripped); a prompt is printed first.

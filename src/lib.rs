@@ -170,6 +170,31 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn interactive_web_seam_compiles() {
+        // Layer 1 of the interactive-web backend: a zero-arg handler passed to
+        // on_click (function-as-id), plus the effect builtins. See
+        // docs/INTERACTIVE_WEB.md.
+        let src = "def boom():\n    flash()\n    beep()\non_click(boom)\n";
+        let wat = compile_to_wat(src).unwrap();
+        assert!(wat.contains(r#"(import "env" "on_click""#), "{wat}");
+        assert!(wat.contains(r#"(import "env" "flash""#), "{wat}");
+        assert!(wat.contains(r#"(import "env" "beep""#), "{wat}");
+        assert!(
+            wat.contains(r#"(export "__dispatch")"#),
+            "dispatch export: {wat}"
+        );
+        // `boom` is the only zero-arg def -> dispatch id 0, passed boxed.
+        assert!(
+            wat.contains("(call $box (i32.const 0))"),
+            "handler-as-id: {wat}"
+        );
+        // And it's all valid WASM.
+        assert_valid_wasm(src);
+        // A normal program emits none of the DOM imports (host stays minimal).
+        assert!(!compile_to_wat("print(1)\n").unwrap().contains("on_click"));
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",
