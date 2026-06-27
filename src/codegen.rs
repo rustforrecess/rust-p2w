@@ -317,6 +317,8 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             // and returns its byte length; WASM pulls each byte.
             r#"(import "env" "gv_fetch" (func $gv_fetch (result i32)))"#,
             r#"(import "env" "gv_byte" (func $gv_byte (param i32) (result i32)))"#,
+            // on_key: pops a key name string + takes the handler id.
+            r#"(import "env" "key_on" (func $key_on (param i32)))"#,
         ] {
             module.imports.push(imp.into());
         }
@@ -6987,6 +6989,18 @@ impl Gen {
                             let h = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $every {ms} (call $unbox {h})) (global.get $NONE))"
+                            ));
+                        }
+                        // on_key(keyname, handler): run a handler when a specific
+                        // key is pressed (e.g. "ArrowLeft") — keyboard for games.
+                        // Reuses the forward string seam + dispatch.
+                        "on_key" if args.len() == 2 => {
+                            self.uses_dom = true; // handler dispatch
+                            self.uses_dom_str = true; // key name string
+                            let key = self.value_expr(cx, &args[0])?;
+                            let h = self.value_expr(cx, &args[1])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $key_on (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         // get_value(selector): read an element's value/text back

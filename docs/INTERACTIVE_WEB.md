@@ -61,9 +61,13 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
 - **Layer 4 — more capabilities.** *Started:* `every(ms, handler)` — the
   animation/game loop (numeric args + the dispatch seam; state persists across
   ticks in module globals since the instance stays alive). Runner uses
-  `setInterval`. Codegen verified; runner wired. Still to do: keyboard/input
-  events (need handler *arguments* — passing event data through `__dispatch`),
-  a curated kid API, starter templates.
+  `setInterval`. **Keyboard done too:** `on_key(keyname, handler)` runs a handler
+  when a specific key is pressed (e.g. `"ArrowLeft"`) — reuses the forward string
+  seam + dispatch, no handler-args needed (the kid names the key). Codegen
+  verified; runner wired (`keydown` listener per binding). The seam now covers
+  click + visuals + audio + read-input + loop + keyboard. Still to do (only if
+  wanted): generic event *data* into handlers (passing the pressed key / coords —
+  needs handler arguments through `__dispatch`), a curated kid API, templates.
 - **Layer 5 (optional).** an HTML/form builder that *emits markup* (a projection,
   like blocks → Python). HTML is the layout IR, so any HTML tool interoperates and
   there's no bespoke designer to build or round-trip.

@@ -226,6 +226,16 @@ print(\"sum of evens:\", total)
         assert!(wat.contains(r#"(import "env" "every""#), "{wat}");
         assert!(wat.contains(r#"(export "__dispatch")"#), "{wat}");
         assert_valid_wasm(ev);
+
+        // on_key(keyname, handler): keyboard for games (forward string + dispatch).
+        let key = "def left():\n    set_attr(\"#b\", \"cx\", \"1\")\non_key(\"ArrowLeft\", left)\n";
+        let wat = compile_to_wat(key).unwrap();
+        assert!(wat.contains(r#"(import "env" "key_on""#), "{wat}");
+        assert!(
+            wat.contains("call $marshal_str"),
+            "key name marshalled: {wat}"
+        );
+        assert_valid_wasm(key);
         // String ops are gated separately: a flash/beep-only program emits none
         // of the string-marshalling machinery (host stays minimal).
         let noarg = compile_to_wat("def b():\n    flash()\non_click(b)\n").unwrap();
