@@ -1570,6 +1570,9 @@ pub struct Vm {
     /// The value most recently returned to a caller during the last step
     /// (cleared at the start of each step) — a teaching cue for "what came back".
     last_return: Option<Value>,
+    /// Pre-supplied input lines served to `input()` during stepping (the VM has
+    /// no real stdin; the IDE fills this from its input box via `set_stdin`).
+    stdin: std::collections::VecDeque<String>,
 }
 
 impl Vm {
@@ -1591,9 +1594,17 @@ impl Vm {
             watchpoints: Vec::new(),
             watch_hit: None,
             last_return: None,
+            stdin: std::collections::VecDeque::new(),
         };
         vm.settle();
         Ok(vm)
+    }
+
+    /// Provide input lines for `input()` during debugging (one per line), so a
+    /// student can step through an activity that reads input. The IDE calls this
+    /// with its input box.
+    pub fn set_stdin(&mut self, s: &str) {
+        self.stdin = s.lines().map(|l| l.to_string()).collect();
     }
 
     pub fn output(&self) -> &str {
@@ -2291,6 +2302,15 @@ impl Vm {
                 line,
             });
             Ok(())
+        } else if name == "input" {
+            // Host INPUT capability in the debugger: print the optional prompt,
+            // then serve a pre-supplied line (set_stdin), or "" when exhausted.
+            if let [Value::Str(p)] = args.as_slice() {
+                self.output.push_str(p);
+            }
+            let line = self.stdin.pop_front().unwrap_or_default();
+            self.push_op(Value::Str(line));
+            Ok(())
         } else {
             let v = call_builtin(name, &args)?;
             self.push_op(v);
@@ -2627,6 +2647,13 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         ("bool", [v]) => Ok(Value::Bool(v.truthy())),
         ("set", []) => Ok(Value::Set(Vec::new())),
         ("set", [v]) => make_set(v),
+        // Host-capability builtins (seed/report lower to env.* at runtime). The
+        // step debugger has no host, so they no-op with a placeholder — the
+        // control flow still traces; the real effect happens under Run.
+        ("seed", []) => Ok(Value::Int(0)),
+        ("report", [_score, _trace]) => Ok(Value::None),
+        ("set_field", [_key, _value]) => Ok(Value::None),
+        ("get_field", [_key]) => Ok(Value::Str(String::new())),
         _ => Err(format!(
             "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
         )),

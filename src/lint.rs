@@ -39,6 +39,11 @@ const BUILTINS: &[&str] = &[
     "set",
     "tuple",
     "type",
+    // Host-capability builtins (lower to env.* imports; see ACTIVITY_INTERFACE.md).
+    "seed",
+    "report",
+    "set_field",
+    "get_field",
 ];
 
 /// "Did you mean…?" diagnostics for calls to unknown, near-miss function names.

@@ -276,6 +276,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             .push(r#"(import "env" "read_char" (func $read_char (result i32)))"#.into());
         module.funcs.push(read_line_helper());
     }
+    if g.uses_seed {
+        module
+            .imports
+            .push(r#"(import "env" "seed" (func $seed (result i32)))"#.into());
+    }
     if g.uses_dom {
         // Host capabilities (the runner provides these): register a click
         // handler by dispatch id, and the demo effects. See INTERACTIVE_WEB.md.
@@ -302,13 +307,44 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             body: b,
         });
     }
-    if g.uses_dom_str {
-        // String-marshalling protocol: build a JS-side string from bytes, then
-        // push it onto an arg stack the string-op imports consume.
+    // Forward string marshalling (s_begin/s_byte/s_push + $marshal_str): push a
+    // WASM-GC string to the host one byte at a time. Shared by the DOM string
+    // ops and report() — emitted once when either is used.
+    if g.uses_dom_str || g.uses_report || g.uses_fields {
         for imp in [
             r#"(import "env" "s_begin" (func $s_begin))"#,
             r#"(import "env" "s_byte" (func $s_byte (param i32)))"#,
             r#"(import "env" "s_push" (func $s_push))"#,
+        ] {
+            module.imports.push(imp.into());
+        }
+        // $marshal_str(v): str()-coerce, then push its bytes as one arg string.
+        let mut b = Body::new();
+        b.push("(local.set $s (ref.cast (ref $STR) (call $to_str (local.get $v))))");
+        b.push("(call $s_begin)");
+        b.push("(local.set $n (array.len (local.get $s)))");
+        b.push("(block $done (loop $next");
+        b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
+        b.push_in(
+            1,
+            "(call $s_byte (array.get_u $STR (local.get $s) (local.get $i)))",
+        );
+        b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(1, "(br $next)))");
+        b.push("(call $s_push)");
+        module.funcs.push(Func {
+            signature: "(func $marshal_str (param $v (ref null eq))".into(),
+            locals: vec![
+                "(local $s (ref null $STR))".into(),
+                "(local $n i32)".into(),
+                "(local $i i32)".into(),
+            ],
+            body: b,
+        });
+    }
+    if g.uses_dom_str {
+        // DOM string ops + reverse marshalling (read an element's value back).
+        for imp in [
             r#"(import "env" "dom_set_attr" (func $dom_set_attr))"#,
             r#"(import "env" "dom_set_text" (func $dom_set_text))"#,
             r#"(import "env" "play_sound" (func $play_sound))"#,
@@ -345,25 +381,42 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             ],
             body: b,
         });
-        // $marshal_str(v): str()-coerce, then push its bytes as one arg string.
+    }
+    if g.uses_report {
+        // report(score, trace): score passed as an f64 param, trace pushed via
+        // $marshal_str; the host reads both as the authoritative outcome.
+        module
+            .imports
+            .push(r#"(import "env" "report" (func $report (param f64)))"#.into());
+    }
+    if g.uses_fields {
+        // Field storage (per-learner persistence): set_field stores the last two
+        // pushed strings (key, value); get_field reads a value back via reverse
+        // marshalling (gf_fetch -> length, gf_byte -> bytes), like $get_value.
+        for imp in [
+            r#"(import "env" "set_field" (func $set_field))"#,
+            r#"(import "env" "gf_fetch" (func $gf_fetch (result i32)))"#,
+            r#"(import "env" "gf_byte" (func $gf_byte (param i32) (result i32)))"#,
+        ] {
+            module.imports.push(imp.into());
+        }
         let mut b = Body::new();
-        b.push("(local.set $s (ref.cast (ref $STR) (call $to_str (local.get $v))))");
-        b.push("(call $s_begin)");
-        b.push("(local.set $n (array.len (local.get $s)))");
+        b.push("(local.set $n (call $gf_fetch))");
+        b.push("(local.set $s (array.new_default $STR (local.get $n)))");
         b.push("(block $done (loop $next");
         b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
         b.push_in(
             1,
-            "(call $s_byte (array.get_u $STR (local.get $s) (local.get $i)))",
+            "(array.set $STR (local.get $s) (local.get $i) (call $gf_byte (local.get $i)))",
         );
         b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
         b.push_in(1, "(br $next)))");
-        b.push("(call $s_push)");
+        b.push("(local.get $s)");
         module.funcs.push(Func {
-            signature: "(func $marshal_str (param $v (ref null eq))".into(),
+            signature: "(func $get_field (result (ref null eq))".into(),
             locals: vec![
-                "(local $s (ref null $STR))".into(),
                 "(local $n i32)".into(),
+                "(local $s (ref null $STR))".into(),
                 "(local $i i32)".into(),
             ],
             body: b,
@@ -5125,6 +5178,15 @@ struct Gen {
     /// `$read_line` helper are only emitted (and only required of the host)
     /// when a program actually reads input.
     uses_input: bool,
+    /// Set when `seed()` is used, so the `env.seed` host import is only emitted
+    /// (and only required of the host) when a program actually calls it.
+    uses_seed: bool,
+    /// Set when `report()` is used → emit the forward string-marshalling base
+    /// (shared with DOM strings) plus the `env.report` host import.
+    uses_report: bool,
+    /// Set when `set_field`/`get_field` are used → forward marshalling (shared)
+    /// plus the field-storage imports and the `$get_field` reverse helper.
+    uses_fields: bool,
     /// User functions: name -> total parameter count (collected before any
     /// body compiles).
     funcs: HashMap<String, usize>,
@@ -7022,6 +7084,42 @@ impl Gen {
                             let h = self.value_expr(cx, &args[2])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {ev}) (call $dom_on (call $unbox {h})) (global.get $NONE))"
+                            ));
+                        }
+                        // seed() -> a host-provided per-attempt integer (the
+                        // platform SEED capability): server-seeded freshness /
+                        // reproducible variation. See ACTIVITY_INTERFACE.md.
+                        "seed" if args.is_empty() => {
+                            self.uses_seed = true;
+                            return Ok("(call $box (call $seed))".to_string());
+                        }
+                        // report(score, trace): the platform REPORT capability —
+                        // push score + trace as strings; the host drains them as
+                        // the authoritative outcome. See ACTIVITY_INTERFACE.md.
+                        "report" if args.len() == 2 => {
+                            self.uses_report = true;
+                            let score = self.value_expr(cx, &args[0])?;
+                            let trace = self.value_expr(cx, &args[1])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {trace}) (call $report (call $unbox_f64 {score})) (global.get $NONE))"
+                            ));
+                        }
+                        // set_field(key, value) / get_field(key): the platform
+                        // FIELD storage capability (per-learner persistence);
+                        // keys/values cross as marshalled strings.
+                        "set_field" if args.len() == 2 => {
+                            self.uses_fields = true;
+                            let key = self.value_expr(cx, &args[0])?;
+                            let val = self.value_expr(cx, &args[1])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $marshal_str {val}) (call $set_field) (global.get $NONE))"
+                            ));
+                        }
+                        "get_field" if args.len() == 1 => {
+                            self.uses_fields = true;
+                            let key = self.value_expr(cx, &args[0])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $get_field))"
                             ));
                         }
                         // input([prompt]) -> a line from stdin (newline

@@ -31,6 +31,12 @@ struct Io {
     out: Vec<u8>,
     input: Vec<u8>,
     pos: usize,
+    /// String-marshalling scratch + the pushed-arg stack (for s_*/report).
+    cur: Vec<u8>,
+    args: Vec<String>,
+    /// Field store + reverse-marshalling result buffer (set_field/get_field).
+    fields: std::collections::HashMap<String, String>,
+    result: Vec<u8>,
 }
 
 /// Compile and execute `src` with no stdin.
@@ -51,6 +57,10 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
             out: Vec::new(),
             input: stdin.as_bytes().to_vec(),
             pos: 0,
+            cur: Vec::new(),
+            args: Vec::new(),
+            fields: std::collections::HashMap::new(),
+            result: Vec::new(),
         },
     );
     let mut linker: Linker<Io> = Linker::new(engine());
@@ -92,6 +102,65 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
             } else {
                 -1
             }
+        })
+        .unwrap();
+    // seed: host-provided per-attempt integer (fixed in tests for determinism).
+    linker
+        .func_wrap("env", "seed", |_caller: Caller<'_, Io>| -> i32 { 42 })
+        .unwrap();
+    // String marshalling + report (the platform REPORT capability): build each
+    // pushed string from bytes; report() drains [score, trace] and echoes them.
+    linker
+        .func_wrap("env", "s_begin", |mut caller: Caller<'_, Io>| {
+            caller.data_mut().cur.clear();
+        })
+        .unwrap();
+    linker
+        .func_wrap("env", "s_byte", |mut caller: Caller<'_, Io>, b: i32| {
+            caller.data_mut().cur.push(b as u8);
+        })
+        .unwrap();
+    linker
+        .func_wrap("env", "s_push", |mut caller: Caller<'_, Io>| {
+            let d = caller.data_mut();
+            let s = String::from_utf8_lossy(&d.cur).into_owned();
+            d.args.push(s);
+            d.cur.clear();
+        })
+        .unwrap();
+    linker
+        .func_wrap("env", "report", |mut caller: Caller<'_, Io>, score: f64| {
+            let d = caller.data_mut();
+            let trace = d.args.pop().unwrap_or_default();
+            d.out
+                .extend_from_slice(format!("report: score={score:.1} trace={trace}").as_bytes());
+        })
+        .unwrap();
+    // Field storage: set_field stores [key, value]; get_field reads via
+    // gf_fetch (length, after popping the key) + gf_byte (bytes).
+    linker
+        .func_wrap("env", "set_field", |mut caller: Caller<'_, Io>| {
+            let d = caller.data_mut();
+            let value = d.args.pop().unwrap_or_default();
+            let key = d.args.pop().unwrap_or_default();
+            d.fields.insert(key, value);
+        })
+        .unwrap();
+    linker
+        .func_wrap("env", "gf_fetch", |mut caller: Caller<'_, Io>| -> i32 {
+            let d = caller.data_mut();
+            let key = d.args.pop().unwrap_or_default();
+            d.result = d.fields.get(&key).cloned().unwrap_or_default().into_bytes();
+            d.result.len() as i32
+        })
+        .unwrap();
+    linker
+        .func_wrap("env", "gf_byte", |caller: Caller<'_, Io>, i: i32| -> i32 {
+            caller
+                .data()
+                .result
+                .get(i as usize)
+                .map_or(0, |&b| b as i32)
         })
         .unwrap();
 
@@ -1733,6 +1802,31 @@ fn string_method_name_falls_back_to_class_method() {
     assert_output(
         "class Shout:\n    def __init__(self, s):\n        self.s = s\n    def upper(self):\n        return self.s + \"!!!\"\nprint(Shout(\"hi\").upper())",
         "hi!!!\n",
+    );
+}
+
+// --- seed() (host capability) ---
+
+#[test]
+fn seed_capability() {
+    // seed() returns the host-provided per-attempt integer (42 in tests).
+    assert_output("print(seed())", "42\n");
+}
+
+#[test]
+fn report_capability() {
+    // report(score, trace): score is passed as an f64 param; only trace is
+    // marshalled as a string (drained from the arg stack). The test host echoes
+    // both, formatting the score to one decimal (1.0 -> "1.0").
+    assert_output(r#"report(1.0, "ok")"#, "report: score=1.0 trace=ok");
+}
+
+#[test]
+fn field_capabilities() {
+    // set_field stores; get_field reads it back ("" when absent).
+    assert_output(
+        "set_field(\"name\", \"Ada\")\nprint(get_field(\"name\"))\nprint(get_field(\"missing\"))",
+        "Ada\n\n",
     );
 }
 
