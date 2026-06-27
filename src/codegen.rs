@@ -302,6 +302,44 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             body: b,
         });
     }
+    if g.uses_dom_str {
+        // String-marshalling protocol: build a JS-side string from bytes, then
+        // push it onto an arg stack the string-op imports consume.
+        for imp in [
+            r#"(import "env" "s_begin" (func $s_begin))"#,
+            r#"(import "env" "s_byte" (func $s_byte (param i32)))"#,
+            r#"(import "env" "s_push" (func $s_push))"#,
+            r#"(import "env" "dom_set_attr" (func $dom_set_attr))"#,
+            r#"(import "env" "dom_set_text" (func $dom_set_text))"#,
+            r#"(import "env" "play_sound" (func $play_sound))"#,
+            r#"(import "env" "dom_on" (func $dom_on (param i32)))"#,
+        ] {
+            module.imports.push(imp.into());
+        }
+        // $marshal_str(v): str()-coerce, then push its bytes as one arg string.
+        let mut b = Body::new();
+        b.push("(local.set $s (ref.cast (ref $STR) (call $to_str (local.get $v))))");
+        b.push("(call $s_begin)");
+        b.push("(local.set $n (array.len (local.get $s)))");
+        b.push("(block $done (loop $next");
+        b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
+        b.push_in(
+            1,
+            "(call $s_byte (array.get_u $STR (local.get $s) (local.get $i)))",
+        );
+        b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(1, "(br $next)))");
+        b.push("(call $s_push)");
+        module.funcs.push(Func {
+            signature: "(func $marshal_str (param $v (ref null eq))".into(),
+            locals: vec![
+                "(local $s (ref null $STR))".into(),
+                "(local $n i32)".into(),
+                "(local $i i32)".into(),
+            ],
+            body: b,
+        });
+    }
     Ok(module.render())
 }
 
@@ -5075,6 +5113,11 @@ struct Gen {
     /// export are only emitted — and only required of the host — when used. The
     /// same gating as `uses_input`. See `docs/INTERACTIVE_WEB.md`.
     uses_dom: bool,
+    /// Set when the string-argument web builtins are used (`set_attr`,
+    /// `set_text`, `play_sound`, `on`) — gates the char-by-char string
+    /// marshalling protocol (`s_begin`/`s_byte`/`s_push`) + `$marshal_str` and
+    /// the string-op imports. Layer 3 of `docs/INTERACTIVE_WEB.md`.
+    uses_dom_str: bool,
 }
 
 impl Gen {
@@ -6868,6 +6911,45 @@ impl Gen {
                             let h = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $on_click (call $unbox {h})) (global.get $NONE))"
+                            ));
+                        }
+                        // Layer 3: string-argument capabilities. Each string is
+                        // marshalled byte-by-byte to a JS-side arg stack via
+                        // $marshal_str (WASM-GC strings aren't JS-readable), then
+                        // the op consumes them. See docs/INTERACTIVE_WEB.md.
+                        "set_attr" if args.len() == 3 => {
+                            self.uses_dom_str = true;
+                            let sel = self.value_expr(cx, &args[0])?;
+                            let name = self.value_expr(cx, &args[1])?;
+                            let val = self.value_expr(cx, &args[2])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {name}) (call $marshal_str {val}) (call $dom_set_attr) (global.get $NONE))"
+                            ));
+                        }
+                        "set_text" if args.len() == 2 => {
+                            self.uses_dom_str = true;
+                            let sel = self.value_expr(cx, &args[0])?;
+                            let text = self.value_expr(cx, &args[1])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {text}) (call $dom_set_text) (global.get $NONE))"
+                            ));
+                        }
+                        "play_sound" if args.len() == 1 => {
+                            self.uses_dom_str = true;
+                            let name = self.value_expr(cx, &args[0])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {name}) (call $play_sound) (global.get $NONE))"
+                            ));
+                        }
+                        // on(selector, event, handler): general event wiring.
+                        "on" if args.len() == 3 => {
+                            self.uses_dom = true; // handler dispatch
+                            self.uses_dom_str = true; // selector/event strings
+                            let sel = self.value_expr(cx, &args[0])?;
+                            let ev = self.value_expr(cx, &args[1])?;
+                            let h = self.value_expr(cx, &args[2])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {ev}) (call $dom_on (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         // input([prompt]) -> a line from stdin (newline

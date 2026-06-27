@@ -195,6 +195,31 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn interactive_web_string_ops_compile() {
+        // Layer 3: string-argument capabilities marshal each string via
+        // $marshal_str, then call the op. See docs/INTERACTIVE_WEB.md.
+        let src = "def grow():\n    set_attr(\"#box\", \"fill\", \"gold\")\n    set_text(\"#msg\", \"hi\")\n    play_sound(\"beep\")\non(\"#box\", \"click\", grow)\n";
+        let wat = compile_to_wat(src).unwrap();
+        for imp in [
+            r#"(import "env" "s_byte""#,
+            r#"(import "env" "dom_set_attr""#,
+            r#"(import "env" "dom_set_text""#,
+            r#"(import "env" "play_sound""#,
+            r#"(import "env" "dom_on""#,
+        ] {
+            assert!(wat.contains(imp), "missing {imp}: {wat}");
+        }
+        assert!(wat.contains("call $marshal_str"), "marshalling: {wat}");
+        assert!(wat.contains("(func $marshal_str"), "marshal helper: {wat}");
+        assert_valid_wasm(src);
+        // String ops are gated separately: a flash/beep-only program emits none
+        // of the string-marshalling machinery (host stays minimal).
+        let noarg = compile_to_wat("def b():\n    flash()\non_click(b)\n").unwrap();
+        assert!(!noarg.contains("dom_set_attr"));
+        assert!(!noarg.contains("$marshal_str"));
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",

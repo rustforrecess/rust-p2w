@@ -47,8 +47,15 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
   click listener that calls `__dispatch`), `flash` (toggle the box fill), `beep`
   (a Web Audio tone). End-to-end "click the box → Python runs → it flashes + beeps";
   click-confirmed in a browser (`dx serve` / the thirtyfour e2e harness).
-- **Layer 3 — strings.** char-by-char marshalling → real `find(selector)`,
-  `set_attr`, `set_text`, `play_sound("name")`; the kid adds arbitrary HTML/SVG.
+- **Layer 3 — strings. DONE.** A char-by-char marshalling protocol
+  (`s_begin`/`s_byte`/`s_push` → a JS-side arg stack; `$marshal_str` in codegen)
+  lets strings cross the WASM-GC↔JS boundary, unlocking `set_attr(sel, name, val)`,
+  `set_text(sel, text)`, `play_sound(name)`, and the general `on(sel, event,
+  handler)`. Gated by `uses_dom_str` so non-string programs stay minimal. Codegen
+  verified (`interactive_web_string_ops_compile`); the runner implements the
+  protocol + ops (browser-confirmed). Still reverse-only: reading a value *back*
+  from JS (`input.value` → a WASM string) is the next sub-step (reverse
+  marshalling). Kids can now drive arbitrary elements by selector.
 - **Layer 4 — more capabilities.** input values, keyboard, timers / animation
   frame; a small curated kid API + starter templates.
 - **Layer 5 (optional).** an HTML/form builder that *emits markup* (a projection,
