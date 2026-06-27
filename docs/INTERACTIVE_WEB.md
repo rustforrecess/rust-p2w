@@ -53,9 +53,11 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
   `set_text(sel, text)`, `play_sound(name)`, and the general `on(sel, event,
   handler)`. Gated by `uses_dom_str` so non-string programs stay minimal. Codegen
   verified (`interactive_web_string_ops_compile`); the runner implements the
-  protocol + ops (browser-confirmed). Still reverse-only: reading a value *back*
-  from JS (`input.value` → a WASM string) is the next sub-step (reverse
-  marshalling). Kids can now drive arbitrary elements by selector.
+  protocol + ops. **Reverse marshalling done too:** `get_value(selector)` reads an
+  input's `.value` (or text) back into a WASM string — JS fetches into a buffer
+  and returns the length (`gv_fetch`), WASM allocates a `$STR` and pulls each byte
+  (`gv_byte`). So a kid can now read what was typed *and* update the page — full
+  forms. Kids drive arbitrary elements by selector.
 - **Layer 4 — more capabilities.** input values, keyboard, timers / animation
   frame; a small curated kid API + starter templates.
 - **Layer 5 (optional).** an HTML/form builder that *emits markup* (a projection,

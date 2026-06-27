@@ -313,9 +313,36 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             r#"(import "env" "dom_set_text" (func $dom_set_text))"#,
             r#"(import "env" "play_sound" (func $play_sound))"#,
             r#"(import "env" "dom_on" (func $dom_on (param i32)))"#,
+            // Reverse marshalling: JS fetches the element's value into a buffer
+            // and returns its byte length; WASM pulls each byte.
+            r#"(import "env" "gv_fetch" (func $gv_fetch (result i32)))"#,
+            r#"(import "env" "gv_byte" (func $gv_byte (param i32) (result i32)))"#,
         ] {
             module.imports.push(imp.into());
         }
+        // $get_value(): with the selector already on the arg stack, fetch the
+        // element's value/text and build a $STR from the returned bytes.
+        let mut b = Body::new();
+        b.push("(local.set $n (call $gv_fetch))");
+        b.push("(local.set $s (array.new_default $STR (local.get $n)))");
+        b.push("(block $done (loop $next");
+        b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
+        b.push_in(
+            1,
+            "(array.set $STR (local.get $s) (local.get $i) (call $gv_byte (local.get $i)))",
+        );
+        b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+        b.push_in(1, "(br $next)))");
+        b.push("(local.get $s)");
+        module.funcs.push(Func {
+            signature: "(func $get_value (result (ref null eq))".into(),
+            locals: vec![
+                "(local $n i32)".into(),
+                "(local $s (ref null $STR))".into(),
+                "(local $i i32)".into(),
+            ],
+            body: b,
+        });
         // $marshal_str(v): str()-coerce, then push its bytes as one arg string.
         let mut b = Body::new();
         b.push("(local.set $s (ref.cast (ref $STR) (call $to_str (local.get $v))))");
@@ -6939,6 +6966,16 @@ impl Gen {
                             let name = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $marshal_str {name}) (call $play_sound) (global.get $NONE))"
+                            ));
+                        }
+                        // get_value(selector): read an element's value/text back
+                        // into a string (reverse marshalling — JS fetches into a
+                        // buffer, WASM pulls the bytes). See INTERACTIVE_WEB.md.
+                        "get_value" if args.len() == 1 => {
+                            self.uses_dom_str = true;
+                            let sel = self.value_expr(cx, &args[0])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $get_value))"
                             ));
                         }
                         // on(selector, event, handler): general event wiring.

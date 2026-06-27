@@ -212,6 +212,13 @@ print(\"sum of evens:\", total)
         assert!(wat.contains("call $marshal_str"), "marshalling: {wat}");
         assert!(wat.contains("(func $marshal_str"), "marshal helper: {wat}");
         assert_valid_wasm(src);
+
+        // get_value reads a value back (reverse marshalling).
+        let gv = "name = get_value(\"#name\")\nset_text(\"#msg\", name)\n";
+        let wat = compile_to_wat(gv).unwrap();
+        assert!(wat.contains(r#"(import "env" "gv_fetch""#), "{wat}");
+        assert!(wat.contains("(func $get_value"), "get_value helper: {wat}");
+        assert_valid_wasm(gv);
         // String ops are gated separately: a flash/beep-only program emits none
         // of the string-marshalling machinery (host stays minimal).
         let noarg = compile_to_wat("def b():\n    flash()\non_click(b)\n").unwrap();
