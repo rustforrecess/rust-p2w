@@ -15,6 +15,7 @@ mod codegen;
 mod debug;
 mod emit;
 mod error;
+mod evidence;
 mod lexer;
 mod lint;
 mod llvm;
@@ -25,6 +26,7 @@ pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
 pub use builtins::{BUILTINS, Builtin};
 pub use debug::{Status, Stepper, Value, Vm};
 pub use error::CompileError;
+pub use evidence::{Concept, concept_evidence};
 
 /// Compile Python (the supported subset) to WebAssembly text (WAT).
 ///
