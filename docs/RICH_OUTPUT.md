@@ -37,14 +37,25 @@ marshalling:
 - Verified: rust-p2w `emit_html_marshals_to_the_host`; IDE e2e section 2h drives
   a real `emit_html("<b>bold</b>")` and asserts it renders.
 
-## Layer 2 — `_repr_html_` protocol (next)
+## Layer 2 — `_repr_html_` protocol (shipped)
 
-Mirror Jupyter's thin protocol: if a value has a `_repr_html_()` method returning
-a string, the IDE renders that instead of `str()`. We do **not** run scikit-learn
-(C extensions, far outside the subset) — we provide the *protocol* and our own
-lightweight estimator-/structure-like objects author `_repr_html_` in p2w itself.
-Depends on class/method support being able to return a string (verify against the
-current `ClassDef` subset before promising it).
+Mirror Jupyter's thin protocol, made explicit (we have no auto-display of the last
+expression): **`show(x)`** renders `x._repr_html_()` as HTML when the class defines
+it, and falls back to printing `x` as text otherwise. We do **not** run
+scikit-learn (C extensions, far outside the subset) — we provide the *protocol*,
+and our own lightweight estimator-/structure-like objects author `_repr_html_` in
+p2w itself.
+
+- Prerequisite verified: the `ClassDef` subset supports a method returning a
+  string (`repr_html_method_returns_a_string`).
+- `show(x)` is an io builtin lowering to a `$show` helper: if `x` is an instance
+  whose class has `_repr_html_`, it runtime-dispatches the method (mirroring
+  `$object_to_str`'s `__str__` lookup via `$class_lookup_method`) and emits the
+  result through the `emit_html` channel; otherwise it prints `x` as text. No new
+  IDE wiring — it reuses the emit_html (rich) and write_char (text) paths.
+- The Vm no-ops `show` (Debug still traces). Tests:
+  `show_dispatches_repr_html_or_text` (rust-p2w) + IDE e2e 2i (rich render +
+  text fallback in a real browser).
 
 ## Layer 3 — the visualizations (the actual payoff)
 

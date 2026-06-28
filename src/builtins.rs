@@ -33,6 +33,9 @@ pub const BUILTINS: &[Builtin] = &[
     // channel; see docs/RICH_OUTPUT.md). No-JS markup only — it's injected via
     // innerHTML, so inline scripts never run.
     b("emit_html", "io", &["html"]),
+    // show(x): render x richly if it defines _repr_html_(), else print it as
+    // text — the _repr_html_ protocol's explicit display (Layer 2).
+    b("show", "io", &["value"]),
     // --- convert / constructors ---
     v("int", "convert", &["x"]),
     v("str", "convert", &["x"]),

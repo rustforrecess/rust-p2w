@@ -2654,6 +2654,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         ("report", [_score, _trace]) => Ok(Value::None),
         ("evidence", [_key, _value]) => Ok(Value::None),
         ("emit_html", [_html]) => Ok(Value::None),
+        ("show", [_value]) => Ok(Value::None),
         ("set_field", [_key, _value]) => Ok(Value::None),
         ("get_field", [_key]) => Ok(Value::Str(String::new())),
         _ => Err(format!(

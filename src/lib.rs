@@ -261,6 +261,42 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn repr_html_method_returns_a_string() {
+        // Layer 2 prerequisite: a class can define a method that returns a
+        // string, and that string can feed emit_html. (The `_repr_html_`
+        // protocol baseline — see docs/RICH_OUTPUT.md.)
+        let src = "class Model:\n    def _repr_html_(self):\n        return \"<b>model</b>\"\n\nm = Model()\nemit_html(m._repr_html_())\n";
+        let wat = compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
+        assert!(wat.contains(r#"(import "env" "emit_html""#), "{wat}");
+        assert_valid_wasm(src);
+    }
+
+    #[test]
+    fn show_dispatches_repr_html_or_text() {
+        // show(obj) emits the $show helper, which renders _repr_html_() as HTML
+        // (emit_html) when present and falls back to printing as text.
+        let src = "class Model:\n    def _repr_html_(self):\n        return \"<b>m</b>\"\n\nshow(Model())\nshow(42)\n";
+        let wat = compile_to_wat(src).unwrap_or_else(|e| panic!("compile failed: {e}"));
+        assert!(wat.contains("(func $show "), "{wat}");
+        assert!(
+            wat.contains(r#"(import "env" "emit_html""#),
+            "show implies emit_html"
+        );
+        assert!(
+            wat.contains("call $class_lookup_method"),
+            "runtime method lookup"
+        );
+        assert!(wat.contains("call $print_value"), "text fallback: {wat}");
+        assert_valid_wasm(src);
+        // No show -> no $show helper.
+        assert!(
+            !compile_to_wat("print(1)\n")
+                .unwrap()
+                .contains("(func $show ")
+        );
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",

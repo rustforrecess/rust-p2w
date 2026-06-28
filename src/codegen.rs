@@ -404,6 +404,37 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             .imports
             .push(r#"(import "env" "emit_html" (func $emit_html))"#.into());
     }
+    if g.uses_show {
+        // $show(x): the _repr_html_ protocol's display. If x is an instance whose
+        // class defines `_repr_html_`, call it (mirrors $object_to_str's __str__
+        // dispatch) and emit the returned string as HTML; otherwise fall back to
+        // printing x as text. uses_show implies uses_emit_html, so $marshal_str
+        // and $emit_html are in scope.
+        let mut b = Body::new();
+        b.push("(if (ref.test (ref $OBJECT) (local.get $x)) (then");
+        b.push("  (local.set $cls (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $x))))");
+        b.push(format!(
+            "  (local.set $m (call $class_lookup_method (local.get $cls) {}))",
+            str_lit("_repr_html_")
+        ));
+        b.push("  (if (ref.test (ref $METHOD) (local.get $m)) (then");
+        b.push("    (call $marshal_str (call_ref $MFUNC (local.get $x) (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)) (struct.get $METHOD 0 (ref.cast (ref $METHOD) (local.get $m)))))");
+        b.push("    (call $emit_html)");
+        b.push("    (return)");
+        b.push("  ))");
+        b.push("))");
+        // Fallback: print x as text, then a newline (matches print()).
+        b.push("(call $print_value (local.get $x))");
+        b.push("(call $write_char (i32.const 10))");
+        module.funcs.push(Func {
+            signature: "(func $show (param $x (ref null eq))".into(),
+            locals: vec![
+                "(local $cls (ref null $CLASS))".into(),
+                "(local $m (ref null eq))".into(),
+            ],
+            body: b,
+        });
+    }
     if g.uses_fields {
         // Field storage (per-learner persistence): set_field stores the last two
         // pushed strings (key, value); get_field reads a value back via reverse
@@ -5208,6 +5239,9 @@ struct Gen {
     /// Set when `emit_html(html)` is used → forward marshalling (shared) plus the
     /// `env.emit_html` import (the rich-output / _repr_html_ channel).
     uses_emit_html: bool,
+    /// Set when `show(x)` is used → the `$show` helper (renders `_repr_html_()`
+    /// via emit_html if present, else prints text). Implies `uses_emit_html`.
+    uses_show: bool,
     /// User functions: name -> total parameter count (collected before any
     /// body compiles).
     funcs: HashMap<String, usize>,
@@ -7069,6 +7103,16 @@ impl Gen {
                             let html = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $marshal_str {html}) (call $emit_html) (global.get $NONE))"
+                            ));
+                        }
+                        // show(x): render x._repr_html_() as HTML if defined, else
+                        // print it (the _repr_html_ protocol display; $show helper).
+                        "show" if args.len() == 1 => {
+                            self.uses_show = true;
+                            self.uses_emit_html = true;
+                            let v = self.value_expr(cx, &args[0])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $show {v}) (global.get $NONE))"
                             ));
                         }
                         // every(ms, handler): run a zero-arg handler repeatedly —
