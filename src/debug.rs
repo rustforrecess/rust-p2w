@@ -2652,6 +2652,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         // control flow still traces; the real effect happens under Run.
         ("seed", []) => Ok(Value::Int(0)),
         ("report", [_score, _trace]) => Ok(Value::None),
+        ("evidence", [_key, _value]) => Ok(Value::None),
         ("set_field", [_key, _value]) => Ok(Value::None),
         ("get_field", [_key]) => Ok(Value::Str(String::new())),
         _ => Err(format!(

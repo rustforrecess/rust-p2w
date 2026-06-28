@@ -310,7 +310,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // Forward string marshalling (s_begin/s_byte/s_push + $marshal_str): push a
     // WASM-GC string to the host one byte at a time. Shared by the DOM string
     // ops and report() — emitted once when either is used.
-    if g.uses_dom_str || g.uses_report || g.uses_fields {
+    if g.uses_dom_str || g.uses_report || g.uses_fields || g.uses_evidence {
         for imp in [
             r#"(import "env" "s_begin" (func $s_begin))"#,
             r#"(import "env" "s_byte" (func $s_byte (param i32)))"#,
@@ -388,6 +388,14 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module
             .imports
             .push(r#"(import "env" "report" (func $report (param f64)))"#.into());
+    }
+    if g.uses_evidence {
+        // evidence(key, value): structured observables (the ECD evidence model) —
+        // both strings, drained by the host into an accumulating list, distinct
+        // from the single summary `report`.
+        module
+            .imports
+            .push(r#"(import "env" "evidence" (func $evidence))"#.into());
     }
     if g.uses_fields {
         // Field storage (per-learner persistence): set_field stores the last two
@@ -5187,6 +5195,9 @@ struct Gen {
     /// Set when `set_field`/`get_field` are used → forward marshalling (shared)
     /// plus the field-storage imports and the `$get_field` reverse helper.
     uses_fields: bool,
+    /// Set when `evidence(key, value)` is used → forward marshalling (shared)
+    /// plus the `env.evidence` import (the ECD structured-observable channel).
+    uses_evidence: bool,
     /// User functions: name -> total parameter count (collected before any
     /// body compiles).
     funcs: HashMap<String, usize>,
@@ -7102,6 +7113,17 @@ impl Gen {
                             let trace = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $marshal_str {trace}) (call $report (call $unbox_f64 {score})) (global.get $NONE))"
+                            ));
+                        }
+                        // evidence(key, value): a structured observable for the ECD
+                        // evidence model — both strings, accumulated by the host
+                        // (many per run), distinct from the single summary report().
+                        "evidence" if args.len() == 2 => {
+                            self.uses_evidence = true;
+                            let key = self.value_expr(cx, &args[0])?;
+                            let val = self.value_expr(cx, &args[1])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $marshal_str {val}) (call $evidence) (global.get $NONE))"
                             ));
                         }
                         // set_field(key, value) / get_field(key): the platform

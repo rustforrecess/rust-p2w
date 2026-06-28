@@ -64,6 +64,7 @@ pub const BUILTINS: &[Builtin] = &[
     // --- activity (host capabilities; see acornstem/ACTIVITY_INTERFACE.md) ---
     b("seed", "activity", &[]),
     b("report", "activity", &["score", "trace"]),
+    b("evidence", "activity", &["key", "value"]),
     b("set_field", "activity", &["key", "value"]),
     b("get_field", "activity", &["key"]),
 ];

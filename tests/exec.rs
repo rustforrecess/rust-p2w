@@ -136,6 +136,17 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
                 .extend_from_slice(format!("report: score={score:.1} trace={trace}").as_bytes());
         })
         .unwrap();
+    // evidence(key, value): a structured observable; the test host drains
+    // [key, value] and echoes each (accumulates across calls).
+    linker
+        .func_wrap("env", "evidence", |mut caller: Caller<'_, Io>| {
+            let d = caller.data_mut();
+            let value = d.args.pop().unwrap_or_default();
+            let key = d.args.pop().unwrap_or_default();
+            d.out
+                .extend_from_slice(format!("evidence: {key}={value}\n").as_bytes());
+        })
+        .unwrap();
     // Field storage: set_field stores [key, value]; get_field reads via
     // gf_fetch (length, after popping the key) + gf_byte (bytes).
     linker
@@ -1819,6 +1830,16 @@ fn report_capability() {
     // marshalled as a string (drained from the arg stack). The test host echoes
     // both, formatting the score to one decimal (1.0 -> "1.0").
     assert_output(r#"report(1.0, "ok")"#, "report: score=1.0 trace=ok");
+}
+
+#[test]
+fn evidence_capability() {
+    // evidence(key, value): structured ECD observables that accumulate across
+    // calls, alongside the summary report().
+    assert_output(
+        "evidence(\"used_loop\", \"yes\")\nevidence(\"attempts\", str(3))\nreport(1.0, \"done\")",
+        "evidence: used_loop=yes\nevidence: attempts=3\nreport: score=1.0 trace=done",
+    );
 }
 
 #[test]
