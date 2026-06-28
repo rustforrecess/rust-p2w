@@ -93,6 +93,32 @@ sensor logger) need tier 4 (+5 for cyclic object graphs).
   model to build a lightweight borrow-like check from, *and* a ready-made way to
   explain memory to kids (K-12 bonus). <https://dl.acm.org/doi/10.1145/3796537>
 
+### Idea: `del` as a *visible* last-use / reuse hint (+ lifetime overlay)
+
+Python already has `del x` (unbinds a name). Most teaching languages either hide
+memory entirely or expose a raw "free now" (Binarian's `drop` — see NOTICE,
+ideas-not-code). The opportunity unique to us: make `del` the **pedagogical and
+the compiler-facing marker at once**, and *show* what it does.
+
+- **Compiler:** treat `del x` (and inferred last uses) as the point where the
+  drop-reuse / `rc == 1` fast path fires — the in-place reuse Perceus gives us
+  (tiers 4–5). `del` becomes an explicit, kid-authored hint that a cell is free
+  to reuse, on top of the inferred last-use analysis (the `live == 0` oracle
+  stays the acceptance test; an explicit `del` should never *worsen* it).
+- **IDE / teaching:** an **AST view with a lifetime/reuse overlay** — annotate
+  where each value is born, last used, dropped, and *reused in place*. This is
+  the visual half of the story: a learner literally sees "this list cell is
+  reused, nothing is allocated here." Reuses the `DEBUGGER_ARCHITECTURE.md` seam;
+  the Blockly blocks are already an AST view to hang the overlay on. This is the
+  *reuse-legible lowering* goal made concrete, and it's novel — nobody teaches
+  K-12 memory by making reuse visible.
+- **Boundary:** keep it Python (`del`, not a new `drop` keyword) — grammar stays
+  a Python superset. The "make the model visible" framing pairs with the
+  Grounded Conceptual Model / permissions-on-paths teaching angle above.
+
+Status: idea, not built. Lands when the Perceus reuse tier + the emitter's
+`dup`/`drop` wiring exist (see Status); the overlay is an IDE follow-on.
+
 ### Formal foundations — extend/verify the type system (optional future)
 - **VerusBelt: A Semantic Foundation for Verus's Proof-Oriented Extensions to the
   Rust Type System** — PLDI 2026, Distinguished Paper (Hance, Elbeheiry, Dreyer,

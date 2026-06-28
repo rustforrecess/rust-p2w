@@ -27,6 +27,25 @@ This project derives from two MIT-licensed works:
    Licensed under the MIT License.
 
 ================================================================================
+Ideas / inspiration (concepts only — NO code read or used)
+================================================================================
+
+The projects below informed *design ideas* in AcornSTEM. No source code from any
+of them was read, copied, or adapted — only public descriptions (READMEs,
+overviews) were consulted. The implementations here are independent
+re-expressions of the underlying (uncopyrightable) concepts. Listed for honest
+attribution and to mark the clean-room boundary. License noted where known, but
+nothing here depends on those licenses since no code is used.
+
+1. Binarian (farkon00) — https://github.com/farkon00/binarian — MIT
+   - The explicit `drop` keyword (visible, programmer-directed memory lifetime)
+     informed our idea of leaning into Python's own `del` as a teachable
+     last-use / reuse hint that the compiler can act on (drop-reuse / rc==1 fast
+     path) and the IDE can visualize. See MEMORY_MANAGEMENT.md.
+   - The AST-visualization tooling pattern (an opt-in graph render of the parsed
+     program) informed the idea of an AST view with a lifetime/reuse overlay.
+
+================================================================================
 p2w — MIT License
 ================================================================================
 
