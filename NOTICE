@@ -45,6 +45,15 @@ nothing here depends on those licenses since no code is used.
    - The AST-visualization tooling pattern (an opt-in graph render of the parsed
      program) informed the idea of an AST view with a lifetime/reuse overlay.
 
+2. scikit-learn — https://scikit-learn.org — BSD-3-Clause
+   - The `_repr_html_` rich-output protocol (an object exposes an HTML string;
+     the host renders it inline) and its **no-JS, pure-CSS collapsible diagram**
+     style (expand/collapse via CSS checkbox tricks, no scripts) informed the
+     idea of a rich-output channel for the IDE: a program emits HTML that the
+     runner injects into the DOM, with no-JS diagrams that survive innerHTML
+     injection. Concept only — sklearn is not a dependency and does not run in
+     the p2w subset.
+
 ================================================================================
 p2w — MIT License
 ================================================================================
