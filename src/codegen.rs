@@ -310,7 +310,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // Forward string marshalling (s_begin/s_byte/s_push + $marshal_str): push a
     // WASM-GC string to the host one byte at a time. Shared by the DOM string
     // ops and report() — emitted once when either is used.
-    if g.uses_dom_str || g.uses_report || g.uses_fields || g.uses_evidence {
+    if g.uses_dom_str || g.uses_report || g.uses_fields || g.uses_evidence || g.uses_emit_html {
         for imp in [
             r#"(import "env" "s_begin" (func $s_begin))"#,
             r#"(import "env" "s_byte" (func $s_byte (param i32)))"#,
@@ -396,6 +396,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module
             .imports
             .push(r#"(import "env" "evidence" (func $evidence))"#.into());
+    }
+    if g.uses_emit_html {
+        // emit_html(html): a marshalled HTML string the host renders inline (the
+        // rich-output / _repr_html_ channel; see docs/RICH_OUTPUT.md).
+        module
+            .imports
+            .push(r#"(import "env" "emit_html" (func $emit_html))"#.into());
     }
     if g.uses_fields {
         // Field storage (per-learner persistence): set_field stores the last two
@@ -5198,6 +5205,9 @@ struct Gen {
     /// Set when `evidence(key, value)` is used → forward marshalling (shared)
     /// plus the `env.evidence` import (the ECD structured-observable channel).
     uses_evidence: bool,
+    /// Set when `emit_html(html)` is used → forward marshalling (shared) plus the
+    /// `env.emit_html` import (the rich-output / _repr_html_ channel).
+    uses_emit_html: bool,
     /// User functions: name -> total parameter count (collected before any
     /// body compiles).
     funcs: HashMap<String, usize>,
@@ -7049,6 +7059,16 @@ impl Gen {
                             let name = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
                                 "(block (result (ref null eq)) (call $marshal_str {name}) (call $play_sound) (global.get $NONE))"
+                            ));
+                        }
+                        // emit_html(html): marshal an HTML string to the host, which
+                        // renders it inline (the rich-output / _repr_html_ channel,
+                        // docs/RICH_OUTPUT.md). No-JS markup — injected via innerHTML.
+                        "emit_html" if args.len() == 1 => {
+                            self.uses_emit_html = true;
+                            let html = self.value_expr(cx, &args[0])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {html}) (call $emit_html) (global.get $NONE))"
                             ));
                         }
                         // every(ms, handler): run a zero-arg handler repeatedly —

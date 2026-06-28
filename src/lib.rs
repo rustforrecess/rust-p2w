@@ -248,6 +248,19 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn emit_html_marshals_to_the_host() {
+        // Rich output: emit_html(s) marshals the string and calls env.emit_html.
+        let src = "emit_html(\"<b>hi</b>\")\n";
+        let wat = compile_to_wat(src).unwrap();
+        assert!(wat.contains(r#"(import "env" "emit_html""#), "{wat}");
+        assert!(wat.contains("call $marshal_str"), "marshalling: {wat}");
+        assert!(wat.contains("call $emit_html"), "{wat}");
+        assert_valid_wasm(src);
+        // A program that doesn't use it emits no emit_html import.
+        assert!(!compile_to_wat("print(1)\n").unwrap().contains("emit_html"));
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",

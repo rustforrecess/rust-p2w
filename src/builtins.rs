@@ -29,6 +29,10 @@ pub const BUILTINS: &[Builtin] = &[
     // --- io ---
     b("print", "io", &["value"]),
     v("input", "io", &["prompt"]),
+    // Rich output: emit an HTML string the IDE renders inline (the _repr_html_
+    // channel; see docs/RICH_OUTPUT.md). No-JS markup only — it's injected via
+    // innerHTML, so inline scripts never run.
+    b("emit_html", "io", &["html"]),
     // --- convert / constructors ---
     v("int", "convert", &["x"]),
     v("str", "convert", &["x"]),
