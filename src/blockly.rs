@@ -180,14 +180,28 @@ impl Builder {
     fn build_program(&mut self, stmts: &[Stmt]) -> Vec<String> {
         let mut tops = Vec::new();
         let mut run: Vec<String> = Vec::new();
-        for s in stmts {
-            match self.stmt_block(s, "") {
+        let mut i = 0;
+        while i < stmts.len() {
+            // Fold the event-handler pattern (def + registration) into one hat.
+            if let Some((kind, name, body)) = match_event_hat(&stmts[i..]) {
+                match self.event_hat_block(&kind, name, body, "", stmts[i].line) {
+                    Ok(block) => run.push(block),
+                    Err(msg) => {
+                        flush_run(&mut run, &mut tops);
+                        self.notes.push(note_from(&msg));
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            match self.stmt_block(&stmts[i], "") {
                 Ok(block) => run.push(block),
                 Err(msg) => {
                     flush_run(&mut run, &mut tops);
                     self.notes.push(note_from(&msg));
                 }
             }
+            i += 1;
         }
         flush_run(&mut run, &mut tops);
         tops
@@ -217,22 +231,69 @@ impl Builder {
     /// represented is noted and skipped, and the rest stay linked — so one bad
     /// line inside a loop/if body doesn't discard the whole body. In strict mode
     /// the first failure propagates.
+    ///
+    /// Before rendering a statement normally, we peek for the event-handler
+    /// pattern (a zero-arg `def` immediately followed by its registration call)
+    /// and fold that pair into a single "event hat" block, so blocks and text
+    /// stay in sync for the interactive-web event seam.
     fn chain(&mut self, stmts: &[Stmt]) -> Result<String, String> {
         if self.tolerant {
             let mut rendered: Vec<String> = Vec::new();
-            for s in stmts {
-                match self.stmt_block(s, "") {
+            let mut i = 0;
+            while i < stmts.len() {
+                if let Some((kind, name, body)) = match_event_hat(&stmts[i..]) {
+                    match self.event_hat_block(&kind, name, body, "", stmts[i].line) {
+                        Ok(b) => rendered.push(b),
+                        Err(msg) => self.notes.push(note_from(&msg)),
+                    }
+                    i += 2;
+                    continue;
+                }
+                match self.stmt_block(&stmts[i], "") {
                     Ok(b) => rendered.push(b),
                     Err(msg) => self.notes.push(note_from(&msg)),
                 }
+                i += 1;
             }
             return Ok(stitch(rendered));
         }
-        let Some((first, rest)) = stmts.split_first() else {
+        let Some((first, _rest)) = stmts.split_first() else {
             return Ok(String::new());
         };
-        let rest_json = self.chain(rest)?;
+        if let Some((kind, name, body)) = match_event_hat(stmts) {
+            // A hat consumes exactly the def + its registration call.
+            let rest_json = self.chain(&stmts[2..])?;
+            return self.event_hat_block(&kind, name, body, &rest_json, first.line);
+        }
+        let rest_json = self.chain(&stmts[1..])?;
         self.stmt_block(first, &rest_json)
+    }
+
+    /// Build an event-hat block (`python_when_click` / `python_when_key` /
+    /// `python_every`) from a matched handler def: the handler name and the
+    /// event-specific field, with the def body in the `DO` stack. Mirrors the JS
+    /// blocks in `assets/blockly-init.js`.
+    fn event_hat_block(
+        &mut self,
+        kind: &HatKind,
+        name: &str,
+        body: &[Stmt],
+        next: &str,
+        line: usize,
+    ) -> Result<String, String> {
+        let stack = self.chain(body)?;
+        let inputs = if stack.is_empty() {
+            String::new()
+        } else {
+            input("DO", &stack)
+        };
+        let (ty, event_field) = match kind {
+            HatKind::Click(sel) => ("python_when_click", field("SELECTOR", &jstr(sel))),
+            HatKind::Key(key) => ("python_when_key", field("KEY", &jstr(key))),
+            HatKind::Every(ms) => ("python_every", field("MS", &jstr(ms))),
+        };
+        let fields = format!("{},{}", event_field, field("NAME", &jstr(name)));
+        Ok(with_data(&block(ty, &fields, &inputs, "", next), line))
     }
 
     /// Build a statement's block and tag it with its 1-based source line in the
@@ -748,6 +809,81 @@ fn block(ty: &str, fields: &str, inputs: &str, extra_state: &str, next: &str) ->
     format!("{{{p}}}")
 }
 
+/// Which event a hat block represents, with its event-specific datum.
+enum HatKind {
+    /// `on(selector, "click", handler)` — a click handler on an element.
+    Click(String),
+    /// `on_key(key, handler)` — a keyboard handler.
+    Key(String),
+    /// `every(ms, handler)` — a timer / game-loop tick (ms as source text).
+    Every(String),
+}
+
+/// If `stmts` begins with the event-handler pattern — a zero-argument `def`
+/// named N immediately followed by its registration call referring to N
+/// (`on(sel, "click", N)`, `on_key(key, N)`, or `every(ms, N)`) — describe the
+/// hat: its kind, the handler name, and the def body. The IDE shows that pair as
+/// one event-hat block (see `assets/blockly-init.js`), and folding it back keeps
+/// blocks and text in sync. Returns `None` when the two statements don't form
+/// the exact pattern (so they round-trip as a plain def + call instead).
+fn match_event_hat(stmts: &[Stmt]) -> Option<(HatKind, &str, &[Stmt])> {
+    let [def_s, reg_s, ..] = stmts else {
+        return None;
+    };
+    let StmtKind::Def {
+        name,
+        params,
+        defaults,
+        return_type,
+        body,
+        ..
+    } = &def_s.kind
+    else {
+        return None;
+    };
+    // Only a plain zero-arg handler folds into a hat; anything richer (params,
+    // defaults, a return type) stays a normal def block.
+    if !params.is_empty() || !defaults.is_empty() || return_type.is_some() {
+        return None;
+    }
+    let StmtKind::Expr(call) = &reg_s.kind else {
+        return None;
+    };
+    let ExprKind::Call(reg, args) = &call.kind else {
+        return None;
+    };
+    // The handler argument must be a bare name referring to this def.
+    let refers = |e: &Expr| matches!(&e.kind, ExprKind::Name(n) if n == name);
+    let str_of = |e: &Expr| match &e.kind {
+        ExprKind::Str(s) => Some(s.clone()),
+        _ => None,
+    };
+    let kind = match (reg.as_str(), args.as_slice()) {
+        ("on", [sel, ev, h])
+            if refers(h) && matches!(&ev.kind, ExprKind::Str(s) if s == "click") =>
+        {
+            HatKind::Click(str_of(sel)?)
+        }
+        ("on_key", [key, h]) if refers(h) => HatKind::Key(str_of(key)?),
+        ("every", [ms, h]) if refers(h) => HatKind::Every(num_text(ms)?),
+        _ => return None,
+    };
+    Some((kind, name, body))
+}
+
+/// Render a simple numeric/name expression to the source text an `every` hat's
+/// editable MS field holds. Only the shapes the forward generator can produce
+/// (`every(<MS text>, handler)`) need to round-trip; anything else returns
+/// `None`, leaving the pair as a plain def + call.
+fn num_text(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Int(n) => Some(n.to_string()),
+        ExprKind::Float(f) => Some(format!("{f}")),
+        ExprKind::Name(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
 /// Split a `"line N: message"` diagnostic into its 1-based line and the bare
 /// message. Returns `(None, whole)` if there's no recognizable prefix.
 fn split_line_prefix(msg: &str) -> (Option<usize>, String) {
@@ -898,6 +1034,66 @@ fn jstr(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_hat_click_folds_def_plus_registration() {
+        // def + on(sel,"click",h) collapses into one python_when_click hat.
+        let json =
+            to_blockly_json("def grow():\n    flash()\non(\"#box\", \"click\", grow)\n").unwrap();
+        assert!(json.contains("\"type\":\"python_when_click\""), "{json}");
+        assert!(json.contains("\"SELECTOR\":\"#box\""), "{json}");
+        assert!(json.contains("\"NAME\":\"grow\""), "{json}");
+        // The handler body rides in the DO stack...
+        assert!(json.contains("\"DO\":{\"block\""), "{json}");
+        assert!(
+            json.contains("\"type\":\"python_call_statement\""),
+            "{json}"
+        );
+        // ...and there's no separate def/registration block left over.
+        assert!(!json.contains("\"type\":\"python_def\""), "{json}");
+    }
+
+    #[test]
+    fn event_hat_key_and_every() {
+        let key =
+            to_blockly_json("def left():\n    flash()\non_key(\"ArrowLeft\", left)\n").unwrap();
+        assert!(key.contains("\"type\":\"python_when_key\""), "{key}");
+        assert!(key.contains("\"KEY\":\"ArrowLeft\""), "{key}");
+
+        let every = to_blockly_json("def tick():\n    flash()\nevery(30, tick)\n").unwrap();
+        assert!(every.contains("\"type\":\"python_every\""), "{every}");
+        assert!(every.contains("\"MS\":\"30\""), "{every}");
+    }
+
+    #[test]
+    fn event_hat_only_folds_the_exact_pattern() {
+        // A def whose name the registration does NOT reference stays unfolded.
+        let mismatch =
+            to_blockly_json("def grow():\n    flash()\non(\"#box\", \"click\", other)\n").unwrap();
+        assert!(mismatch.contains("\"type\":\"python_def\""), "{mismatch}");
+        assert!(!mismatch.contains("python_when_click"), "{mismatch}");
+
+        // A handler that takes a parameter isn't a zero-arg hat.
+        let with_param =
+            to_blockly_json("def grow(x):\n    flash()\non(\"#box\", \"click\", grow)\n").unwrap();
+        assert!(
+            with_param.contains("\"type\":\"python_def\""),
+            "{with_param}"
+        );
+        assert!(!with_param.contains("python_when_click"), "{with_param}");
+    }
+
+    #[test]
+    fn event_hat_chains_with_surrounding_statements() {
+        // A hat in the middle of a program keeps the statements before and after.
+        let json = to_blockly_json(
+            "x = 1\ndef grow():\n    flash()\non(\"#box\", \"click\", grow)\nprint(x)\n",
+        )
+        .unwrap();
+        assert!(json.contains("\"type\":\"variables_set\""), "{json}");
+        assert!(json.contains("\"type\":\"python_when_click\""), "{json}");
+        assert!(json.contains("\"type\":\"text_print\""), "{json}");
+    }
 
     #[test]
     fn assignment_and_print() {
