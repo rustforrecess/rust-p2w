@@ -43,10 +43,12 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
   unchanged and the host stays minimal. Verified: `interactive_web_seam_compiles`
   (valid WASM + the right imports/export/id).
 - **Layer 2 — IDE runner.** Keep the instance + import closures alive; render a
-  preview (an `<svg>` with a `#box`); implement `on_click` (store id + add a JS
-  click listener that calls `__dispatch`), `flash` (toggle the box fill), `beep`
-  (a Web Audio tone). End-to-end "click the box → Python runs → it flashes + beeps";
-  click-confirmed in a browser (`dx serve` / the thirtyfour e2e harness).
+  preview; implement `on_click`/`flash`/`beep`. End-to-end "click → Python runs →
+  effect"; click-confirmed in a browser (`dx serve` / the thirtyfour e2e harness).
+- **Author-your-own page — DONE.** `run_interactive(wat, page_html)` injects the
+  kid's HTML/SVG into the stage (was a hardcoded demo box); the IDE has a
+  `page_html` editor seeded with a starter (`#box`/`#msg`/`#go`). The Python
+  targets those elements by selector. This unblocks templates + event blocks.
 - **Layer 3 — strings. DONE.** A char-by-char marshalling protocol
   (`s_begin`/`s_byte`/`s_push` → a JS-side arg stack; `$marshal_str` in codegen)
   lets strings cross the WASM-GC↔JS boundary, unlocking `set_attr(sel, name, val)`,
