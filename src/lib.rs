@@ -20,6 +20,7 @@ mod lexer;
 mod lint;
 mod llvm;
 mod parser;
+mod reuse;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};

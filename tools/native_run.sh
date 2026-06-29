@@ -139,6 +139,9 @@ run_case comp_dyn  'xs: list[int] = [1, 2, 3]\nys = [x * x for x in xs]\nprint(y
 run_case comp_packed 'xs: list[int] = [1, 2, 3, 4]\nsq: list[int] = [x * x for x in xs]\nprint(sq)\nprint(len(sq))\n' '[1, 4, 9, 16]\n4' || fails=$((fails+1))
 run_case comp_filter 'nums: list[int] = [1, 2, 3, 4, 5, 6]\nevens: list[int] = [n for n in nums if n % 2 == 0]\nprint(evens)\n' '[2, 4, 6]' || fails=$((fails+1))
 run_case comp_range 'squares: list[int] = [i * i for i in range(5)]\nprint(squares)\n' '[0, 1, 4, 9, 16]' || fails=$((fails+1))
+# Chained comprehensions — a reuse target (each stage's input dies at last use).
+# Correctness locked here; the alloc win is tracked in tools/reuse_bench.sh.
+run_case comp_chain 'a: list[int] = [1, 2, 3]\nb = [x + 1 for x in a]\nc = [y * 2 for y in b]\nprint(c)\n' '[4, 6, 8]' || fails=$((fails+1))
 run_case comp_float 'data: list[float] = [x / 2 for x in range(4)]\nprint(data)\n' '[0.0, 0.5, 1.0, 1.5]' || fails=$((fails+1))
 run_case dictcomp  'd = {x: x * x for x in range(4)}\nprint(d[2])\nprint(len(d))\n' '4\n4' || fails=$((fails+1))
 run_case dictcomp_filter 'd = {n: n + 1 for n in range(6) if n % 2 == 0}\nprint(len(d))\nprint(d[4])\n' '3\n5' || fails=$((fails+1))
