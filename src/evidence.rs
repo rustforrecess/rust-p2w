@@ -44,6 +44,15 @@ const ORDER: &[&str] = &[
     "io",
 ];
 
+/// The full concept vocabulary, in stable reporting order — the authoritative
+/// source for the `code.*` skill ids in the cross-project skill registry (see
+/// `C:\Code\education\EVIDENCE-CONTRACT.md`). Exposed so the registry derives
+/// `code.<concept>` from here and can't drift from what `concept_evidence`
+/// actually reports.
+pub fn concept_vocab() -> &'static [&'static str] {
+    ORDER
+}
+
 /// The concepts a program exercises, in vocabulary order (only those present).
 /// Unparseable source yields an empty list (best-effort, error-recovering parse).
 pub fn concept_evidence(source: &str) -> Vec<Concept> {
@@ -332,6 +341,21 @@ mod tests {
             .into_iter()
             .find(|c| c.name == concept)
             .map_or(0, |c| c.count)
+    }
+
+    #[test]
+    fn concept_vocab_is_the_skill_id_authority() {
+        let v = concept_vocab();
+        // Stable, non-empty, no duplicates — it backs the `code.*` skill ids.
+        assert!(!v.is_empty());
+        let mut sorted = v.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), v.len(), "duplicate concept in vocab");
+        // Anything concept_evidence can report is in the vocab (it filters ORDER).
+        for name in names("xs = [1]\nfor x in xs:\n    print(x)\n") {
+            assert!(v.contains(&name), "{name} missing from concept_vocab");
+        }
     }
 
     #[test]
