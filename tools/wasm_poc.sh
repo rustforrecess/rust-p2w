@@ -70,6 +70,45 @@ run_case heap  'xs = [1, 2, 3]\nxs.append(4)\nt = 0\nfor x in xs:\n    t = t + x
 run_case strs  'print("py" + "thon")\n'                                     'python' || fails=$((fails+1))
 
 echo
-[ "$fails" = 0 ] && echo "PoC OK: compiled Python ran as linear-memory wasm32 (no WASM-GC) in a real VM." \
-                 || echo "PoC: $fails case(s) failed."
+[ "$fails" = 0 ] && echo "Core PoC OK: compiled Python ran as linear-memory wasm32 (no WASM-GC) in a real VM." \
+                 || echo "Core PoC: $fails case(s) failed."
+
+# --- Component step: wrap the SAME compiled Python as a real Component-Model
+# component (the PXC-guest shape). wasm-tools needs canonical-ABI import/export
+# names, so a tiny shim renames the host import to a WIT interface and exports a
+# no-arg `run`. Proves: compiled Python -> a valid component implementing a WIT
+# (imports a capability, exports an entry). (Executing a component with a custom
+# import needs a component host — wasmtime-rust or jco — a separate step.)
+if command -v wasm-tools >/dev/null 2>&1 && [ -f "$OUT/heap.ll" ]; then
+  echo; echo "=== component step (heap case) ==="
+  cat > "$OUT/poc.wit" <<'EOF'
+package poc:guest;
+interface env {
+  p2w-putc: func(byte: s32);
+}
+world guest {
+  import env;
+  export run: func() -> s32;
+}
+EOF
+  cat > "$OUT/shim.c" <<'EOF'
+__attribute__((import_module("poc:guest/env"), import_name("p2w-putc")))
+extern void canon_putc(int c);
+void p2w_putc(int c) { canon_putc(c); }
+extern int main(void);
+__attribute__((export_name("run"))) int run(void) { return main(); }
+EOF
+  if clang --target=wasm32 -Wno-override-module -nostdlib -O1 -Wl,--no-entry \
+        -Wl,--export=run "$OUT/heap.ll" "$OUT/shim.c" "$LIB" -o "$OUT/heapc.core.wasm" 2>"$OUT/comp.err" \
+     && wasm-tools component embed "$OUT/poc.wit" --world guest "$OUT/heapc.core.wasm" \
+        -o "$OUT/heapc.embed.wasm" 2>>"$OUT/comp.err" \
+     && wasm-tools component new "$OUT/heapc.embed.wasm" -o "$OUT/heap.component.wasm" 2>>"$OUT/comp.err" \
+     && wasm-tools validate --features component-model "$OUT/heap.component.wasm" 2>>"$OUT/comp.err"; then
+    echo "PASS [component]  valid Component-Model component ($(wc -c < "$OUT/heap.component.wasm") bytes)"
+    echo "--- its WIT ---"; wasm-tools component wit "$OUT/heap.component.wasm" 2>/dev/null
+  else
+    echo "FAIL [component]:"; tail -8 "$OUT/comp.err"; fails=$((fails+1))
+  fi
+fi
+
 exit "$fails"
