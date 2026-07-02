@@ -77,8 +77,9 @@ echo
 # component (the PXC-guest shape). wasm-tools needs canonical-ABI import/export
 # names, so a tiny shim renames the host import to a WIT interface and exports a
 # no-arg `run`. Proves: compiled Python -> a valid component implementing a WIT
-# (imports a capability, exports an entry). (Executing a component with a custom
-# import needs a component host — wasmtime-rust or jco — a separate step.)
+# (imports a capability, exports an entry) — and then EXECUTES it in a real
+# component host (jco/Node, the Bytecode Alliance's JS host), the capability
+# provided host-side, asserting output + live==0 end to end.
 if command -v wasm-tools >/dev/null 2>&1 && [ -f "$OUT/heap.ll" ]; then
   echo; echo "=== component step (heap case) ==="
   cat > "$OUT/poc.wit" <<'EOF'
@@ -89,6 +90,7 @@ interface env {
 world guest {
   import env;
   export run: func() -> s32;
+  export live: func() -> s32;
 }
 EOF
   cat > "$OUT/shim.c" <<'EOF'
@@ -96,10 +98,13 @@ __attribute__((import_module("poc:guest/env"), import_name("p2w-putc")))
 extern void canon_putc(int c);
 void p2w_putc(int c) { canon_putc(c); }
 extern int main(void);
+extern int p2w_live(void);
 __attribute__((export_name("run"))) int run(void) { return main(); }
+__attribute__((export_name("live"))) int live(void) { return p2w_live(); }
 EOF
   if clang --target=wasm32 -Wno-override-module -nostdlib -O1 -Wl,--no-entry \
-        -Wl,--export=run "$OUT/heap.ll" "$OUT/shim.c" "$LIB" -o "$OUT/heapc.core.wasm" 2>"$OUT/comp.err" \
+        -Wl,--export=run -Wl,--export=live \
+        "$OUT/heap.ll" "$OUT/shim.c" "$LIB" -o "$OUT/heapc.core.wasm" 2>"$OUT/comp.err" \
      && wasm-tools component embed "$OUT/poc.wit" --world guest "$OUT/heapc.core.wasm" \
         -o "$OUT/heapc.embed.wasm" 2>>"$OUT/comp.err" \
      && wasm-tools component new "$OUT/heapc.embed.wasm" -o "$OUT/heap.component.wasm" 2>>"$OUT/comp.err" \
@@ -108,6 +113,35 @@ EOF
     echo "--- its WIT ---"; wasm-tools component wit "$OUT/heap.component.wasm" 2>/dev/null
   else
     echo "FAIL [component]:"; tail -8 "$OUT/comp.err"; fails=$((fails+1))
+  fi
+
+  # Execute the component. First run downloads jco via npx (cached after);
+  # skip gracefully when npx is unavailable.
+  if command -v npx >/dev/null 2>&1 && [ -f "$OUT/heap.component.wasm" ]; then
+    echo; echo "=== component EXECUTION (jco host) ==="
+    ( cd "$OUT" && npx --yes @bytecodealliance/jco transpile heap.component.wasm \
+        -o jco --map 'poc:guest/env=./env.js' >jco.log 2>&1 ) || {
+      echo "FAIL [component-exec]: jco transpile"; tail -5 "$OUT/jco.log"; fails=$((fails+1)); exit "$fails"; }
+    cat > "$OUT/jco/env.js" <<'EOF'
+// Host side of the poc:guest/env capability: buffer the activity's output bytes.
+export const out = [];
+export function p2wPutc(byte) { out.push(byte & 0xff); }
+EOF
+    cat > "$OUT/jco/driver.mjs" <<'EOF'
+import { run, live } from './heap.component.js';
+import { out } from './env.js';
+const code = run();
+process.stdout.write(Buffer.from(out).toString('utf8'));
+console.error(`exit=${code} P2W_LIVE=${live()}`);
+EOF
+    got=$(node "$OUT/jco/driver.mjs" 2>"$OUT/jco/run.err" | tr -d '\r')
+    live=$(sed -n 's/.*P2W_LIVE=\(-\?[0-9]*\).*/\1/p' "$OUT/jco/run.err"); : "${live:=?}"
+    want=$(printf '10\ndone')
+    if [ "$got" = "$want" ] && [ "$live" = "0" ]; then
+      echo "PASS [component-exec]  output matches CPython, live=0 — the component RUNS"
+    else
+      echo "FAIL [component-exec]: got [$got] live=$live"; fails=$((fails+1))
+    fi
   fi
 fi
 
