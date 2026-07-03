@@ -79,10 +79,10 @@ bench_case wl_chain    'a: list[int] = [1, 2, 3, 4, 5]\nb = [x + 1 for x in a]\n
 # overwrites the dead old xs in place (was 6 allocs / peak 2; now 2 / 1).
 bench_case wl_realloc  'xs = [0, 0, 0, 0]\nxs = [1, 1, 1, 1]\nxs = [2, 2, 2, 2]\nprint(xs[0])\n'
 
-echo
-echo "# WISHLIST — should reuse but don't yet (these alloc counts are the target):"
-# Accumulate via concat in a loop: the intermediate strings die each turn —
-# needs a capacity/growth strategy, not element-wise reuse.
+# Concat loop — LANDED (append drop-reuse, p2w_add_assign): a unique receiver
+# grows in place within its block's spare capacity, realloc'ing with 2x slack
+# when it runs out (was 17 allocs; now 10 — the remaining 8 are the
+# per-iteration "x" LITERAL allocations; literal hoisting is the follow-on).
 bench_case wl_concat   's = ""\nfor i in range(8):\n    s = s + "x"\nprint(len(s))\n'
 
 echo

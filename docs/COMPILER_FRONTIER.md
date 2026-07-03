@@ -81,16 +81,17 @@ sites).
 
 ## The open tasks (pick your poison)
 
-### 1. String/buffer growth (`wl_concat` — the last wishlist entry)
+### 1. Literal hoisting / interning (the `wl_concat` remainder)
 
-`s = s + "x"` in a loop: 17 allocs for 8 iterations. The intermediates die
-every turn, but concat *grows*, so element-wise reuse doesn't apply — this
-needs a capacity strategy (amortized growth on unique receivers: reuse the
-dead LHS buffer when capacity allows, i.e. `realloc`-style in the arena, or a
-small-string/rope hybrid). **Interface:** runtime concat entry points +
-possibly a `p2w_can_grow(v, need)` predicate; emitter pattern for
-`x = x + e` on unique strings/lists. **Acceptance:** `wl_concat` allocs drop
-substantially; oracle green incl. new adversaries (aliased receiver, unicode).
+The append itself is landed (`p2w_add_assign`: unique receivers grow in place
+with amortized 2× slack — `wl_concat` went 17 → 10 allocs). The remaining 10
+are dominated by the **per-iteration suffix literal**: `"x"` is materialized
+as a fresh heap string every loop turn. Hoist loop-invariant string literals
+(or intern module string constants once at startup). **Interface:** a
+module-level interned-constants table + emitter hoisting for literals inside
+loops. **Acceptance:** `wl_concat` drops toward ~2–3 allocs; oracle green
+(watch: interned strings must never be released by RC — pin or refcount-bias
+them).
 
 ### 2. Full backward liveness (upgrade the last-mention analysis)
 

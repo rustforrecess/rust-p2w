@@ -38,10 +38,18 @@ run-oracle. The staging, and where it stands:
    (tag + unique + exact length — the tag test keeps a Boxed slot holding a
    string/tuple safe); element writes are synthesized `SetIndex` statements so
    boxed and packed slots keep normal transfer semantics. Measured:
-   `wl_realloc` 6 → 2 allocs, peak 2 → 1. **Still open in step 3:**
-   string-growth strategies (`wl_concat` — a capacity strategy, not
-   element-wise reuse), widening the element whitelist with real type
-   inference, and reuse across further statement shapes.
+   `wl_realloc` 6 → 2 allocs, peak 2 → 1. **And append/extend reuse**
+   (`try_add_assign` + runtime `p2w_add_assign`): `x = x + e` consumes the old
+   x — a unique string grows in place inside its block's spare capacity (the
+   allocator's size header = free capacity metadata), realloc'ing with 2×
+   slack when full (amortized O(1), the CPython refcount-1 trick); a unique
+   list extends in place. The runtime guards (`rc == 1` + `a != b`) are
+   *complete* — any other live reference implies rc ≥ 2 — so no emitter-side
+   expression restrictions are needed. Measured: `wl_concat` 17 → 10 allocs
+   (the rest are per-iteration suffix-literal allocations). **Still open in
+   step 3:** literal hoisting/interning (the `wl_concat` remainder), widening
+   the element whitelist with real type inference, and reuse across further
+   statement shapes.
 4. **Escape / borrowed-param inference** (tier 2) and **cycle handling** (tier 5)
    — later. Cycles are the gate for making linear-memory the safe default in the
    browser/component build (see `acornstem/ACTIVITY_INTERFACE.md`).

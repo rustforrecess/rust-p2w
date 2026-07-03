@@ -60,6 +60,7 @@ declare i1 @p2w_unique(i32)
 declare i1 @p2w_can_reuse_list(i32, i32)
 declare i1 @p2w_can_reuse_iarray(i32, i32)
 declare i1 @p2w_can_reuse_farray(i32, i32)
+declare i32 @p2w_add_assign(i32, i32)
 ; containers
 declare i32 @p2w_list_new()
 declare i32 @p2w_list_append(i32, i32)
@@ -941,6 +942,36 @@ impl<'a> FuncEmitter<'a> {
         Ok(true)
     }
 
+    /// Append/extend drop-reuse: `x = x + rhs` on a Boxed slot. The slot's old
+    /// value is passed to `p2w_add_assign`, which CONSUMES it (grows a unique
+    /// string in place / extends a unique list / falls back to add + release),
+    /// so the result is stored with a raw `store` — NOT `store_var`, whose
+    /// release-the-old would double-free the consumed reference. All aliasing
+    /// (including `x = x + x` and escapes through calls in `rhs`) is handled by
+    /// the runtime's uniqueness + pointer-equality guards: any other live
+    /// reference implies rc >= 2, which falls back to copy semantics.
+    fn try_add_assign(&mut self, name: &str, rhs: &Expr) -> Result<bool, String> {
+        // Only Boxed slots take the dynamic p2w_add path (typed Int/Float slots
+        // use native instructions; packed arrays don't support `+`).
+        if !self.vars.iter().any(|v| v == name) || self.slot_repr(name) != Repr::Boxed {
+            return Ok(false);
+        }
+        // A borrowed param's value belongs to the caller — never consume it.
+        if self.borrowed_params.iter().any(|p| p == name) {
+            return Ok(false);
+        }
+        // Left-to-right evaluation, same as the normal path: the lhs Name is a
+        // pure load; then the rhs.
+        let old = self.call_value(&format!("load i32, ptr %v_{name}"));
+        let (vb, br, bo) = self.expr_borrow_typed(rhs)?;
+        let b_owned = boxes_to_new_temp(br) || bo;
+        let vb = self.as_boxed(vb, br);
+        let new = self.call_value(&format!("call i32 @p2w_add_assign(i32 {old}, i32 {vb})"));
+        self.release_if_owned(&vb, b_owned);
+        self.line(&format!("store i32 {new}, ptr %v_{name}"));
+        Ok(true)
+    }
+
     /// Build the nested loop/filter body of a comprehension: each `for` clause
     /// becomes a loop (counted `range` or iterating) wrapping the rest, each `if`
     /// a guard around it. `inner` is the innermost statement (the append or
@@ -1232,6 +1263,16 @@ impl<'a> FuncEmitter<'a> {
                 // it's a unique same-tag same-length collection at runtime.
                 if let ExprKind::List(items) = &value.kind
                     && self.try_reuse_literal(name, items, value.line)?
+                {
+                    return Ok(());
+                }
+                // Append/extend drop-reuse: `x = x + e` on a Boxed slot consumes
+                // the old x as the token — unique strings grow in place
+                // (amortized via slack), unique lists extend in place; aliased
+                // or non-string/list values fall back with identical semantics.
+                if let ExprKind::Bin(BinOp::Add, lhs, rhs) = &value.kind
+                    && matches!(&lhs.kind, ExprKind::Name(n) if n == name)
+                    && self.try_add_assign(name, rhs)?
                 {
                     return Ok(());
                 }

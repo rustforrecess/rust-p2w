@@ -248,6 +248,78 @@ pub extern "C" fn p2w_can_reuse_farray(v: Value, n: i32) -> bool {
     can_reuse(v, T_FARRAY, n)
 }
 
+/// `x = x + b` — the append/extend drop-reuse. CONSUMES `a` (the slot's old
+/// value: reused in place or released); BORROWS `b` (like `p2w_add`'s args).
+///
+/// Unique-string append writes `b`'s bytes into `a`'s spare block capacity
+/// (the allocator's size header makes capacity knowable) — zero allocation —
+/// or reallocates with 2× slack so subsequent appends land in place
+/// (amortized O(1), the CPython refcount-1 trick). Unique-list concat pushes
+/// `b`'s elements into `a`'s buffer. `a != b` guards self-append (`s + s`
+/// passes the same pointer twice at rc 1); ANY other live reference implies
+/// rc >= 2, so the uniqueness test alone makes aliasing fall back to the
+/// plain copy path with identical semantics.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_add_assign(a: Value, b: Value) -> Value {
+    // Unique string append.
+    if is_heap(a)
+        && obj_tag(a) == T_STR
+        && rd(a as usize + 4) == 1
+        && a != b
+        && is_heap(b)
+        && obj_tag(b) == T_STR
+    {
+        let (la, lb) = (str_len(a), str_len(b));
+        let need = 12 + la + lb;
+        // Block payload capacity: the u32 size header just before the payload
+        // stores align4(4 + payload), so usable payload = header - 4.
+        let cap = rd(a as usize - 4) as usize - 4;
+        if cap >= need {
+            for i in 0..lb {
+                wr_byte(a as usize + 12 + la + i, str_byte(b, i));
+            }
+            wr(a as usize + 8, (la + lb) as u32);
+            return a; // in place: no allocation, a's bytes never copied
+        }
+        // Grow with slack so the next appends land in place.
+        let p = alloc(need * 2);
+        if p == 0 {
+            trap("out of memory");
+        }
+        wr(p, T_STR);
+        wr(p + 4, 1);
+        live_inc();
+        wr(p + 8, (la + lb) as u32);
+        for i in 0..la {
+            wr_byte(p + 12 + i, str_byte(a, i));
+        }
+        for i in 0..lb {
+            wr_byte(p + 12 + la + i, str_byte(b, i));
+        }
+        p2w_release(a);
+        return p as Value;
+    }
+    // Unique list extend: push b's elements into a's existing buffer.
+    if is_heap(a)
+        && obj_tag(a) == T_LIST
+        && rd(a as usize + 4) == 1
+        && a != b
+        && is_heap(b)
+        && obj_tag(b) == T_LIST
+    {
+        let ao = a as usize;
+        for i in 0..coll_len(b as usize) {
+            list_push(ao, owned(list_get(b as usize, i)));
+        }
+        return a;
+    }
+    // Fallback: plain add, then release the consumed old value (a no-op for
+    // inline scalars).
+    let r = p2w_add(a, b);
+    p2w_release(a);
+    r
+}
+
 /// `str(v)` — the value's display form as a fresh heap string. Runs the print
 /// formatter twice: once to size the buffer, once to fill it (no_std, no Vec).
 #[unsafe(no_mangle)]
@@ -2082,6 +2154,68 @@ mod tests {
         assert!(!p2w_can_reuse_list(p2w_int(7), 1));
         p2w_release(s);
         p2w_release(xs);
+    }
+
+    #[test]
+    fn add_assign_grows_strings_in_place_and_falls_back() {
+        let _g = heap_guard();
+        // In place: "ab"'s block has alignment spare — a 2-byte append fits.
+        let s = str_val("ab");
+        let suffix = str_val("cd");
+        let live_before = p2w_live();
+        let r = p2w_add_assign(s, suffix);
+        assert_eq!(r, s, "unique append with capacity reuses the same block");
+        assert_eq!(shown(r), "abcd");
+        assert_eq!(p2w_live(), live_before, "no new object");
+        // Grow: a big suffix forces a slack realloc; old is consumed.
+        let big = str_val("efghijklmnop");
+        let live_before = p2w_live();
+        let r2 = p2w_add_assign(r, big);
+        assert_ne!(r2, r, "grow reallocates");
+        assert_eq!(shown(r2), "abcdefghijklmnop");
+        assert_eq!(p2w_live(), live_before, "+1 new, -1 consumed old");
+        // ...and the slack means the NEXT append is in place again.
+        let more = str_val("qr");
+        let r3 = p2w_add_assign(r2, more);
+        assert_eq!(r3, r2, "slack absorbs the next append");
+        assert_eq!(shown(r3), "abcdefghijklmnopqr");
+        // Aliased: rc 2 -> copy path; the alias keeps the original bytes.
+        p2w_retain(r3); // simulate a second binding
+        let tail = str_val("!!");
+        let r4 = p2w_add_assign(r3, tail);
+        assert_ne!(r4, r3);
+        assert_eq!(shown(r4), "abcdefghijklmnopqr!!");
+        assert_eq!(shown(r3), "abcdefghijklmnopqr", "alias untouched");
+        // Self-append (a == b at rc 1) must copy, not smear.
+        let z = str_val("xy");
+        let r5 = p2w_add_assign(z, z);
+        assert_eq!(shown(r5), "xyxy");
+        // Numeric fallback: consumed old is an inline no-op.
+        assert_eq!(p2w_add_assign(p2w_int(2), p2w_int(3)), p2w_int(5));
+        p2w_release(r3);
+        p2w_release(r4);
+        p2w_release(r5);
+        p2w_release(tail);
+        p2w_release(more);
+        p2w_release(suffix);
+        p2w_release(str_val("")); // keep the guard's balance obvious
+    }
+
+    #[test]
+    fn add_assign_extends_unique_lists_in_place() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        p2w_list_append(xs, p2w_int(1));
+        let ys = p2w_list_new();
+        p2w_list_append(ys, p2w_int(2));
+        p2w_list_append(ys, p2w_int(3));
+        let r = p2w_add_assign(xs, ys);
+        assert_eq!(r, xs, "unique list extends in place");
+        assert_eq!(shown(r), "[1, 2, 3]");
+        assert_eq!(shown(ys), "[2, 3]", "b is borrowed, untouched");
+        p2w_release(r);
+        p2w_release(ys);
+        assert_eq!(p2w_live(), 0);
     }
 
     #[test]

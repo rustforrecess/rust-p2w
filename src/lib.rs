@@ -348,6 +348,21 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn self_concat_consumes_the_old_value() {
+        // `s = s + "x"` on a Boxed slot lowers to p2w_add_assign (the old value
+        // consumed as a reuse token: in-place growth when unique).
+        let ir = compile_to_llvm_ir("s = \"\"\ns = s + \"x\"\nprint(s)\n").unwrap();
+        assert_eq!(ir.matches("call i32 @p2w_add_assign").count(), 1, "{ir}");
+        // A different target isn't the pattern. (Match the CALL form — the
+        // declare line exists in every module's runtime ABI header.)
+        let ir2 = compile_to_llvm_ir("s = \"a\"\nt = s + \"x\"\nprint(t)\n").unwrap();
+        assert_eq!(ir2.matches("call i32 @p2w_add_assign").count(), 0, "{ir2}");
+        // Typed int slots take the native add, never the dynamic path.
+        let ir3 = compile_to_llvm_ir("n: int = 1\nn = n + 1\nprint(n)\n").unwrap();
+        assert_eq!(ir3.matches("call i32 @p2w_add_assign").count(), 0, "{ir3}");
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",

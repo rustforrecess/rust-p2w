@@ -179,6 +179,18 @@ run_case reuse_lit_packed 'ys: list[int] = [1, 2]\nys = [3, 4]\nprint(ys)\n' '[3
 # Overwriting boxed elements with a different type: each replaced element is
 # released by the runtime; the new values are strings.
 run_case reuse_lit_types 'xs = [1, 2]\nxs = ["a", "b"]\nprint(xs[0])\nprint(xs[1])\n' 'a\nb' || fails=$((fails+1))
+# --- append/extend drop-reuse: x = x + e consumes the old x ------------------
+# Aliased receiver -> copy path; the alias keeps the original.
+run_case concat_alias 's = "ab"\nt = s\ns = s + "c"\nprint(s)\nprint(t)\n' 'abc\nab' || fails=$((fails+1))
+# Self-append (same pointer both sides at rc 1) must copy, not smear.
+run_case concat_self 's = "ab"\ns = s + s\nprint(s)\n' 'abab' || fails=$((fails+1))
+# A long grow loop crosses several slack boundaries; indexing catches corruption.
+run_case concat_grow 's = ""\nfor i in range(20):\n    s = s + "xy"\nprint(len(s))\nprint(s[0])\nprint(s[39])\n' '40\nx\ny' || fails=$((fails+1))
+# Lists extend in place when unique; aliased lists copy.
+run_case concat_list 'xs = [1, 2]\nxs = xs + [3]\nprint(xs)\n' '[1, 2, 3]' || fails=$((fails+1))
+run_case concat_listalias 'xs = [1]\nys = xs\nxs = xs + [2]\nprint(xs)\nprint(ys)\n' '[1, 2]\n[1]' || fails=$((fails+1))
+# Boxed dynamic ints hit the numeric fallback (inline release is a no-op).
+run_case concat_boxint 'x = 5\ny = x\nx = x + 1\nprint(x)\nprint(y)\n' '6\n5' || fails=$((fails+1))
 run_case comp_float 'data: list[float] = [x / 2 for x in range(4)]\nprint(data)\n' '[0.0, 0.5, 1.0, 1.5]' || fails=$((fails+1))
 run_case dictcomp  'd = {x: x * x for x in range(4)}\nprint(d[2])\nprint(len(d))\n' '4\n4' || fails=$((fails+1))
 run_case dictcomp_filter 'd = {n: n + 1 for n in range(6) if n % 2 == 0}\nprint(len(d))\nprint(d[4])\n' '3\n5' || fails=$((fails+1))
