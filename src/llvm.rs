@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::reuse::Liveness;
 
 /// The runtime ABI the emitted module depends on (implemented by the device
 /// runtime). Declared at the top of every module.
@@ -159,11 +160,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         }
     }
 
-    let top: Vec<&Stmt> = stmts
-        .iter()
-        .filter(|s| !matches!(s.kind, StmtKind::Def { .. }))
-        .collect();
-    let (main_def, main_g) = emit_main(&top, &funcs, &borrow_masks, &param_reprs, &ret_reprs)?;
+    let (main_def, main_g) = emit_main(stmts, &funcs, &borrow_masks, &param_reprs, &ret_reprs)?;
     globals.push_str(&main_g);
 
     Ok(format!(
@@ -196,7 +193,10 @@ fn emit_function(
             f.borrowed_params.push(p.clone());
         }
     }
-    f.block(body)?;
+    // Precise drops over the body's top-level sequence: values die at their
+    // last mention, not at scope end (see src/reuse.rs).
+    let live = Liveness::analyze(body);
+    f.block_precise(body, &live)?;
     if !f.terminated {
         // Implicit return on fall-through: release locals, then return None
         // (boxed) or a raw zero for an unboxed-return function that fell off.
@@ -230,15 +230,24 @@ fn emit_function(
 }
 
 fn emit_main(
-    top: &[&Stmt],
+    stmts: &[Stmt],
     funcs: &HashSet<String>,
     borrow_masks: &HashMap<String, Vec<bool>>,
     param_reprs: &HashMap<String, Vec<Repr>>,
     ret_reprs: &HashMap<String, Repr>,
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(funcs, borrow_masks, param_reprs, ret_reprs, "main");
-    for s in top {
+    // Analyze the UNFILTERED module so def-body reads pin their globals (a
+    // function can run at any later point); defs themselves emit nothing here.
+    let live = Liveness::analyze(stmts);
+    for (idx, s) in stmts.iter().enumerate() {
+        if matches!(s.kind, StmtKind::Def { .. }) {
+            continue;
+        }
         f.stmt(s)?;
+        if !f.terminated {
+            f.early_releases(live.dead_after(idx));
+        }
     }
     if !f.terminated {
         // Release all top-level locals so a finished program ends at live==0.
@@ -928,6 +937,46 @@ impl<'a> FuncEmitter<'a> {
             self.stmt(s)?;
         }
         Ok(())
+    }
+
+    /// Emit a *top-level* body sequence with **precise drops**: after each
+    /// statement, release the heap slots whose last mention it was (last-mention
+    /// liveness, `src/reuse.rs`). Only used for the outermost sequence of a
+    /// function body / `main` — nested bodies (loop/if arms) keep the plain
+    /// scope-end `block` walk, matching the analysis's statement granularity.
+    fn block_precise(&mut self, stmts: &[Stmt], live: &Liveness) -> Result<(), String> {
+        for (idx, s) in stmts.iter().enumerate() {
+            self.stmt(s)?;
+            // After a terminator (`return`) the exit path already released
+            // everything; anything further is dead code.
+            if !self.terminated {
+                self.early_releases(live.dead_after(idx));
+            }
+        }
+        Ok(())
+    }
+
+    /// Release the named slots now (their last mention has passed) and zero
+    /// them, so the scope-exit release — which still walks every slot — becomes
+    /// a harmless no-op (zeroed slots release nothing, same as never-assigned
+    /// ones). The analysis reports *names*; ownership policy stays here: skip
+    /// borrowed params (the caller owns those) and non-heap (unboxed) slots.
+    fn early_releases(&mut self, dead: &[String]) {
+        for name in dead {
+            if self.borrowed_params.contains(name) {
+                continue;
+            }
+            if !self.vars.iter().any(|v| v == name) {
+                continue;
+            }
+            if !is_heap_repr(self.slot_repr(name)) {
+                continue;
+            }
+            let t = self.temp();
+            self.line(&format!("{t} = load i32, ptr %v_{name}"));
+            self.release(&t);
+            self.line(&format!("store i32 0, ptr %v_{name}"));
+        }
     }
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {

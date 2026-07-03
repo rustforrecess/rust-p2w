@@ -1,20 +1,18 @@
-//! Perceus reuse tier — analysis scaffold (the compiler hire fills this in).
+//! Perceus reuse tier — the last-use analysis (steps 1–2 of `docs/REUSE_PLAN.md`).
 //!
-//! The native backend's RC pass (`llvm.rs`) is correct but **naive**: it releases
-//! heap values at scope end, not at last use, and has only one hand-written reuse
-//! case (`try_inplace_map`). The precise drops + general drop-reuse that make it
-//! true Perceus need a **last-use (backward liveness) analysis**. This module is
-//! where that lives; see `docs/REUSE_PLAN.md` for the staging + acceptance
-//! contract (every change keeps `tools/native_run.sh` green: matches CPython AND
-//! `live == 0`).
+//! - [`vars_read`] / [`vars_assigned`] — tested AST primitives (the raw "which
+//!   names appear" substrate the dataflow builds on).
+//! - [`Liveness`] — **last-mention liveness** (live), consumed by the native
+//!   emitter's `block_precise`/`early_releases` (`llvm.rs`): heap slots are
+//!   released right after their last-mention statement instead of at scope end,
+//!   shrinking peak live memory (the `p2w_peak` watermark; see
+//!   `tools/reuse_bench.sh`).
 //!
-//! Shipped here as PREP:
-//! - [`vars_read`] / [`vars_assigned`] — correct, tested AST primitives (the raw
-//!   "which names appear" substrate any dataflow needs).
-//! - [`Liveness`] — a CONSERVATIVE stub (nothing dies before scope end, i.e.
-//!   today's emitter behavior). Replacing [`Liveness::analyze`]'s body with real
-//!   backward liveness is the keystone task; the emitter consumes [`Liveness::dead_after`]
-//!   and the `live == 0` oracle is the safety net.
+//! Acceptance contract (unchanged): every change keeps `tools/native_run.sh`
+//! green — output matches CPython AND `live == 0` — incl. the `drop_*`
+//! adversarial cases. Remaining tiers for the compiler hire: general drop-reuse
+//! (pair a death with the next same-size allocation), full backward liveness
+//! (early release before a reassignment), escape inference, cycles.
 //!
 //! Native-only: the browser backend (WASM-GC) needs none of this.
 #![allow(dead_code)]

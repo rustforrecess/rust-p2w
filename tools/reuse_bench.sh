@@ -35,15 +35,19 @@ cat > "$OUT/putc.c" <<'EOF'
 #include <stdlib.h>
 extern int p2w_live(void);
 extern int p2w_allocs(void);
+extern int p2w_peak(void);
 static void report(void) {
-  fprintf(stderr, "P2W_ALLOCS=%d P2W_LIVE=%d\n", p2w_allocs(), p2w_live());
+  fprintf(stderr, "P2W_ALLOCS=%d P2W_LIVE=%d P2W_PEAK=%d\n",
+          p2w_allocs(), p2w_live(), p2w_peak());
 }
 void p2w_putc(unsigned char c) { (void)c; } /* bench: discard stdout */
 __attribute__((constructor)) static void init(void) { atexit(report); }
 EOF
 
-printf '%-22s %8s %6s\n' "case" "allocs" "live"
-printf '%-22s %8s %6s\n' "----" "------" "----"
+# allocs = total births (drop-REUSE will shrink these); peak = high-water live
+# objects (precise last-use DROPS shrink these); live must be 0.
+printf '%-22s %8s %6s %6s\n' "case" "allocs" "peak" "live"
+printf '%-22s %8s %6s %6s\n' "----" "------" "----" "----"
 
 bench_case() {
   local name="$1" src="$2"
@@ -53,10 +57,11 @@ bench_case() {
     && clang -Wno-override-module "$OUT/$name.o" "$OUT/putc.c" "$LIB" -o "$OUT/$name.exe" 2>>"$OUT/$name.err" || {
     printf '%-22s %8s %6s\n' "$name" "BUILD-FAIL" "-"; return; }
   local line; line=$(timeout 10 "$OUT/$name.exe" 2>&1 >/dev/null)
-  local allocs live
+  local allocs live peak
   allocs=$(printf '%s' "$line" | sed -n 's/.*P2W_ALLOCS=\(-\?[0-9]*\).*/\1/p')
   live=$(printf '%s' "$line" | sed -n 's/.*P2W_LIVE=\(-\?[0-9]*\).*/\1/p')
-  printf '%-22s %8s %6s\n' "$name" "${allocs:-?}" "${live:-?}"
+  peak=$(printf '%s' "$line" | sed -n 's/.*P2W_PEAK=\(-\?[0-9]*\).*/\1/p')
+  printf '%-22s %8s %6s %6s\n' "$name" "${allocs:-?}" "${peak:-?}" "${live:-?}"
 }
 
 # --- baselines: cases the reuse tier should improve ----------------------
@@ -76,5 +81,7 @@ bench_case wl_realloc  'xs = [0, 0, 0, 0]\nxs = [1, 1, 1, 1]\nxs = [2, 2, 2, 2]\
 bench_case wl_concat   's = ""\nfor i in range(8):\n    s = s + "x"\nprint(len(s))\n'
 
 echo
-echo "Interpretation: live must be 0 everywhere. On the WISHLIST, lower allocs"
-echo "after the reuse pass lands = reuse working. Keep tools/native_run.sh green."
+echo "Interpretation: live must be 0 everywhere. allocs drop when general"
+echo "drop-REUSE lands (the wishlist counts are the target). peak drops with"
+echo "precise last-use drops (landed: wl_chain went 4 -> 3 — each stage's input"
+echo "buffer now dies before the next stage builds). Keep native_run.sh green."

@@ -142,6 +142,15 @@ run_case comp_range 'squares: list[int] = [i * i for i in range(5)]\nprint(squar
 # Chained comprehensions — a reuse target (each stage's input dies at last use).
 # Correctness locked here; the alloc win is tracked in tools/reuse_bench.sh.
 run_case comp_chain 'a: list[int] = [1, 2, 3]\nb = [x + 1 for x in a]\nc = [y * 2 for y in b]\nprint(c)\n' '[4, 6, 8]' || fails=$((fails+1))
+# --- precise-drop adversaries: early release must not corrupt live data -----
+# inner's SLOT dies after stmt 1 (its last mention) but the OBJECT survives via
+# outer's container refs; junk's allocation must not clobber it (rc must be 2).
+run_case drop_alias 'inner = [1]\nouter = [inner, inner]\njunk = [9, 9, 9]\nprint(outer[0])\nprint(outer[1])\nprint(len(junk))\n' '[1]\n[1]\n3' || fails=$((fails+1))
+# s is freed right after t is built; u likely REUSES s's cell (first-fit) — t
+# must still hold its own copied bytes.
+run_case drop_reusecell 's = "abc"\nt = s + "def"\nu = "XXXX"\nprint(t)\nprint(u)\n' 'abcdef\nXXXX' || fails=$((fails+1))
+# Same shape inside a FUNCTION body (the emit_function precise-drop path).
+run_case drop_infunc 'def f(xs):\n    a = [1, 2, 3]\n    n = len(a)\n    b = [9, 9]\n    return n + len(b) + len(xs)\nprint(f([5]))\n' '6' || fails=$((fails+1))
 run_case comp_float 'data: list[float] = [x / 2 for x in range(4)]\nprint(data)\n' '[0.0, 0.5, 1.0, 1.5]' || fails=$((fails+1))
 run_case dictcomp  'd = {x: x * x for x in range(4)}\nprint(d[2])\nprint(len(d))\n' '4\n4' || fails=$((fails+1))
 run_case dictcomp_filter 'd = {n: n + 1 for n in range(6) if n % 2 == 0}\nprint(len(d))\nprint(d[4])\n' '3\n5' || fails=$((fails+1))

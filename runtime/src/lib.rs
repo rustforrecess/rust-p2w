@@ -121,6 +121,10 @@ static mut LIVE: i32 = 0;
 // Cumulative allocation count (objects + buffers). Lets the run-oracle measure
 // the FBIP drop-reuse win (an in-place map does zero allocations).
 static mut ALLOCS: i32 = 0;
+/// High-water mark of `LIVE` — peak simultaneous heap objects. The metric that
+/// precise (last-use) drops improve: total allocations stay the same, but values
+/// die sooner, so fewer are ever alive at once. Resets with the heap.
+static mut PEAK: i32 = 0;
 
 /// Object type tags (in the header's first word).
 const T_STR: u32 = 1;
@@ -161,12 +165,18 @@ pub fn heap_reset() {
         FREELIST = 0;
         LIVE = 0;
         ALLOCS = 0;
+        PEAK = 0;
     }
 }
 
 /// One heap object was born (refcount initialized to 1).
 fn live_inc() {
-    unsafe { LIVE += 1 }
+    unsafe {
+        LIVE += 1;
+        if LIVE > PEAK {
+            PEAK = LIVE;
+        }
+    }
 }
 /// One heap object was freed.
 fn live_dec() {
@@ -195,6 +205,13 @@ pub extern "C" fn p2w_unbox_int(v: Value) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_allocs() -> i32 {
     unsafe { ALLOCS }
+}
+
+/// Peak simultaneous live heap objects (the `LIVE` high-water mark) — what
+/// precise drops shrink on a memory-tight device. Resets with the heap.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_peak() -> i32 {
+    unsafe { PEAK }
 }
 
 /// Whether `v` is a heap object with refcount 1 (uniquely owned) — the FBIP
@@ -2013,6 +2030,24 @@ mod tests {
             0,
             "releasing a container must free its children"
         );
+    }
+
+    #[test]
+    fn peak_tracks_the_high_water_mark() {
+        let _g = heap_guard();
+        assert_eq!(p2w_peak(), 0);
+        let a = str_val("one");
+        let b = str_val("two");
+        assert_eq!(p2w_peak(), 2);
+        p2w_release(a);
+        p2w_release(b);
+        // Peak stays at the high-water mark even after everything is freed...
+        assert_eq!(p2w_live(), 0);
+        assert_eq!(p2w_peak(), 2);
+        // ...and a lone later allocation doesn't raise it.
+        let c = str_val("three");
+        assert_eq!(p2w_peak(), 2);
+        p2w_release(c);
     }
 
     #[test]

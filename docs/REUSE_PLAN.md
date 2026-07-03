@@ -1,38 +1,51 @@
 # Perceus reuse tier — implementation plan (onboarding for the compiler hire)
 
-**Status: prep done, analysis not started.** This is the staging, the invariants,
-and the acceptance contract for the precise-RC + reuse work (native/Pico backend
-only — the browser uses WASM-GC). Read alongside `MEMORY_MANAGEMENT.md` (the
-research + tiers) and `PICO_BACKEND.md` (the value model).
+**Status: steps 1–2 LANDED (last-mention liveness + precise drops); steps 3–5
+open.** This is the staging, the invariants, and the acceptance contract for the
+precise-RC + reuse work (native/Pico backend only — the browser uses WASM-GC).
+Read alongside `MEMORY_MANAGEMENT.md` (the research + tiers) and
+`PICO_BACKEND.md` (the value model).
 
 ## TL;DR for the new compiler person
 
 The foundation is built and correct: the emitter (`src/llvm.rs`) inserts
-`retain`/`release` (naive, scope-end), the runtime (`runtime/src/lib.rs`) is
-RC-correct with a `[tag][refcount][len][data]` object layout, and there's a
-`live == 0` run-oracle. **Your job is the analysis the naive emitter is missing**,
-in this order:
+`retain`/`release`, the runtime (`runtime/src/lib.rs`) is RC-correct with a
+`[tag][refcount][len][data]` object layout, and there's a `live == 0`
+run-oracle. The staging, and where it stands:
 
-1. **Last-use analysis** (the keystone) — backward liveness over the AST so a
-   value can be released at its last use, not at scope end.
-2. **Precise drops** — move releases from scope-end to last-use, using (1).
-3. **General drop-reuse** — pair a death with a following same-size allocation →
-   in-place update (FBIP). Generalize the one shipped special case.
+1. **Last-use analysis** — ✅ landed as **last-mention liveness** in
+   `src/reuse.rs` (statement granularity; assignments count as mentions so an
+   early release can never precede a reassignment's release-of-old — no double
+   free; def/class bodies pin their reads; loops are opaque units). Upgrading to
+   full backward liveness (early release *before* a reassignment) is open.
+2. **Precise drops** — ✅ landed: `block_precise`/`early_releases` in `llvm.rs`
+   release heap slots right after their last mention and zero the slot (so the
+   scope-exit release stays a no-op). Applied to function-body top level +
+   `main` (nested bodies stay scope-end). Measured: `wl_chain` peak live objects
+   4 → 3 (`p2w_peak` watermark).
+3. **General drop-reuse** — OPEN (the main prize): pair a death with a following
+   same-size allocation → in-place update (FBIP). Generalize the one shipped
+   special case (`try_inplace_map`). This is what moves the wishlist *alloc*
+   counts.
 4. **Escape / borrowed-param inference** (tier 2) and **cycle handling** (tier 5)
-   — later.
+   — later. Cycles are the gate for making linear-memory the safe default in the
+   browser/component build (see `acornstem/ACTIVITY_INTERFACE.md`).
 
 **Acceptance contract (non-negotiable):** every change keeps `tools/native_run.sh`
-green — output matches CPython **and** `live == 0` (no leaks). Use-after-free
-shows up as a wrong/garbage output or a trap (the oracle caps runtime). Reuse
-*wins* are measured by `tools/reuse_bench.sh` (allocation counts), not guessed.
+green — output matches CPython **and** `live == 0` (no leaks), incl. the
+`drop_*` adversarial cases (alias-into-container, freed-cell reuse, in-function).
+Use-after-free shows up as wrong/garbage output or a trap (the oracle caps
+runtime). Wins are measured by `tools/reuse_bench.sh` — **allocs** (drop-reuse's
+metric) and **peak** (precise drops' metric) — not guessed.
 
 ## What already exists (don't rebuild)
 
 - **Emitter RC pass** (`llvm.rs`): transfer-based model, documented in the big
-  comment near the top (~line 261). Owned slots `+1`; every `ret` releases live
-  locals (`emit_exit_releases`); reassignment releases the old value; borrowed
-  params aren't released. **Naive: releases at scope end, no last-use precision**
-  (`llvm.rs:287`).
+  comment near the top. Owned slots `+1`; every `ret` releases live locals
+  (`emit_exit_releases`); reassignment releases the old value; borrowed params
+  aren't released. **Plus precise drops** (`block_precise`/`early_releases`):
+  top-level heap slots are released at their last mention, slot zeroed so exit
+  releases stay no-ops.
 - **Runtime** (`runtime/src/lib.rs`): `p2w_retain`/`p2w_release`, the unique test
   (`refcount == 1`), `p2w_live()` (births − frees) and `p2w_allocs()` (total
   births) for the oracle/bench, and the heap object layout.
