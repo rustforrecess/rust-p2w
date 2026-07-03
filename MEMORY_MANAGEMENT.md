@@ -250,10 +250,24 @@ coalescing (our first-fit fragments over long runs — reuse mostly sidesteps it
 fault-safe behavior for `trap`/OOM in a robot (halt motors, not loop forever);
 float/fixed-point for robotics math (M33 has an FPU).
 
-## Status
-- **Built:** the heap allocator (static arena + first-fit free list), the string
-  heap type, and naïve RC primitives (`p2w_retain`/`p2w_release`) in `runtime/`
-  (`p2w-rt`), host-tested.
-- **Next:** lists/dicts; then upgrade RC to **Perceus-style (reuse)**; wire the
-  emitter to emit `dup`/`drop`; cycle handling; then the static tiers (escape
-  analysis, monomorphization from the type annotations).
+## Status (Jul 2026)
+- **Built and measured — the Perceus tier is live** (see `docs/REUSE_PLAN.md`
+  for detail and `docs/COMPILER_FRONTIER.md` for the proof table):
+  - the runtime (`p2w-rt`): arena + first-fit free list (block-size headers =
+    capacity metadata), full RC across strings/lists/dicts/sets/tuples/packed
+    arrays, `p2w_unique`, `p2w_can_reuse_*`, `p2w_add_assign`, and the
+    `p2w_live`/`p2w_allocs`/`p2w_peak` counters;
+  - the emitter RC pass (transfer-based, borrowed params) **plus** last-mention
+    liveness (`src/reuse.rs`), precise drops at last use, dying-source map
+    reuse, assign-site literal reuse, append/extend growth, and per-site
+    interned literals;
+  - measured: `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4,
+    self-map 4→2 — map pipelines and reassignment churn run at or near
+    zero-allocation steady state, no GC.
+- **Verified by three nets:** the 117-case CPython-diff + `live == 0` oracle
+  (`tools/native_run.sh`), the alloc/peak bench (`tools/reuse_bench.sh`), and
+  the differential fuzzer (`tools/fuzz_native.sh` — 120 seeds green).
+- **Next (the frontier — `docs/COMPILER_FRONTIER.md`):** full backward
+  liveness, type inference to widen the reuse whitelist, escape/reachability
+  inference (tier 2 generalized), and cycle handling (tier 5 — design sketched
+  from Nim ORC; gates making linear-memory the browser/component default).

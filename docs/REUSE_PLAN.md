@@ -1,7 +1,11 @@
 # Perceus reuse tier — implementation plan (onboarding for the compiler hire)
 
-**Status: steps 1–2 LANDED (last-mention liveness + precise drops); step 3
-LANDED for the map-chain case (dying-source drop-reuse); rest open.** This is the staging, the invariants, and the acceptance contract for the
+**Status: steps 1–3 LANDED — the original reuse wishlist is CLOSED**
+(last-mention liveness, precise drops, and drop-reuse in four forms:
+dying-source maps, literal reassignment, append/extend growth, interned
+literals — `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4).
+Open: full backward liveness, type inference, escape inference, cycles
+(`COMPILER_FRONTIER.md`). This is the staging, the invariants, and the acceptance contract for the
 precise-RC + reuse work (native/Pico backend only — the browser uses WASM-GC).
 Read alongside `MEMORY_MANAGEMENT.md` (the research + tiers) and
 `PICO_BACKEND.md` (the value model).

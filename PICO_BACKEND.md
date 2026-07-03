@@ -159,7 +159,8 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    (name-dispatched `p2w_method0/1/2`), and **for-each** (`p2w_iter`/`iter_has`/
    `iter_next`), and **`and`/`or`** (short-circuit, returns the deciding operand
    via a result slot). Vars are entry-block `alloca i32`. The emitter now covers
-   the **full teaching subset** (sans tuples/comprehensions/classes). The
+   the **full teaching subset** incl. sets, immutable tuples, slices, f-strings
+   and list/dict comprehensions (classes remain WASM-backend-only). The
    **runtime crate** (`runtime/`, `p2w-rt`) is `no_std` + host-tested over the
    concrete tagged-`i32` rep (2-bit tag: small int / heap ptr / immediate
    singleton). Done: int/bool/None/**float** + arithmetic (`+ - * / // % **`, neg)
@@ -169,10 +170,14 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    (first-fit free list) + **strings, lists, dicts** (literals, subscript get/set,
    `len`, concat, structural eq, print), the **iteration protocol**, **methods**
    (append/pop), and ref-count primitives (`p2w_retain`/`release`, buffers freed).
-   **The emitter RC pass is in and host-validated:** the emitter emits
-   retain/release (transfer ownership model), and `tools/native_run.sh` runs 21
-   programs ending `live==0` (see RC_PASS_TODO.md). **Still to do:** Perceus-style
-   precision (last-use, borrowed params) + drop-reuse (FBIP) + cycles,
+   **The emitter RC pass is in and host-validated — and the Perceus reuse tier
+   on top of it** (Jul 2026): last-mention liveness + precise drops, borrowed
+   params, and drop-reuse in four forms (dying-source maps, literal
+   reassignment, append/extend growth, interned literals) — measured
+   `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4;
+   `tools/native_run.sh` runs **117 programs** ending `live==0`, plus a
+   differential fuzzer (see `docs/REUSE_PLAN.md`). **Still to do:** cycles
+   (design sketched from Nim ORC — `docs/COMPILER_FRONTIER.md` task 5),
    real device `p2w_putc` over USB-CDC, then the on-device toolchain spike
    (phase 1: `llc`/`picotool` → `.uf2`) to flash + run on a board.
 4. **I/O + peripherals:** USB-CDC `print`, the temp sensor, GPIO.
@@ -184,7 +189,7 @@ our emitted IR, and because values are i32 *arena offsets* (not machine
 pointers) the IR + `p2w-rt` link and **run on the host** with output matching
 CPython. `tools/native_run.sh` is the run-oracle: IR → `clang` `.o` → link the
 runtime staticlib (`cargo rustc --crate-type staticlib -- -C panic=abort`) + a
-`p2w_putc` stub → execute → diff (7 cases pass). The runtime now carries a
+`p2w_putc` stub → execute → diff (7 cases at the time; **117 today**). The runtime now carries a
 `#[cfg(not(test))] #[panic_handler]` (needed for any no_std artifact — this lib
 and the device build). **Still device-gated:** the on-board path (`.o` → RP2350
 boot block → ELF → UF2 via `llc`/`lld`/`picotool`, run over USB-CDC) — but host

@@ -42,9 +42,10 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
   `__dispatch` are gated on use (like `uses_input`), so ordinary programs are
   unchanged and the host stays minimal. Verified: `interactive_web_seam_compiles`
   (valid WASM + the right imports/export/id).
-- **Layer 2 — IDE runner.** Keep the instance + import closures alive; render a
-  preview; implement `on_click`/`flash`/`beep`. End-to-end "click → Python runs →
-  effect"; click-confirmed in a browser (`dx serve` / the thirtyfour e2e harness).
+- **Layer 2 — IDE runner. DONE.** The instance + import closures stay alive
+  after `_start`; `run_interactive` renders the page and wires events to
+  `__dispatch`. End-to-end "click → Python runs → effect" is **e2e-verified**
+  (the thirtyfour harness clicks `#box` and asserts `set_attr` turned it gold).
 - **Author-your-own page — DONE.** `run_interactive(wat, page_html)` injects the
   kid's HTML/SVG into the stage (was a hardcoded demo box); the IDE has a
   `page_html` editor seeded with a starter (`#box`/`#msg`/`#go`). The Python
@@ -70,9 +71,15 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
   click + visuals + audio + read-input + loop + keyboard. Still to do (only if
   wanted): generic event *data* into handlers (passing the pressed key / coords —
   needs handler arguments through `__dispatch`), a curated kid API, templates.
-- **Layer 5 (optional).** an HTML/form builder that *emits markup* (a projection,
-  like blocks → Python). HTML is the layout IR, so any HTML tool interoperates and
-  there's no bespoke designer to build or round-trip.
+- **Layer 5 — the page designer. DONE** (in `acornstem-ide`): a visual designer
+  over an element IR (`src/formir.rs` there — open prop map, data-driven widget
+  registry, pluggable `Export` trait; the HTML textarea, the canvas, and the
+  preview are all projections of one page). Palette drop, per-element id/text
+  edit, freeform drag with grid snap, multi-select group drag, drop-into-a-Box
+  nesting, and the payoff loop: **"⚡ on click" wires an element's `id` to a
+  Python click handler**, which rust-p2w folds into a `when #id clicked` event
+  hat block. All e2e-verified. Related: the non-interactive rich-output channel
+  (`emit_html`/`show()` + `_repr_html_`) is a separate doc — `RICH_OUTPUT.md`.
 
 ## Why this shape
 - **HTML/SVG is the layout IR** — no invented format, no canvas to keep in sync

@@ -157,9 +157,10 @@ because the ints that generated them are no longer boxed.
     — **zero** runtime calls). Coercions at the boundaries via `coerce` (box =
     `p2w_int`, unbox = new runtime `p2w_unbox_int`): boxed arg → int param unboxes,
     int result → `print` boxes. Validated: oracle `typedsq`/`typedfact`/
-    `typedboxarg`/`typedreassign`, all `live==0`. *Float params (LLVM `double`
-    signature) remain.* Note: boxing a >30-bit unboxed int is lossy until the
-    heap-int box (decision 3) lands.
+    `typedboxarg`/`typedreassign`, all `live==0`. *Done (Float): `: float`
+    params/returns use real LLVM `double` signatures (oracle `floatparam`/
+    `floatlocal`/`floatintarg`).* Note: boxing a >30-bit unboxed int is lossy
+    until the heap-int box (decision 3) lands.
 - **C — packed arrays.** `list[int]` DONE: a `Repr::IntArray` (heap ref, refcounted
   like Boxed) backed by the runtime `T_IARRAY` (flat i32 buffer, no per-element
   refcount). `xs: list[int] = [...]` builds packed (target type drives literal
@@ -191,5 +192,6 @@ because the ints that generated them are no longer boxed.
   type + ops for phase C; typed extract/construct ABI as needed.
 - Annotations: surfaced from the parser's existing `: T` / `-> T` into the AST the
   emitter reads (confirm what's already carried vs dropped).
-- Related: `MEMORY_MANAGEMENT.md` (tier 1), `RC_PASS_TODO.md` (RC is now
-  repr-aware), `docs/TASKS.md` Task 1.
+- Related: `MEMORY_MANAGEMENT.md` (tier 1), `docs/REUSE_PLAN.md` (the reuse
+  tier built on this model), `docs/COMPILER_FRONTIER.md` (open tasks, incl.
+  the type inference that widens the unannotated paths).

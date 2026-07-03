@@ -12,15 +12,27 @@ One front-end (lexer → parser → spanned AST) drives two **compiled** backend
 - **Native (Pico):** AST → textual **LLVM IR** → `clang`/`lld`, with a small
   `no_std` runtime (`p2w-rt`). We compile — we don't ship an interpreter.
 
-The headline, shipped and measured: an in-place comprehension over a uniquely-owned
-packed array does **zero allocation** —
+The headline, shipped and measured — the **Perceus drop-reuse tier**: values are
+released at their last mention, and a death right before a matching allocation
+becomes an **in-place update** ("functional but in-place", FBIP), always guarded
+by a runtime `rc == 1` check so aliased data keeps copy semantics:
 
 ```python
-data = [x * x for x in data]   # data: list[int]  →  in-place map, 0 allocs
+a = [1, 2, 3]                  # a 3-stage pipeline runs in ONE buffer:
+b = [x + 1 for x in a]         # b is built inside a's dying buffer
+c = [y * 2 for y in b]         # c inside b's — 10 allocs naive → 3
 ```
 
-guarded by a runtime `rc == 1` check so an aliased array still gets copy semantics
-("functional but in-place", à la Perceus FBIP).
+| program shape | naive RC | reuse tier |
+|---|---|---|
+| 3-stage comprehension pipeline | 10 allocs | **3** |
+| 3× list reassignment | 6 | **2** |
+| 8× string-append loop | 17 | **4** (in-place growth + interned literals) |
+
+Plus a **Component-Model proof**: the same compiled Python builds as a
+linear-memory WASM **component** (no WASM-GC) that runs correct and leak-free
+in a real component host (`tools/wasm_poc.sh`) — the guest shape a
+sandboxed-activity standard (PXC) needs.
 
 ## Status
 
@@ -31,7 +43,10 @@ with no boxing and no refcount traffic:
   float promotion, params/returns/locals, `for` and `while` loops
 - packed `list[int]`/`list[float]` — flat i32/f64 buffers, bounds-checked
 - list & dict comprehensions (dynamic or packed, `if` filters, `range` sources)
-- FBIP in-place reuse for the self-map; full-`i32` ints (no silent truncation)
+- **the drop-reuse tier**: last-mention liveness + precise drops
+  (`src/reuse.rs`), dying-source map reuse, literal-reassignment reuse,
+  `x = x + e` in-place growth (2× slack, amortized), per-site interned
+  literals; full-`i32` ints (no silent truncation)
 - precise, validated RC (transfer-ownership insertion, borrow-on-read, borrowed
   params for read-only Boxed/array params)
 - the broader subset too — slices, f-strings, **sets** (set theory + methods,
@@ -40,11 +55,14 @@ with no boxing and no refcount traffic:
 
 Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-in.
 
-**Validated without hardware.** Because values are i32 arena *offsets* (not machine
-pointers), the emitted IR + runtime compile with `clang` and run on the host.
-`tools/native_run.sh` is a mechanical oracle: it runs each program through real
-LLVM, diffs stdout against CPython, and asserts `p2w_live() == 0` (no leaks) at
-exit — **95 cases green**.
+**Validated without hardware, three ways.** Because values are i32 arena
+*offsets* (not machine pointers), the emitted IR + runtime compile with `clang`
+and run on the host. `tools/native_run.sh` is a mechanical oracle: real LLVM,
+stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **117 cases
+green**, including adversaries that attack each reuse guard.
+`tools/reuse_bench.sh` measures allocs/peak so wins are numbers, not claims.
+`tools/fuzz_native.sh` differential-fuzzes generated programs against CPython
+(dependency-free, seeded — 120 seeds green).
 
 **Compiles to the board's CPU.** That same IR cross-compiles to **Cortex-M33**
 (`clang --target=thumbv8m.main-none-eabi`), the runtime builds for the target, and
@@ -75,9 +93,13 @@ bash tools/pico_build.sh            # cross-compile+link to a Cortex-M33 ELF (cl
 
 - `docs/PYTHON_COMPAT.md` — the supported Python subset and where it differs from
   CPython (sets, integers, cycles, current gaps).
-- `docs/PITCH.md` — one-page technical pitch (audience: PL / compiler engineers).
-- `docs/TASKS.md` — scoped frontier tasks for a contributor, each with the
-  `live==0` oracle as acceptance gate.
+- `docs/COMPILER_FRONTIER.md` — the pitch + scoped open tasks for a PL/compilers
+  contributor (each with an interface and an executable acceptance gate).
+- `docs/REUSE_PLAN.md` — the Perceus staging, invariants, and the three
+  acceptance nets (oracle / bench / fuzzer).
+- `docs/INTERACTIVE_WEB.md` / `docs/RICH_OUTPUT.md` — the browser capability
+  palette (DOM/SVG/audio/timers) and the `emit_html`/`show()` rich-output
+  channel.
 - `VALUE_MODEL.md` — the boxed↔unboxed representation contract.
 - `MEMORY_MANAGEMENT.md` — the memory model and the PL research it draws on.
 - `PICO_BACKEND.md` — native backend design and status.

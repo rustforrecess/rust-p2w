@@ -14,17 +14,23 @@ built from published PL research — **Perceus-style precise reference counting 
 reuse, type-driven monomorphization, escape analysis** — applied somewhere that
 combination hasn't been: a kid-friendly language on bare metal.
 
-The headline — **functional-but-in-place comprehensions** — is no longer "building
+The headline — **the Perceus drop-reuse tier** — is no longer "building
 toward," it's shipped and measured:
 
 ```python
-data = [x * x for x in data]   # over a unique list[int]
+a = [1, 2, 3]
+b = [x + 1 for x in a]     # b is built inside a's dying buffer
+c = [y * 2 for y in b]     # and c inside b's — the pipeline runs in ONE buffer
 ```
 
-compiles to an **in-place map: zero allocation** (the buffer is reused), guarded
-by a runtime `rc==1` check so an aliased array still gets copy semantics. Measured:
-2 allocs in-place vs 4 copying, on a 4-element map — a steady-state sensor loop
-allocates nothing.
+Values are released at their **last mention** (a liveness pass), and a death
+right before a matching allocation becomes an **in-place update**, always
+guarded by a runtime `rc==1` check so aliased data keeps copy semantics.
+Measured: a 3-stage pipeline **10 → 3 allocs**, 3× list reassignment **6 → 2**,
+an 8× string-append loop **17 → 4** (in-place growth + interned literals) — a
+steady-state sensor loop allocates nothing. The same compiled Python also
+builds as a **linear-memory WASM Component-Model component** (no WASM-GC) that
+runs correct and leak-free in a real component host.
 
 ## Why it's not vaporware — the evidence
 
@@ -53,7 +59,10 @@ code, no boxing, no refcount traffic:**
   win for sensor logs and game state.
 - **Comprehensions** (list + dict): dynamic *or* packed (target-typed), with `if`
   filters and `range` sources; compose with promotion and true division.
-- **FBIP drop-reuse** for the self-map (above), `rc==1`-guarded.
+- **FBIP drop-reuse in four forms**, all `rc==1`-guarded: dying-source map
+  chains, literal reassignment, `x = x + e` in-place growth (2× slack,
+  amortized), and per-site interned literals (a loop's literal materializes
+  once; the cache's permanent +1 doubles as the mutation guard).
 - Ints are full `i32` (heap-boxed beyond the 30-bit inline range — no silent
   truncation). Unannotated code stays a dynamic tagged-`i32` path, byte-identical
   to before; the whole thing is opt-in via annotations.
@@ -100,10 +109,13 @@ live-object counter (`p2w_live()`) and an allocation counter (`p2w_allocs()`), s
 each program through real LLVM, runs it, diffs stdout against CPython, asserts
 **`live_objects == 0`** at exit, and lets us *measure* the reuse win in allocations.
 
-**95 cases pass that gate**, all ending `live == 0`. It caught a real double-free
-during bring-up (a dict-update freeing a key the runtime already owned). Memory-
-safety work here is **verifiable, offline, in seconds** — not "looks right in
-review."
+**117 cases pass that gate**, all ending `live == 0` — including adversaries
+that attack each reuse guard (aliased sources, borrowed-param theft, freed-cell
+corruption). It caught a real double-free during bring-up (a dict-update
+freeing a key the runtime already owned). A **differential fuzzer**
+(`tools/fuzz_native.sh`) generates fresh programs and diffs them against
+CPython — 120 seeds green. Memory-safety work here is **verifiable, offline,
+in seconds** — not "looks right in review."
 
 ## Architecture, at a glance
 
@@ -121,18 +133,20 @@ source ─► lexer ─► parser ─► spanned AST ─┬─► WAT/WASM-GC em
 ## Open problems (where a compiler person would have real impact)
 
 Each sits on the **finished** value model, has a published spec, and a ready-made
-acceptance gate (`live==0` + output diff + alloc/RC counts). See `docs/TASKS.md`.
+acceptance gate (`live==0` + output diff + alloc/peak counts + the fuzzer). The
+scoped list with interfaces and acceptance criteria is
+**`docs/COMPILER_FRONTIER.md`**; the headline items:
 
-1. **General Perceus reuse** — drop/reuse tokens beyond the self-map special case
-   (in-place updates for any unique construction, FBIP in full).
-2. **Full last-use (Perceus)** — release at last use via per-block liveness;
-   shrinks lifetimes and unlocks more reuse.
-3. **Reachability-type escape inference** — generalize today's syntactic
-   borrowed-param analysis into proper flow-sensitive escape/ownership inference
-   (more borrowed params, more reuse, a principled static tier).
-4. **Verified RC pass** — the "language can't, the compiler can" angle: prove the
-   insertion sound (RustBelt/VerusBelt lineage), turning the oracle's test-assured
-   safety into proof-assured safety.
+1. **Full backward liveness** — upgrade last-mention to release *before* a
+   reassignment and inside branches; more deaths, more reuse.
+2. **Type inference** — widen the reuse element whitelist (typed calls should
+   reuse; today only literal arithmetic does).
+3. **Reachability-type escape inference** — generalize the borrowed-param
+   analysis into flow-sensitive escape/ownership inference.
+4. **Cycle handling** — trial deletion over type-limited candidates (design
+   sketched from Nim ORC); gates making linear-memory the default everywhere.
+5. **Verified RC pass** — prove the insertion sound (RustBelt/VerusBelt
+   lineage), turning test-assured safety into proof-assured safety.
 
 Grounding: Perceus (PLDI 2021) and drop-guided reuse; reachability types /
 "Free to Move" (2025), Polymorphic Reachability Types (OOPSLA 2024); Tree Borrows
@@ -143,8 +157,12 @@ Grounding: Perceus (PLDI 2021) and drop-guided reuse; reachability types /
 Native backend covers the teaching subset (ints, floats, strings, lists, dicts,
 packed `list[int/float]`, control flow, functions+recursion, iteration, methods,
 list/dict comprehensions, slices, f-strings, sets, immutable tuples) with a
-**complete value model**, precise validated RC, and FBIP in-place reuse. Host
-run-oracle green: **95 cases, `live == 0`**; tests: 185 lib, 27 runtime, 165
-integration. **Cross-compiles + links to a Cortex-M33 image** (`tools/pico_build.sh`,
-~8–9 KB). **Next hardware milestone:** on-device flash/run (`.uf2`) + the on-chip
-temperature sensor — toolchain in hand, gated only on the board.
+**complete value model**, precise validated RC, and the **full drop-reuse
+tier** (last-mention liveness, precise drops, four reuse forms — the original
+reuse wishlist is closed). Host run-oracle green: **117 cases, `live == 0`**;
+217 lib + 31 runtime tests; differential fuzzer at 120 seeds green.
+**Cross-compiles + links to a Cortex-M33 image** (`tools/pico_build.sh`,
+~8–9 KB) and **builds + runs as a linear-memory WASM component**
+(`tools/wasm_poc.sh`). **Next hardware milestone:** on-device flash/run
+(`.uf2`) + the on-chip temperature sensor — toolchain in hand, gated only on
+the board.

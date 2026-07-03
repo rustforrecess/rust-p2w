@@ -1,13 +1,18 @@
-# Emitter RC Pass — Status: DONE (step 1), validated on host
+# Emitter RC Pass — DONE, then superseded by the reuse tier (historical)
 
-**Status: RC PASS LANDED (2026-06-23).** The emitter now emits `retain`/`release`
-per the transfer ownership model, and it's **validated on the host** (no board):
-`clang` compiles our IR, links `p2w-rt`, and `tools/native_run.sh` runs 21 cases
-with **`live_objects == 0`** at exit (the leak gate is on by default). The gate
-caught a real double-free (dict-update released a key the runtime already owned)
-during bring-up. Remaining work is *precision/optimization*, not correctness:
-last-use release, borrowed params, drop-reuse (FBIP), and cycles — see below and
-MEMORY_MANAGEMENT.md. A board is still only needed for *on-device* confirmation.
+**Historical doc.** The RC pass landed 2026-06-23 (21 oracle cases at the
+time), validated on the host: `clang` compiles our IR, links `p2w-rt`, and the
+oracle asserts **`live == 0`** at exit. The "remaining precision/optimization"
+work it anticipated has SINCE LANDED (Jul 2026): last-mention liveness +
+precise drops, borrowed params, and drop-reuse in four forms (dying-source
+maps, literal reassignment, append/extend growth, interned literals) —
+measured `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4, under a
+117-case oracle + a differential fuzzer. **The living docs are
+`docs/REUSE_PLAN.md` (staging + nets) and `docs/COMPILER_FRONTIER.md` (open
+tasks: full backward liveness, type inference, escape inference, cycles).**
+The narrative below is the original bring-up record — the gate caught a real
+double-free (dict-update released a key the runtime already owned). A board is
+still only needed for *on-device* confirmation.
 
 Why this was possible offline: values are i32 *offsets* into a static arena, not
 machine pointers, so the emitted IR + runtime are host-portable.

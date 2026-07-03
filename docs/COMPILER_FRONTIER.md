@@ -48,8 +48,10 @@ Reproduce with `tools/native_run.sh` (correctness oracle) and
 What's landed of the Perceus staging (`REUSE_PLAN.md` has the detail):
 last-mention liveness (`src/reuse.rs`) → precise drops at last use →
 dying-source map reuse (`try_reuse_map`) → assign-site literal reuse
-(`try_reuse_literal`), each runtime-guarded (`p2w_unique` /
-`p2w_can_reuse_*`) so aliasing silently degrades to copy semantics.
+(`try_reuse_literal`) → append/extend growth (`p2w_add_assign`) → per-site
+interned literals — each runtime-guarded (`p2w_unique` / `p2w_can_reuse_*` /
+`a != b`) so aliasing silently degrades to copy semantics. The original
+wishlist is closed; what remains below is the deeper analysis work.
 
 ## Why it's interesting work
 
@@ -154,6 +156,16 @@ statically rejected with a friendly error); the acyclic bench is unchanged
 
 Dict comprehensions; reuse across `if/else` join points; reuse for
 `append`-then-die builders; slicing that steals from a dying source.
+
+### 7. Stretch: a verified RC pass (the research angle)
+
+The RustBelt/VerusBelt lineage (see `MEMORY_MANAGEMENT.md`) makes it plausible
+to *prove* the emitter's ownership discipline sound rather than just test it —
+"safety the language can't guarantee, enforced by the compiler" is literally
+this project's thesis (POPL'26's *Semantic Back-Translation* framing). A
+mechanized argument for the transfer model + reuse tokens would be a
+publishable result on its own. **Acceptance:** a machine-checked statement of
+the invariant the oracle currently samples (output ≡ CPython ∧ live == 0).
 
 ## Reading order
 
