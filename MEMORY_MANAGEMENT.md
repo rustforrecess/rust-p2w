@@ -64,6 +64,22 @@ sensor logger) need tier 4 (+5 for cyclic object graphs).
   reuse is the biggest embedded win (a game/sensor-log **mutates cells in place**
   instead of churning the allocator). Same cycle caveat → tier 5.
   <https://www.microsoft.com/en-us/research/publication/perceus-garbage-free-reference-counting-with-reuse/>
+- **The Perceus continuation line (the hire's reading order after Perceus):**
+  **Frame-Limited Reuse** — ICFP 2022 (Lorenzen, Leijen): bounds reuse-token
+  lifetimes to the current frame, fixing pathologies where a token outlives its
+  usefulness — directly upgrades our dying-token protocol. **FP²: Fully
+  in-Place Functional Programming** — ICFP 2023: a type discipline guaranteeing
+  *zero* allocation for whole functions. **The Functional Essence of Imperative
+  Binary Search Trees** — PLDI 2024: FBIP at real data-structure scale.
+- **Production analogs (design docs, not papers — ideas-not-code):**
+  **Nim ARC/ORC** — ARC = compile-time RC with move semantics + `sink`/`lent`
+  inference; **ORC = ARC + a trial-deletion cycle collector run only over
+  candidates whose *type* is statically judged potentially-cyclic** — the
+  closest production system to our tier-5 plan (see the cycle-design sketch in
+  `docs/REUSE_PLAN.md`). **Roc** — Perceus-style RC **plus automatic borrow
+  inference** to erase RC traffic on non-owning uses (our escape/borrow task,
+  the practical companion to Reachability Types). **Lobster** — claims ~95% of
+  RC ops eliminated by compile-time analysis; small, readable design notes.
 
 ### Static discipline for a higher-level language (our tiers 1–2)
 - **Reachability Types** — bringing Rust-style reasoning (aliasing, **separation**,

@@ -63,6 +63,21 @@ nothing here depends on those licenses since no code is used.
      backing for the activity `set_field`/`get_field` field storage. Concept only
      — reviewed from the public README, code not read.
 
+4. Nim (ARC/ORC memory management) — https://nim-lang.org — MIT
+   - The ORC design — a trial-deletion cycle collector limited to statically
+     potentially-cyclic types, with O(1) candidate registration — informs our
+     planned tier-5 cycle handling (docs/REUSE_PLAN.md, COMPILER_FRONTIER.md
+     task 5). Reviewed from the public docs and blog only; no source read.
+
+5. CPython — https://www.python.org — PSF License
+   - The widely documented refcount-1 in-place string-append optimization
+     informed `p2w_add_assign`'s unique-receiver growth strategy. The technique
+     is public knowledge; our implementation is original over our own arena
+     allocator (block-size headers as capacity metadata). No CPython source
+     read or used. (CPython is also the black-box *behavioral oracle* for
+     tools/native_run.sh — running an interpreter to diff outputs uses it as a
+     tool and imposes no license obligation on this code.)
+
 ================================================================================
 p2w — MIT License
 ================================================================================

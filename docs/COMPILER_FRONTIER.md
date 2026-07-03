@@ -124,14 +124,29 @@ retain/release counter to `p2w-rt`); oracle green.
 
 ### 5. Cycle handling (tier 5 — the strategic one)
 
-RC leaks cycles; today the compiler has a `may_form_cycle` lint (conservative
-whole-program answer). Options: trial-deletion collector for the suspect set,
-weak-ref discipline, or a static cycle-freedom refinement. **This gates making
-linear-memory the default browser/component build** (today WASM-GC covers the
-browser; the no-GC build is opt-in for device/component targets).
-**Acceptance:** cyclic-program oracle cases end at live == 0 (or are
-statically rejected with a friendly error); no throughput regression on the
-acyclic bench.
+RC leaks cycles. **Design sketch (modeled on Nim ORC — trial deletion over
+type-limited candidates; from their public docs only, see NOTICE):**
+
+- **Layer 0 — program-level (exists):** the `may_form_cycle` lint gives a
+  *whole-program* cycle-freedom guarantee; when it says no, the collector
+  isn't enabled at all — zero overhead, and most K-12 programs land here.
+  (Nim can't do this under separate compilation; we can — our biggest edge.)
+- **Layer 1 — type-level (ORC's key move, stronger for us):** a cycle can
+  only be *closed* by mutating a container (`T_LIST`/`T_DICT`/`T_SET`
+  insertions); strings, packed arrays, floats are acyclic by construction.
+  Only container-tagged objects ever become candidates — our runtime tag IS
+  the classification Nim derives from type analysis + `.acyclic`.
+- **Layer 2 — candidates + trial deletion:** O(1) registration of a container
+  into a candidates buffer when a `p2w_release` decrement leaves rc > 0 (the
+  only event that can strand a cycle); Lins/Bacon–Rajan trial deletion over
+  the buffer at an allocation threshold. Bounded, incremental, no
+  stop-the-world — ORC reports sub-millisecond latencies with this shape.
+
+**This gates making linear-memory the default browser/component build** (today
+WASM-GC covers the browser; the no-GC build is opt-in for device/component
+targets). **Acceptance:** cyclic-program oracle cases end at live == 0 (or are
+statically rejected with a friendly error); the acyclic bench is unchanged
+(Layer 0 keeps today's fast path exactly).
 
 ### 6. Stretch: more reuse shapes
 
