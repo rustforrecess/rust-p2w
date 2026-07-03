@@ -133,6 +133,9 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
 
     let mut globals = String::new();
     let mut defs = String::new();
+    // Interned-literal cache slots from every function + main, released at
+    // main's exit so a finished program ends at live == 0.
+    let mut str_caches: Vec<String> = Vec::new();
 
     for s in stmts {
         if let StmtKind::Def {
@@ -157,6 +160,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
                 &borrow_masks,
                 &param_reprs,
                 &ret_reprs,
+                &mut str_caches,
             )?;
             defs.push_str(&def);
             defs.push('\n');
@@ -164,7 +168,14 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         }
     }
 
-    let (main_def, main_g) = emit_main(stmts, &funcs, &borrow_masks, &param_reprs, &ret_reprs)?;
+    let (main_def, main_g) = emit_main(
+        stmts,
+        &funcs,
+        &borrow_masks,
+        &param_reprs,
+        &ret_reprs,
+        &mut str_caches,
+    )?;
     globals.push_str(&main_g);
 
     Ok(format!(
@@ -181,6 +192,7 @@ fn emit_function(
     borrow_masks: &HashMap<String, Vec<bool>>,
     param_reprs: &HashMap<String, Vec<Repr>>,
     ret_reprs: &HashMap<String, Repr>,
+    str_caches: &mut Vec<String>,
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(funcs, borrow_masks, param_reprs, ret_reprs, name);
     let mask = borrow_masks.get(name).cloned().unwrap_or_default();
@@ -230,6 +242,9 @@ fn emit_function(
         f.allocas,
         f.body
     );
+    // Functions never release their literal caches (they persist across
+    // calls); main frees them all at exit.
+    str_caches.extend(f.str_caches.iter().cloned());
     Ok((def, f.globals))
 }
 
@@ -239,6 +254,7 @@ fn emit_main(
     borrow_masks: &HashMap<String, Vec<bool>>,
     param_reprs: &HashMap<String, Vec<Repr>>,
     ret_reprs: &HashMap<String, Repr>,
+    str_caches: &mut Vec<String>,
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(funcs, borrow_masks, param_reprs, ret_reprs, "main");
     // Analyze the UNFILTERED module so def-body reads pin their globals (a
@@ -257,6 +273,15 @@ fn emit_main(
     if !f.terminated {
         // Release all top-level locals so a finished program ends at live==0.
         f.emit_exit_releases();
+        // ...and free the interned-literal cache (module globals filled by any
+        // function or main; a never-executed literal's slot is 0 → no-op).
+        str_caches.extend(f.str_caches.iter().cloned());
+        for slot in str_caches.iter() {
+            let t = f.temp();
+            f.body.push_str(&format!("  {t} = load i32, ptr {slot}\n"));
+            f.body
+                .push_str(&format!("  call void @p2w_release(i32 {t})\n"));
+        }
         f.body.push_str("  ret i32 0\n");
     }
     let def = format!("define i32 @main() {{\nentry:\n{}{}}}\n", f.allocas, f.body);
@@ -381,6 +406,10 @@ struct FuncEmitter<'a> {
     /// (loop/if bodies — where a "dying" name is still read by later iterations)
     /// can never consume a token that belongs to their enclosing statement.
     dying: Vec<String>,
+    /// Module-global cache slots for interned string literals (one per literal
+    /// SITE, filled lazily on first execution). `main` releases them all at
+    /// exit so a finished program still ends at live == 0.
+    str_caches: Vec<String>,
     terminated: bool,
 }
 
@@ -411,6 +440,7 @@ impl<'a> FuncEmitter<'a> {
             loops: Vec::new(),
             cleanups: Vec::new(),
             dying: Vec::new(),
+            str_caches: Vec::new(),
             terminated: false,
         }
     }
@@ -1771,10 +1801,35 @@ impl<'a> FuncEmitter<'a> {
             }
             ExprKind::NoneLit => Ok((self.call_value("call i32 @p2w_none()"), Repr::Boxed)),
             ExprKind::Str(s) => {
+                // Interned-literal cache (per SITE, lazily filled): a literal
+                // inside a loop materializes ONCE, later executions load +
+                // retain. Sharing is mutation-safe *because of* the cache: its
+                // permanent +1 pins rc >= 2 whenever anyone else holds the
+                // string, so p2w_add_assign's uniqueness guard can never grow a
+                // cached literal in place. The handout is retained, so callers
+                // see the same owned(+1) contract as a fresh allocation; main
+                // releases every cache slot at exit (live == 0 stays exact).
                 let bytes = s.as_bytes();
                 let g = self.intern_str(bytes);
-                let v =
+                let slot = format!("@sc_{}_{}", self.gprefix, self.gcount);
+                self.gcount += 1;
+                self.globals
+                    .push_str(&format!("{slot} = internal global i32 0\n"));
+                self.str_caches.push(slot.clone());
+                let c = self.call_value(&format!("load i32, ptr {slot}"));
+                let isz = self.temp();
+                self.line(&format!("{isz} = icmp eq i32 {c}, 0"));
+                let mk = self.fresh_label("smk");
+                let done = self.fresh_label("sdone");
+                self.terminator(&format!("br i1 {isz}, label %{mk}, label %{done}"));
+                self.place_label(&mk);
+                let new =
                     self.call_value(&format!("call i32 @p2w_str(ptr {g}, i32 {})", bytes.len()));
+                self.line(&format!("store i32 {new}, ptr {slot}"));
+                self.br_to(&done);
+                self.place_label(&done);
+                let v = self.call_value(&format!("load i32, ptr {slot}"));
+                self.retain(&v);
                 Ok((v, Repr::Boxed))
             }
             ExprKind::Name(name) => {

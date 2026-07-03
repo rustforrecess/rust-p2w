@@ -79,10 +79,12 @@ bench_case wl_chain    'a: list[int] = [1, 2, 3, 4, 5]\nb = [x + 1 for x in a]\n
 # overwrites the dead old xs in place (was 6 allocs / peak 2; now 2 / 1).
 bench_case wl_realloc  'xs = [0, 0, 0, 0]\nxs = [1, 1, 1, 1]\nxs = [2, 2, 2, 2]\nprint(xs[0])\n'
 
-# Concat loop — LANDED (append drop-reuse, p2w_add_assign): a unique receiver
-# grows in place within its block's spare capacity, realloc'ing with 2x slack
-# when it runs out (was 17 allocs; now 10 — the remaining 8 are the
-# per-iteration "x" LITERAL allocations; literal hoisting is the follow-on).
+# Concat loop — LANDED (append drop-reuse + interned-literal caching): a unique
+# receiver grows in place with 2x slack, and each literal SITE materializes
+# once (cached in a module global; main frees the cache at exit). 17 -> 10 ->
+# 4 allocs. Note the honest trade: peak rose 3 -> 4 because cached literals
+# stay pinned for the run — total churn collapsed, but pinned objects count
+# toward peak (on-device they're morally static data).
 bench_case wl_concat   's = ""\nfor i in range(8):\n    s = s + "x"\nprint(len(s))\n'
 
 echo

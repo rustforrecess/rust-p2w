@@ -363,6 +363,29 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn string_literals_are_cached_per_site() {
+        // Each literal site gets a lazily-filled module-global cache slot: a
+        // literal in a loop materializes once, later iterations load + retain.
+        let ir = compile_to_llvm_ir("s = \"\"\nfor i in range(8):\n    s = s + \"x\"\nprint(s)\n")
+            .unwrap();
+        assert!(ir.contains("@sc_main_"), "cache slot global: {ir}");
+        assert!(
+            ir.contains("internal global i32 0"),
+            "zero-init cache slots: {ir}"
+        );
+        // main frees every cache slot at exit (live == 0 stays exact): at least
+        // as many releases as there are cache slots.
+        let slots = ir.matches("= internal global i32 0").count();
+        assert!(slots >= 2, "two literal sites expected: {ir}");
+        // A function's literal cache is also freed by main, not the function.
+        let ir2 = compile_to_llvm_ir(
+            "def tag(n):\n    return \"#\" + str(n)\nprint(tag(1))\nprint(tag(2))\n",
+        )
+        .unwrap();
+        assert!(ir2.contains("@sc_tag_"), "function-site cache slot: {ir2}");
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",

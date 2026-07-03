@@ -46,10 +46,16 @@ run-oracle. The staging, and where it stands:
    list extends in place. The runtime guards (`rc == 1` + `a != b`) are
    *complete* — any other live reference implies rc ≥ 2 — so no emitter-side
    expression restrictions are needed. Measured: `wl_concat` 17 → 10 allocs
-   (the rest are per-iteration suffix-literal allocations). **Still open in
-   step 3:** literal hoisting/interning (the `wl_concat` remainder), widening
-   the element whitelist with real type inference, and reuse across further
-   statement shapes.
+   (the rest were per-iteration suffix-literal allocations). **And interned
+   literals**: every string-literal SITE gets a lazily-filled module-global
+   cache (loop literals materialize once; `main` frees the cache at exit so
+   `live == 0` stays exact; the cache's permanent +1 doubles as the mutation
+   guard — a cached literal can never be rc==1 in a consumer's hands, so
+   in-place growth can't touch it). `wl_concat` now 17 → **4** allocs (peak
+   3 → 4: pinned literals count toward peak — churn collapsed, the right
+   trade on-device). **The original wishlist is fully closed. Still open in
+   step 3:** widening the element whitelist with real type inference, and
+   reuse across further statement shapes.
 4. **Escape / borrowed-param inference** (tier 2) and **cycle handling** (tier 5)
    — later. Cycles are the gate for making linear-memory the safe default in the
    browser/component build (see `acornstem/ACTIVITY_INTERFACE.md`).

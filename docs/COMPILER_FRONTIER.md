@@ -28,6 +28,7 @@ Reproduce with `tools/native_run.sh` (correctness oracle) and
 | 3-stage comprehension pipeline (`wl_chain`) | 10 allocs, peak 3 | **3 allocs, peak 1** — the pipeline runs in ONE buffer |
 | 3× literal reassignment (`wl_realloc`) | 6 allocs, peak 2 | **2 allocs, peak 1** |
 | unique self-map (`fbip_unique`) | 4 allocs | **2 allocs** (in-place) |
+| 8-iteration string-append loop (`wl_concat`) | 17 allocs | **4 allocs** (in-place growth + interned literals) |
 
 - **Zero-allocation steady state** for map pipelines and reassignment churn —
   what a sensor loop or game loop on a 520 KB-RAM device needs.
@@ -81,17 +82,18 @@ sites).
 
 ## The open tasks (pick your poison)
 
-### 1. Literal hoisting / interning (the `wl_concat` remainder)
+### 1. ~~Literal hoisting / interning~~ — LANDED
 
-The append itself is landed (`p2w_add_assign`: unique receivers grow in place
-with amortized 2× slack — `wl_concat` went 17 → 10 allocs). The remaining 10
-are dominated by the **per-iteration suffix literal**: `"x"` is materialized
-as a fresh heap string every loop turn. Hoist loop-invariant string literals
-(or intern module string constants once at startup). **Interface:** a
-module-level interned-constants table + emitter hoisting for literals inside
-loops. **Acceptance:** `wl_concat` drops toward ~2–3 allocs; oracle green
-(watch: interned strings must never be released by RC — pin or refcount-bias
-them).
+Per-site lazy caching: every string-literal site gets a zero-init module
+global; the first execution materializes via `p2w_str`, later executions
+(loop iterations) `load + retain`. `main` frees the whole cache at exit, so
+`live == 0` stays exact. The predicted pin hazard resolved *elegantly*: the
+cache's permanent +1 pins rc ≥ 2 whenever a consumer holds a cached literal,
+so `p2w_add_assign`'s uniqueness guard can never grow one in place — the pin
+IS the mutation guard. Measured: `wl_concat` 17 → 10 → **4 allocs** (peak
+3 → 4: pinned literals count toward peak; churn collapsed — the right trade
+on-device). The original wishlist is now fully closed; remaining reuse work
+is tasks 2–4 + 6 below.
 
 ### 2. Full backward liveness (upgrade the last-mention analysis)
 
