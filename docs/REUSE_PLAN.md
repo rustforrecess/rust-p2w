@@ -61,6 +61,16 @@ Use-after-free shows up as wrong/garbage output or a trap (the oracle caps
 runtime). Wins are measured by `tools/reuse_bench.sh` — **allocs** (drop-reuse's
 metric) and **peak** (precise drops' metric) — not guessed.
 
+**Third net — differential fuzzing:** `tools/fuzz_native.sh` (with
+`tools/gen_program.py`, dependency-free, seeded/reproducible) generates
+programs that are *safe by construction* (magnitude-tracked ints, non-negative
+`//`/`%` operands, ASCII strings, in-bounds indexing, bounded loops) and
+*weighted at the reuse machinery* (comp chains, literal reassign, append,
+aliases), then diffs CPython vs native output and gates `live == 0` per seed.
+Any DIFF/LEAK is a real finding with a one-command repro
+(`python3 tools/gen_program.py <seed>`). Run a large batch after any
+reuse-path change: `FUZZ_N=200 tools/fuzz_native.sh`.
+
 ## What already exists (don't rebuild)
 
 - **Emitter RC pass** (`llvm.rs`): transfer-based model, documented in the big
