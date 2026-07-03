@@ -70,11 +70,13 @@ bench_case fbip_unique 'data: list[int] = [1, 2, 3, 4]\ndata = [x * x for x in d
 # Aliased: must copy (someone else can observe the original) — more allocs is correct.
 bench_case fbip_alias  'data: list[int] = [1, 2, 3, 4]\nalias = data\ndata = [x * x for x in data]\nprint(len(alias))\n'
 
+# Chain maps — LANDED (drop-reuse step 3): each stage consumes its dying
+# source's buffer, so the whole pipeline runs in ONE buffer (was 10 allocs /
+# peak 3 under naive scope-end; now 3 allocs / peak 1).
+bench_case wl_chain    'a: list[int] = [1, 2, 3, 4, 5]\nb = [x + 1 for x in a]\nc = [y * 2 for y in b]\nprint(c[0])\n'
+
 echo
 echo "# WISHLIST — should reuse but don't yet (these alloc counts are the target):"
-# Chained comprehensions: each stage's input dies at its last use, so each could
-# reuse the prior buffer in place instead of allocating a fresh one.
-bench_case wl_chain    'a: list[int] = [1, 2, 3, 4, 5]\nb = [x + 1 for x in a]\nc = [y * 2 for y in b]\nprint(c[0])\n'
 # Reassignment churn: each `xs = [...]` should be able to reuse the dead old xs.
 bench_case wl_realloc  'xs = [0, 0, 0, 0]\nxs = [1, 1, 1, 1]\nxs = [2, 2, 2, 2]\nprint(xs[0])\n'
 # Accumulate via concat in a loop: the intermediate strings/lists die each turn.

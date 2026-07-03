@@ -244,6 +244,7 @@ fn emit_main(
         if matches!(s.kind, StmtKind::Def { .. }) {
             continue;
         }
+        f.dying = live.dead_after(idx).to_vec();
         f.stmt(s)?;
         if !f.terminated {
             f.early_releases(live.dead_after(idx));
@@ -370,6 +371,12 @@ struct FuncEmitter<'a> {
     /// Owned temps that outlive a single statement (loop iterators/sequences,
     /// counted-loop bounds) and must be released at every function exit.
     cleanups: Vec<String>,
+    /// Names whose last mention is the statement about to be emitted — the
+    /// Perceus **reuse tokens**. Set by `block_precise`/`emit_main` before each
+    /// top-level statement; `stmt()` *takes* it on entry so nested statements
+    /// (loop/if bodies — where a "dying" name is still read by later iterations)
+    /// can never consume a token that belongs to their enclosing statement.
+    dying: Vec<String>,
     terminated: bool,
 }
 
@@ -399,6 +406,7 @@ impl<'a> FuncEmitter<'a> {
             vars: Vec::new(),
             loops: Vec::new(),
             cleanups: Vec::new(),
+            dying: Vec::new(),
             terminated: false,
         }
     }
@@ -724,6 +732,134 @@ impl<'a> FuncEmitter<'a> {
         Ok(true)
     }
 
+    /// General Perceus drop-reuse (step 3, `docs/REUSE_PLAN.md`): lower
+    /// `dst = [f(x) for x in src]` — where `src` **dies at this statement** (its
+    /// reuse token is in `dying`) — to an in-place map over src's packed buffer
+    /// when it's uniquely owned at runtime, then TRANSFER the buffer to `dst`:
+    /// zero allocation, and src's slot is zeroed (moved, not released), so the
+    /// early-release after the statement is a no-op. Aliased at runtime → build
+    /// a fresh array (the aliased original is never mutated) and let the normal
+    /// death path release src. Generalizes `try_inplace_map` from the self-map
+    /// to any map whose source is provably dead.
+    fn try_reuse_map(
+        &mut self,
+        dst: &str,
+        element: &Expr,
+        clauses: &[CompClause],
+        dying: &[String],
+    ) -> Result<bool, String> {
+        // Exactly `for lv in <src>`, filterless (length-preserving); src ≠ dst
+        // (the self case is try_inplace_map's) and the loop var can't be dst.
+        if clauses.len() != 1 {
+            return Ok(false);
+        }
+        let (loopvar, src) = match &clauses[0] {
+            CompClause::For { vars, iter } if vars.len() == 1 && vars[0] != dst => {
+                match &iter.kind {
+                    ExprKind::Name(s) if s != dst => (vars[0].clone(), s.clone()),
+                    _ => return Ok(false),
+                }
+            }
+            _ => return Ok(false),
+        };
+        // The token: src's last mention is THIS statement…
+        if !dying.contains(&src) {
+            return Ok(false);
+        }
+        // …and the buffer is ours to take: never steal a borrowed param's (the
+        // caller owns it — at rc==1 that count IS the caller's slot).
+        if self.borrowed_params.contains(&src) {
+            return Ok(false);
+        }
+        if !self.vars.iter().any(|v| v == &src) {
+            return Ok(false);
+        }
+        let src_repr = self.slot_repr(&src);
+        let elem_repr = match src_repr {
+            Repr::IntArray => Repr::Int,
+            Repr::FloatArray => Repr::Float,
+            _ => return Ok(false),
+        };
+        // dst adopts src's packed repr — only when dst is new or already matches.
+        if self.vars.iter().any(|v| v == dst) && self.slot_repr(dst) != src_repr {
+            return Ok(false);
+        }
+        // The element may only see src through the loop var (an arbitrary
+        // `src[k]` read would observe already-overwritten cells), and must be
+        // conservatively typed to the buffer's element repr — dst may be
+        // unannotated, and `str(x)` must not adopt a packed-int buffer.
+        if expr_uses_name(element, &src) {
+            return Ok(false);
+        }
+        if !elem_matches_repr(element, &loopvar, elem_repr) {
+            return Ok(false);
+        }
+
+        let line = element.line;
+        self.ensure_slot(dst, src_repr);
+        let arr = self.call_value(&format!("load i32, ptr %v_{src}")); // borrow
+        let uniq = self.temp();
+        self.line(&format!("{uniq} = call i1 @p2w_unique(i32 {arr})"));
+        let reuse = self.fresh_label("reuse");
+        let copy = self.fresh_label("copy");
+        let endl = self.fresh_label("mapend");
+        self.terminator(&format!("br i1 {uniq}, label %{reuse}, label %{copy}"));
+
+        // Reuse: overwrite src's cells with f(x), then transfer the buffer.
+        self.place_label(&reuse);
+        self.ensure_slot(&loopvar, elem_repr);
+        let id = self.next_label;
+        self.next_label += 1;
+        let iname = format!("__map{id}");
+        let mk = |k: ExprKind| Expr {
+            kind: k,
+            line,
+            span: (0, 0),
+        };
+        let src_name = || mk(ExprKind::Name(src.clone()));
+        let idx = || mk(ExprKind::Name(iname.clone()));
+        let body = vec![
+            Stmt {
+                kind: StmtKind::Assign(
+                    loopvar.clone(),
+                    mk(ExprKind::Index(Box::new(src_name()), Box::new(idx()))),
+                ),
+                line,
+            },
+            Stmt {
+                kind: StmtKind::SetIndex {
+                    target: src_name(),
+                    index: idx(),
+                    value: element.clone(),
+                },
+                line,
+            },
+        ];
+        let len = mk(ExprKind::Call("len".to_string(), vec![src_name()]));
+        self.emit_for(
+            &iname,
+            &mk(ExprKind::Int(0)),
+            &len,
+            &mk(ExprKind::Int(1)),
+            &body,
+        )?;
+        let moved = self.call_value(&format!("load i32, ptr %v_{src}"));
+        let dptr = format!("%v_{dst}");
+        self.store_var(dst, &dptr, moved, src_repr); // releases dst's old value
+        self.line(&format!("store i32 0, ptr %v_{src}")); // moved, not released
+        self.br_to(&endl);
+
+        // Copy: fresh packed array; src stays put for the normal death path.
+        self.place_label(&copy);
+        let new = self.build_comprehension(src_repr, element, clauses)?;
+        let dptr = format!("%v_{dst}");
+        self.store_var(dst, &dptr, new, src_repr);
+        self.br_to(&endl);
+
+        self.place_label(&endl);
+        Ok(true)
+    }
+
     /// Build the nested loop/filter body of a comprehension: each `for` clause
     /// becomes a loop (counted `range` or iterating) wrapping the rest, each `if`
     /// a guard around it. `inner` is the innermost statement (the append or
@@ -946,6 +1082,10 @@ impl<'a> FuncEmitter<'a> {
     /// scope-end `block` walk, matching the analysis's statement granularity.
     fn block_precise(&mut self, stmts: &[Stmt], live: &Liveness) -> Result<(), String> {
         for (idx, s) in stmts.iter().enumerate() {
+            // Offer this statement's deaths as reuse tokens (stmt() takes them;
+            // a consumed token zeroes the source slot, making the early release
+            // below a no-op for it).
+            self.dying = live.dead_after(idx).to_vec();
             self.stmt(s)?;
             // After a terminator (`return`) the exit path already released
             // everything; anything further is dead code.
@@ -980,6 +1120,9 @@ impl<'a> FuncEmitter<'a> {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        // Take this statement's reuse tokens; nested stmt() calls see empty
+        // (a name dying after an enclosing loop is still live inside it).
+        let dying = std::mem::take(&mut self.dying);
         let nope = |what: &str| {
             Err(format!(
                 "line {}: the native (Pico) backend doesn't handle {what} yet",
@@ -992,6 +1135,14 @@ impl<'a> FuncEmitter<'a> {
                 // maps in place (zero allocation); otherwise it falls through.
                 if let ExprKind::ListComp { element, clauses } = &value.kind
                     && self.try_inplace_map(name, element, clauses)?
+                {
+                    return Ok(());
+                }
+                // General drop-reuse: `b = [f(x) for x in a]` where `a` DIES at
+                // this statement — consume a's death as a reuse token and build
+                // b inside a's buffer when it's unique at runtime.
+                if let ExprKind::ListComp { element, clauses } = &value.kind
+                    && self.try_reuse_map(name, element, clauses, &dying)?
                 {
                     return Ok(());
                 }
@@ -2199,6 +2350,34 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
             .iter()
             .any(|(k, v)| expr_uses_name(k, name) || expr_uses_name(v, name)),
         _ => true, // unknown — assume it might reference `name`
+    }
+}
+
+/// Conservative syntactic typing for a reuse-map element: is `e` *guaranteed*
+/// to produce the packed buffer's element type? Int buffers: integer arithmetic
+/// over the loop var and int literals (no `/` — true division makes floats; no
+/// `**` — negative exponents do too). Float buffers: float arithmetic over the
+/// loop var and numeric literals. Anything else (calls, strings, comparisons,
+/// other names) → no reuse. Widen with real type inference later (the hire).
+fn elem_matches_repr(e: &Expr, loopvar: &str, elem: Repr) -> bool {
+    match (&e.kind, elem) {
+        (ExprKind::Name(n), _) => n == loopvar,
+        (ExprKind::Int(_), _) => true, // int literals promote into float buffers
+        (ExprKind::Float(_), Repr::Float) => true,
+        (ExprKind::Unary(UnOp::Neg, i), _) => elem_matches_repr(i, loopvar, elem),
+        (ExprKind::Bin(op, a, b), Repr::Int) => {
+            matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod
+            ) && elem_matches_repr(a, loopvar, elem)
+                && elem_matches_repr(b, loopvar, elem)
+        }
+        (ExprKind::Bin(op, a, b), Repr::Float) => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                && elem_matches_repr(a, loopvar, elem)
+                && elem_matches_repr(b, loopvar, elem)
+        }
+        _ => false,
     }
 }
 

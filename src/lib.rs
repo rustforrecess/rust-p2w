@@ -298,6 +298,35 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn chain_map_consumes_the_dying_source() {
+        // Drop-reuse (step 3): both chain stages consume their dying source's
+        // buffer — each emits a runtime unique() guard.
+        let ir = compile_to_llvm_ir(
+            "a: list[int] = [1, 2, 3]\nb = [x + 1 for x in a]\nc = [y * 2 for y in b]\nprint(c)\n",
+        )
+        .unwrap();
+        assert_eq!(ir.matches("call i1 @p2w_unique").count(), 2, "{ir}");
+        // Source still read later -> no death token -> no reuse guard.
+        let ir2 = compile_to_llvm_ir(
+            "a: list[int] = [1, 2, 3]\nb = [x + 1 for x in a]\nprint(a)\nprint(b)\n",
+        )
+        .unwrap();
+        assert_eq!(ir2.matches("call i1 @p2w_unique").count(), 0, "{ir2}");
+        // A borrowed param's buffer is never stolen, even when it dies in the
+        // callee (rc==1 is the CALLER's count) — no guard emitted.
+        let ir3 = compile_to_llvm_ir(
+            "def dbl(xs: list[int]) -> int:\n    b = [x * 2 for x in xs]\n    return b[0]\nys: list[int] = [3, 4]\nprint(dbl(ys))\nprint(ys)\n",
+        )
+        .unwrap();
+        assert_eq!(ir3.matches("call i1 @p2w_unique").count(), 0, "{ir3}");
+        // A non-whitelisted element (str(x) isn't int-typed) never adopts the
+        // packed buffer.
+        let ir4 = compile_to_llvm_ir("a: list[int] = [1, 2]\nb = [str(x) for x in a]\nprint(b)\n")
+            .unwrap();
+        assert_eq!(ir4.matches("call i1 @p2w_unique").count(), 0, "{ir4}");
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",

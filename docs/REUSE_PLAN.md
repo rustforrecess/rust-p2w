@@ -1,7 +1,7 @@
 # Perceus reuse tier — implementation plan (onboarding for the compiler hire)
 
-**Status: steps 1–2 LANDED (last-mention liveness + precise drops); steps 3–5
-open.** This is the staging, the invariants, and the acceptance contract for the
+**Status: steps 1–2 LANDED (last-mention liveness + precise drops); step 3
+LANDED for the map-chain case (dying-source drop-reuse); rest open.** This is the staging, the invariants, and the acceptance contract for the
 precise-RC + reuse work (native/Pico backend only — the browser uses WASM-GC).
 Read alongside `MEMORY_MANAGEMENT.md` (the research + tiers) and
 `PICO_BACKEND.md` (the value model).
@@ -23,10 +23,19 @@ run-oracle. The staging, and where it stands:
    scope-exit release stays a no-op). Applied to function-body top level +
    `main` (nested bodies stay scope-end). Measured: `wl_chain` peak live objects
    4 → 3 (`p2w_peak` watermark).
-3. **General drop-reuse** — OPEN (the main prize): pair a death with a following
-   same-size allocation → in-place update (FBIP). Generalize the one shipped
-   special case (`try_inplace_map`). This is what moves the wishlist *alloc*
-   counts.
+3. **General drop-reuse** — ✅ landed for the flagship case: `try_reuse_map` in
+   `llvm.rs` lowers `dst = [f(x) for x in src]` *where src dies at that
+   statement* (its token from the liveness) to an in-place map over src's
+   buffer when unique at runtime, transferring the buffer to dst — zero
+   allocation. Guards: tokens are top-level-statement-only (`stmt()` takes
+   `self.dying` on entry so loop bodies never see one), borrowed params are
+   never stolen (rc==1 is the caller's count), and the element must pass a
+   conservative syntactic type whitelist (`elem_matches_repr`) since dst may
+   be unannotated. Measured: `wl_chain` 10 → 3 allocs, peak 3 → 1 — a 3-stage
+   pipeline runs in ONE buffer. **Still open in step 3:** literal-reassignment
+   reuse (`wl_realloc`), string-growth strategies (`wl_concat`), widening the
+   element whitelist with real type inference, and reuse across statement
+   shapes beyond map comprehensions.
 4. **Escape / borrowed-param inference** (tier 2) and **cycle handling** (tier 5)
    — later. Cycles are the gate for making linear-memory the safe default in the
    browser/component build (see `acornstem/ACTIVITY_INTERFACE.md`).
