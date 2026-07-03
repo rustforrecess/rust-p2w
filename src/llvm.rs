@@ -57,6 +57,9 @@ declare void @p2w_print(i32)
 declare void @p2w_retain(i32)
 declare void @p2w_release(i32)
 declare i1 @p2w_unique(i32)
+declare i1 @p2w_can_reuse_list(i32, i32)
+declare i1 @p2w_can_reuse_iarray(i32, i32)
+declare i1 @p2w_can_reuse_farray(i32, i32)
 ; containers
 declare i32 @p2w_list_new()
 declare i32 @p2w_list_append(i32, i32)
@@ -860,6 +863,84 @@ impl<'a> FuncEmitter<'a> {
         Ok(true)
     }
 
+    /// Assign-site drop-reuse: `xs = [a, b, c]` reassigning an existing slot —
+    /// the old collection dies right here (the assign would release it). When
+    /// the old value is a unique collection of the same tag and EXACT length
+    /// (a runtime `p2w_can_reuse_*` check — a Boxed slot could hold *anything*,
+    /// including a string or an immutable tuple, so the tag test is essential),
+    /// overwrite its elements in place instead of allocating a fresh object +
+    /// buffer. The element writes are synthesized `SetIndex` statements, so
+    /// boxed and packed slots get exactly the normal transfer/coercion
+    /// semantics (the runtime releases each replaced element).
+    fn try_reuse_literal(
+        &mut self,
+        name: &str,
+        items: &[Expr],
+        line: usize,
+    ) -> Result<bool, String> {
+        if items.is_empty() || !self.vars.iter().any(|v| v == name) {
+            return Ok(false);
+        }
+        // A borrowed param's value belongs to the caller — never overwrite it.
+        if self.borrowed_params.iter().any(|p| p == name) {
+            return Ok(false);
+        }
+        let slot = self.slot_repr(name);
+        let pred = match slot {
+            Repr::Boxed => "p2w_can_reuse_list",
+            Repr::IntArray => "p2w_can_reuse_iarray",
+            Repr::FloatArray => "p2w_can_reuse_farray",
+            _ => return Ok(false),
+        };
+        // An element reading the container would observe already-overwritten
+        // cells (`xs = [xs[1], xs[0]]` must swap, not smear).
+        if items.iter().any(|it| expr_uses_name(it, name)) {
+            return Ok(false);
+        }
+
+        let old = self.call_value(&format!("load i32, ptr %v_{name}"));
+        let fit = self.temp();
+        self.line(&format!(
+            "{fit} = call i1 @{pred}(i32 {old}, i32 {})",
+            items.len()
+        ));
+        let reuse = self.fresh_label("reuse");
+        let copy = self.fresh_label("copy");
+        let endl = self.fresh_label("litend");
+        self.terminator(&format!("br i1 {fit}, label %{reuse}, label %{copy}"));
+
+        // Reuse: overwrite each element in place, left to right (same order —
+        // and side effects — as the literal build in the copy branch).
+        self.place_label(&reuse);
+        let mk = |k: ExprKind| Expr {
+            kind: k,
+            line,
+            span: (0, 0),
+        };
+        for (i, item) in items.iter().enumerate() {
+            self.stmt(&Stmt {
+                kind: StmtKind::SetIndex {
+                    target: mk(ExprKind::Name(name.to_string())),
+                    index: mk(ExprKind::Int(i as i64)),
+                    value: item.clone(),
+                },
+                line,
+            })?;
+        }
+        self.br_to(&endl);
+
+        // Copy: the normal build + reassign (releases the old binding).
+        self.place_label(&copy);
+        let list_expr = mk(ExprKind::List(items.to_vec()));
+        let (v, vr) = self.eval_for_slot(slot, &list_expr)?;
+        let ptr = format!("%v_{name}");
+        self.store_var(name, &ptr, v, vr);
+        self.br_to(&endl);
+
+        self.place_label(&endl);
+        Ok(true)
+    }
+
     /// Build the nested loop/filter body of a comprehension: each `for` clause
     /// becomes a loop (counted `range` or iterating) wrapping the rest, each `if`
     /// a guard around it. `inner` is the innermost statement (the append or
@@ -1143,6 +1224,14 @@ impl<'a> FuncEmitter<'a> {
                 // b inside a's buffer when it's unique at runtime.
                 if let ExprKind::ListComp { element, clauses } = &value.kind
                     && self.try_reuse_map(name, element, clauses, &dying)?
+                {
+                    return Ok(());
+                }
+                // Assign-site drop-reuse: `xs = [lit…]` over an existing slot —
+                // the old collection dies right here; overwrite it in place when
+                // it's a unique same-tag same-length collection at runtime.
+                if let ExprKind::List(items) = &value.kind
+                    && self.try_reuse_literal(name, items, value.line)?
                 {
                     return Ok(());
                 }

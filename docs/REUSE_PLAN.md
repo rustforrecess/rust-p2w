@@ -32,10 +32,16 @@ run-oracle. The staging, and where it stands:
    never stolen (rc==1 is the caller's count), and the element must pass a
    conservative syntactic type whitelist (`elem_matches_repr`) since dst may
    be unannotated. Measured: `wl_chain` 10 → 3 allocs, peak 3 → 1 — a 3-stage
-   pipeline runs in ONE buffer. **Still open in step 3:** literal-reassignment
-   reuse (`wl_realloc`), string-growth strategies (`wl_concat`), widening the
-   element whitelist with real type inference, and reuse across statement
-   shapes beyond map comprehensions.
+   pipeline runs in ONE buffer. **Also landed:** assign-site literal reuse
+   (`try_reuse_literal`): `xs = [lit…]` over an existing slot overwrites the
+   dead old collection in place when a runtime `p2w_can_reuse_*` guard passes
+   (tag + unique + exact length — the tag test keeps a Boxed slot holding a
+   string/tuple safe); element writes are synthesized `SetIndex` statements so
+   boxed and packed slots keep normal transfer semantics. Measured:
+   `wl_realloc` 6 → 2 allocs, peak 2 → 1. **Still open in step 3:**
+   string-growth strategies (`wl_concat` — a capacity strategy, not
+   element-wise reuse), widening the element whitelist with real type
+   inference, and reuse across further statement shapes.
 4. **Escape / borrowed-param inference** (tier 2) and **cycle handling** (tier 5)
    — later. Cycles are the gate for making linear-memory the safe default in the
    browser/component build (see `acornstem/ACTIVITY_INTERFACE.md`).

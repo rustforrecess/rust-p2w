@@ -75,11 +75,14 @@ bench_case fbip_alias  'data: list[int] = [1, 2, 3, 4]\nalias = data\ndata = [x 
 # peak 3 under naive scope-end; now 3 allocs / peak 1).
 bench_case wl_chain    'a: list[int] = [1, 2, 3, 4, 5]\nb = [x + 1 for x in a]\nc = [y * 2 for y in b]\nprint(c[0])\n'
 
+# Reassignment churn — LANDED (assign-site literal reuse): each `xs = [...]`
+# overwrites the dead old xs in place (was 6 allocs / peak 2; now 2 / 1).
+bench_case wl_realloc  'xs = [0, 0, 0, 0]\nxs = [1, 1, 1, 1]\nxs = [2, 2, 2, 2]\nprint(xs[0])\n'
+
 echo
 echo "# WISHLIST — should reuse but don't yet (these alloc counts are the target):"
-# Reassignment churn: each `xs = [...]` should be able to reuse the dead old xs.
-bench_case wl_realloc  'xs = [0, 0, 0, 0]\nxs = [1, 1, 1, 1]\nxs = [2, 2, 2, 2]\nprint(xs[0])\n'
-# Accumulate via concat in a loop: the intermediate strings/lists die each turn.
+# Accumulate via concat in a loop: the intermediate strings die each turn —
+# needs a capacity/growth strategy, not element-wise reuse.
 bench_case wl_concat   's = ""\nfor i in range(8):\n    s = s + "x"\nprint(len(s))\n'
 
 echo

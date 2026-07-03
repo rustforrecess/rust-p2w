@@ -164,6 +164,21 @@ run_case reuse_float 'd: list[float] = [1.0, 2.0]\ne = [v * 2.0 for v in d]\npri
 # A BORROWED param's buffer must never be stolen even when it dies in the
 # callee and rc==1 (that count is the CALLER's slot): ys must survive the call.
 run_case reuse_borrowed 'def dbl(xs: list[int]) -> int:\n    b = [x * 2 for x in xs]\n    return b[0]\nys: list[int] = [3, 4]\nprint(dbl(ys))\nprint(ys)\n' '6\n[3, 4]' || fails=$((fails+1))
+# --- assign-site literal reuse: xs = [lit...] overwrites the dead old xs -----
+run_case reuse_lit 'xs = [1, 2]\nxs = [3, 4]\nprint(xs)\n' '[3, 4]' || fails=$((fails+1))
+# Aliased -> the runtime guard forces a fresh build; the alias keeps old values.
+run_case reuse_lit_alias 'xs = [1, 2]\nkeep = xs\nxs = [3, 4]\nprint(xs)\nprint(keep)\n' '[3, 4]\n[1, 2]' || fails=$((fails+1))
+# Length mismatch -> copy path.
+run_case reuse_lit_len 'xs = [1, 2]\nxs = [3, 4, 5]\nprint(xs)\n' '[3, 4, 5]' || fails=$((fails+1))
+# Elements reading the container must NOT reuse (swap, not smear).
+run_case reuse_lit_self 'xs = [1, 2]\nxs = [xs[1], xs[0]]\nprint(xs)\n' '[2, 1]' || fails=$((fails+1))
+# A Boxed slot holding a STRING: the tag guard must refuse (never setindex a str).
+run_case reuse_lit_str 's = "ab"\ns = [1, 2]\nprint(s)\n' '[1, 2]' || fails=$((fails+1))
+# Packed (annotated) slots reuse too.
+run_case reuse_lit_packed 'ys: list[int] = [1, 2]\nys = [3, 4]\nprint(ys)\n' '[3, 4]' || fails=$((fails+1))
+# Overwriting boxed elements with a different type: each replaced element is
+# released by the runtime; the new values are strings.
+run_case reuse_lit_types 'xs = [1, 2]\nxs = ["a", "b"]\nprint(xs[0])\nprint(xs[1])\n' 'a\nb' || fails=$((fails+1))
 run_case comp_float 'data: list[float] = [x / 2 for x in range(4)]\nprint(data)\n' '[0.0, 0.5, 1.0, 1.5]' || fails=$((fails+1))
 run_case dictcomp  'd = {x: x * x for x in range(4)}\nprint(d[2])\nprint(len(d))\n' '4\n4' || fails=$((fails+1))
 run_case dictcomp_filter 'd = {n: n + 1 for n in range(6) if n % 2 == 0}\nprint(len(d))\nprint(d[4])\n' '3\n5' || fails=$((fails+1))

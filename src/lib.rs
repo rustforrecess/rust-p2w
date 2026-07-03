@@ -327,6 +327,27 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn literal_reassignment_reuses_in_place() {
+        // Assign-site drop-reuse: reassigning with a literal emits the runtime
+        // can-reuse guard (tag + unique + exact length).
+        let ir = compile_to_llvm_ir("xs = [1, 2]\nxs = [3, 4]\nprint(xs)\n").unwrap();
+        assert_eq!(ir.matches("call i1 @p2w_can_reuse_list").count(), 1, "{ir}");
+        // Annotated slots use the packed predicate.
+        let ir2 = compile_to_llvm_ir("ys: list[int] = [1, 2]\nys = [3, 4]\nprint(ys)\n").unwrap();
+        assert_eq!(
+            ir2.matches("call i1 @p2w_can_reuse_iarray").count(),
+            1,
+            "{ir2}"
+        );
+        // Elements reading the container must NOT reuse (swap, not smear).
+        let ir3 = compile_to_llvm_ir("xs = [1, 2]\nxs = [xs[1], xs[0]]\nprint(xs)\n").unwrap();
+        assert_eq!(ir3.matches("call i1 @p2w_can_reuse").count(), 0, "{ir3}");
+        // A first assignment (no old value) has nothing to reuse.
+        let ir4 = compile_to_llvm_ir("xs = [1, 2]\nprint(xs)\n").unwrap();
+        assert_eq!(ir4.matches("call i1 @p2w_can_reuse").count(), 0, "{ir4}");
+    }
+
+    #[test]
     fn emitted_wat_parses_if_elif_else() {
         assert_valid_wasm(
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n",

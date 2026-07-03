@@ -222,6 +222,32 @@ pub extern "C" fn p2w_unique(v: Value) -> bool {
     is_heap(v) && rd(v as usize + 4) == 1
 }
 
+/// Assign-site drop-reuse guard: can `v` be overwritten in place as an
+/// `n`-element collection of `tag`? Requires the right tag (a Boxed slot could
+/// hold *anything* — a string must never be setindex'd), unique ownership, and
+/// the exact length (the literal's element count).
+fn can_reuse(v: Value, tag: u32, n: i32) -> bool {
+    is_heap(v) && rd(v as usize) == tag && rd(v as usize + 4) == 1 && rd(v as usize + 8) == n as u32
+}
+
+/// `v` is a unique n-element boxed list — safe to overwrite element-wise.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_can_reuse_list(v: Value, n: i32) -> bool {
+    can_reuse(v, T_LIST, n)
+}
+
+/// `v` is a unique n-element packed int array — safe to overwrite in place.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_can_reuse_iarray(v: Value, n: i32) -> bool {
+    can_reuse(v, T_IARRAY, n)
+}
+
+/// `v` is a unique n-element packed float array — safe to overwrite in place.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_can_reuse_farray(v: Value, n: i32) -> bool {
+    can_reuse(v, T_FARRAY, n)
+}
+
 /// `str(v)` — the value's display form as a fresh heap string. Runs the print
 /// formatter twice: once to size the buffer, once to fill it (no_std, no Vec).
 #[unsafe(no_mangle)]
@@ -2030,6 +2056,32 @@ mod tests {
             0,
             "releasing a container must free its children"
         );
+    }
+
+    #[test]
+    fn can_reuse_checks_tag_uniqueness_and_length() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        p2w_list_append(xs, p2w_int(1));
+        p2w_list_append(xs, p2w_int(2));
+        assert!(p2w_can_reuse_list(xs, 2));
+        assert!(!p2w_can_reuse_list(xs, 3), "length must match exactly");
+        assert!(
+            !p2w_can_reuse_iarray(xs, 2),
+            "tag must match (list != iarray)"
+        );
+        // A string is heap + unique but the wrong tag — the Boxed-slot hazard.
+        let s = str_val("ab");
+        assert!(!p2w_can_reuse_list(s, 2));
+        // Aliased (rc 2) — never reusable.
+        p2w_retain(xs);
+        assert!(!p2w_can_reuse_list(xs, 2));
+        p2w_release(xs);
+        assert!(p2w_can_reuse_list(xs, 2), "back to unique");
+        // Inline values are never reusable.
+        assert!(!p2w_can_reuse_list(p2w_int(7), 1));
+        p2w_release(s);
+        p2w_release(xs);
     }
 
     #[test]
