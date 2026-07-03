@@ -4,8 +4,11 @@
 > watchpoints, variable/scope inspection, call stack) is meant to work across
 > *both* execution targets — the browser WASM-GC runner and the eventual
 > Raspberry Pi Pico 2 W native backend — without forking the UI or the semantics.
-> Companion to `GRAMMAR_ARCHITECTURE.md` and the Pico target notes. Nothing here
-> is built yet; this is the shape to build toward.
+> Companion to `GRAMMAR_ARCHITECTURE.md` and the Pico target notes. Status: the
+> browser adapter (step 1) is **shipped** — `Stepper` + the CPS `Vm` in
+> `src/debug.rs`, wired into the IDE's Debug mode; the native LLVM backend the
+> Pico adapters need also exists now (`PICO_BACKEND.md`). Steps 3–4 (the
+> on-device transports) remain the shape to build toward.
 
 ## Why we can do this at all
 
@@ -65,8 +68,10 @@ changes" → that block lights up). This teaching view is unique to our stack.
 
 ## Pico 2 W — "follow onto the board"
 
-Depends on the native backend (our AST → LLVM → bare-metal RP2350; Cortex-M33 or
-Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
+The native backend these adapters need exists (our AST → LLVM → bare-metal
+RP2350, Cortex-M33; cross-compiles and links today — `PICO_BACKEND.md`); what
+remains is the on-device debug transport itself. Two paths, deliberately kept
+under the same `DebugAdapter`.
 
 ### Path 1 — real hardware debug (SWD + probe) — "pro mode"
 - **Transport:** SWD (`SWCLK`/`SWDIO` on the debug header) via a debug probe (the
@@ -139,7 +144,11 @@ Hazard3 RISC-V). Two paths, deliberately kept under the same `DebugAdapter`.
    watches, watchpoints, the variables list, the call-stack panel, and the
    line+block highlight. Remaining niceties: writing globals from a function
    (`global`), and calling user functions inside a watch expression.
-2. Native LLVM backend (separate, large — see the Pico target notes).
+2. Native LLVM backend — ✅ **exists** (textual-IR emitter + `no_std` RC
+   runtime with the Perceus-style reuse tier; cross-compiles/links for RP2350
+   and builds linear-memory WASM components — see `PICO_BACKEND.md` /
+   `docs/COMPILER_FRONTIER.md`). On-device flash/run is the remaining
+   hardware-gated step.
 3. **`UsbStubAdapter`** — on-device step hooks + USB-CDC control channel + the
    variable-layout map. No probe, consistent UX.
 4. **`ProbeAdapter`** — DWARF emission + `probe-rs`/DAP + DWT watchpoints. The

@@ -63,16 +63,23 @@ therefore leak-free). The browser backend uses WASM-GC and is unaffected.
 
 ## Other gaps (clean errors, not silent differences)
 
-- **f-string format specs** (`f"{x:.2f}"`) aren't supported; plain `f"{x}"` is.
+- **f-string format specs** (`f"{x:.2f}"`) work on the **browser** backend
+  (common specs; exotic ones are a clean "unsupported format spec" error) but
+  aren't in the **native** backend yet; plain `f"{x}"` works on both.
 - **Tuples** are immutable by convention (lowered to lists internally).
-- **Not yet implemented:** classes, generators, `lambda`, `*args`/`**kwargs`,
-  exceptions. These are rejected with a clear "not in the native backend yet"
-  message rather than miscompiling.
+- **Not yet implemented on native:** classes (the **browser** backend has the
+  full v1 object model — see `CLASSES_DESIGN.md`), generators, `lambda`,
+  `*args`/`**kwargs`, exceptions, default arguments. These are rejected with a
+  clear "not in the native backend yet" message rather than miscompiling.
 
 ## What's faithful
 
 For completeness, the supported subset matches CPython on: int/float arithmetic
-and comparisons, strings (`+`, indexing, slicing, `in`), lists (incl.
-`list[int]`/`list[float]`), dicts, control flow, functions + recursion, `for`/
-`while`, list & dict comprehensions (nested, filters, `range`, tuple targets),
-tuple unpacking, `str()`, `len()`, and `print()`.
+and comparisons, strings (`+`, indexing, slicing, `in`), plain f-strings
+(`f"hi {name}"`, including expressions), lists (incl.
+`list[int]`/`list[float]`), dicts, sets (values/ops/methods — see the Sets
+section for the display caveat), tuples (incl. as set elements), control flow,
+functions + recursion, `for`/`while`, list & dict comprehensions (nested,
+filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`, and
+`print()` — all gated by the 117-case CPython differential oracle
+(`tools/native_run.sh`), which also requires leak-freedom (`live == 0`).

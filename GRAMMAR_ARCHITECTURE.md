@@ -171,22 +171,27 @@ no MicroPython, no on-device interpreter.
 
 - **WASM-GC (browser)** — today; free, zero-hardware, runs on the Chromebooks
   schools already have. (Currently a hand-written WAT emitter.)
-- **Raspberry Pi Pico 2 W — native, via LLVM** — eventual. A ~$7 RP2350 board
-  (WiFi + on-chip temp sensor + ADC/GPIO). We own the AST and **compile it
-  directly to embedded native code through LLVM** (RP2350 = Cortex-M33 + RISC-V,
-  both first-class LLVM targets) — **not** MicroPython, not any interpreter
-  shipped to the device. Same student Python, compiled to bare metal; the
-  artifact (ELF/UF2) is flashed from the browser (WebSerial/WebUSB / UF2 mass
-  storage). Device peripherals exposed through the same host-import-style
-  contract as the WASM runner.
+- **Raspberry Pi Pico 2 W — native, via LLVM** — **built** (on-device flash is
+  the remaining hardware-gated step). A ~$7 RP2350 board (WiFi + on-chip temp
+  sensor + ADC/GPIO). We own the AST and **compile it directly to embedded
+  native code through LLVM** (RP2350 = Cortex-M33 + RISC-V, both first-class
+  LLVM targets) — **not** MicroPython, not any interpreter shipped to the
+  device. Same student Python, compiled to bare metal: the backend
+  (`src/llvm.rs` + the `no_std` RC runtime) cross-compiles and links for the
+  RP2350 today, with a 117-case CPython differential oracle and a
+  Perceus-style reuse tier (`PICO_BACKEND.md`). The artifact (ELF/UF2) will be
+  flashed from the browser (WebSerial/WebUSB / UF2 mass storage). Device
+  peripherals exposed through the same host-import-style contract as the WASM
+  runner.
 
 So "write Python once → run free in-browser **or compile it to native code on a
 $7 board**" is the backend story — a real compiler to bare metal, not an
 interpreter on the device. It's the answer to the micro:bit cost/sensor
 positioning, and it's why the IR/backend separation matters even while Python
 stays the only language. (Note: today's WASM backend is a bespoke WAT emitter;
-the native target introduces an LLVM lowering, which could later unify both since
-LLVM emits WASM as well.)
+the native target's LLVM lowering now exists alongside it — and already emits
+linear-memory WASM too, proven as a Component-Model build — so the two could
+later unify since LLVM emits WASM as well.)
 
 ## Revisit trigger
 
