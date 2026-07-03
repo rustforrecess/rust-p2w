@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
-use crate::reuse::Liveness;
+use crate::reuse::{Liveness, stmt_mentions_name};
 
 /// The runtime ABI the emitted module depends on (implemented by the device
 /// runtime). Declared at the top of every module.
@@ -79,6 +79,7 @@ declare void @p2w_setindex(i32, i32, i32)
 declare i32 @p2w_len(i32)
 declare i32 @p2w_str_of(i32)
 declare i32 @p2w_slice(i32, i32, i32, i32)
+declare i32 @p2w_slice_assign(i32, i32, i32, i32)
 ; sets + set/bitwise operators + membership
 declare i32 @p2w_set_new()
 declare i32 @p2w_set_of(i32)
@@ -1002,6 +1003,61 @@ impl<'a> FuncEmitter<'a> {
         Ok(true)
     }
 
+    /// Slice drop-reuse: `dst = src[a:b:c]` where the source's value is ours
+    /// to consume — either `dst == src` (the assign itself kills the old
+    /// value: `s = s[1:]` peel loops, `xs = xs[1:]` pop-front) or `src` dies
+    /// at this statement (its reuse token). The old value goes to
+    /// `p2w_slice_assign`, which CONSUMES it: a unique string/list compacts
+    /// in place (step >= 1), anything else falls back to slice + release with
+    /// identical semantics. The consumed source slot is therefore stored raw
+    /// (self case) or zeroed (dying case) — never released again.
+    fn try_slice_assign(
+        &mut self,
+        dst: &str,
+        src: &str,
+        start: &Option<Box<Expr>>,
+        stop: &Option<Box<Expr>>,
+        step: &Option<Box<Expr>>,
+    ) -> Result<bool, String> {
+        // A borrowed param's value belongs to the caller — never consume it.
+        if self.borrowed_params.iter().any(|p| p == src) {
+            return Ok(false);
+        }
+        // Only a Boxed source slot holds a runtime-tagged value the guard can
+        // inspect; packed arrays keep the normal path.
+        if !self.vars.iter().any(|v| v == src) || self.slot_repr(src) != Repr::Boxed {
+            return Ok(false);
+        }
+        // The Boxed result must not coerce into a packed dst slot.
+        if dst != src && self.vars.iter().any(|v| v == dst) && self.slot_repr(dst) != Repr::Boxed {
+            return Ok(false);
+        }
+        // Same evaluation order as the normal slice path: the object (a pure
+        // load), then the bounds — which may freely read `src` (they only see
+        // the pre-consume value, and any alias they could create just bumps
+        // rc, flipping the runtime guard to the copy path).
+        let old = self.call_value(&format!("load i32, ptr %v_{src}"));
+        let (s, so) = self.opt_arg(start)?;
+        let (e, eo) = self.opt_arg(stop)?;
+        let (st, sto) = self.opt_arg(step)?;
+        let new = self.call_value(&format!(
+            "call i32 @p2w_slice_assign(i32 {old}, i32 {s}, i32 {e}, i32 {st})"
+        ));
+        self.release_if_owned(&s, so);
+        self.release_if_owned(&e, eo);
+        self.release_if_owned(&st, sto);
+        if dst == src {
+            // The old value was consumed — a raw store; store_var's
+            // release-the-old would double-free it.
+            self.line(&format!("store i32 {new}, ptr %v_{dst}"));
+        } else {
+            let ptr = self.var_slot(dst);
+            self.store_var(dst, &ptr, new, Repr::Boxed); // releases dst's old
+            self.line(&format!("store i32 0, ptr %v_{src}")); // moved, not released
+        }
+        Ok(true)
+    }
+
     /// Build the nested loop/filter body of a comprehension: each `for` clause
     /// becomes a loop (counted `range` or iterating) wrapping the rest, each `if`
     /// a guard around it. `inner` is the innermost statement (the append or
@@ -1306,6 +1362,22 @@ impl<'a> FuncEmitter<'a> {
                 {
                     return Ok(());
                 }
+                // Slice drop-reuse: `s = s[1:]` / `xs = xs[1:]` (the assign
+                // kills the old value) or `ys = xs[a:b]` where xs dies here —
+                // a unique string/list compacts in place; aliased or reversed
+                // falls back to copy + release with identical semantics.
+                if let ExprKind::Slice {
+                    obj,
+                    start,
+                    stop,
+                    step,
+                } = &value.kind
+                    && let ExprKind::Name(src) = &obj.kind
+                    && (src == name || dying.contains(src))
+                    && self.try_slice_assign(name, src, start, stop, step)?
+                {
+                    return Ok(());
+                }
                 // Reassigning an existing IntArray slot with a literal rebuilds it
                 // packed; a new/Boxed slot evaluates normally.
                 let slot = if self.vars.iter().any(|x| x == name) {
@@ -1421,7 +1493,7 @@ impl<'a> FuncEmitter<'a> {
                 body,
                 elifs,
                 else_body,
-            } => self.emit_if(cond, body, elifs, else_body.as_deref()),
+            } => self.emit_if(cond, body, elifs, else_body.as_deref(), &dying),
             StmtKind::While { cond, body } => self.emit_while(cond, body),
             StmtKind::For {
                 var,
@@ -1497,12 +1569,21 @@ impl<'a> FuncEmitter<'a> {
         Ok(())
     }
 
+    /// `tokens`: reuse tokens inherited from the enclosing statement walk —
+    /// names whose last mention is this `if` as a whole. The arms are mutually
+    /// exclusive, so EACH arm gets every token, re-placed at the name's last
+    /// mention *within that arm* (reuse across the join point). Whichever way
+    /// an arm drops the value — a consuming lowering or the mirrored early
+    /// release — the slot ends up zeroed, so the caller's own early release at
+    /// the join stays a harmless no-op on that path and does the real release
+    /// only on paths (untaken conds, missing else) that never dropped it.
     fn emit_if(
         &mut self,
         cond: &Expr,
         body: &[Stmt],
         elifs: &[(Expr, Vec<Stmt>)],
         else_body: Option<&[Stmt]>,
+        tokens: &[String],
     ) -> Result<(), String> {
         let end = self.fresh_label("ifend");
         let mut branches: Vec<(&Expr, &[Stmt])> = vec![(cond, body)];
@@ -1515,15 +1596,42 @@ impl<'a> FuncEmitter<'a> {
             let next = self.fresh_label("elif");
             self.terminator(&format!("br i1 {cv}, label %{then}, label %{next}"));
             self.place_label(&then);
-            self.block(b)?;
+            self.arm_block(b, tokens)?;
             self.br_to(&end);
             self.place_label(&next);
         }
         if let Some(eb) = else_body {
-            self.block(eb)?;
+            self.arm_block(eb, tokens)?;
         }
         self.br_to(&end);
         self.place_label(&end);
+        Ok(())
+    }
+
+    /// Emit one `if` arm, distributing inherited reuse tokens to their
+    /// last-mention statement within the arm — a scoped-down `block_precise`
+    /// that tracks ONLY the inherited names, not the arm's own locals. After
+    /// the last-mention statement the token's slot is released and zeroed
+    /// (mirroring `block_precise`), so consuming and non-consuming paths both
+    /// leave a zeroed slot for the join. A token the arm never mentions is
+    /// left alone — the join release covers that path.
+    fn arm_block(&mut self, stmts: &[Stmt], tokens: &[String]) -> Result<(), String> {
+        if tokens.is_empty() {
+            return self.block(stmts);
+        }
+        let mut deaths: Vec<Vec<String>> = vec![Vec::new(); stmts.len()];
+        for t in tokens {
+            if let Some(i) = stmts.iter().rposition(|s| stmt_mentions_name(s, t)) {
+                deaths[i].push(t.clone());
+            }
+        }
+        for (idx, s) in stmts.iter().enumerate() {
+            self.dying = deaths[idx].clone();
+            self.stmt(s)?;
+            if !self.terminated {
+                self.early_releases(&deaths[idx]);
+            }
+        }
         Ok(())
     }
 

@@ -29,10 +29,12 @@ Reproduce with `tools/native_run.sh` (correctness oracle) and
 | 3× literal reassignment (`wl_realloc`) | 6 allocs, peak 2 | **2 allocs, peak 1** |
 | unique self-map (`fbip_unique`) | 4 allocs | **2 allocs** (in-place) |
 | 8-iteration string-append loop (`wl_concat`) | 17 allocs | **4 allocs** (in-place growth + interned literals) |
+| 10-iteration string peel loop, `s = s[1:]` (`wl_slice`) | 11 allocs, peak 3 | **2 allocs, peak 2** — the loop runs in ONE buffer |
+| comprehension over a source dying at an if/else join (`wl_branch`) | 6 allocs, peak 2 | **3 allocs, peak 1** (the taken arm steals the buffer) |
 
 - **Zero-allocation steady state** for map pipelines and reassignment churn —
   what a sensor loop or game loop on a 520 KB-RAM device needs.
-- **111-case run-oracle**: every case's output is diffed against CPython *and*
+- **134-case run-oracle**: every case's output is diffed against CPython *and*
   the runtime's live-object counter must end at **0** (leak-free RC), including
   adversarial cases that attack each soundness guard (aliased sources,
   borrowed-param theft, freed-cell reuse corruption, container-reading
@@ -49,9 +51,11 @@ What's landed of the Perceus staging (`REUSE_PLAN.md` has the detail):
 last-mention liveness (`src/reuse.rs`) → precise drops at last use →
 dying-source map reuse (`try_reuse_map`) → assign-site literal reuse
 (`try_reuse_literal`) → append/extend growth (`p2w_add_assign`) → per-site
-interned literals — each runtime-guarded (`p2w_unique` / `p2w_can_reuse_*` /
-`a != b`) so aliasing silently degrades to copy semantics. The original
-wishlist is closed; what remains below is the deeper analysis work.
+interned literals → slice-steal (`p2w_slice_assign`: peel/pop-front loops
+compact in place) → reuse tokens distributed into mutually-exclusive if/else
+arms — each runtime-guarded (`p2w_unique` / `p2w_can_reuse_*` / `a != b`) so
+aliasing silently degrades to copy semantics. The original wishlist is
+closed; what remains below is the deeper analysis work.
 
 ## Why it's interesting work
 
@@ -152,10 +156,17 @@ targets). **Acceptance:** cyclic-program oracle cases end at live == 0 (or are
 statically rejected with a friendly error); the acyclic bench is unchanged
 (Layer 0 keeps today's fast path exactly).
 
-### 6. Stretch: more reuse shapes
+### 6. Stretch: more reuse shapes (two of four LANDED)
 
-Dict comprehensions; reuse across `if/else` join points; reuse for
-`append`-then-die builders; slicing that steals from a dying source.
+~~Slicing that steals from a dying source~~ — landed as `p2w_slice_assign`
+(`s = s[1:]` peel loops and `xs = xs[1:]` pop-fronts compact a unique
+string/list in place; `wl_slice` 11 → 2 allocs). ~~Reuse across `if/else`
+join points~~ — landed as arm-token distribution (`arm_block`: a token dying
+at an `if` is re-placed inside each mutually-exclusive arm; `wl_branch`
+6 → 3 allocs). Still open: **dict comprehensions** (kv-pair overwrite needs
+a same-shape guard) and **`append`-then-die builders** (`ys = []; for x in
+xs: ys.append(f(x))` stealing xs's buffer — wants task 2's cross-loop
+liveness, since the source dies after the loop, not at a statement).
 
 ### 7. Stretch: a verified RC pass (the research angle)
 

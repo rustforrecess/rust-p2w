@@ -87,6 +87,17 @@ bench_case wl_realloc  'xs = [0, 0, 0, 0]\nxs = [1, 1, 1, 1]\nxs = [2, 2, 2, 2]\
 # toward peak (on-device they're morally static data).
 bench_case wl_concat   's = ""\nfor i in range(8):\n    s = s + "x"\nprint(len(s))\n'
 
+# Peel loop — LANDED (slice drop-reuse, p2w_slice_assign): `s = s[1:]`
+# compacts the unique string in place, so the whole loop runs in ONE buffer
+# (was 11 allocs / peak 3; now 2 / 2 — the literal + one first-iteration copy,
+# because the interned cache's pin correctly blocks mutating the literal).
+bench_case wl_slice    's = "abcdefghij"\nn = 0\nwhile len(s) > 0:\n    n = n + len(s)\n    s = s[1:]\nprint(n)\n'
+
+# Reuse across an if/else join — LANDED (arm-token distribution): the dying
+# source's token is re-placed inside each mutually-exclusive arm, so the taken
+# branch's comprehension steals the buffer (was 6 allocs / peak 2; now 3 / 1).
+bench_case wl_branch   'flag = 1\nxs: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [x * 3 for x in xs]\nprint(ys[0])\n'
+
 echo
 echo "Interpretation: live must be 0 everywhere. allocs drop when general"
 echo "drop-REUSE lands (the wishlist counts are the target). peak drops with"

@@ -202,6 +202,39 @@ class Gen:
         self.lists[dst] = (n, mag + k)
         self.lines.append(f"{dst} = [x {op} {k} for x in {src}]")
 
+    def slice_str(self):
+        # The p2w_slice_assign path: s = s[1:] (peel) and friends. Slicing is
+        # total (any bounds on any length), so no length tracking is needed
+        # for strings. Occasionally a NEW destination (the dying-source form).
+        if not self.strs:
+            return self.new_str()
+        s = self.r.choice(self.strs)
+        form = self.r.choice(["[1:]", "[:3]", "[::2]", "[1:3]", "[::-1]"])
+        if self.r.random() < 0.25:
+            dst = self.name("s")
+            self.strs.append(dst)
+            self.lines.append(f"{dst} = {s}{form}")
+        else:
+            self.lines.append(f"{s} = {s}{form}")
+
+    def slice_list(self):
+        # List slice-consume. The tracked MINIMUM length shrinks monotonically
+        # under each form (min is monotone), so in-bounds indexing stays sound.
+        if not self.lists:
+            return self.new_list()
+        l = self.r.choice(sorted(self.lists))
+        n, mag = self.lists[l]
+        form, keep = self.r.choice(
+            [("[1:]", max(0, n - 1)), ("[:2]", min(n, 2)), ("[::2]", (n + 1) // 2)]
+        )
+        if self.r.random() < 0.25:
+            dst = self.name("l")
+            self.lists[dst] = (keep, mag)
+            self.lines.append(f"{dst} = {l}{form}")
+        else:
+            self.lists[l] = (keep, mag)
+            self.lines.append(f"{l} = {l}{form}")
+
     def print_something(self):
         pools = []
         if self.ints:
@@ -308,6 +341,8 @@ class Gen:
             (self.extend_list, 3),
             (self.alias_list, 2),
             (self.comprehension, 4),
+            (self.slice_str, 3),
+            (self.slice_list, 3),
             (self.print_something, 4),
             (self.if_block, 2),
             (self.for_range, 2),

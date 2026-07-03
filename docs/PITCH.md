@@ -59,10 +59,12 @@ code, no boxing, no refcount traffic:**
   win for sensor logs and game state.
 - **Comprehensions** (list + dict): dynamic *or* packed (target-typed), with `if`
   filters and `range` sources; compose with promotion and true division.
-- **FBIP drop-reuse in four forms**, all `rc==1`-guarded: dying-source map
+- **FBIP drop-reuse in six forms**, all `rc==1`-guarded: dying-source map
   chains, literal reassignment, `x = x + e` in-place growth (2× slack,
-  amortized), and per-site interned literals (a loop's literal materializes
-  once; the cache's permanent +1 doubles as the mutation guard).
+  amortized), per-site interned literals (a loop's literal materializes
+  once; the cache's permanent +1 doubles as the mutation guard), slice-steal
+  (`s = s[1:]` peel loops compact in place), and reuse across `if`/`else`
+  join points (the dying source's token follows into each arm).
 - Ints are full `i32` (heap-boxed beyond the 30-bit inline range — no silent
   truncation). Unannotated code stays a dynamic tagged-`i32` path, byte-identical
   to before; the whole thing is opt-in via annotations.
@@ -109,12 +111,12 @@ live-object counter (`p2w_live()`) and an allocation counter (`p2w_allocs()`), s
 each program through real LLVM, runs it, diffs stdout against CPython, asserts
 **`live_objects == 0`** at exit, and lets us *measure* the reuse win in allocations.
 
-**117 cases pass that gate**, all ending `live == 0` — including adversaries
+**134 cases pass that gate**, all ending `live == 0` — including adversaries
 that attack each reuse guard (aliased sources, borrowed-param theft, freed-cell
 corruption). It caught a real double-free during bring-up (a dict-update
 freeing a key the runtime already owned). A **differential fuzzer**
 (`tools/fuzz_native.sh`) generates fresh programs and diffs them against
-CPython — 120 seeds green. Memory-safety work here is **verifiable, offline,
+CPython — 200 seeds green. Memory-safety work here is **verifiable, offline,
 in seconds** — not "looks right in review."
 
 ## Architecture, at a glance
@@ -159,7 +161,7 @@ packed `list[int/float]`, control flow, functions+recursion, iteration, methods,
 list/dict comprehensions, slices, f-strings, sets, immutable tuples) with a
 **complete value model**, precise validated RC, and the **full drop-reuse
 tier** (last-mention liveness, precise drops, four reuse forms — the original
-reuse wishlist is closed). Host run-oracle green: **117 cases, `live == 0`**;
+reuse wishlist is closed). Host run-oracle green: **134 cases, `live == 0`**;
 217 lib + 31 runtime tests; differential fuzzer at 120 seeds green.
 **Cross-compiles + links to a Cortex-M33 image** (`tools/pico_build.sh`,
 ~8–9 KB) and **builds + runs as a linear-memory WASM component**

@@ -348,6 +348,73 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn self_slice_consumes_the_old_value() {
+        // `s = s[1:]` lowers to p2w_slice_assign (the old value consumed as a
+        // reuse token: in-place compaction when unique).
+        let ir = compile_to_llvm_ir("s = \"hello\"\nwhile len(s) > 2:\n    s = s[1:]\nprint(s)\n")
+            .unwrap();
+        assert_eq!(ir.matches("call i32 @p2w_slice_assign").count(), 1, "{ir}");
+        // A dying source is consumed too, and its slot is zeroed (moved).
+        let ir2 = compile_to_llvm_ir("xs = [1, 2, 3]\nys = xs[1:]\nprint(ys)\n").unwrap();
+        assert_eq!(
+            ir2.matches("call i32 @p2w_slice_assign").count(),
+            1,
+            "{ir2}"
+        );
+        assert!(ir2.contains("store i32 0, ptr %v_xs"), "moved: {ir2}");
+        // A source that's still read later keeps the plain copying slice.
+        let ir3 =
+            compile_to_llvm_ir("xs = [1, 2, 3]\nys = xs[1:]\nprint(xs)\nprint(ys)\n").unwrap();
+        assert_eq!(
+            ir3.matches("call i32 @p2w_slice_assign").count(),
+            0,
+            "{ir3}"
+        );
+        assert_eq!(ir3.matches("call i32 @p2w_slice(").count(), 1, "{ir3}");
+        // A reassigned param ESCAPES -> owned-by-transfer (the callee holds
+        // its own +1), so the self-slice consume is sound and fires; a caller
+        // that keeps its binding makes rc >= 2, flipping the runtime guard to
+        // the copy path (the oracle's slice_borrowed case proves it).
+        let ir4 = compile_to_llvm_ir(
+            "def peel(s):\n    s = s[1:]\n    return s\na = \"hey\"\nprint(peel(a))\nprint(a)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ir4.matches("call i32 @p2w_slice_assign").count(),
+            1,
+            "{ir4}"
+        );
+        // A genuinely borrowed param (no escape) never produces a token and
+        // isn't the self case — the plain copying slice.
+        let ir5 = compile_to_llvm_ir(
+            "def head(s):\n    u = s[1:]\n    return u\na = \"hey\"\nprint(head(a))\nprint(a)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ir5.matches("call i32 @p2w_slice_assign").count(),
+            0,
+            "{ir5}"
+        );
+    }
+
+    #[test]
+    fn branch_arms_inherit_the_dying_source_token() {
+        // xs's last mention is the `if` as a whole; the token is re-placed in
+        // EACH mutually-exclusive arm, so both comprehensions guard + reuse.
+        let ir = compile_to_llvm_ir(
+            "flag = 1\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [x * 3 for x in xs]\nprint(ys)\n",
+        )
+        .unwrap();
+        assert_eq!(ir.matches("call i1 @p2w_unique").count(), 2, "{ir}");
+        // Read after the if -> no token -> no guards in the arms.
+        let ir2 = compile_to_llvm_ir(
+            "flag = 1\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [x * 3 for x in xs]\nprint(xs)\nprint(ys)\n",
+        )
+        .unwrap();
+        assert_eq!(ir2.matches("call i1 @p2w_unique").count(), 0, "{ir2}");
+    }
+
+    #[test]
     fn self_concat_consumes_the_old_value() {
         // `s = s + "x"` on a Boxed slot lowers to p2w_add_assign (the old value
         // consumed as a reuse token: in-place growth when unique).

@@ -46,7 +46,8 @@ with no boxing and no refcount traffic:
 - **the drop-reuse tier**: last-mention liveness + precise drops
   (`src/reuse.rs`), dying-source map reuse, literal-reassignment reuse,
   `x = x + e` in-place growth (2× slack, amortized), per-site interned
-  literals; full-`i32` ints (no silent truncation)
+  literals, slice-steal (`s = s[1:]` peel loops compact in place), and reuse
+  across `if`/`else` join points; full-`i32` ints (no silent truncation)
 - precise, validated RC (transfer-ownership insertion, borrow-on-read, borrowed
   params for read-only Boxed/array params)
 - the broader subset too — slices, f-strings, **sets** (set theory + methods,
@@ -58,11 +59,11 @@ Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-i
 **Validated without hardware, three ways.** Because values are i32 arena
 *offsets* (not machine pointers), the emitted IR + runtime compile with `clang`
 and run on the host. `tools/native_run.sh` is a mechanical oracle: real LLVM,
-stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **117 cases
+stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **134 cases
 green**, including adversaries that attack each reuse guard.
 `tools/reuse_bench.sh` measures allocs/peak so wins are numbers, not claims.
 `tools/fuzz_native.sh` differential-fuzzes generated programs against CPython
-(dependency-free, seeded — 120 seeds green).
+(dependency-free, seeded, reuse-shape-weighted incl. slices — 200 seeds green).
 
 **Compiles to the board's CPU.** That same IR cross-compiles to **Cortex-M33**
 (`clang --target=thumbv8m.main-none-eabi`), the runtime builds for the target, and

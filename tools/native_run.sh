@@ -235,6 +235,25 @@ run_case tuple_swap 'a = 1\nb = 2\na, b = b, a\nprint(a)\nprint(b)\n' '2\n1' || 
 run_case tuple_return 'def minmax(x: int, y: int):\n    if x < y:\n        return x, y\n    return y, x\nlo, hi = minmax(5, 3)\nprint(lo)\nprint(hi)\n' '3\n5' || fails=$((fails+1))
 run_case tuple_index 'pt = (10, 20, 30)\nprint(pt[1])\nprint(len(pt))\n' '20\n3' || fails=$((fails+1))
 run_case comp_tuple_target 'pairs = [(1, 10), (2, 20), (3, 30)]\nsums: list[int] = [a + b for a, b in pairs]\nprint(sums)\n' '[11, 22, 33]' || fails=$((fails+1))
+# --- slice drop-reuse (p2w_slice_assign) + its adversaries ---
+run_case slice_peel_str 's = "abcd"\nwhile len(s) > 0:\n    print(s[0])\n    s = s[1:]\n' 'a\nb\nc\nd' || fails=$((fails+1))
+run_case slice_popfront 'xs = [1, 2, 3]\nwhile len(xs) > 0:\n    print(xs[0])\n    xs = xs[1:]\n' '1\n2\n3' || fails=$((fails+1))
+run_case slice_alias_self 's = "hello"\nt = s\ns = s[1:]\nprint(s)\nprint(t)\n' 'ello\nhello' || fails=$((fails+1))
+run_case slice_dying 'xs = [1, 2, 3, 4]\nys = xs[1:3]\nprint(ys)\n' '[2, 3]' || fails=$((fails+1))
+run_case slice_dying_alias 'xs = [1, 2, 3, 4]\nzs = xs\nys = xs[1:]\nprint(ys)\nprint(zs)\n' '[2, 3, 4]\n[1, 2, 3, 4]' || fails=$((fails+1))
+run_case slice_self_step 's = "abcdefg"\ns = s[::2]\nprint(s)\n' 'aceg' || fails=$((fails+1))
+run_case slice_self_rev 's = "abc"\ns = s[::-1]\nprint(s)\n' 'cba' || fails=$((fails+1))
+run_case slice_self_negb 's = "abcdef"\ns = s[-4:-1]\nprint(s)\n' 'cde' || fails=$((fails+1))
+run_case slice_self_empty 's = "abc"\ns = s[5:]\nprint(len(s))\n' '0' || fails=$((fails+1))
+run_case slice_drop_release 'xs = [["a"], ["b"], ["c"]]\nxs = xs[1:]\nprint(xs)\n' "[['b'], ['c']]" || fails=$((fails+1))
+run_case slice_step_release 'xs = ["a", "b", "c", "d", "e"]\nxs = xs[1::2]\nprint(xs)\n' "['b', 'd']" || fails=$((fails+1))
+run_case slice_borrowed 'def peel(s):\n    s = s[1:]\n    return s\na = "hey"\nprint(peel(a))\nprint(a)\n' 'ey\nhey' || fails=$((fails+1))
+# --- reuse tokens across if/else join points ---
+run_case branch_reuse 'flag = 1\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [x * 3 for x in xs]\nprint(ys)\n' '[2, 4, 6]' || fails=$((fails+1))
+run_case branch_reuse_else 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [x * 3 for x in xs]\nprint(ys)\n' '[3, 6, 9]' || fails=$((fails+1))
+run_case branch_reuse_alias 'flag = 1\nxs: list[int] = [1, 2, 3]\nzs = xs\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [x * 3 for x in xs]\nprint(ys)\nprint(zs)\n' '[2, 4, 6]\n[1, 2, 3]' || fails=$((fails+1))
+run_case branch_unmentioned_arm 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [9]\nprint(ys)\n' '[9]' || fails=$((fails+1))
+run_case branch_token_slice 'flag = 1\nxs = [1, 2, 3, 4]\nif flag == 1:\n    ys = xs[1:]\nelse:\n    ys = xs[:2]\nprint(ys)\n' '[2, 3, 4]' || fails=$((fails+1))
 
 echo "---"
 if [ "$fails" -eq 0 ]; then

@@ -259,14 +259,18 @@ float/fixed-point for robotics math (M33 has an FPU).
     `p2w_live`/`p2w_allocs`/`p2w_peak` counters;
   - the emitter RC pass (transfer-based, borrowed params) **plus** last-mention
     liveness (`src/reuse.rs`), precise drops at last use, dying-source map
-    reuse, assign-site literal reuse, append/extend growth, and per-site
-    interned literals;
+    reuse, assign-site literal reuse, append/extend growth, per-site interned
+    literals, slice-steal (`p2w_slice_assign` — peel/pop-front loops compact
+    in place), and reuse tokens distributed into mutually-exclusive `if`/`else`
+    arms;
   - measured: `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4,
-    self-map 4→2 — map pipelines and reassignment churn run at or near
-    zero-allocation steady state, no GC.
-- **Verified by three nets:** the 117-case CPython-diff + `live == 0` oracle
+    `wl_slice` 11→2, `wl_branch` 6→3, self-map 4→2 — map pipelines,
+    reassignment churn, and peel loops run at or near zero-allocation steady
+    state, no GC.
+- **Verified by three nets:** the 134-case CPython-diff + `live == 0` oracle
   (`tools/native_run.sh`), the alloc/peak bench (`tools/reuse_bench.sh`), and
-  the differential fuzzer (`tools/fuzz_native.sh` — 120 seeds green).
+  the differential fuzzer (`tools/fuzz_native.sh` — the generator now also
+  emits slice shapes; 200 seeds green).
 - **Next (the frontier — `docs/COMPILER_FRONTIER.md`):** full backward
   liveness, type inference to widen the reuse whitelist, escape/reachability
   inference (tier 2 generalized), and cycle handling (tier 5 — design sketched

@@ -1,9 +1,11 @@
 # Perceus reuse tier — implementation plan (onboarding for the compiler hire)
 
-**Status: steps 1–3 LANDED — the original reuse wishlist is CLOSED**
-(last-mention liveness, precise drops, and drop-reuse in four forms:
-dying-source maps, literal reassignment, append/extend growth, interned
-literals — `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4).
+**Status: steps 1–3 LANDED — the original reuse wishlist is CLOSED, plus two
+frontier-task-6 stretch shapes** (last-mention liveness, precise drops, and
+drop-reuse in six forms: dying-source maps, literal reassignment,
+append/extend growth, interned literals, slice-steal, and reuse across
+if/else join points — `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat`
+17→4, `wl_slice` 11→2, `wl_branch` 6→3).
 Open: full backward liveness, type inference, escape inference, cycles
 (`COMPILER_FRONTIER.md`). This is the staging, the invariants, and the acceptance contract for the
 precise-RC + reuse work (native/Pico backend only — the browser uses WASM-GC).
@@ -57,9 +59,27 @@ run-oracle. The staging, and where it stands:
    guard — a cached literal can never be rc==1 in a consumer's hands, so
    in-place growth can't touch it). `wl_concat` now 17 → **4** allocs (peak
    3 → 4: pinned literals count toward peak — churn collapsed, the right
-   trade on-device). **The original wishlist is fully closed. Still open in
-   step 3:** widening the element whitelist with real type inference, and
-   reuse across further statement shapes.
+   trade on-device). **And slice-steal** (`try_slice_assign` + runtime
+   `p2w_slice_assign`): `s = s[1:]` / `xs = xs[1:]` (the assign kills the old
+   value) and `ys = xs[a:b]` over a dying source consume the source — a
+   unique string compacts its bytes in place, a unique list keeps the taken
+   elements and releases the dropped ones (in-place only for `step >= 1`,
+   where write index `j` never passes read index `start + j*step`; reversal
+   and aliases fall back to copy + release). The peel loop (`wl_slice`) went
+   11 → **2** allocs — the whole loop runs in one buffer (the 2 = the interned
+   literal + one first-iteration copy: the cache's pin correctly refuses to
+   mutate the literal itself). **And reuse across if/else join points**
+   (`arm_block` in `llvm.rs`): a token whose name's last mention is an `if`
+   statement is re-placed at the name's last mention inside EACH mutually
+   exclusive arm (`stmt_mentions_name`), so the taken branch's comprehension
+   or slice steals the buffer; every consuming/releasing path zeroes the
+   slot, so the join-point early release no-ops where the value already died
+   and does the real release on paths (untaken conds, missing else) that
+   never dropped it. `wl_branch` went 6 → **3** allocs, peak 2 → 1. **The
+   original wishlist is fully closed and two of frontier task 6's stretch
+   shapes are in. Still open in step 3:** widening the element whitelist with
+   real type inference, dict-comprehension reuse, and append-then-die
+   builders (which want task 2's full liveness).
 4. **Escape / borrowed-param inference** (tier 2) and **cycle handling** (tier 5)
    — later. Cycles are the gate for making linear-memory the safe default in the
    browser/component build (see `acornstem/ACTIVITY_INTERFACE.md`).

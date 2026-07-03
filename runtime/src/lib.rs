@@ -342,21 +342,14 @@ pub extern "C" fn p2w_str_of(v: Value) -> Value {
     p as Value
 }
 
-/// `obj[start:stop:step]` for lists and strings — Python slice semantics: each
-/// bound is `V_NONE` when omitted, indices may be negative, and a negative step
-/// reverses. Returns a fresh list/string (owning retained elements for a list).
-#[unsafe(no_mangle)]
-pub extern "C" fn p2w_slice(obj: Value, start_v: Value, stop_v: Value, step_v: Value) -> Value {
-    if !(is_heap(obj) && matches!(obj_tag(obj), T_STR | T_LIST)) {
-        trap("only lists and strings can be sliced");
-    }
-    let o = obj as usize;
-    let len = rd(o + 8) as i64; // element/byte count (same offset for str and list)
+/// Resolve Python slice bounds against `len`: apply the `V_NONE` defaults and
+/// clamp explicit indices per CPython's PySlice_AdjustIndices. Traps on
+/// `step == 0`. Returns `(start, stop, step)`.
+fn slice_bounds(len: i64, start_v: Value, stop_v: Value, step_v: Value) -> (i64, i64, i64) {
     let step = if step_v == V_NONE { 1 } else { as_int(step_v) };
     if step == 0 {
         trap("slice step cannot be zero");
     }
-    // CPython's PySlice_AdjustIndices for an explicit bound.
     let adjust = |raw: i64| -> i64 {
         let mut i = raw;
         if i < 0 {
@@ -379,6 +372,20 @@ pub extern "C" fn p2w_slice(obj: Value, start_v: Value, stop_v: Value, step_v: V
     } else {
         adjust(as_int(stop_v))
     };
+    (start, stop, step)
+}
+
+/// `obj[start:stop:step]` for lists and strings — Python slice semantics: each
+/// bound is `V_NONE` when omitted, indices may be negative, and a negative step
+/// reverses. Returns a fresh list/string (owning retained elements for a list).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_slice(obj: Value, start_v: Value, stop_v: Value, step_v: Value) -> Value {
+    if !(is_heap(obj) && matches!(obj_tag(obj), T_STR | T_LIST)) {
+        trap("only lists and strings can be sliced");
+    }
+    let o = obj as usize;
+    let len = rd(o + 8) as i64; // element/byte count (same offset for str and list)
+    let (start, stop, step) = slice_bounds(len, start_v, stop_v, step_v);
     let take = |i: i64| if step > 0 { i < stop } else { i > stop };
 
     if obj_tag(obj) == T_STR {
@@ -414,6 +421,65 @@ pub extern "C" fn p2w_slice(obj: Value, start_v: Value, stop_v: Value, step_v: V
         }
         result
     }
+}
+
+/// `x = xs[a:b:c]` where the old value is ours — the slice drop-reuse.
+/// CONSUMES `obj` (reused in place or released); the bounds are borrowed
+/// values (`V_NONE` when omitted), like `p2w_slice`'s.
+///
+/// A unique string compacts the taken bytes into its own buffer and a unique
+/// list keeps the taken elements (releasing the dropped ones) and compacts
+/// its element buffer — zero allocation, and the shrunken length leaves the
+/// block's capacity as slack for a later `p2w_add_assign`. In-place is only
+/// taken for `step >= 1`, where write index `j` never passes read index
+/// `start + j*step` (a negative step reads backward into already-overwritten
+/// cells). Shared values, negative steps, and non-sliceable values fall back
+/// to `p2w_slice` + release with identical semantics — any other live
+/// reference implies rc >= 2, so the uniqueness test alone keeps aliasing on
+/// the copy path.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_slice_assign(
+    obj: Value,
+    start_v: Value,
+    stop_v: Value,
+    step_v: Value,
+) -> Value {
+    if is_heap(obj) && matches!(obj_tag(obj), T_STR | T_LIST) && rd(obj as usize + 4) == 1 {
+        let o = obj as usize;
+        let len = rd(o + 8) as i64;
+        let (start, stop, step) = slice_bounds(len, start_v, stop_v, step_v);
+        if step >= 1 {
+            if obj_tag(obj) == T_STR {
+                let mut j = 0i64;
+                let mut i = start;
+                while i < stop {
+                    wr_byte(o + 12 + j as usize, str_byte(obj, i as usize));
+                    j += 1;
+                    i += step;
+                }
+                wr(o + 8, j as u32);
+            } else {
+                // One forward pass: move each taken element down (ownership
+                // moves with the pointer), release the dropped ones.
+                let taken = |i: i64| i >= start && i < stop && (i - start) % step == 0;
+                let mut j = 0usize;
+                for k in 0..len {
+                    let v = list_get(o, k as usize);
+                    if taken(k) {
+                        list_set_at(o, j, v);
+                        j += 1;
+                    } else {
+                        p2w_release(v);
+                    }
+                }
+                set_len(o, j);
+            }
+            return obj;
+        }
+    }
+    let r = p2w_slice(obj, start_v, stop_v, step_v);
+    p2w_release(obj);
+    r
 }
 
 /// Extract a raw `f64` from a boxed value (the unbox half for floats). Accepts a
@@ -2215,6 +2281,66 @@ mod tests {
         assert_eq!(shown(ys), "[2, 3]", "b is borrowed, untouched");
         p2w_release(r);
         p2w_release(ys);
+        assert_eq!(p2w_live(), 0);
+    }
+
+    #[test]
+    fn slice_assign_compacts_unique_strings_in_place() {
+        let _g = heap_guard();
+        // s = s[1:] — the peel loop's step: same block, bytes shifted down.
+        let s = str_val("abcdef");
+        let live_before = p2w_live();
+        let r = p2w_slice_assign(s, p2w_int(1), V_NONE, V_NONE);
+        assert_eq!(r, s, "unique string slices in place");
+        assert_eq!(shown(r), "bcdef");
+        assert_eq!(p2w_live(), live_before, "no new object");
+        // A step-2 slice compacts in place too.
+        let r2 = p2w_slice_assign(r, V_NONE, V_NONE, p2w_int(2));
+        assert_eq!(r2, r, "step >= 1 stays in place");
+        assert_eq!(shown(r2), "bdf");
+        // An empty result is a zero-length string in the same block.
+        let r3 = p2w_slice_assign(r2, p2w_int(9), V_NONE, V_NONE);
+        assert_eq!(r3, r2);
+        assert_eq!(shown(r3), "");
+        p2w_release(r3);
+        assert_eq!(p2w_live(), 0);
+    }
+
+    #[test]
+    fn slice_assign_keeps_taken_list_elements_and_releases_dropped() {
+        let _g = heap_guard();
+        // Heap elements so a leaked drop would show up in `live`.
+        let xs = p2w_list_new();
+        p2w_list_append(xs, str_val("a"));
+        p2w_list_append(xs, str_val("b"));
+        p2w_list_append(xs, str_val("c"));
+        p2w_list_append(xs, str_val("d"));
+        let live_before = p2w_live();
+        let r = p2w_slice_assign(xs, p2w_int(1), p2w_int(3), V_NONE);
+        assert_eq!(r, xs, "unique list slices in place");
+        assert_eq!(shown(r), "['b', 'c']");
+        assert_eq!(p2w_live(), live_before - 2, "dropped elements released");
+        p2w_release(r);
+        assert_eq!(p2w_live(), 0);
+    }
+
+    #[test]
+    fn slice_assign_falls_back_when_shared_or_reversed() {
+        let _g = heap_guard();
+        // Shared: rc 2 — the alias must keep the original bytes.
+        let s = str_val("hello");
+        p2w_retain(s); // simulate a second binding
+        let r = p2w_slice_assign(s, p2w_int(1), V_NONE, V_NONE);
+        assert_ne!(r, s, "shared value copies");
+        assert_eq!(shown(r), "ello");
+        assert_eq!(shown(s), "hello", "alias untouched");
+        p2w_release(r);
+        p2w_release(s);
+        // Reversal (step < 0) can't compact forward — fresh string, old consumed.
+        let t = str_val("abc");
+        let rev = p2w_slice_assign(t, V_NONE, V_NONE, p2w_int(-1));
+        assert_eq!(shown(rev), "cba");
+        p2w_release(rev);
         assert_eq!(p2w_live(), 0);
     }
 

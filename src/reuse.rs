@@ -126,6 +126,19 @@ pub fn vars_assigned(s: &Stmt, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Whether `s` mentions `name` at all — read or assigned, including nested
+/// control-flow bodies. Def/class-body reads count as mentions here (belt and
+/// braces: the analysis pins such names, so they never become reuse tokens in
+/// the first place). Used to place an inherited reuse token at its
+/// last-mention statement inside an `if` arm — arms are mutually exclusive,
+/// so each arm may independently consume the same token.
+pub fn stmt_mentions_name(s: &Stmt, name: &str) -> bool {
+    let mut m = BTreeSet::new();
+    let mut pinned = BTreeSet::new();
+    stmt_mentions(s, &mut m, &mut pinned);
+    m.contains(name) || pinned.contains(name)
+}
+
 /// All names *mentioned* — read OR assigned — anywhere within `s`, recursing
 /// through control-flow bodies (`if`/`for`/`while` and their conditions) but NOT
 /// into `def`/`class` bodies: names read inside those go to `pinned` instead,
