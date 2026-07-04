@@ -122,6 +122,33 @@ operator closure + function signatures) would replace it. **Interface:** a
 as the fallback. **Acceptance:** new bench cases (typed-call elements) reuse;
 oracle green; no regression on the `str(x)`-style negative tests.
 
+**Scope extension — first-assignment slot inference (decided Jul 2026).**
+Task 3 includes inferring UNANNOTATED locals' slot reprs: a pre-pass joins
+the repr of every assignment to a name (via `type_of`; the slot map and
+`type_of` are mutually recursive halves of one pass), and a name whose
+assignments all provably agree gets a typed slot — so `x = 1` takes the
+native-int path and `xs = [1, 2, 3]` becomes a packed array with NO
+annotation, which is what lets the reuse tier fire on the unannotated code
+students actually write. Precedent is everywhere: Go's `:=`, mypy's default
+(errors on `x = 1; x = "hi"`), RPython's type-stable variables, Codon,
+Cython `infer_types`, Julia's type-stability culture, JIT monomorphism.
+CAUTION — the join must demote, not promote: a mixed int/float name in a
+Float slot would print `1.0` where CPython prints `1`, so ANY disagreement
+(including int/float) → Boxed. **Open policy question (deliberately
+unresolved): what happens on a cross-type reassignment.** The mechanism is
+policy-neutral — the conflict site is one line: demote to Boxed (silent,
+CPython-identical), lint (teach the discipline softly), or reject (Codon/
+mypy-style; better pedagogy for genuine type confusion, and Jason is
+sympathetic to it). Evidence on each side: rejection breaks the canonical
+beginner pattern `age = input(...)` / `age = int(age)` (str→int churn — a
+top real-world mypy complaint) and int→float accumulator churn, and it
+breaks PYTHON_COMPAT's guiding rule; but `x = 1; x = "hi"` IS a bug in
+waiting and mypy will tell them so later. **Plan: ship demote + IDE lint
+behind a strictness seam (the `STRICT_TYPES` precedent in the blocks layer;
+Hedy-style level-gating is the model), measure what the lint actually fires
+on in student code, and only then decide whether to promote it to an
+error — per classroom level, not for the language.**
+
 **Design decision — deliberately NOT Hindley–Milner (Jul 2026).** Types here
 only *gate optimizations*: `type_of` returning `None` means "stay boxed," so
 an inference miss is a missed alloc win, never a rejected program or a wrong
