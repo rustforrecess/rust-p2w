@@ -54,7 +54,7 @@ analysis in v1.**
   locals + native compare/arith is **fully native** (no boxing, no runtime calls):
   `def s(n: int): total: int = 0; i: int = 0; while i < n: total = total + i;
   i = i + 1; return total` → a tight `icmp`/`add` loop. (Bare `x: int` without a
-  value, and unboxing *unannotated* locals via inference, remain future work.)
+  value remains future work; unannotated-local inference is DONE — below.)
 - **Native counted-`for` — DONE.** `for i in range(...)` now uses an unboxed i32
   counter: native `icmp` guard + raw `add` increment (ascending `slt`/`+step`,
   descending `sgt`/`+negstep`), bound held as a raw i32. So `for i in range(n):
@@ -63,13 +63,19 @@ analysis in v1.**
 - **Operators propagate** the obvious result repr: `Int op Int → Int`,
   `Int +-*/ Float → Float` (promotion; `/` is always `Float`), comparisons →
   `Bool`, etc. If any operand is `Boxed`, the result is `Boxed` (fall back).
-- **Unannotated names default to `Boxed`.** (Inferring unboxed *unannotated*
-  locals — the join analysis for `if c: y=1 else: y=2`, etc. — is a deliberate
-  future extension, not v1. Document that annotating a hot local unlocks the
-  speedup; this keeps v1 predictable for both kids and the compiler hire.)
+- **Unannotated scalars are now INFERRED — DONE (frontier task 3).** The join
+  analysis (`infer_slot_reprs` in `src/llvm.rs`) runs over every binding of
+  each unannotated local (assignments, loop vars, unpack targets, both `if`
+  arms) to a fixpoint; a name whose bindings all provably agree on Int/Float
+  gets the raw slot, so `x = 5` / `t = 0; t = t + i` compile exactly like
+  their annotated forms — no annotation needed. ANY disagreement or unknown
+  (type churn `x = 1; x = "hi"`, int/float mixing, dynamic sources) demotes
+  to `Boxed`, keeping output CPython-identical. Containers stay Boxed unless
+  annotated (packed inference needs mutation-site constraints — future).
 
-So: annotated ⇒ unboxed end-to-end; unannotated ⇒ boxed end-to-end; conversions
-happen only where the two worlds meet (next section).
+So: annotated OR provably-consistent ⇒ unboxed end-to-end; anything mixed or
+unprovable ⇒ boxed end-to-end; conversions happen only where the two worlds
+meet (next section).
 
 ## The coexistence contract (the heart)
 
@@ -125,8 +131,10 @@ because the ints that generated them are no longer boxed.
    `p2w_unbox_int` cover both forms with no emitter change (a heap int is an
    ordinary Boxed/refcounted value). `x = 2000000000; print(x)` → `2000000000`
    (was truncated), `live==0`. Ints are now consistently full `i32`.
-4. **Unboxed unannotated locals.** v1: **no** (boxed). Revisit as a join/liveness
-   extension (pairs naturally with Task 2 last-use).
+4. **Unboxed unannotated locals.** ~~v1: no (boxed)~~ — **DONE** (frontier
+   task 3): the `infer_slot_reprs` fixpoint join; demote-on-conflict keeps
+   churny names Boxed and output CPython-identical. Scalars only; packed
+   container inference still needs mutation-site constraints.
 
 ## Phasing
 

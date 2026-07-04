@@ -263,15 +263,22 @@ float/fixed-point for robotics math (M33 has an FPU).
     literals, slice-steal (`p2w_slice_assign` — peel/pop-front loops compact
     in place), and reuse tokens distributed into mutually-exclusive `if`/`else`
     arms;
+  - **type inference (frontier task 3)**: `infer_expr_repr` widens the
+    reuse-map gate (typed-call elements steal buffers; closed the
+    int-literal-into-float-buffer output bug), and `infer_slot_reprs` gives
+    unannotated scalar locals raw Int/Float slots by a demote-on-conflict
+    fixpoint join — the typed tier now fires on the unannotated code kids
+    actually write, with type churn keeping today's boxed path;
   - measured: `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4,
     `wl_slice` 11→2, `wl_branch` 6→3, self-map 4→2 — map pipelines,
     reassignment churn, and peel loops run at or near zero-allocation steady
     state, no GC.
-- **Verified by three nets:** the 134-case CPython-diff + `live == 0` oracle
+- **Verified by three nets:** the 153-case CPython-diff + `live == 0` oracle
   (`tools/native_run.sh`), the alloc/peak bench (`tools/reuse_bench.sh`), and
-  the differential fuzzer (`tools/fuzz_native.sh` — the generator now also
-  emits slice shapes; 200 seeds green).
+  the differential fuzzer (`tools/fuzz_native.sh` — the generator emits slice
+  shapes and type-churn adversaries; 200 seeds green).
 - **Next (the frontier — `docs/COMPILER_FRONTIER.md`):** full backward
-  liveness, type inference to widen the reuse whitelist, escape/reachability
-  inference (tier 2 generalized), and cycle handling (tier 5 — design sketched
-  from Nim ORC; gates making linear-memory the browser/component default).
+  liveness, container slot inference (mutation-site constraints), escape/
+  reachability inference (tier 2 generalized), and cycle handling (tier 5 —
+  design sketched from Nim ORC; gates making linear-memory the
+  browser/component default).

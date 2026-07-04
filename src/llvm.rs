@@ -210,6 +210,14 @@ fn emit_function(
             f.borrowed_params.push(p.clone());
         }
     }
+    // First-assignment slot inference: unannotated locals whose bindings all
+    // provably agree get typed slots (params are fixed by the signature).
+    let fixed: HashMap<String, Repr> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.clone(), preprs.get(i).copied().unwrap_or(Repr::Boxed)))
+        .collect();
+    f.inferred = infer_slot_reprs(body, &fixed, ret_reprs);
     // Precise drops over the body's top-level sequence: values die at their
     // last mention, not at scope end (see src/reuse.rs).
     let live = Liveness::analyze(body);
@@ -258,6 +266,9 @@ fn emit_main(
     str_caches: &mut Vec<String>,
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(funcs, borrow_masks, param_reprs, ret_reprs, "main");
+    // First-assignment slot inference for main's locals (no params here; the
+    // walker skips Def bodies — separate scopes).
+    f.inferred = infer_slot_reprs(stmts, &HashMap::new(), ret_reprs);
     // Analyze the UNFILTERED module so def-body reads pin their globals (a
     // function can run at any later point); defs themselves emit nothing here.
     let live = Liveness::analyze(stmts);
@@ -385,6 +396,10 @@ struct FuncEmitter<'a> {
     /// Representation of each variable slot (default `Boxed`; typed params set
     /// theirs). Drives load typing, assignment coercion, and exit-release.
     var_reprs: HashMap<String, Repr>,
+    /// First-assignment slot inference (`infer_slot_reprs`): unannotated
+    /// locals whose every binding provably agrees on Int/Float. Consulted
+    /// when an assignment CREATES a slot; absent names stay Boxed.
+    inferred: HashMap<String, Repr>,
     /// Prefix for this function's string-constant globals (unique per function).
     gprefix: String,
     /// Module-level string-constant definitions produced by this function.
@@ -430,6 +445,7 @@ impl<'a> FuncEmitter<'a> {
             borrowed_params: Vec::new(),
             ret_repr: Repr::Boxed,
             var_reprs: HashMap::new(),
+            inferred: HashMap::new(),
             gprefix: gprefix.to_string(),
             globals: String::new(),
             gcount: 0,
@@ -820,13 +836,15 @@ impl<'a> FuncEmitter<'a> {
             return Ok(false);
         }
         // The element may only see src through the loop var (an arbitrary
-        // `src[k]` read would observe already-overwritten cells), and must be
-        // conservatively typed to the buffer's element repr — dst may be
-        // unannotated, and `str(x)` must not adopt a packed-int buffer.
+        // `src[k]` read would observe already-overwritten cells), and its
+        // repr must be PROVABLY the buffer's element repr — dst is
+        // unannotated, so `str(x)` must not adopt a packed-int buffer, and
+        // an all-int element must not adopt a float buffer (CPython gives
+        // `[7 for x in floats]` a list of ints, not floats).
         if expr_uses_name(element, &src) {
             return Ok(false);
         }
-        if !elem_matches_repr(element, &loopvar, elem_repr) {
+        if self.infer_repr(element, &[(&loopvar, elem_repr)]) != Some(elem_repr) {
             return Ok(false);
         }
 
@@ -893,6 +911,33 @@ impl<'a> FuncEmitter<'a> {
 
         self.place_label(&endl);
         Ok(true)
+    }
+
+    /// Conservative forward type inference (frontier task 3's `type_of`):
+    /// `Some(repr)` only when the expression's representation is PROVABLE
+    /// from literals, typed slots, annotated signatures, packed-array
+    /// indexing, and Python's numeric promotion; `None` means "don't know —
+    /// stay dynamic." `over` binds names whose repr the caller knows (a
+    /// comprehension's loop var). A miss only costs an optimization, never
+    /// correctness. The core lives in `infer_expr_repr` so the pre-emission
+    /// slot-inference pass can run it against its own environment.
+    fn infer_repr(&self, e: &Expr, over: &[(&str, Repr)]) -> Option<Repr> {
+        infer_expr_repr(
+            e,
+            &|n| {
+                if let Some((_, r)) = over.iter().find(|(o, _)| *o == n) {
+                    return Some(*r);
+                }
+                if !self.vars.iter().any(|v| v == n) {
+                    return None;
+                }
+                match self.slot_repr(n) {
+                    Repr::Boxed | Repr::Bool => None, // Boxed slots prove nothing
+                    r => Some(r),
+                }
+            },
+            self.ret_reprs,
+        )
     }
 
     /// Assign-site drop-reuse: `xs = [a, b, c]` reassigning an existing slot —
@@ -1379,14 +1424,16 @@ impl<'a> FuncEmitter<'a> {
                     return Ok(());
                 }
                 // Reassigning an existing IntArray slot with a literal rebuilds it
-                // packed; a new/Boxed slot evaluates normally.
+                // packed; a NEW slot takes its inferred repr (first-assignment
+                // slot inference — unannotated `x = 1` gets a raw Int slot when
+                // every binding provably agrees) or Boxed.
                 let slot = if self.vars.iter().any(|x| x == name) {
                     self.slot_repr(name)
                 } else {
-                    Repr::Boxed
+                    self.inferred.get(name).copied().unwrap_or(Repr::Boxed)
                 };
                 let (v, vr) = self.eval_for_slot(slot, value)?;
-                let ptr = self.var_slot(name); // new locals are created Boxed
+                let ptr = self.ensure_slot(name, slot);
                 self.store_var(name, &ptr, v, vr);
                 Ok(())
             }
@@ -2034,8 +2081,18 @@ impl<'a> FuncEmitter<'a> {
                         // Borrowed heap param (Boxed/array) fed a named value:
                         // load it without retaining and don't release — the
                         // caller keeps ownership, the callee won't free it.
-                        let (v, _, _) = self.expr_borrow_typed(a)?;
-                        ops.push(format!("i32 {v}"));
+                        // EXCEPT a raw scalar slot (`x: int` / `: float`): its
+                        // value isn't a tagged heap word, so it must be BOXED
+                        // for the Boxed param — the box is a fresh temp the
+                        // caller releases after the call (the callee borrows).
+                        let (v, vr, _) = self.expr_borrow_typed(a)?;
+                        if is_heap_repr(vr) {
+                            ops.push(format!("i32 {v}"));
+                        } else {
+                            let b = self.as_boxed(v, vr);
+                            to_release.push(b.clone());
+                            ops.push(format!("i32 {b}"));
+                        }
                     } else {
                         // Transfer (callee releases), or a borrowed param fed a
                         // fresh temp (the caller releases after the call). Either
@@ -2652,25 +2709,216 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
 /// `**` — negative exponents do too). Float buffers: float arithmetic over the
 /// loop var and numeric literals. Anything else (calls, strings, comparisons,
 /// other names) → no reuse. Widen with real type inference later (the hire).
-fn elem_matches_repr(e: &Expr, loopvar: &str, elem: Repr) -> bool {
-    match (&e.kind, elem) {
-        (ExprKind::Name(n), _) => n == loopvar,
-        (ExprKind::Int(_), _) => true, // int literals promote into float buffers
-        (ExprKind::Float(_), Repr::Float) => true,
-        (ExprKind::Unary(UnOp::Neg, i), _) => elem_matches_repr(i, loopvar, elem),
-        (ExprKind::Bin(op, a, b), Repr::Int) => {
-            matches!(
-                op,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod
-            ) && elem_matches_repr(a, loopvar, elem)
-                && elem_matches_repr(b, loopvar, elem)
+/// The inference core behind `FuncEmitter::infer_repr` and the slot-inference
+/// pre-pass: `look` resolves a name to a PROVEN repr (or None). Trusting a
+/// `-> int` annotation is sound because the typed call convention already
+/// unboxes the return — a lying annotation traps at the call, with or
+/// without us. Every unknown shape errs toward `None`.
+fn infer_expr_repr(
+    e: &Expr,
+    look: &dyn Fn(&str) -> Option<Repr>,
+    rets: &HashMap<String, Repr>,
+) -> Option<Repr> {
+    match &e.kind {
+        ExprKind::Int(_) => Some(Repr::Int),
+        ExprKind::Float(_) => Some(Repr::Float),
+        ExprKind::Name(n) => look(n),
+        ExprKind::Unary(UnOp::Neg, i) => match infer_expr_repr(i, look, rets) {
+            r @ Some(Repr::Int | Repr::Float) => r,
+            _ => None,
+        },
+        ExprKind::Bin(op, a, b) => {
+            let ta = infer_expr_repr(a, look, rets)?;
+            let tb = infer_expr_repr(b, look, rets)?;
+            if !matches!(ta, Repr::Int | Repr::Float) || !matches!(tb, Repr::Int | Repr::Float) {
+                return None;
+            }
+            match op {
+                BinOp::Div => Some(Repr::Float), // true division: always float
+                BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                    if ta == Repr::Float || tb == Repr::Float {
+                        Some(Repr::Float)
+                    } else {
+                        Some(Repr::Int)
+                    }
+                }
+                // Float floor/mod use runtime semantics — don't claim them.
+                BinOp::FloorDiv | BinOp::Mod if ta == Repr::Int && tb == Repr::Int => {
+                    Some(Repr::Int)
+                }
+                _ => None,
+            }
         }
-        (ExprKind::Bin(op, a, b), Repr::Float) => {
-            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
-                && elem_matches_repr(a, loopvar, elem)
-                && elem_matches_repr(b, loopvar, elem)
+        ExprKind::Call(f, _) => {
+            if f == "len" {
+                return Some(Repr::Int);
+            }
+            match rets.get(f) {
+                Some(r @ (Repr::Int | Repr::Float)) => Some(*r),
+                _ => None,
+            }
         }
-        _ => false,
+        ExprKind::Index(obj, _) => match infer_expr_repr(obj, look, rets) {
+            Some(Repr::IntArray) => Some(Repr::Int),
+            Some(Repr::FloatArray) => Some(Repr::Float),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// First-assignment slot inference (task 3, stage 2): join the provable repr
+/// of every binding of each unannotated local — plain assignments AND
+/// loop-variable bindings — and give a name whose bindings all agree on
+/// Int/Float a typed (unboxed) slot; ANY disagreement or unknown demotes to
+/// Boxed, exactly today's behavior. The join demotes even on int/float
+/// mixing: a mixed name in a Float slot would print `1.0` where CPython
+/// prints `1`. So inference can only change representation, never observable
+/// behavior — this is deliberately the silent-demote arm of the
+/// reject-vs-lint policy question recorded in `docs/COMPILER_FRONTIER.md`.
+///
+/// `fixed` holds names whose repr is authoritative and NOT ours to infer
+/// (params from the signature, annotated names from their annotation) — they
+/// resolve reads but are excluded from the output. Runs to a fixpoint so
+/// `t = 0; t = t + 1` and loop-carried reads resolve regardless of order;
+/// each name moves monotonically unknown → known → Boxed, so it terminates.
+fn infer_slot_reprs(
+    body: &[Stmt],
+    fixed: &HashMap<String, Repr>,
+    rets: &HashMap<String, Repr>,
+) -> HashMap<String, Repr> {
+    // Annotated names are authoritative wherever the annotation appears.
+    let mut fixed = fixed.clone();
+    fn collect_ann(body: &[Stmt], fixed: &mut HashMap<String, Repr>) {
+        for s in body {
+            match &s.kind {
+                StmtKind::AnnAssign { name, ann, .. } => {
+                    fixed
+                        .entry(name.clone())
+                        .or_insert_with(|| repr_of_ann(&Some(ann.clone())));
+                }
+                StmtKind::If {
+                    body,
+                    elifs,
+                    else_body,
+                    ..
+                } => {
+                    collect_ann(body, fixed);
+                    for (_, b) in elifs {
+                        collect_ann(b, fixed);
+                    }
+                    if let Some(b) = else_body {
+                        collect_ann(b, fixed);
+                    }
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::ForEach { body, .. }
+                | StmtKind::While { body, .. } => collect_ann(body, fixed),
+                _ => {}
+            }
+        }
+    }
+    collect_ann(body, &mut fixed);
+
+    let mut env: HashMap<String, Repr> = HashMap::new();
+    for _ in 0..8 {
+        let before = env.clone();
+        walk_bindings(body, &fixed, rets, &mut env);
+        if env == before {
+            break;
+        }
+    }
+    env.retain(|_, r| matches!(r, Repr::Int | Repr::Float));
+    env
+}
+
+/// One fixpoint round of `infer_slot_reprs`: join each binding's repr into
+/// `env`. `Boxed` is the poison value (any disagreement / unknown).
+fn walk_bindings(
+    body: &[Stmt],
+    fixed: &HashMap<String, Repr>,
+    rets: &HashMap<String, Repr>,
+    env: &mut HashMap<String, Repr>,
+) {
+    let join = |env: &mut HashMap<String, Repr>, name: &str, r: Option<Repr>| {
+        if fixed.contains_key(name) {
+            return; // authoritative elsewhere; not ours
+        }
+        let r = match r {
+            Some(x @ (Repr::Int | Repr::Float)) => x,
+            _ => Repr::Boxed,
+        };
+        match env.get(name) {
+            None => {
+                env.insert(name.to_string(), r);
+            }
+            Some(cur) if *cur == r => {}
+            _ => {
+                env.insert(name.to_string(), Repr::Boxed);
+            }
+        }
+    };
+    // Reads resolve fixed names first, then the env under construction.
+    let snapshot = env.clone();
+    let look = |n: &str| -> Option<Repr> {
+        if let Some(r) = fixed.get(n) {
+            return match r {
+                Repr::Boxed | Repr::Bool => None,
+                r => Some(*r),
+            };
+        }
+        match snapshot.get(n) {
+            Some(r @ (Repr::Int | Repr::Float | Repr::IntArray | Repr::FloatArray)) => Some(*r),
+            _ => None,
+        }
+    };
+    for s in body {
+        match &s.kind {
+            StmtKind::Assign(name, value) => {
+                join(env, name, infer_expr_repr(value, &look, rets));
+            }
+            StmtKind::UnpackAssign { targets, .. } => {
+                for t in targets {
+                    if let ExprKind::Name(n) = &t.kind {
+                        join(env, n, None);
+                    }
+                }
+            }
+            StmtKind::For { var, body, .. } => {
+                join(env, var, Some(Repr::Int)); // native range counter
+                walk_bindings(body, fixed, rets, env);
+            }
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => {
+                let elem = match infer_expr_repr(iterable, &look, rets) {
+                    Some(Repr::IntArray) => Some(Repr::Int),
+                    Some(Repr::FloatArray) => Some(Repr::Float),
+                    _ => None,
+                };
+                join(env, var, elem);
+                walk_bindings(body, fixed, rets, env);
+            }
+            StmtKind::While { body, .. } => walk_bindings(body, fixed, rets, env),
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                walk_bindings(body, fixed, rets, env);
+                for (_, b) in elifs {
+                    walk_bindings(b, fixed, rets, env);
+                }
+                if let Some(b) = else_body {
+                    walk_bindings(b, fixed, rets, env);
+                }
+            }
+            // Defs/classes are separate scopes; nothing else binds names.
+            _ => {}
+        }
     }
 }
 
@@ -3023,25 +3271,54 @@ mod tests {
 
     #[test]
     fn float_literals_box_through_p2w_float() {
+        // Slot inference gives `x` a raw double slot, so the literal stores
+        // unboxed and p2w_float boxing happens at the dynamic sink (print).
         let out = ir("x = 3.5\nprint(x)\n");
         assert!(out.contains("declare i32 @p2w_float(double)"), "{out}");
-        // 3.5 is exactly representable; its bit pattern is 0x400C000000000000.
         assert!(
-            out.contains("call i32 @p2w_float(double 0x400C000000000000)"),
-            "{out}"
+            out.contains("store double 0x400C000000000000"),
+            "raw literal store: {out}"
+        );
+        assert!(
+            out.contains("call i32 @p2w_float(double"),
+            "boxed at print: {out}"
         );
     }
 
     #[test]
     fn control_flow_uses_truthy_and_blocks() {
+        // Slot inference makes `x` a raw Int, so `x < 1` is a native icmp
+        // driving the branch — no truthy call, no boxing.
         let out = ir("x = 5\nif x < 1:\n    print(1)\nelse:\n    print(2)\n");
-        assert!(out.contains("call i1 @p2w_truthy(i32"), "{out}");
+        assert!(out.contains("icmp slt i32"), "native comparison: {out}");
+        assert!(!out.contains("call i1 @p2w_truthy"), "{out}");
         assert!(out.contains("br i1"), "{out}");
         assert!(out.contains("ifend"), "{out}");
+
+        // A genuinely dynamic condition (a list) still goes through truthy.
+        let out = ir("xs = [1]\nif xs:\n    print(1)\n");
+        assert!(out.contains("call i1 @p2w_truthy(i32"), "{out}");
 
         let out = ir("i = 0\nwhile i < 3:\n    i = i + 1\n");
         assert!(out.contains("whead"), "{out}");
         assert!(out.contains("br label %whead0"), "back-edge: {out}");
+    }
+
+    #[test]
+    fn slot_inference_types_unannotated_scalars_and_demotes_churn() {
+        // `t = 0; t = t + i` — every binding provably int -> raw i32 slot,
+        // native loop arithmetic, zero runtime calls in the hot path.
+        let out = ir("t = 0\nfor i in range(4):\n    t = t + i\nprint(t)\n");
+        assert!(out.contains("%v_t = alloca i32"), "{out}");
+        assert!(!out.contains("call i32 @p2w_add"), "native add: {out}");
+        // Type churn demotes: `x = 1; x = \"hi\"` keeps a Boxed slot and
+        // CPython-identical output (the deliberate silent-demote arm of the
+        // reject-vs-lint question in COMPILER_FRONTIER.md).
+        let churn = ir("x = 1\nprint(x)\nx = \"hi\"\nprint(x)\n");
+        assert!(churn.contains("call i32 @p2w_int(i32 1)"), "boxed: {churn}");
+        // Int/float mixing demotes too (a Float slot would print 1.0 for 1).
+        let mix = ir("y = 1\nprint(y)\ny = 1.5\nprint(y)\n");
+        assert!(mix.contains("call i32 @p2w_int(i32 1)"), "boxed: {mix}");
     }
 
     #[test]

@@ -81,5 +81,5 @@ and comparisons, strings (`+`, indexing, slicing, `in`), plain f-strings
 section for the display caveat), tuples (incl. as set elements), control flow,
 functions + recursion, `for`/`while`, list & dict comprehensions (nested,
 filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`, and
-`print()` — all gated by the 134-case CPython differential oracle
+`print()` — all gated by the 153-case CPython differential oracle
 (`tools/native_run.sh`), which also requires leak-freedom (`live == 0`).

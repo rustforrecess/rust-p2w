@@ -111,7 +111,7 @@ live-object counter (`p2w_live()`) and an allocation counter (`p2w_allocs()`), s
 each program through real LLVM, runs it, diffs stdout against CPython, asserts
 **`live_objects == 0`** at exit, and lets us *measure* the reuse win in allocations.
 
-**134 cases pass that gate**, all ending `live == 0` — including adversaries
+**153 cases pass that gate**, all ending `live == 0` — including adversaries
 that attack each reuse guard (aliased sources, borrowed-param theft, freed-cell
 corruption). It caught a real double-free during bring-up (a dict-update
 freeing a key the runtime already owned). A **differential fuzzer**
@@ -140,14 +140,15 @@ scoped list with interfaces and acceptance criteria is
 **`docs/COMPILER_FRONTIER.md`**; the headline items:
 
 1. **Full backward liveness** — upgrade last-mention to release *before* a
-   reassignment and inside branches; more deaths, more reuse.
-2. **Type inference** — widen the reuse element whitelist (typed calls should
-   reuse; today only literal arithmetic does).
-3. **Reachability-type escape inference** — generalize the borrowed-param
+   reassignment and inside branches; more deaths, more reuse. (Type inference
+   landed: typed-call elements reuse, and unannotated scalars get raw slots
+   via a demote-on-conflict join — the next inference rung is container slot
+   inference with mutation-site constraints.)
+2. **Reachability-type escape inference** — generalize the borrowed-param
    analysis into flow-sensitive escape/ownership inference.
-4. **Cycle handling** — trial deletion over type-limited candidates (design
+3. **Cycle handling** — trial deletion over type-limited candidates (design
    sketched from Nim ORC); gates making linear-memory the default everywhere.
-5. **Verified RC pass** — prove the insertion sound (RustBelt/VerusBelt
+4. **Verified RC pass** — prove the insertion sound (RustBelt/VerusBelt
    lineage), turning test-assured safety into proof-assured safety.
 
 Grounding: Perceus (PLDI 2021) and drop-guided reuse; reachability types /
@@ -161,7 +162,7 @@ packed `list[int/float]`, control flow, functions+recursion, iteration, methods,
 list/dict comprehensions, slices, f-strings, sets, immutable tuples) with a
 **complete value model**, precise validated RC, and the **full drop-reuse
 tier** (last-mention liveness, precise drops, four reuse forms — the original
-reuse wishlist is closed). Host run-oracle green: **134 cases, `live == 0`**;
+reuse wishlist is closed). Host run-oracle green: **153 cases, `live == 0`**;
 217 lib + 31 runtime tests; differential fuzzer at 120 seeds green.
 **Cross-compiles + links to a Cortex-M33 image** (`tools/pico_build.sh`,
 ~8–9 KB) and **builds + runs as a linear-memory WASM component**

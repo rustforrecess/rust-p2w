@@ -31,10 +31,12 @@ Reproduce with `tools/native_run.sh` (correctness oracle) and
 | 8-iteration string-append loop (`wl_concat`) | 17 allocs | **4 allocs** (in-place growth + interned literals) |
 | 10-iteration string peel loop, `s = s[1:]` (`wl_slice`) | 11 allocs, peak 3 | **2 allocs, peak 2** — the loop runs in ONE buffer |
 | comprehension over a source dying at an if/else join (`wl_branch`) | 6 allocs, peak 2 | **3 allocs, peak 1** (the taken arm steals the buffer) |
+| typed-call comprehension `[dbl(x) for x in a]`, `dbl -> int` (`wl_typedcall`) | 6 allocs, peak 2 | **3 allocs, peak 1** (inference proves the element int) |
+| unannotated big-int accumulator loop (`wl_accum`) | 6 allocs, peak 2 | **1 alloc, peak 1** (slot inference: raw i32, no boxing) |
 
 - **Zero-allocation steady state** for map pipelines and reassignment churn —
   what a sensor loop or game loop on a 520 KB-RAM device needs.
-- **134-case run-oracle**: every case's output is diffed against CPython *and*
+- **153-case run-oracle**: every case's output is diffed against CPython *and*
   the runtime's live-object counter must end at **0** (leak-free RC), including
   adversarial cases that attack each soundness guard (aliased sources,
   borrowed-param theft, freed-cell reuse corruption, container-reading
@@ -112,42 +114,50 @@ never double-release. **Interface:** replace `Liveness::analyze`'s body; the
 need per-branch granularity). **Acceptance:** oracle green; peak numbers drop
 on new bench cases that today's analysis can't catch.
 
-### 3. Type inference to widen the reuse whitelist
+### 3. ~~Type inference to widen the reuse whitelist~~ — LANDED (both halves)
 
-`elem_matches_repr` is a syntactic int/float-arithmetic whitelist — sound but
-narrow (`[f(x) for x in a]` with a typed `f` should reuse; today it doesn't).
-A small forward type inference over the subset (annotations + literals +
-operator closure + function signatures) would replace it. **Interface:** a
-`type_of(expr) -> Option<Repr>` usable by both reuse sites; keep the whitelist
-as the fallback. **Acceptance:** new bench cases (typed-call elements) reuse;
-oracle green; no regression on the `str(x)`-style negative tests.
+**Half 1 — expression inference (`infer_expr_repr`, the `type_of`):**
+conservative forward inference over literals, typed slots, annotated
+signatures, `len`, packed-array indexing, and Python's numeric promotion
+(`/` → float; float floor/mod stay runtime). It REPLACED the syntactic
+whitelist at the reuse-map gate rather than falling back to it, because the
+whitelist's `Int-literal-matches-anything` arm was a live output bug:
+`[7 for x in floats]` adopted the float buffer and printed `7.0` where
+CPython prints `7` (caught during bring-up; now an oracle regression case).
+Typed-call elements (`[dbl(x) for x in a]` with `dbl -> int`) now steal the
+dying buffer. Bring-up also flushed out a second pre-existing miscompile:
+a raw `x: int` slot passed to a BORROWED unannotated (Boxed) param skipped
+boxing entirely — the callee got an untagged word and trapped; fixed at the
+call-site fast path (box + release-after-call).
 
-**Scope extension — first-assignment slot inference (decided Jul 2026).**
-Task 3 includes inferring UNANNOTATED locals' slot reprs: a pre-pass joins
-the repr of every assignment to a name (via `type_of`; the slot map and
-`type_of` are mutually recursive halves of one pass), and a name whose
-assignments all provably agree gets a typed slot — so `x = 1` takes the
-native-int path and `xs = [1, 2, 3]` becomes a packed array with NO
-annotation, which is what lets the reuse tier fire on the unannotated code
-students actually write. Precedent is everywhere: Go's `:=`, mypy's default
-(errors on `x = 1; x = "hi"`), RPython's type-stable variables, Codon,
-Cython `infer_types`, Julia's type-stability culture, JIT monomorphism.
-CAUTION — the join must demote, not promote: a mixed int/float name in a
-Float slot would print `1.0` where CPython prints `1`, so ANY disagreement
-(including int/float) → Boxed. **Open policy question (deliberately
-unresolved): what happens on a cross-type reassignment.** The mechanism is
-policy-neutral — the conflict site is one line: demote to Boxed (silent,
-CPython-identical), lint (teach the discipline softly), or reject (Codon/
-mypy-style; better pedagogy for genuine type confusion, and Jason is
-sympathetic to it). Evidence on each side: rejection breaks the canonical
-beginner pattern `age = input(...)` / `age = int(age)` (str→int churn — a
-top real-world mypy complaint) and int→float accumulator churn, and it
-breaks PYTHON_COMPAT's guiding rule; but `x = 1; x = "hi"` IS a bug in
-waiting and mypy will tell them so later. **Plan: ship demote + IDE lint
-behind a strictness seam (the `STRICT_TYPES` precedent in the blocks layer;
-Hedy-style level-gating is the model), measure what the lint actually fires
-on in student code, and only then decide whether to promote it to an
-error — per classroom level, not for the language.**
+**Half 2 — first-assignment slot inference (`infer_slot_reprs`):** a
+fixpoint join over every binding of each unannotated local (plain assigns,
+loop vars, unpack targets), demoting to Boxed on ANY disagreement or
+unknown — including int/float mixing (a mixed name in a Float slot would
+print `1.0` where CPython prints `1`). Names whose bindings all provably
+agree get raw Int/Float slots: `x = 5; if x < 1:` is a native `icmp` with
+no truthy call, `t = 0; t = t + i` loops with zero runtime calls, and >2^30
+intermediates stop heap-boxing. Precedent: Go's `:=`, mypy's default,
+RPython, Codon, Cython `infer_types`, Julia's type-stability culture. This
+ships the **silent-demote arm** of the policy question below; containers
+(`xs = [1, 2, 3]` → packed) are the remaining stretch — they need
+mutation-site constraints (`.append`/setindex arg types) before the join is
+sound.
+
+**Open policy question (deliberately unresolved): what happens on a
+cross-type reassignment.** The mechanism is policy-neutral — the conflict
+site is one line: demote to Boxed (silent, CPython-identical — what shipped),
+lint (teach the discipline softly), or reject (Codon/mypy-style; better
+pedagogy for genuine type confusion, and Jason is sympathetic to it).
+Evidence on each side: rejection breaks the canonical beginner pattern
+`age = input(...)` / `age = int(age)` (str→int churn — a top real-world mypy
+complaint) and int→float accumulator churn, and it breaks PYTHON_COMPAT's
+guiding rule; but `x = 1; x = "hi"` IS a bug in waiting and mypy will tell
+them so later. **Plan: add the IDE lint behind a strictness seam (the
+`STRICT_TYPES` precedent in the blocks layer; Hedy-style level-gating is the
+model), measure what the lint actually fires on in student code, and only
+then decide whether to promote it to an error — per classroom level, not
+for the language.**
 
 **Design decision — deliberately NOT Hindley–Milner (Jul 2026).** Types here
 only *gate optimizations*: `type_of` returning `None` means "stay boxed," so

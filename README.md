@@ -48,6 +48,10 @@ with no boxing and no refcount traffic:
   `x = x + e` in-place growth (2× slack, amortized), per-site interned
   literals, slice-steal (`s = s[1:]` peel loops compact in place), and reuse
   across `if`/`else` join points; full-`i32` ints (no silent truncation)
+- **type inference (no annotations needed)**: typed-call comprehension
+  elements steal dying buffers, and unannotated scalars (`x = 5`, `t = t + i`)
+  get raw i32/f64 slots via a demote-on-conflict join — type churn
+  (`x = 1` then `x = "hi"`) keeps the dynamic path, output CPython-identical
 - precise, validated RC (transfer-ownership insertion, borrow-on-read, borrowed
   params for read-only Boxed/array params)
 - the broader subset too — slices, f-strings, **sets** (set theory + methods,
@@ -59,7 +63,7 @@ Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-i
 **Validated without hardware, three ways.** Because values are i32 arena
 *offsets* (not machine pointers), the emitted IR + runtime compile with `clang`
 and run on the host. `tools/native_run.sh` is a mechanical oracle: real LLVM,
-stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **134 cases
+stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **153 cases
 green**, including adversaries that attack each reuse guard.
 `tools/reuse_bench.sh` measures allocs/peak so wins are numbers, not claims.
 `tools/fuzz_native.sh` differential-fuzzes generated programs against CPython

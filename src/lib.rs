@@ -348,6 +348,38 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn typed_call_elements_adopt_the_dying_buffer() {
+        // Task 3 (type inference): an annotated `-> int` call element is now
+        // PROVABLY int, so the comprehension steals the dying packed source.
+        let ir = compile_to_llvm_ir(
+            "def dbl(n: int) -> int:\n    return n * 2\na: list[int] = [1, 2, 3]\nb = [dbl(x) for x in a]\nprint(b)\n",
+        )
+        .unwrap();
+        assert_eq!(ir.matches("call i1 @p2w_unique").count(), 1, "{ir}");
+        // An UNANNOTATED callee proves nothing — no adoption.
+        let ir2 = compile_to_llvm_ir(
+            "def g(n):\n    return n * 2\na: list[int] = [1, 2]\nb = [g(x) for x in a]\nprint(b)\n",
+        )
+        .unwrap();
+        assert_eq!(ir2.matches("call i1 @p2w_unique").count(), 0, "{ir2}");
+        // Regression (pre-existing bug): an all-int element must NOT adopt a
+        // float buffer — CPython gives `[7 for x in floats]` ints, not floats.
+        let ir3 = compile_to_llvm_ir("a: list[float] = [1.5, 2.5]\nb = [7 for x in a]\nprint(b)\n")
+            .unwrap();
+        assert_eq!(ir3.matches("call i1 @p2w_unique").count(), 0, "{ir3}");
+    }
+
+    #[test]
+    fn raw_scalar_args_to_borrowed_boxed_params_are_boxed() {
+        // Regression (pre-existing bug): `x: int` is a RAW i32 slot; passing
+        // it to an unannotated (Boxed, borrowed) param must box it — the old
+        // fast path handed the untagged word straight to the callee (trap).
+        let ir =
+            compile_to_llvm_ir("def g(n):\n    return n * 2\nx: int = 3\nprint(g(x))\n").unwrap();
+        assert!(ir.contains("call i32 @p2w_int"), "boxes the raw arg: {ir}");
+    }
+
+    #[test]
     fn self_slice_consumes_the_old_value() {
         // `s = s[1:]` lowers to p2w_slice_assign (the old value consumed as a
         // reuse token: in-place compaction when unique).

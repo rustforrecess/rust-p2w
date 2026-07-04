@@ -93,6 +93,18 @@ bench_case wl_concat   's = ""\nfor i in range(8):\n    s = s + "x"\nprint(len(s
 # because the interned cache's pin correctly blocks mutating the literal).
 bench_case wl_slice    's = "abcdefghij"\nn = 0\nwhile len(s) > 0:\n    n = n + len(s)\n    s = s[1:]\nprint(n)\n'
 
+# Unannotated accumulator — LANDED (first-assignment slot inference): `t` is
+# provably int everywhere -> raw i32 slot, so the >2^30 intermediates that
+# used to heap-box each iteration never allocate (was 6 allocs / peak 2; now
+# 1 / 1 — the 1 is the final print boxing the big result).
+bench_case wl_accum 't = 0\nfor i in range(8):\n    t = t + 200000000\nprint(t)\n'
+
+# Typed-call element — LANDED (task 3 type inference): `dbl` is annotated
+# `-> int`, so the element is provably int and the comprehension steals the
+# dying packed source's buffer instead of building a boxed list (was 6
+# allocs / peak 2; now 3 / 1).
+bench_case wl_typedcall 'def dbl(n: int) -> int:\n    return n + n\na: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]\nb = [dbl(x) for x in a]\nprint(b[0])\n'
+
 # Reuse across an if/else join — LANDED (arm-token distribution): the dying
 # source's token is re-placed inside each mutually-exclusive arm, so the taken
 # branch's comprehension steals the buffer (was 6 allocs / peak 2; now 3 / 1).

@@ -235,6 +235,27 @@ class Gen:
             self.lists[l] = (keep, mag)
             self.lines.append(f"{l} = {l}{form}")
 
+    def churn_type(self):
+        # The slot-inference demote adversary: rebind an int var to a string
+        # (or back), moving it between pools so later statements use it at
+        # its NEW type. Top-level only — conditional churn would make the
+        # static type unknowable — so this is registered in generate() and
+        # must never go into simple_block_stmt.
+        if self.ints and self.r.random() < 0.6:
+            v = self.r.choice(sorted(self.ints))
+            del self.ints[v]
+            lit = "".join(self.r.choice("abc") for _ in range(2))
+            self.strs.append(v)
+            self.lines.append(f'{v} = "{lit}"')
+        elif self.strs:
+            v = self.r.choice(self.strs)
+            self.strs.remove(v)
+            k = self.r.randint(0, 99)
+            self.ints[v] = k
+            self.lines.append(f"{v} = {k}")
+        else:
+            return self.new_int()
+
     def print_something(self):
         pools = []
         if self.ints:
@@ -255,7 +276,14 @@ class Gen:
             l = self.r.choice(sorted(self.lists))
             self.lines.append(f"print({l})" if self.r.random() < 0.6 else f"print(len({l}))")
         else:
-            l = self.r.choice(sorted(self.lists))
+            # In-bounds index print needs a list whose tracked MINIMUM length
+            # is >= 1 (slicing can shrink the minimum to 0).
+            pool = [l for l in sorted(self.lists) if self.lists[l][0] >= 1]
+            if not pool:
+                l = self.r.choice(sorted(self.lists))
+                self.lines.append(f"print(len({l}))")
+                return
+            l = self.r.choice(pool)
             n, _ = self.lists[l]
             self.lines.append(f"print({l}[{self.r.randint(0, n - 1)}])")
 
@@ -343,6 +371,7 @@ class Gen:
             (self.comprehension, 4),
             (self.slice_str, 3),
             (self.slice_list, 3),
+            (self.churn_type, 2),
             (self.print_something, 4),
             (self.if_block, 2),
             (self.for_range, 2),

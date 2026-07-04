@@ -77,8 +77,19 @@ run-oracle. The staging, and where it stands:
    and does the real release on paths (untaken conds, missing else) that
    never dropped it. `wl_branch` went 6 → **3** allocs, peak 2 → 1. **The
    original wishlist is fully closed and two of frontier task 6's stretch
-   shapes are in. Still open in step 3:** widening the element whitelist with
-   real type inference, dict-comprehension reuse, and append-then-die
+   shapes are in.** **And type inference (frontier task 3, both halves):**
+   `infer_expr_repr` (literals + typed slots + annotated signatures + `len` +
+   packed indexing + numeric promotion) REPLACED the syntactic element
+   whitelist at the reuse-map gate — typed-call elements
+   (`[dbl(x) for x in a]`, `dbl -> int`) now steal the dying buffer, and the
+   whitelist's int-literal-into-float-buffer hole (`[7 for x in floats]`
+   printed `7.0`, CPython prints `7`) is closed. `infer_slot_reprs` gives
+   unannotated scalar locals raw Int/Float slots by a fixpoint join over
+   every binding (assigns, loop vars, unpack targets), demoting to Boxed on
+   any disagreement — type churn (`x = 1; x = "hi"`) and int/float mixing
+   keep today's boxed path and CPython-identical output. **Still open in
+   step 3:** container slot inference (`xs = [1, 2, 3]` → packed — needs
+   mutation-site constraints), dict-comprehension reuse, and append-then-die
    builders (which want task 2's full liveness).
 4. **Escape / borrowed-param inference** (tier 2) and **cycle handling** (tier 5)
    — later. Cycles are the gate for making linear-memory the safe default in the
