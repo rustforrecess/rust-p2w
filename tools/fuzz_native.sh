@@ -36,6 +36,7 @@ cat > "$OUT/putc.c" <<'EOF'
 extern int p2w_live(void);
 static void report(void) { fprintf(stderr, "P2W_LIVE=%d\n", p2w_live()); }
 void p2w_putc(unsigned char c) { putchar(c); }
+int p2w_getc(void) { return getchar(); }
 __attribute__((constructor)) static void init(void) { atexit(report); }
 EOF
 

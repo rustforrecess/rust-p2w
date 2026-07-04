@@ -575,6 +575,20 @@ fn is_float(v: Value) -> bool {
     is_heap(v) && obj_tag(v) == T_FLOAT
 }
 
+/// Byte-wise string less-than. UTF-8 byte order equals code-point order, so
+/// this matches Python's `<` on strings.
+fn str_lt(a: Value, b: Value) -> bool {
+    let (la, lb) = (str_len(a), str_len(b));
+    let n = if la < lb { la } else { lb };
+    for i in 0..n {
+        let (ca, cb) = (str_byte(a, i), str_byte(b, i));
+        if ca != cb {
+            return ca < cb;
+        }
+    }
+    la < lb
+}
+
 fn as_f64(v: Value) -> f64 {
     unsafe { core::ptr::read_unaligned(heap_base().add(v as usize + 8) as *const f64) }
 }
@@ -1795,12 +1809,63 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
             out(b'}');
         }
         T_SET => {
+            // Sorted canonical display when homogeneously orderable (all
+            // numeric or all strings) — browser-backend parity; mixed sets
+            // fall back to insertion order. Selection-print keeps it
+            // no_std + zero-allocation (set elements are unique, so a
+            // strictly-greater-than-last scan visits each exactly once).
             out(b'{');
-            for i in 0..coll_len(o) {
-                if i > 0 {
-                    write_bytes(b", ", out);
+            let n = coll_len(o);
+            let all_num = (0..n).all(|i| {
+                let e = list_get(o, i);
+                num(e).is_some() || is_float(e)
+            });
+            let all_str = (0..n).all(|i| {
+                let e = list_get(o, i);
+                is_heap(e) && obj_tag(e) == T_STR
+            });
+            if n > 1 && (all_num || all_str) {
+                let key = |v: Value| -> f64 {
+                    if let Some(k) = num(v) {
+                        k as f64
+                    } else {
+                        as_f64(v)
+                    }
+                };
+                let lt = |a: Value, b: Value| -> bool {
+                    if all_num {
+                        key(a) < key(b)
+                    } else {
+                        str_lt(a, b)
+                    }
+                };
+                let mut last: Value = 0;
+                for printed in 0..n {
+                    let mut best: Option<Value> = None;
+                    for i in 0..n {
+                        let e = list_get(o, i);
+                        if printed > 0 && !lt(last, e) {
+                            continue;
+                        }
+                        best = match best {
+                            Some(b2) if !lt(e, b2) => Some(b2),
+                            _ => Some(e),
+                        };
+                    }
+                    let e = best.expect("selection scan always finds the next element");
+                    if printed > 0 {
+                        write_bytes(b", ", out);
+                    }
+                    write_repr(e, out);
+                    last = e;
                 }
-                write_repr(list_get(o, i), out);
+            } else {
+                for i in 0..n {
+                    if i > 0 {
+                        write_bytes(b", ", out);
+                    }
+                    write_repr(list_get(o, i), out);
+                }
             }
             out(b'}');
         }
@@ -1933,12 +1998,195 @@ unsafe extern "C" {
     /// The platform byte sink: USB-CDC on the device. (Provided at final link;
     /// host tests supply a stub — see the tests module.)
     fn p2w_putc(c: u8);
+    /// The platform byte source (stdin / USB-CDC): next byte, or a negative
+    /// value at end-of-input. (Provided at final link, like `p2w_putc`.)
+    fn p2w_getc() -> i32;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_print(v: Value) {
     write_value(v, &mut |c| unsafe { p2w_putc(c) });
     unsafe { p2w_putc(b'\n') };
+}
+
+/// `input(prompt)` — write the prompt (no newline), then read one line from
+/// the platform byte source into a fresh heap string. The trailing newline is
+/// stripped (and `\r` ignored, for CRLF hosts); end-of-input yields whatever
+/// was read so far (an empty string at immediate EOF — a friendlier device
+/// behavior than CPython's EOFError, noted in PYTHON_COMPAT.md). BORROWS
+/// `prompt` (`V_NONE` for none); returns an owned string.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_input(prompt: Value) -> Value {
+    if is_heap(prompt) && obj_tag(prompt) == T_STR {
+        for i in 0..str_len(prompt) {
+            unsafe { p2w_putc(str_byte(prompt, i)) };
+        }
+    }
+    // Grow-by-doubling heap string (no_std: no Vec) — same consume-and-copy
+    // shape as p2w_add_assign's grow path.
+    let mut cap = 32usize;
+    let mut p = alloc(12 + cap);
+    if p == 0 {
+        trap("out of memory");
+    }
+    wr(p, T_STR);
+    wr(p + 4, 1);
+    live_inc();
+    let mut n = 0usize;
+    loop {
+        let c = unsafe { p2w_getc() };
+        if c < 0 || c == i32::from(b'\n') {
+            break;
+        }
+        if c == i32::from(b'\r') {
+            continue;
+        }
+        if n == cap {
+            cap *= 2;
+            let np = alloc(12 + cap);
+            if np == 0 {
+                trap("out of memory");
+            }
+            wr(np, T_STR);
+            wr(np + 4, 1);
+            live_inc();
+            wr(np + 8, n as u32);
+            for i in 0..n {
+                wr_byte(np + 12 + i, rd_byte(p + 12 + i));
+            }
+            p2w_release(p as Value);
+            p = np;
+        }
+        wr_byte(p + 12 + n, c as u8);
+        n += 1;
+    }
+    wr(p + 8, n as u32);
+    p as Value
+}
+
+/// `format(v, spec)` with the spec pre-parsed by the compiler (same contract
+/// as the WASM backend's `$f64_to_fixed`/`$str_pad`): float formatting uses
+/// `prec` decimals with ties-to-even rounding; `align` is 0=left / 1=right /
+/// 2=center / 3=auto (numbers right, everything else left). BORROWS `v`;
+/// returns an owned string.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_format(
+    v: Value,
+    as_fixed: i32,
+    prec: i32,
+    width: i32,
+    fill: i32,
+    align: i32,
+) -> Value {
+    let s = if as_fixed != 0 {
+        to_fixed(p2w_unbox_float(v), prec)
+    } else {
+        p2w_str_of(v)
+    };
+    let n = str_len(s);
+    if width <= 0 || n >= width as usize {
+        return s;
+    }
+    let eff_align = if align == 3 {
+        // Auto: numbers right-align, everything else left (browser parity).
+        if num(v).is_some() || is_float(v) {
+            1
+        } else {
+            0
+        }
+    } else {
+        align
+    };
+    let w = width as usize;
+    let pad = w - n;
+    let lp = match eff_align {
+        1 => pad,
+        2 => pad / 2,
+        _ => 0,
+    };
+    let p = alloc(12 + w);
+    if p == 0 {
+        trap("out of memory");
+    }
+    wr(p, T_STR);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, w as u32);
+    for i in 0..w {
+        let b = if i < lp || i >= lp + n {
+            fill as u8
+        } else {
+            str_byte(s, i - lp)
+        };
+        wr_byte(p + 12 + i, b);
+    }
+    p2w_release(s);
+    p as Value
+}
+
+/// Format `x` with exactly `prec` decimal places, rounding ties to even —
+/// mirrors the WASM `$f64_to_fixed` algorithm (scale by 10^prec, nearest,
+/// split int/frac; scaled magnitudes beyond i64 saturate). Returns an owned
+/// heap string.
+fn to_fixed(x: f64, prec: i32) -> Value {
+    let neg = x < 0.0;
+    let x = if neg { -x } else { x };
+    let mut scale = 1.0f64;
+    let mut sci: i64 = 1;
+    for _ in 0..prec {
+        scale *= 10.0;
+        sci *= 10;
+    }
+    // `f64.nearest` (ties to even), by hand — core has no `round`.
+    let scaled_f = x * scale;
+    let t = scaled_f as i64; // truncating, saturating
+    let frac = scaled_f - t as f64;
+    let round_up = frac > 0.5 || (frac == 0.5 && t % 2 != 0);
+    let scaled = if round_up { t + 1 } else { t };
+    let ip = scaled / sci;
+    let fp = scaled % sci;
+    let mut buf = [0u8; 48];
+    let mut n = 0usize;
+    let push = |b: u8, buf: &mut [u8; 48], n: &mut usize| {
+        if *n < buf.len() {
+            buf[*n] = b;
+            *n += 1;
+        }
+    };
+    if neg {
+        push(b'-', &mut buf, &mut n);
+    }
+    // Integer digits (ip >= 0 here).
+    let mut tmp = [0u8; 20];
+    let mut k = 0usize;
+    let mut m = ip;
+    if m == 0 {
+        tmp[k] = b'0';
+        k += 1;
+    }
+    while m > 0 {
+        tmp[k] = b'0' + (m % 10) as u8;
+        m /= 10;
+        k += 1;
+    }
+    while k > 0 {
+        k -= 1;
+        push(tmp[k], &mut buf, &mut n);
+    }
+    if prec > 0 {
+        push(b'.', &mut buf, &mut n);
+        // prec fraction digits, zero-padded, filled right-to-left.
+        let mut fd = [0u8; 20];
+        let mut m = fp;
+        for i in (0..prec as usize).take(20) {
+            fd[prec as usize - 1 - i] = b'0' + (m % 10) as u8;
+            m /= 10;
+        }
+        for &d in fd.iter().take(prec as usize) {
+            push(d, &mut buf, &mut n);
+        }
+    }
+    str_alloc(&buf[..n])
 }
 
 /// Halt on an unrecoverable runtime error. On the device this will report over
@@ -1972,6 +2220,12 @@ mod tests {
     // Satisfy the linker for the test binary (p2w_print references p2w_putc).
     #[unsafe(no_mangle)]
     extern "C" fn p2w_putc(_c: u8) {}
+
+    // ...and p2w_input references p2w_getc (immediate end-of-input in tests).
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_getc() -> i32 {
+        -1
+    }
 
     // The heap is one shared `static mut`, but `cargo test` runs tests in
     // parallel — so heap-touching tests serialize on this lock (and reset the

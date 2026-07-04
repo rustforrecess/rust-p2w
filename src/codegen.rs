@@ -7399,7 +7399,9 @@ fn emit_char(out: &mut Body, byte: u8) {
 /// `(is_float, precision, width, fill_char_code, align)` where align is
 /// 0=left, 1=right, 2=center. Supports `[[fill]align][0][width][.prec][type]`
 /// with type in `f`/`d`/`s` (or none).
-fn parse_format_spec(spec: &str) -> std::result::Result<(bool, i32, i32, i32, i32), String> {
+pub(crate) fn parse_format_spec(
+    spec: &str,
+) -> std::result::Result<(bool, i32, i32, i32, i32), String> {
     let cs: Vec<char> = spec.chars().collect();
     let mut i = 0;
     let is_align = |c: char| matches!(c, '<' | '>' | '^');

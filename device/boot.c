@@ -27,6 +27,13 @@ void p2w_putc(unsigned char c) {
     UART0_DR = c;
 }
 
+/* Byte source for input(). UART RX needs the flag-register wait (and clock
+ * setup) that's part of the hardware-gated bring-up; until then input() on
+ * the device sees immediate end-of-input and returns "". */
+int p2w_getc(void) {
+    return -1;
+}
+
 void Reset_Handler(void) {
     /* Copy initialised data from flash to RAM. */
     uint32_t *src = &__data_load;

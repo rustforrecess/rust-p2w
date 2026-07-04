@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::codegen::parse_format_spec;
 use crate::reuse::{Liveness, stmt_mentions_name};
 
 /// The runtime ABI the emitted module depends on (implemented by the device
@@ -80,6 +81,8 @@ declare i32 @p2w_len(i32)
 declare i32 @p2w_str_of(i32)
 declare i32 @p2w_slice(i32, i32, i32, i32)
 declare i32 @p2w_slice_assign(i32, i32, i32, i32)
+declare i32 @p2w_input(i32)
+declare i32 @p2w_format(i32, i32, i32, i32, i32, i32)
 ; sets + set/bitwise operators + membership
 declare i32 @p2w_set_new()
 declare i32 @p2w_set_of(i32)
@@ -114,6 +117,8 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
     let mut borrow_masks: HashMap<String, Vec<bool>> = HashMap::new();
     let mut param_reprs: HashMap<String, Vec<Repr>> = HashMap::new();
     let mut ret_reprs: HashMap<String, Repr> = HashMap::new();
+    let mut func_params: HashMap<String, Vec<String>> = HashMap::new();
+    let mut func_defaults: HashMap<String, Vec<Expr>> = HashMap::new();
     for s in stmts {
         if let StmtKind::Def {
             name,
@@ -121,7 +126,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
             body,
             param_types,
             return_type,
-            ..
+            defaults,
         } = &s.kind
         {
             let mask = params.iter().map(|p| !param_escapes(body, p)).collect();
@@ -129,6 +134,8 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
             let preprs = param_types.iter().map(repr_of_ann).collect();
             param_reprs.insert(name.clone(), preprs);
             ret_reprs.insert(name.clone(), repr_of_ann(return_type));
+            func_params.insert(name.clone(), params.clone());
+            func_defaults.insert(name.clone(), defaults.clone());
         }
     }
 
@@ -138,45 +145,27 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
     // main's exit so a finished program ends at live == 0.
     let mut str_caches: Vec<String> = Vec::new();
 
+    let sigs = Sigs {
+        funcs: &funcs,
+        borrow_masks: &borrow_masks,
+        param_reprs: &param_reprs,
+        ret_reprs: &ret_reprs,
+        func_params: &func_params,
+        func_defaults: &func_defaults,
+    };
     for s in stmts {
         if let StmtKind::Def {
-            name,
-            params,
-            defaults,
-            body,
-            ..
+            name, params, body, ..
         } = &s.kind
         {
-            if !defaults.is_empty() {
-                return Err(format!(
-                    "line {}: default arguments aren't in the native backend yet",
-                    s.line
-                ));
-            }
-            let (def, g) = emit_function(
-                name,
-                params,
-                body,
-                &funcs,
-                &borrow_masks,
-                &param_reprs,
-                &ret_reprs,
-                &mut str_caches,
-            )?;
+            let (def, g) = emit_function(name, params, body, &sigs, &mut str_caches)?;
             defs.push_str(&def);
             defs.push('\n');
             globals.push_str(&g);
         }
     }
 
-    let (main_def, main_g) = emit_main(
-        stmts,
-        &funcs,
-        &borrow_masks,
-        &param_reprs,
-        &ret_reprs,
-        &mut str_caches,
-    )?;
+    let (main_def, main_g) = emit_main(stmts, &sigs, &mut str_caches)?;
     globals.push_str(&main_g);
 
     Ok(format!(
@@ -184,21 +173,29 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The per-module signature tables every function emission needs — computed
+/// once up front so call sites (which may precede the definition) can emit
+/// the matching convention, coerce args/results, and fill in defaults.
+struct Sigs<'a> {
+    funcs: &'a HashSet<String>,
+    borrow_masks: &'a HashMap<String, Vec<bool>>,
+    param_reprs: &'a HashMap<String, Vec<Repr>>,
+    ret_reprs: &'a HashMap<String, Repr>,
+    func_params: &'a HashMap<String, Vec<String>>,
+    func_defaults: &'a HashMap<String, Vec<Expr>>,
+}
+
 fn emit_function(
     name: &str,
     params: &[String],
     body: &[Stmt],
-    funcs: &HashSet<String>,
-    borrow_masks: &HashMap<String, Vec<bool>>,
-    param_reprs: &HashMap<String, Vec<Repr>>,
-    ret_reprs: &HashMap<String, Repr>,
+    sigs: &Sigs,
     str_caches: &mut Vec<String>,
 ) -> Result<(String, String), String> {
-    let mut f = FuncEmitter::new(funcs, borrow_masks, param_reprs, ret_reprs, name);
-    let mask = borrow_masks.get(name).cloned().unwrap_or_default();
-    let preprs = param_reprs.get(name).cloned().unwrap_or_default();
-    f.ret_repr = ret_reprs.get(name).copied().unwrap_or(Repr::Boxed);
+    let mut f = FuncEmitter::new(sigs, name);
+    let mask = sigs.borrow_masks.get(name).cloned().unwrap_or_default();
+    let preprs = sigs.param_reprs.get(name).cloned().unwrap_or_default();
+    f.ret_repr = sigs.ret_reprs.get(name).copied().unwrap_or(Repr::Boxed);
     for (i, p) in params.iter().enumerate() {
         let pr = preprs.get(i).copied().unwrap_or(Repr::Boxed);
         let ptr = f.ensure_slot(p, pr); // typed slot (double for a float param)
@@ -217,7 +214,7 @@ fn emit_function(
         .enumerate()
         .map(|(i, p)| (p.clone(), preprs.get(i).copied().unwrap_or(Repr::Boxed)))
         .collect();
-    f.inferred = infer_slot_reprs(body, &fixed, ret_reprs);
+    f.inferred = infer_slot_reprs(body, &fixed, sigs.ret_reprs);
     // Precise drops over the body's top-level sequence: values die at their
     // last mention, not at scope end (see src/reuse.rs).
     let live = Liveness::analyze(body);
@@ -259,16 +256,13 @@ fn emit_function(
 
 fn emit_main(
     stmts: &[Stmt],
-    funcs: &HashSet<String>,
-    borrow_masks: &HashMap<String, Vec<bool>>,
-    param_reprs: &HashMap<String, Vec<Repr>>,
-    ret_reprs: &HashMap<String, Repr>,
+    sigs: &Sigs,
     str_caches: &mut Vec<String>,
 ) -> Result<(String, String), String> {
-    let mut f = FuncEmitter::new(funcs, borrow_masks, param_reprs, ret_reprs, "main");
+    let mut f = FuncEmitter::new(sigs, "main");
     // First-assignment slot inference for main's locals (no params here; the
     // walker skips Def bodies — separate scopes).
-    f.inferred = infer_slot_reprs(stmts, &HashMap::new(), ret_reprs);
+    f.inferred = infer_slot_reprs(stmts, &HashMap::new(), sigs.ret_reprs);
     // Analyze the UNFILTERED module so def-body reads pin their globals (a
     // function can run at any later point); defs themselves emit nothing here.
     let live = Liveness::analyze(stmts);
@@ -388,6 +382,11 @@ struct FuncEmitter<'a> {
     /// param) and return representations, so call sites coerce args/results.
     param_reprs: &'a HashMap<String, Vec<Repr>>,
     ret_reprs: &'a HashMap<String, Repr>,
+    /// Per-function parameter names + default expressions, so call sites can
+    /// bind keyword arguments and fill in defaults (compile-time expansion to
+    /// a full positional list, same convention as the WASM backend).
+    func_params: &'a HashMap<String, Vec<String>>,
+    func_defaults: &'a HashMap<String, Vec<Expr>>,
     /// This function's own parameters that are borrowed (slots we must NOT
     /// release at exit — the caller still owns them).
     borrowed_params: Vec<String>,
@@ -430,18 +429,14 @@ struct FuncEmitter<'a> {
 }
 
 impl<'a> FuncEmitter<'a> {
-    fn new(
-        funcs: &'a HashSet<String>,
-        borrow_masks: &'a HashMap<String, Vec<bool>>,
-        param_reprs: &'a HashMap<String, Vec<Repr>>,
-        ret_reprs: &'a HashMap<String, Repr>,
-        gprefix: &str,
-    ) -> Self {
+    fn new(sigs: &Sigs<'a>, gprefix: &str) -> Self {
         FuncEmitter {
-            funcs,
-            borrow_masks,
-            param_reprs,
-            ret_reprs,
+            funcs: sigs.funcs,
+            borrow_masks: sigs.borrow_masks,
+            param_reprs: sigs.param_reprs,
+            ret_reprs: sigs.ret_reprs,
+            func_params: sigs.func_params,
+            func_defaults: sigs.func_defaults,
             borrowed_params: Vec::new(),
             ret_repr: Repr::Boxed,
             var_reprs: HashMap::new(),
@@ -2048,11 +2043,101 @@ impl<'a> FuncEmitter<'a> {
                     };
                     return Ok((r, Repr::Boxed));
                 }
+                if name == "input" {
+                    // input([prompt]): write the prompt raw, read one line.
+                    let (p, po) = match args.len() {
+                        0 => (self.call_value("call i32 @p2w_none()"), true),
+                        1 => self.expr_borrow(&args[0])?,
+                        _ => return nope("input() with more than one argument"),
+                    };
+                    let r = self.call_value(&format!("call i32 @p2w_input(i32 {p})"));
+                    self.release_if_owned(&p, po);
+                    return Ok((r, Repr::Boxed));
+                }
+                if name == "format" {
+                    // The f-string desugaring: `{x:spec}` -> format(x, "spec").
+                    // The spec is parsed at compile time (browser parity); the
+                    // runtime does fixed-point + padding.
+                    if args.len() != 2 {
+                        return nope("format() without exactly two arguments");
+                    }
+                    let ExprKind::Str(spec) = &args[1].kind else {
+                        return Err(format!(
+                            "line {}: the format spec must be a string literal",
+                            e.line
+                        ));
+                    };
+                    let (isf, prec, width, fill, align) =
+                        parse_format_spec(spec).map_err(|m| format!("line {}: {m}", e.line))?;
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let r = self.call_value(&format!(
+                        "call i32 @p2w_format(i32 {v}, i32 {}, i32 {prec}, i32 {width}, i32 {fill}, i32 {align})",
+                        i32::from(isf)
+                    ));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
                 if !self.funcs.contains(name) {
                     return nope(
                         "calling this function (only your own functions, len, str, set, + print)",
                     );
                 }
+                // Bind parameter slots — positional, then keyword, then
+                // defaults — into a full positional list at compile time
+                // (the WASM backend's convention; a default EXPRESSION is
+                // evaluated at the call site, so `def f(xs=[])` yields a
+                // fresh list per call — see PYTHON_COMPAT.md).
+                let fparams = self.func_params.get(name).cloned().unwrap_or_default();
+                let fdefaults = self.func_defaults.get(name).cloned().unwrap_or_default();
+                let total = fparams.len();
+                let required = total - fdefaults.len();
+                let mut slots: Vec<Option<Expr>> = vec![None; total];
+                let mut npos = 0usize;
+                for a in args {
+                    if let ExprKind::Kwarg(k, v) = &a.kind {
+                        let Some(j) = fparams.iter().position(|p| p == k) else {
+                            return Err(format!(
+                                "line {}: {name}() got an unexpected keyword argument '{k}'",
+                                e.line
+                            ));
+                        };
+                        if slots[j].is_some() {
+                            return Err(format!(
+                                "line {}: {name}() got multiple values for argument '{k}'",
+                                e.line
+                            ));
+                        }
+                        slots[j] = Some((**v).clone());
+                    } else {
+                        if npos >= total {
+                            return Err(format!(
+                                "line {}: {name}() takes {total} argument(s) but more were given",
+                                e.line
+                            ));
+                        }
+                        if slots[npos].is_some() {
+                            return Err(format!(
+                                "line {}: {name}() got multiple values for argument '{}'",
+                                e.line, fparams[npos]
+                            ));
+                        }
+                        slots[npos] = Some(a.clone());
+                        npos += 1;
+                    }
+                }
+                for (j, s) in slots.iter_mut().enumerate() {
+                    if s.is_none() {
+                        if j >= required {
+                            *s = Some(fdefaults[j - required].clone());
+                        } else {
+                            return Err(format!(
+                                "line {}: {name}() is missing the argument '{}'",
+                                e.line, fparams[j]
+                            ));
+                        }
+                    }
+                }
+                let full_args: Vec<Expr> = slots.into_iter().flatten().collect();
                 // Coerce each argument to the callee's parameter repr and match
                 // its ownership convention. An `Int` param takes a raw value (no
                 // refcount). A `Boxed` param is borrowed (no transfer) or owned
@@ -2060,9 +2145,9 @@ impl<'a> FuncEmitter<'a> {
                 let mask = self.borrow_masks.get(name).cloned().unwrap_or_default();
                 let preprs = self.param_reprs.get(name).cloned().unwrap_or_default();
                 let ret_repr = self.ret_reprs.get(name).copied().unwrap_or(Repr::Boxed);
-                let mut ops = Vec::with_capacity(args.len());
+                let mut ops = Vec::with_capacity(full_args.len());
                 let mut to_release = Vec::new();
-                for (i, a) in args.iter().enumerate() {
+                for (i, a) in full_args.iter().enumerate() {
                     let prepr = preprs.get(i).copied().unwrap_or(Repr::Boxed);
                     let borrowable = mask.get(i).copied().unwrap_or(false);
                     if !is_heap_repr(prepr) {

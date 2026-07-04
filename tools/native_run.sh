@@ -41,6 +41,7 @@ static void report(void) {
   fprintf(stderr, "P2W_ALLOCS=%d\n", p2w_allocs());
 }
 void p2w_putc(unsigned char c) { putchar(c); }
+int p2w_getc(void) { return getchar(); }
 __attribute__((constructor)) static void init(void) { atexit(report); }
 EOF
 
@@ -69,6 +70,30 @@ run_case() {
   if [ "$GATE_LEAKS" = "1" ] && [ "$live" != "0" ]; then
     echo "LEAK [$name]: output ok but live=$live (expected 0)"
     return 1
+  fi
+  echo "PASS [$name]  live=$live"
+  return 0
+}
+
+# Like run_case, but with a 4th argument piped to the program's stdin
+# (for input() cases; p2w_getc reads it via getchar).
+run_case_in() {
+  local name="$1" src="$2" want="$3" give="$4"
+  printf '%b' "$src" | cargo run -q --example emit_ll > "$OUT/$name.ll" 2>"$OUT/$name.err" || {
+    echo "FAIL [$name]: emit"; cat "$OUT/$name.err"; return 1; }
+  clang -Wno-override-module "$OUT/$name.ll" "$OUT/putc.c" "$LIB" -o "$OUT/$name.exe" \
+    2>"$OUT/$name.err" || { echo "FAIL [$name]: build"; cat "$OUT/$name.err"; return 1; }
+  local got; got=$(printf '%b' "$give" | timeout 10 "$OUT/$name.exe" 2>"$OUT/$name.live" | tr -d '\r')
+  if [ $? -eq 124 ]; then
+    echo "FAIL [$name]: timed out (likely a runtime trap)"; return 1
+  fi
+  local live; live=$(sed -n 's/.*P2W_LIVE=\(-\?[0-9]*\).*/\1/p' "$OUT/$name.live")
+  : "${live:=?}"
+  if [ "$got" != "$(printf '%b' "$want")" ]; then
+    echo "FAIL [$name]: got [$got] want [$(printf '%b' "$want")]  live=$live"; return 1
+  fi
+  if [ "$GATE_LEAKS" = "1" ] && [ "$live" != "0" ]; then
+    echo "LEAK [$name]: output ok but live=$live (expected 0)"; return 1
   fi
   echo "PASS [$name]  live=$live"
   return 0
@@ -275,6 +300,23 @@ run_case branch_reuse_else 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n
 run_case branch_reuse_alias 'flag = 1\nxs: list[int] = [1, 2, 3]\nzs = xs\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [x * 3 for x in xs]\nprint(ys)\nprint(zs)\n' '[2, 4, 6]\n[1, 2, 3]' || fails=$((fails+1))
 run_case branch_unmentioned_arm 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [9]\nprint(ys)\n' '[9]' || fails=$((fails+1))
 run_case branch_token_slice 'flag = 1\nxs = [1, 2, 3, 4]\nif flag == 1:\n    ys = xs[1:]\nelse:\n    ys = xs[:2]\nprint(ys)\n' '[2, 3, 4]' || fails=$((fails+1))
+
+# --- p2w parity batch: defaults/kwargs, format specs, input(), set sort ---
+run_case default_args 'def greet(name, punct="!"):\n    return name + punct\nprint(greet("Ana"))\nprint(greet("Bo", "?"))\n' 'Ana!\nBo?' || fails=$((fails+1))
+run_case default_int 'def scale(n: int, k: int = 3) -> int:\n    return n * k\nprint(scale(5))\nprint(scale(5, 2))\n' '15\n10' || fails=$((fails+1))
+run_case kwargs 'def area(w, h):\n    return w * h\nprint(area(h=3, w=4))\n' '12' || fails=$((fails+1))
+run_case kwargs_mixed 'def f(a, b, c=10):\n    return a + b + c\nprint(f(1, c=2, b=3))\nprint(f(1, 2))\n' '6\n13' || fails=$((fails+1))
+run_case fmt_float 'x = 3.14159\nprint(f"{x:.2f}")\nprint(f"{2.5:.0f}")\nprint(f"{1.005:.2f}")\nprint(f"{-3.456:.1f}")\n' '3.14\n2\n1.00\n-3.5' || fails=$((fails+1))
+run_case fmt_width 'n = 42\nprint(f"{n:5d}|")\nprint(f"{7:04d}")\nprint(f"{5:^5d}|")\n' '   42|\n0007\n  5  |' || fails=$((fails+1))
+run_case fmt_str 's = "hi"\nprint(f"[{s:>5}]")\nprint(f"[{s:5}]")\n' '[   hi]\n[hi   ]' || fails=$((fails+1))
+run_case set_sorted_display 'print({3, 1, 2})\nprint({2.5, 1, 3})\n' '{1, 2, 3}\n{1, 2.5, 3}' || fails=$((fails+1))
+# Canonical SORTED display is ours by design (CPython prints hash order) —
+# the expected strings here are the canonical form, not a CPython diff.
+run_case set_sorted_strs 'print({"pear", "apple", "fig"})\n' "{'apple', 'fig', 'pear'}" || fails=$((fails+1))
+run_case_in input_line 'x = input()\nprint("got " + x)\n' 'got hello' 'hello\n' || fails=$((fails+1))
+run_case_in input_prompt 'name = input("Who? ")\nprint("Hi " + name)\n' 'Who? Hi Ana' 'Ana\n' || fails=$((fails+1))
+run_case_in input_eof 'x = input()\nprint(len(x))\n' '0' '' || fails=$((fails+1))
+run_case_in input_loop 'a = input()\nb = input()\nprint(b + a)\n' 'ba' 'a\nb\n' || fails=$((fails+1))
 
 echo "---"
 if [ "$fails" -eq 0 ]; then

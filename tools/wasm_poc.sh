@@ -97,6 +97,7 @@ EOF
 __attribute__((import_module("poc:guest/env"), import_name("p2w-putc")))
 extern void canon_putc(int c);
 void p2w_putc(int c) { canon_putc(c); }
+int p2w_getc(void) { return -1; } /* component PoC: no input stream yet */
 extern int main(void);
 extern int p2w_live(void);
 __attribute__((export_name("run"))) int run(void) { return main(); }

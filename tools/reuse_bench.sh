@@ -41,6 +41,7 @@ static void report(void) {
           p2w_allocs(), p2w_live(), p2w_peak());
 }
 void p2w_putc(unsigned char c) { (void)c; } /* bench: discard stdout */
+int p2w_getc(void) { return -1; } /* bench: no stdin */
 __attribute__((constructor)) static void init(void) { atexit(report); }
 EOF
 

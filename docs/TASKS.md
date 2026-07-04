@@ -19,7 +19,7 @@ Of the tasks originally listed here (Jun 2026):
 - **Cycle collector** — open, now `COMPILER_FRONTIER.md` task 5 (design
   sketched from Nim ORC).
 
-The acceptance machinery described here grew too: the oracle is 153 cases
+The acceptance machinery described here grew too: the oracle is 166 cases
 (`tools/native_run.sh`), the bench reports allocs/peak/live
 (`tools/reuse_bench.sh`), and a differential fuzzer generates fresh cases
 against CPython (`tools/fuzz_native.sh`).
