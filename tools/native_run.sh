@@ -301,6 +301,13 @@ run_case branch_reuse_alias 'flag = 1\nxs: list[int] = [1, 2, 3]\nzs = xs\nif fl
 run_case branch_unmentioned_arm 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [9]\nprint(ys)\n' '[9]' || fails=$((fails+1))
 run_case branch_token_slice 'flag = 1\nxs = [1, 2, 3, 4]\nif flag == 1:\n    ys = xs[1:]\nelse:\n    ys = xs[:2]\nprint(ys)\n' '[2, 3, 4]' || fails=$((fails+1))
 
+# --- lambda (desugars to def; the assigned-to-a-name form is THE form) ---
+run_case lambda_basic 'f = lambda x: x + 1\nprint(f(2))\n' '3' || fails=$((fails+1))
+run_case lambda_two 'area = lambda w, h: w * h\nprint(area(3, 4))\n' '12' || fails=$((fails+1))
+run_case lambda_default 'g = lambda n, k=10: n + k\nprint(g(5))\nprint(g(5, 1))\n' '15\n6' || fails=$((fails+1))
+run_case lambda_noarg 'seven = lambda: 7\nprint(seven())\n' '7' || fails=$((fails+1))
+run_case lambda_feeds_comp 'dbl = lambda n: n * 2\na: list[int] = [1, 2, 3]\nb = [dbl(x) for x in a]\nprint(b)\n' '[2, 4, 6]' || fails=$((fails+1))
+
 # --- classes (native v1): construction/attrs/methods/inheritance/super/repr ---
 run_case cls_basic 'class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + " makes a sound"\nclass Dog(Animal):\n    def __init__(self, name):\n        super().__init__(name)\n        self.tricks = []\n    def speak(self):\n        return self.name + " barks"\n    def learn(self, t):\n        self.tricks.append(t)\nd = Dog("Rex")\nd.learn("sit")\nprint(d.speak())\nprint(d.tricks)\na = Animal("Cat")\nprint(a.speak())\n' 'Rex barks\n[\x27sit\x27]\nCat makes a sound' || fails=$((fails+1))
 run_case cls_str 'class Pt:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __str__(self):\n        return "Pt(" + str(self.x) + ", " + str(self.y) + ")"\np = Pt(1, 2)\nprint(p)\nprint(str(p))\n' 'Pt(1, 2)\nPt(1, 2)' || fails=$((fails+1))

@@ -96,7 +96,12 @@ semantics and leak-freedom are oracle-gated). Differences:
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
-- **Not yet implemented on native:** generators, `lambda`, `*args`/`**kwargs`,
+- **`lambda` works only as `name = lambda params: expr`** (all backends) — it
+  desugars to the equivalent `def`, so functions still aren't first-class
+  values. Any other lambda position is a friendly, specific error. Defaults
+  work (`lambda n, k=10: ...`); blocks/text round-trips canonicalize the
+  spelling to `def`.
+- **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.
 
@@ -109,6 +114,6 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (incl. as set elements), control flow, classes (v1 — see above), functions +
 recursion + default arguments + keyword arguments, `for`/`while`, list & dict comprehensions
 (nested, filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`,
-`input()`, and `print()` — all gated by the 175-case CPython differential
+`input()`, and `print()` — all gated by the 180-case CPython differential
 oracle (`tools/native_run.sh`), which also requires leak-freedom
 (`live == 0`).

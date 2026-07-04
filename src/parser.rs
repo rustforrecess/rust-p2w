@@ -457,6 +457,21 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.peek(), Tok::Eq) {
             self.advance();
+            // `name = lambda params: expr` desugars to `def name(params):
+            // return expr` — functions aren't first-class in the subset, so
+            // the assigned-to-a-name form is THE lambda form, and the
+            // desugaring gives it to all three backends (WASM, native,
+            // debugger) at once. Blocks/text round-trips canonicalize it to
+            // the def spelling.
+            if self.is_keyword("lambda") {
+                let ExprKind::Name(name) = e.kind else {
+                    return Err(CompileError::at(
+                        line,
+                        "a lambda can only be assigned to a simple name (f = lambda x: ...)",
+                    ));
+                };
+                return self.lambda_def(name, line);
+            }
             let value = self.expr_list()?;
             self.expect(&Tok::Newline, "a new line")?;
             return match e.kind {
@@ -1068,6 +1083,56 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `name = lambda [params]: expr` — parse from the `lambda` keyword and
+    /// build the equivalent `def` (untyped params, optional defaults, a
+    /// single-expression `return` body).
+    fn lambda_def(&mut self, name: String, line: usize) -> Result<Stmt> {
+        self.advance(); // the `lambda` keyword
+        let mut params = Vec::new();
+        let mut defaults = Vec::new();
+        if !matches!(self.peek(), Tok::Colon) {
+            loop {
+                let Tok::Name(p) = self.peek().clone() else {
+                    return Err(CompileError::at(line, "expected a lambda parameter name"));
+                };
+                self.advance();
+                params.push(p);
+                if matches!(self.peek(), Tok::Eq) {
+                    self.advance();
+                    defaults.push(self.expr(0)?);
+                } else if !defaults.is_empty() {
+                    return Err(CompileError::at(
+                        line,
+                        "a parameter without a default can't follow one with a default",
+                    ));
+                }
+                if matches!(self.peek(), Tok::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::Colon, "':' after the lambda parameters")?;
+        let body_expr = self.expr(0)?;
+        self.expect(&Tok::Newline, "a new line")?;
+        let n = params.len();
+        Ok(Stmt {
+            kind: StmtKind::Def {
+                name,
+                params,
+                param_types: vec![None; n],
+                defaults,
+                return_type: None,
+                body: vec![Stmt {
+                    kind: StmtKind::Return(Some(body_expr)),
+                    line,
+                }],
+            },
+            line,
+        })
+    }
+
     fn primary(&mut self) -> Result<Expr> {
         let line = self.line();
         let start = self.byte();
@@ -1262,6 +1327,14 @@ impl<'a> Parser<'a> {
                     "True" => Ok(expr(ExprKind::Bool(true))),
                     "False" => Ok(expr(ExprKind::Bool(false))),
                     "None" => Ok(expr(ExprKind::NoneLit)),
+                    // Functions aren't first-class in the subset, so a lambda
+                    // anywhere except `name = lambda ...` (handled in the
+                    // assignment statement) gets a friendly, specific error.
+                    "lambda" => Err(CompileError::at(
+                        line,
+                        "a lambda only works as `name = lambda ...` here — for anything \
+                         bigger, use `def`",
+                    )),
                     _ if matches!(self.peek(), Tok::LParen) => {
                         // Span covers the callee name, so a "did you mean…?" typo
                         // squiggles exactly the misspelled name.

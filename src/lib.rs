@@ -380,6 +380,24 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn lambda_desugars_to_a_def_on_every_path() {
+        // `f = lambda x: x + 1` is sugar for `def f(x): return x + 1` — the
+        // parser rewrites it, so WASM, native, and the debugger all get it.
+        let wat = compile_to_wat("f = lambda x: x + 1\nprint(f(2))\n").unwrap();
+        assert!(wat.contains("(func $f_f"), "browser def: {wat}");
+        let ir = compile_to_llvm_ir("f = lambda x: x + 1\nprint(f(2))\n").unwrap();
+        assert!(ir.contains("define i32 @f("), "native def: {ir}");
+        // Defaults ride along on the def machinery.
+        let ir2 = compile_to_llvm_ir("g = lambda n, k=10: n + k\nprint(g(5))\n").unwrap();
+        assert!(ir2.contains("define i32 @g("), "{ir2}");
+        // Any other position is a friendly, specific error.
+        let e = compile_to_llvm_ir("print(lambda x: x)\n").unwrap_err();
+        assert!(e.contains("name = lambda"), "{e}");
+        let e2 = compile_to_llvm_ir("xs = [1]\nxs[0] = lambda x: x\n").unwrap_err();
+        assert!(e2.contains("simple name"), "{e2}");
+    }
+
+    #[test]
     fn native_classes_dispatch_and_guard_dunders() {
         // The canonical class program emits: construction, a generated
         // dispatcher (switch on class id), and the module's p2w_obj_repr.
