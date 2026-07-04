@@ -122,6 +122,28 @@ operator closure + function signatures) would replace it. **Interface:** a
 as the fallback. **Acceptance:** new bench cases (typed-call elements) reuse;
 oracle green; no regression on the `str(x)`-style negative tests.
 
+**Design decision — deliberately NOT Hindley–Milner (Jul 2026).** Types here
+only *gate optimizations*: `type_of` returning `None` means "stay boxed," so
+an inference miss is a missed alloc win, never a rejected program or a wrong
+answer — which flips the usual power/complexity trade. What HM would add:
+backward unification for empty-container builders (`ys = []` + appends →
+`list[int]`), unannotated function boundaries, recursive return types, and a
+principal-types completeness guarantee. What it costs: a unification engine
+that fights Python semantics — reassignment/mutation break let-polymorphism
+(value-restriction territory), and `x = 1; x = "hi"` is legal Python that
+unification rejects, which is exactly how Codon makes HM work (by rejecting
+dynamic programs — the one move ruled out here; no production Python checker
+uses HM either, for the same reason). Every HM-only win is recoverable with
+one annotation (`ys: list[int] = []`), which is curriculum, not a tax, in a
+K-12 tool. **If more inference power is ever wanted, the upgrade path is
+call-site monomorphization (Julia-style specialization — fits our
+whole-program, no-separate-compilation setup and subsumes the unannotated-
+function case), then flow-based dataflow with widening (the mypy/Pyright
+shape) — not HM.** Prior-art note: this was decided without reading Codon /
+LPython source (ideas-not-code discipline, see NOTICE); the relevant
+references are specs — CPython numeric semantics (already enforced
+mechanically by the oracle) and PEP 484.
+
 ### 4. Escape / reachability inference (generalize borrow masks)
 
 Parameters are borrowed today via a local escape check. Reachability-types
