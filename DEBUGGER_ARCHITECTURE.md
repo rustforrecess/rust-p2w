@@ -142,7 +142,18 @@ under the same `DebugAdapter`.
    suite, not the IDE engine. The IDE has the full stepping model — **Step into /
    Over / Out** (`step`/`step_over`/`step_out`) — plus Continue/Stop, breakpoints,
    watches, watchpoints, the variables list, the call-stack panel, and the
-   line+block highlight. Remaining niceties: writing globals from a function
+   line+block highlight. **Classes run in the Vm too** (Jul 2026): construction /
+   `__init__` / attributes / methods / inheritance / `super()` — every one a
+   real frame push, so kids step INTO their constructors and dunders — plus
+   `__str__`/`__repr__` in print/str and the operator dunders
+   (`__add__`-family, `__eq__` direct→reflected→identity, comparisons,
+   `__len__`, `__getitem__`), with the same clean-error guards as the native
+   backend (undispatched dunders, class vars). Instances are `Rc`-shared, so
+   aliases see each other's attribute writes (true reference semantics).
+   Debugger-only narrowings, documented here: instances nested inside a
+   printed CONTAINER show the default `<Dog object>` (no user-code calls
+   mid-format), and `in`/dict-key lookups compare instances by identity
+   rather than `__eq__`. Remaining niceties: writing globals from a function
    (`global`), and calling user functions inside a watch expression.
 2. Native LLVM backend — ✅ **exists** (textual-IR emitter + `no_std` RC
    runtime with the Perceus-style reuse tier; cross-compiles/links for RP2350

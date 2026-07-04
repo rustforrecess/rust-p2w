@@ -45,7 +45,26 @@ pub enum Value {
     Set(Vec<Value>),
     /// Insertion-ordered key/value pairs, like Python dicts.
     Dict(Vec<(Value, Value)>),
+    /// A class instance. `Rc`-shared so aliases see each other's attribute
+    /// writes (true reference semantics, like the compiled backends).
+    Object(Rc<VmObj>),
     None,
+}
+
+/// A class instance's storage. Equality is IDENTITY (same allocation) — the
+/// debugger dispatches `__eq__` at explicit `==`/`!=` sites, but `in` and
+/// dict-key lookups fall back to identity for instances (a documented
+/// debugger-only narrowing; the compiled backends dispatch there too).
+#[derive(Debug)]
+pub struct VmObj {
+    pub class: String,
+    pub attrs: std::cell::RefCell<HashMap<String, Value>>,
+}
+
+impl PartialEq for VmObj {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
 }
 
 impl Value {
@@ -60,6 +79,7 @@ impl Value {
             Value::Tuple(v) => !v.is_empty(),
             Value::Set(v) => !v.is_empty(),
             Value::Dict(d) => !d.is_empty(),
+            Value::Object(_) => true, // instances are truthy (CPython default)
             Value::None => false,
         }
     }
@@ -75,6 +95,10 @@ impl Value {
     /// `repr()` form — how a value shows *inside* a container (strings quoted).
     pub fn py_repr(&self) -> String {
         match self {
+            // Default instance display; a __str__/__repr__ is dispatched at
+            // top-level print/str sites (values nested in containers show
+            // this default — a documented debugger-only narrowing).
+            Value::Object(o) => format!("<{} object>", o.class),
             Value::Int(n) => n.to_string(),
             // Rust's float Debug is shortest-round-trip like Python's repr, and
             // keeps the trailing `.0` Python shows (e.g. 5.0 -> "5.0").
@@ -141,6 +165,10 @@ fn sorted_set_view(items: &[Value]) -> Vec<&Value> {
 /// structural equality for strings/lists/dicts.
 fn py_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        // Instances compare by IDENTITY here (`in`, dict keys, nested
+        // containers); explicit ==/!= sites dispatch __eq__ before reaching
+        // this (see the Bin task).
+        (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::None, Value::None) => true,
         (Value::List(x), Value::List(y)) | (Value::Tuple(x), Value::Tuple(y)) => {
@@ -1396,6 +1424,7 @@ fn num_result(v: f64, ints: bool) -> Value {
 
 fn type_name(v: &Value) -> &'static str {
     match v {
+        Value::Object(_) => "object",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
         Value::Bool(_) => "bool",
@@ -1536,6 +1565,25 @@ enum Task {
     },
     /// Pop value then index; assign `name[index] = value`.
     StoreIndex(String),
+    /// Pop the (discarded) __init__ return and push the constructed instance.
+    ReplaceTop(Value),
+    /// Pop an instance; push its attribute's value.
+    AttrGet(String),
+    /// Pop value then instance; store the attribute.
+    StoreAttr(String),
+    /// Pop a value; an instance becomes its __str__/__repr__ (frame call) or
+    /// default display string — everything else passes through untouched.
+    ToDisplay,
+    /// Pop `argc` args then the receiver VALUE; dispatch a method on an
+    /// instance (non-Name receivers — Name receivers use MethodOnName).
+    CallMethodValue(String, usize),
+    /// Pop `argc` args; call `owner.method` with the current frame's `self`
+    /// (the compile-time-resolved `super().method(...)`).
+    CallSuper(String, String, usize),
+    /// Pop `argc` args then the base instance; call `method` on its ATTRIBUTE
+    /// (`self.tricks.append(..)`): an instance attribute dispatches a frame,
+    /// a container attribute mutates in place inside the attrs cell.
+    CallMethodOnAttr(String, String, usize),
 }
 
 impl Task {
@@ -1548,6 +1596,12 @@ impl Task {
     }
 }
 
+/// A class as the debugger sees it: its base and directly-defined methods.
+struct VmClass {
+    base: Option<String>,
+    methods: HashMap<String, VmFunc>,
+}
+
 /// One call frame: its own continuation + operand stacks and local scope.
 struct VmFrame {
     /// Display name for the call stack ("<module>" for the top level).
@@ -1556,6 +1610,9 @@ struct VmFrame {
     operands: Vec<Value>,
     scope: HashMap<String, Value>,
     line: usize,
+    /// The class whose method body this frame runs (None elsewhere) —
+    /// `super()` resolves from this class's base at the call site.
+    class_ctx: Option<String>,
 }
 
 /// The CPS virtual machine. Same public surface as [`Stepper`], plus
@@ -1563,6 +1620,9 @@ struct VmFrame {
 pub struct Vm {
     frames: Vec<VmFrame>,
     funcs: HashMap<String, VmFunc>,
+    /// Classes registered by executed `class` statements: name -> (base,
+    /// directly-defined methods). Lookup walks the base chain (hop-capped).
+    classes: HashMap<String, VmClass>,
     output: String,
     status: Status,
     watchpoints: Vec<Watchpoint>,
@@ -1585,10 +1645,12 @@ impl Vm {
             operands: Vec::new(),
             scope: HashMap::new(),
             line: 0,
+            class_ctx: None,
         };
         let mut vm = Vm {
             frames: vec![module],
             funcs: HashMap::new(),
+            classes: HashMap::new(),
             output: String::new(),
             status: Status::Finished,
             watchpoints: Vec::new(),
@@ -1831,6 +1893,9 @@ impl Vm {
                 {
                     self.push_task(Task::Print(args.len()));
                     for a in args.iter().rev() {
+                        // Instances display via __str__/__repr__ (a frame
+                        // call), so convert each argument after evaluating it.
+                        self.push_task(Task::ToDisplay);
                         self.push_task(Task::Eval(Rc::new(a.clone())));
                     }
                 } else {
@@ -1924,10 +1989,72 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new(value.clone())));
                 self.push_task(Task::Eval(Rc::new(index.clone())));
             }
-            StmtKind::ClassDef { .. }
-            | StmtKind::SetAttr { .. }
-            | StmtKind::UnpackAssign { .. }
-            | StmtKind::Import(_) => {
+            StmtKind::ClassDef {
+                name,
+                base,
+                methods,
+                class_vars,
+            } => {
+                if !class_vars.is_empty() {
+                    return Err(
+                        "class variables aren't in the step debugger yet — use Run".to_string()
+                    );
+                }
+                let mut mm = HashMap::new();
+                for m in methods {
+                    let allowed = matches!(
+                        m.name.as_str(),
+                        "__init__"
+                            | "__repr__"
+                            | "__str__"
+                            | "__add__"
+                            | "__sub__"
+                            | "__mul__"
+                            | "__eq__"
+                            | "__lt__"
+                            | "__le__"
+                            | "__gt__"
+                            | "__ge__"
+                            | "__len__"
+                            | "__getitem__"
+                    );
+                    if m.name.starts_with("__") && m.name.ends_with("__") && !allowed {
+                        return Err(format!(
+                            "{} isn't dispatched in the step debugger yet — use Run",
+                            m.name
+                        ));
+                    }
+                    if m.params.first().map(String::as_str) != Some("self") {
+                        return Err("a method's first parameter must be 'self'".to_string());
+                    }
+                    mm.insert(
+                        m.name.clone(),
+                        VmFunc {
+                            params: m.params.clone(),
+                            defaults: Vec::new(),
+                            body: Rc::new(m.body.clone()),
+                        },
+                    );
+                }
+                if let Some(b) = base
+                    && !self.classes.contains_key(b)
+                {
+                    return Err(format!("class '{name}' inherits from unknown '{b}'"));
+                }
+                self.classes.insert(
+                    name.clone(),
+                    VmClass {
+                        base: base.clone(),
+                        methods: mm,
+                    },
+                );
+            }
+            StmtKind::SetAttr { obj, attr, value } => {
+                self.push_task(Task::StoreAttr(attr.clone()));
+                self.push_task(Task::Eval(Rc::new(value.clone())));
+                self.push_task(Task::Eval(Rc::new(obj.clone())));
+            }
+            StmtKind::UnpackAssign { .. } | StmtKind::Import(_) => {
                 return Err(format!(
                     "{} isn't in the step debugger yet — use Run for that",
                     describe_stmt(&s.kind)
@@ -1955,7 +2082,11 @@ impl Vm {
             Task::Bin(op) => {
                 let r = self.pop_op()?;
                 let l = self.pop_op()?;
-                self.push_op(apply_bin(op, &l, &r)?);
+                if matches!(l, Value::Object(_)) || matches!(r, Value::Object(_)) {
+                    self.bin_dunder(op, l, r)?;
+                } else {
+                    self.push_op(apply_bin(op, &l, &r)?);
+                }
             }
             Task::Unary(op) => {
                 let v = self.pop_op()?;
@@ -2114,7 +2245,14 @@ impl Vm {
             Task::IndexGet => {
                 let idx = self.pop_op()?;
                 let obj = self.pop_op()?;
-                self.push_op(index_get(&obj, &idx)?);
+                if let Value::Object(o) = &obj {
+                    let (owner, _) = self
+                        .resolve_method(&o.class, "__getitem__")
+                        .ok_or("this object can't be indexed (no __getitem__)")?;
+                    self.call_method_frame(&owner, "__getitem__", obj.clone(), vec![idx])?;
+                } else {
+                    self.push_op(index_get(&obj, &idx)?);
+                }
             }
             Task::MethodOnName(name, method, argc) => {
                 let mut args = Vec::with_capacity(argc);
@@ -2122,8 +2260,24 @@ impl Vm {
                     args.push(self.pop_op()?);
                 }
                 args.reverse();
-                let result = list_method(self.top(), &name, &method, args)?;
-                self.push_op(result);
+                // An instance dispatches through its class chain (the Rc is
+                // shared, so the method mutates the same object the variable
+                // holds); containers keep the name-based mutation path.
+                if let Some(recv @ Value::Object(_)) = self.lookup(&name) {
+                    let owner = match &recv {
+                        Value::Object(o) => self
+                            .resolve_method(&o.class, &method)
+                            .map(|(w, _)| w)
+                            .ok_or_else(|| {
+                                format!("this object has no method '{method}' (or wrong arguments)")
+                            })?,
+                        _ => unreachable!(),
+                    };
+                    self.call_method_frame(&owner, &method, recv, args)?;
+                } else {
+                    let result = list_method(self.top(), &name, &method, args)?;
+                    self.push_op(result);
+                }
             }
             Task::ForEachSetup(var, body) => {
                 let items = match self.pop_op()? {
@@ -2165,6 +2319,119 @@ impl Vm {
                     span: (0, 0),
                 };
                 assign_index_in(&mut self.top().scope, &target, index, value)?;
+            }
+            Task::ReplaceTop(v) => {
+                self.pop_op()?; // the discarded __init__ return value
+                self.push_op(v);
+            }
+            Task::AttrGet(attr) => {
+                let v = self.pop_op()?;
+                let Value::Object(o) = &v else {
+                    return Err(format!(
+                        "only objects have attributes, not {}",
+                        type_name(&v)
+                    ));
+                };
+                let got = o
+                    .attrs
+                    .borrow()
+                    .get(&attr)
+                    .cloned()
+                    .ok_or_else(|| format!("this object has no attribute '{attr}'"))?;
+                self.push_op(got);
+            }
+            Task::StoreAttr(attr) => {
+                let value = self.pop_op()?;
+                let objv = self.pop_op()?;
+                let Value::Object(o) = &objv else {
+                    return Err(format!(
+                        "only objects have attributes, not {}",
+                        type_name(&objv)
+                    ));
+                };
+                o.attrs.borrow_mut().insert(attr, value);
+            }
+            Task::ToDisplay => {
+                let v = self.pop_op()?;
+                if let Value::Object(o) = &v {
+                    let shown = self
+                        .resolve_method(&o.class, "__str__")
+                        .map(|(w, _)| (w, "__str__"))
+                        .or_else(|| {
+                            self.resolve_method(&o.class, "__repr__")
+                                .map(|(w, _)| (w, "__repr__"))
+                        });
+                    if let Some((owner, m)) = shown {
+                        self.call_method_frame(&owner, m, v.clone(), Vec::new())?;
+                        return Ok(());
+                    }
+                }
+                self.push_op(v);
+            }
+            Task::CallMethodValue(method, argc) => {
+                let mut args = Vec::with_capacity(argc);
+                for _ in 0..argc {
+                    args.push(self.pop_op()?);
+                }
+                args.reverse();
+                let recv = self.pop_op()?;
+                let Value::Object(o) = &recv else {
+                    return Err(
+                        "method calls need a simple variable (e.g. xs.append(..)) here yet"
+                            .to_string(),
+                    );
+                };
+                let (owner, _) = self.resolve_method(&o.class, &method).ok_or_else(|| {
+                    format!("this object has no method '{method}' (or wrong arguments)")
+                })?;
+                self.call_method_frame(&owner, &method, recv.clone(), args)?;
+            }
+            Task::CallMethodOnAttr(attr, method, argc) => {
+                let mut args = Vec::with_capacity(argc);
+                for _ in 0..argc {
+                    args.push(self.pop_op()?);
+                }
+                args.reverse();
+                let basev = self.pop_op()?;
+                let Value::Object(o) = &basev else {
+                    return Err(format!(
+                        "only objects have attributes, not {}",
+                        type_name(&basev)
+                    ));
+                };
+                // An instance attribute dispatches through its class; a
+                // container attribute mutates in place inside the cell.
+                let attr_is_obj = matches!(o.attrs.borrow().get(&attr), Some(Value::Object(_)));
+                if attr_is_obj {
+                    let recv = o.attrs.borrow().get(&attr).cloned().unwrap();
+                    let Value::Object(inner) = &recv else {
+                        unreachable!()
+                    };
+                    let (owner, _) =
+                        self.resolve_method(&inner.class, &method).ok_or_else(|| {
+                            format!("this object has no method '{method}' (or wrong arguments)")
+                        })?;
+                    self.call_method_frame(&owner, &method, recv.clone(), args)?;
+                } else {
+                    let mut cell = o.attrs.borrow_mut();
+                    let slot = cell
+                        .get_mut(&attr)
+                        .ok_or_else(|| format!("this object has no attribute '{attr}'"))?;
+                    let out = container_method(slot, &method, args)?;
+                    drop(cell);
+                    self.push_op(out);
+                }
+            }
+            Task::CallSuper(owner, method, argc) => {
+                let mut args = Vec::with_capacity(argc);
+                for _ in 0..argc {
+                    args.push(self.pop_op()?);
+                }
+                args.reverse();
+                let selfv = self
+                    .lookup("self")
+                    .ok_or("super() only works inside a method")?;
+                self.call_method_frame(&owner, &method, selfv, args)?;
             }
         }
         Ok(())
@@ -2232,16 +2499,60 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new((**idx).clone())));
                 self.push_task(Task::Eval(Rc::new((**obj).clone())));
             }
+            ExprKind::Attr(obj, attr) => {
+                self.push_task(Task::AttrGet(attr.clone()));
+                self.push_task(Task::Eval(Rc::new((**obj).clone())));
+            }
             ExprKind::MethodCall(obj, method, args) => {
-                let ExprKind::Name(recv) = &obj.kind else {
-                    return Err(
-                        "method calls need a simple variable (e.g. xs.append(..)) in call-stack mode yet"
-                            .to_string(),
-                    );
-                };
-                self.push_task(Task::MethodOnName(recv.clone(), method.clone(), args.len()));
-                for a in args.iter().rev() {
-                    self.push_task(Task::Eval(Rc::new(a.clone())));
+                // `super().m(...)` — resolved from the running method's class.
+                if let ExprKind::Call(n, cargs) = &obj.kind
+                    && n == "super"
+                    && cargs.is_empty()
+                {
+                    let class = self
+                        .frames
+                        .last()
+                        .and_then(|f| f.class_ctx.clone())
+                        .ok_or("super() only works inside a method")?;
+                    let base = self
+                        .classes
+                        .get(&class)
+                        .and_then(|c| c.base.clone())
+                        .ok_or_else(|| format!("'{class}' has no base class for super()"))?;
+                    let (owner, _) = self
+                        .resolve_method(&base, method)
+                        .ok_or_else(|| format!("super() found no method '{method}'"))?;
+                    self.push_task(Task::CallSuper(owner, method.clone(), args.len()));
+                    for a in args.iter().rev() {
+                        self.push_task(Task::Eval(Rc::new(a.clone())));
+                    }
+                    return Ok(());
+                }
+                if let ExprKind::Name(recv) = &obj.kind {
+                    self.push_task(Task::MethodOnName(recv.clone(), method.clone(), args.len()));
+                    for a in args.iter().rev() {
+                        self.push_task(Task::Eval(Rc::new(a.clone())));
+                    }
+                } else if let ExprKind::Attr(base, attr) = &obj.kind {
+                    // `self.tricks.append(t)` — the receiver lives in an
+                    // instance's attrs cell, so mutations write back there.
+                    self.push_task(Task::CallMethodOnAttr(
+                        attr.clone(),
+                        method.clone(),
+                        args.len(),
+                    ));
+                    for a in args.iter().rev() {
+                        self.push_task(Task::Eval(Rc::new(a.clone())));
+                    }
+                    self.push_task(Task::Eval(Rc::new((**base).clone())));
+                } else {
+                    // General receiver: evaluate it, then dispatch by value —
+                    // instances only (lists still need the name-based path).
+                    self.push_task(Task::CallMethodValue(method.clone(), args.len()));
+                    for a in args.iter().rev() {
+                        self.push_task(Task::Eval(Rc::new(a.clone())));
+                    }
+                    self.push_task(Task::Eval(Rc::new((**obj).clone())));
                 }
             }
             _ => {
@@ -2275,6 +2586,61 @@ impl Vm {
         }
         args.reverse();
 
+        // Construction: `Dog(args)` — build the instance, run __init__ (a
+        // real frame, so kids step INTO their constructor), then deliver the
+        // instance as the call's value (ReplaceTop discards __init__'s None).
+        if self.classes.contains_key(name) {
+            let obj = Value::Object(Rc::new(VmObj {
+                class: name.to_string(),
+                attrs: std::cell::RefCell::new(HashMap::new()),
+            }));
+            if let Some((owner, f)) = self.resolve_method(name, "__init__") {
+                if args.len() != f.params.len() - 1 {
+                    return Err(format!(
+                        "{name}() takes {} argument(s) but {} were given",
+                        f.params.len() - 1,
+                        args.len()
+                    ));
+                }
+                self.push_task(Task::ReplaceTop(obj.clone()));
+                return self.call_method_frame(&owner, "__init__", obj, args);
+            }
+            if !args.is_empty() {
+                return Err(format!(
+                    "{name}() takes 0 arguments but {} were given",
+                    args.len()
+                ));
+            }
+            self.push_op(obj);
+            return Ok(());
+        }
+        // len()/str() on an instance dispatch __len__ / __str__-then-__repr__.
+        if name == "len"
+            && args.len() == 1
+            && let Value::Object(o) = &args[0]
+        {
+            let (owner, _) = self
+                .resolve_method(&o.class, "__len__")
+                .ok_or("this object has no len() (no __len__)")?;
+            return self.call_method_frame(&owner, "__len__", args[0].clone(), Vec::new());
+        }
+        if name == "str"
+            && args.len() == 1
+            && let Value::Object(o) = &args[0]
+        {
+            let shown = self
+                .resolve_method(&o.class, "__str__")
+                .map(|(w, _)| (w, "__str__"))
+                .or_else(|| {
+                    self.resolve_method(&o.class, "__repr__")
+                        .map(|(w, _)| (w, "__repr__"))
+                });
+            if let Some((owner, m)) = shown {
+                return self.call_method_frame(&owner, m, args[0].clone(), Vec::new());
+            }
+            self.push_op(Value::Str(args[0].py_repr()));
+            return Ok(());
+        }
         if let Some(f) = self.funcs.get(name).cloned() {
             let nparams = f.params.len();
             let nrequired = nparams - f.defaults.len();
@@ -2300,6 +2666,7 @@ impl Vm {
                 operands: Vec::new(),
                 scope,
                 line,
+                class_ctx: None,
             });
             Ok(())
         } else if name == "input" {
@@ -2327,6 +2694,109 @@ impl Vm {
             self.last_return = Some(v); // a real return to a caller
         }
         // else: module frame ended -> settle() will report Finished.
+    }
+
+    /// Where `class.method` resolves: the OWNING class and its function,
+    /// walking the single-inheritance chain (hop-capped, so a registration
+    /// cycle can't loop).
+    fn resolve_method(&self, class: &str, method: &str) -> Option<(String, VmFunc)> {
+        let mut cur = class.to_string();
+        for _ in 0..=self.classes.len() {
+            let c = self.classes.get(&cur)?;
+            if let Some(f) = c.methods.get(method) {
+                return Some((cur, f.clone()));
+            }
+            cur = c.base.clone()?;
+        }
+        None
+    }
+
+    /// Push a frame running `owner.method` with `self` + `args` bound —
+    /// construction, dispatch, dunders, and super() all funnel through here,
+    /// so every one of them is step-into-able like a plain function call.
+    fn call_method_frame(
+        &mut self,
+        owner: &str,
+        method: &str,
+        selfv: Value,
+        args: Vec<Value>,
+    ) -> Result<(), String> {
+        let f = self
+            .classes
+            .get(owner)
+            .and_then(|c| c.methods.get(method))
+            .cloned()
+            .ok_or_else(|| format!("no method '{method}' on '{owner}'"))?;
+        if args.len() != f.params.len() - 1 {
+            return Err(format!(
+                "{method}() takes {} argument(s) but {} were given",
+                f.params.len() - 1,
+                args.len()
+            ));
+        }
+        let mut scope = HashMap::new();
+        scope.insert(f.params[0].clone(), selfv);
+        for (i, a) in args.into_iter().enumerate() {
+            scope.insert(f.params[i + 1].clone(), a);
+        }
+        let line = f.body.first().map(|s| s.line).unwrap_or(0);
+        self.frames.push(VmFrame {
+            func: format!("{owner}.{method}"),
+            work: vec![Task::Next(f.body, 0)],
+            operands: Vec::new(),
+            scope,
+            line,
+            class_ctx: Some(owner.to_string()),
+        });
+        Ok(())
+    }
+
+    /// A binary operator with an instance operand: dispatch the dunder.
+    /// `==`/`!=` try direct, then reflected, then identity (`!=` negates via
+    /// a pre-pushed `not` task, so the method's own result flows through it).
+    fn bin_dunder(&mut self, op: BinOp, l: Value, r: Value) -> Result<(), String> {
+        let dunder = match op {
+            BinOp::Add => "__add__",
+            BinOp::Sub => "__sub__",
+            BinOp::Mul => "__mul__",
+            BinOp::Lt => "__lt__",
+            BinOp::Le => "__le__",
+            BinOp::Gt => "__gt__",
+            BinOp::Ge => "__ge__",
+            BinOp::Eq | BinOp::Ne => "__eq__",
+            _ => {
+                return Err("these two values can't be combined with this operator".to_string());
+            }
+        };
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
+            if matches!(op, BinOp::Ne) {
+                self.push_task(Task::Unary(UnOp::Not));
+            }
+            if let Value::Object(o) = &l
+                && let Some((owner, _)) = self.resolve_method(&o.class, "__eq__")
+            {
+                return self.call_method_frame(&owner, "__eq__", l.clone(), vec![r]);
+            }
+            if let Value::Object(o) = &r
+                && let Some((owner, _)) = self.resolve_method(&o.class, "__eq__")
+            {
+                return self.call_method_frame(&owner, "__eq__", r.clone(), vec![l]);
+            }
+            // Identity fallback (both instances: same allocation; mixed: False).
+            let same = match (&l, &r) {
+                (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+                _ => false,
+            };
+            self.push_op(Value::Bool(same));
+            return Ok(());
+        }
+        let Value::Object(o) = &l else {
+            return Err("these two values can't be combined with this operator".to_string());
+        };
+        let (owner, _) = self
+            .resolve_method(&o.class, dunder)
+            .ok_or_else(|| format!("this object doesn't support that operator (no {dunder})"))?;
+        self.call_method_frame(&owner, dunder, l.clone(), vec![r])
     }
 
     fn check_watchpoints(&mut self) {
@@ -2670,10 +3140,21 @@ fn list_method(
     method: &str,
     args: Vec<Value>,
 ) -> Result<Value, String> {
+    let recv = frame
+        .scope
+        .get_mut(name)
+        .ok_or_else(|| format!("name '{name}' is not defined"))?;
+    container_method(recv, method, args)
+}
+
+/// A container method against a mutable VALUE — shared by variable receivers
+/// (`xs.append(..)`, via the scope slot) and attribute receivers
+/// (`self.tricks.append(..)`, via the instance's attrs cell).
+fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<Value, String> {
     let unsupported =
         || format!(".{method}() isn't in the step debugger's call-stack mode yet — use Run");
-    match frame.scope.get_mut(name) {
-        Some(Value::List(items)) => match (method, args.as_slice()) {
+    match recv {
+        Value::List(items) => match (method, args.as_slice()) {
             ("append", [v]) => {
                 items.push(v.clone());
                 Ok(Value::None)
@@ -2690,7 +3171,7 @@ fn list_method(
             }
             _ => Err(unsupported()),
         },
-        Some(Value::Set(items)) => {
+        Value::Set(items) => {
             if let Some(res) = set_method_mut(items, method, &args) {
                 return res;
             }
@@ -2950,6 +3431,61 @@ mod tests {
             vm.status()
         );
         vm.output().to_string()
+    }
+
+    #[test]
+    fn vm_runs_classes_end_to_end() {
+        // The canonical curriculum program: inheritance, override,
+        // super().__init__, attrs, methods, list-in-attr — same output as
+        // the compiled backends.
+        let out = vm_run(
+            "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\nclass Dog(Animal):\n    def __init__(self, name):\n        super().__init__(name)\n        self.tricks = []\n    def speak(self):\n        return self.name + \" barks\"\n    def learn(self, t):\n        self.tricks.append(t)\nd = Dog(\"Rex\")\nd.learn(\"sit\")\nprint(d.speak())\nprint(d.tricks)\na = Animal(\"Cat\")\nprint(a.speak())\n",
+        );
+        assert_eq!(out, "Rex barks\n['sit']\nCat makes a sound\n");
+    }
+
+    #[test]
+    fn vm_objects_have_reference_semantics_and_dunders() {
+        // Aliasing: writes through one name are visible through the other.
+        let out = vm_run(
+            "class Box:\n    def __init__(self):\n        self.v = 0\nb = Box()\nc = b\nc.v = 9\nprint(b.v)\n",
+        );
+        assert_eq!(out, "9\n");
+        // __add__ + __str__ (print dispatches __str__ via a frame call).
+        let out2 = vm_run(
+            "class Vec:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __add__(self, o):\n        return Vec(self.x + o.x, self.y + o.y)\n    def __str__(self):\n        return \"Vec(\" + str(self.x) + \", \" + str(self.y) + \")\"\nv = Vec(1, 2) + Vec(3, 4)\nprint(v)\n",
+        );
+        assert_eq!(out2, "Vec(4, 6)\n");
+        // __eq__ (direct + !=), and identity/int-mix for a class WITHOUT
+        // __eq__ (CPython's default) — same shapes as the native oracle.
+        let out3 = vm_run(
+            "class Pt:\n    def __init__(self, x):\n        self.x = x\n    def __eq__(self, o):\n        return self.x == o.x\nprint(Pt(3) == Pt(3))\nprint(Pt(3) == Pt(4))\nprint(Pt(3) != Pt(4))\n",
+        );
+        assert_eq!(out3, "True\nFalse\nTrue\n");
+        let out3b = vm_run(
+            "class Tag:\n    def __init__(self):\n        self.z = 0\nt1 = Tag()\nt2 = Tag()\nprint(t1 == t1)\nprint(t1 == t2)\nprint(t1 == 5)\n",
+        );
+        assert_eq!(out3b, "True\nFalse\nFalse\n");
+        let out4 = vm_run(
+            "class Deck:\n    def __init__(self):\n        self.cards = [\"A\", \"K\"]\n    def __len__(self):\n        return len(self.cards)\n    def __getitem__(self, i):\n        return self.cards[i]\nd = Deck()\nprint(len(d))\nprint(d[1])\n",
+        );
+        assert_eq!(out4, "2\nK\n");
+    }
+
+    #[test]
+    fn vm_class_errors_are_friendly() {
+        // A dunder the debugger doesn't dispatch is a clean error at the
+        // class statement (parity with the native backend's guard).
+        let mut vm =
+            Vm::new("class V:\n    def __setitem__(self, k, v):\n        return 0\n").unwrap();
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert!(
+            matches!(vm.status(), Status::Error { message, .. } if message.contains("__setitem__")),
+            "{:?}",
+            vm.status()
+        );
     }
 
     #[test]
