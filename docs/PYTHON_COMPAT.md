@@ -82,10 +82,13 @@ semantics and leak-freedom are oracle-gated). Differences:
 - **Default display is `<Dog object>`**, not CPython's
   `<__main__.Dog object at 0x...>` (no addresses on a deterministic teaching
   device — CPython's form isn't reproducible anyway).
-- **Operator dunders (`__eq__`, `__add__`, `__lt__`, …) are a clean compile
-  error** rather than silently ignored — native operators don't dispatch to
-  them yet (`==` on instances is identity, which IS CPython's default when no
-  `__eq__` exists). The browser backend dispatches them (`CLASSES_DESIGN.md`).
+- **Operator dunders are dispatched**: `__add__`/`__sub__`/`__mul__`,
+  `__eq__` (direct, then reflected, then identity — so `!=`, `in`, and
+  dict-key lookups all use it, and `obj == 5` is `False` like CPython),
+  `__lt__`/`__le__`/`__gt__`/`__ge__`, `__len__`, `__getitem__`. A dunder the
+  backend doesn't dispatch (e.g. `__setitem__`) is a clean compile error, as
+  is a dispatched dunder with the wrong parameter count. No reflected
+  arithmetic (`__radd__`-style) yet: `5 + obj` is a clean runtime error.
 - **Class variables and first-class methods** (`f = d.speak`) are clean
   errors for now.
 
@@ -114,6 +117,6 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (incl. as set elements), control flow, classes (v1 — see above), functions +
 recursion + default arguments + keyword arguments, `for`/`while`, list & dict comprehensions
 (nested, filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`,
-`input()`, and `print()` — all gated by the 180-case CPython differential
+`input()`, and `print()` — all gated by the 187-case CPython differential
 oracle (`tools/native_run.sh`), which also requires leak-freedom
 (`live == 0`).

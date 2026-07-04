@@ -89,6 +89,7 @@ declare i32 @p2w_class_id(i32)
 declare i32 @p2w_getattr(i32, i32)
 declare void @p2w_setattr(i32, i32, i32)
 declare i32 @p2w_no_such_method()
+declare i32 @p2w_unsupported_operand()
 ; sets + set/bitwise operators + membership
 declare i32 @p2w_set_new()
 declare i32 @p2w_set_of(i32)
@@ -168,12 +169,26 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
             }
             let mut mmap = HashMap::new();
             for m in methods {
-                let allowed_dunder = matches!(m.name.as_str(), "__init__" | "__repr__" | "__str__");
+                // Dunders the backend actually dispatches; anything else is an
+                // ERROR (it would be silently ignored — never acceptable).
+                // Operator dunders also get their arity checked here — a
+                // mismatch would surface as a baffling dispatch trap later.
+                let expected = dunder_arity(&m.name);
+                let allowed_dunder = matches!(m.name.as_str(), "__init__" | "__repr__" | "__str__")
+                    || expected.is_some();
                 if m.name.starts_with("__") && m.name.ends_with("__") && !allowed_dunder {
                     return Err(format!(
                         "line {}: the native backend doesn't dispatch {} yet — defining it \
                          would be silently ignored, so it's an error instead",
                         s.line, m.name
+                    ));
+                }
+                if let Some(np) = expected
+                    && m.params.len() != np
+                {
+                    return Err(format!(
+                        "line {}: {} takes exactly {} parameter(s) (including self)",
+                        s.line, m.name, np
                     ));
                 }
                 if m.params.first().map(String::as_str) != Some("self") {
@@ -292,6 +307,31 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
     ))
 }
 
+/// The operator dunders the native backend dispatches, with their runtime op
+/// code (MIRRORS the `OP_*` constants in `runtime/src/lib.rs` — keep in
+/// sync) and required parameter count including self.
+const DUNDER_OPS: &[(&str, i32, usize)] = &[
+    ("__add__", 0, 2),
+    ("__sub__", 1, 2),
+    ("__mul__", 2, 2),
+    ("__eq__", 3, 2),
+    ("__lt__", 4, 2),
+    ("__le__", 5, 2),
+    ("__gt__", 6, 2),
+    ("__ge__", 7, 2),
+    ("__len__", 8, 1),
+    ("__getitem__", 9, 2),
+];
+
+/// The required parameter count (incl. self) for a dispatched operator
+/// dunder, or None if the name isn't one.
+fn dunder_arity(name: &str) -> Option<usize> {
+    DUNDER_OPS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, _, np)| *np)
+}
+
 /// Bytes of `s` as an LLVM private constant array + its declaration text.
 fn byte_global(name: &str, s: &str) -> String {
     let esc: String = s.bytes().map(|b| format!("\\{b:02X}")).collect();
@@ -352,6 +392,96 @@ fn emit_class_glue(classes: &ClassTable, dispatchers: &[(String, usize)]) -> (St
         body.push_str("d:\n  %s = call i32 @p2w_str(ptr @or_default, i32 8)\n  ret i32 %s\n}\n");
     }
     defs.push_str(&body);
+    defs.push('\n');
+
+    // --- p2w_obj_op: operator-dunder dispatch (the runtime's op hooks call
+    // this for any instance operand). Per op: switch class_id(a) over the
+    // classes whose chain defines the dunder -> direct call (operands
+    // retained — methods consume owned). __eq__ adds reflected-then-identity
+    // fallbacks; everything else falls to the unsupported-operand trap.
+    // ALWAYS defined — the runtime links against it.
+    let mut b = String::from("define i32 @p2w_obj_op(i32 %op, i32 %a, i32 %b) {\nentry:\n");
+    if classes.decls.is_empty() {
+        b.push_str("  %t = call i32 @p2w_unsupported_operand()\n  ret i32 %t\n}\n");
+    } else {
+        b.push_str("  %cida = call i32 @p2w_class_id(i32 %a)\n");
+        let op_arms: Vec<String> = DUNDER_OPS
+            .iter()
+            .map(|(_, code, _)| format!("i32 {code}, label %op{code}"))
+            .collect();
+        b.push_str(&format!(
+            "  switch i32 %op, label %bad [ {} ]\n",
+            op_arms.join(" ")
+        ));
+        for (mname, code, np) in DUNDER_OPS {
+            b.push_str(&format!("op{code}:\n"));
+            // Classes whose chain resolves this dunder (owning class).
+            let arms: Vec<(usize, String)> = classes
+                .decls
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| classes.resolve(&d.name, mname).map(|(o, _)| (i, o)))
+                .collect();
+            let is_eq = *mname == "__eq__";
+            let miss = if is_eq {
+                format!("refl{code}")
+            } else {
+                "bad".to_string()
+            };
+            if arms.is_empty() {
+                b.push_str(&format!("  br label %{miss}\n"));
+            } else {
+                let labels: Vec<String> = arms
+                    .iter()
+                    .map(|(i, _)| format!("i32 {i}, label %c{code}_{i}"))
+                    .collect();
+                b.push_str(&format!(
+                    "  switch i32 %cida, label %{miss} [ {} ]\n",
+                    labels.join(" ")
+                ));
+                for (i, owner) in &arms {
+                    b.push_str(&format!("c{code}_{i}:\n  call void @p2w_retain(i32 %a)\n"));
+                    if *np == 2 {
+                        b.push_str("  call void @p2w_retain(i32 %b)\n");
+                        b.push_str(&format!(
+                            "  %r{code}_{i} = call i32 @m_{owner}_{mname}(i32 %a, i32 %b)\n  ret i32 %r{code}_{i}\n"
+                        ));
+                    } else {
+                        b.push_str(&format!(
+                            "  %r{code}_{i} = call i32 @m_{owner}_{mname}(i32 %a)\n  ret i32 %r{code}_{i}\n"
+                        ));
+                    }
+                }
+            }
+            if is_eq {
+                // Reflected: b's class may define __eq__ (b.__eq__(a));
+                // otherwise identity — a raw compare, NEVER back into the
+                // runtime's eq (that would recurse).
+                b.push_str(&format!("refl{code}:\n"));
+                b.push_str("  %cidb = call i32 @p2w_class_id(i32 %b)\n");
+                if arms.is_empty() {
+                    b.push_str("  br label %ident\n");
+                } else {
+                    let rlabels: Vec<String> = arms
+                        .iter()
+                        .map(|(i, _)| format!("i32 {i}, label %rc{i}"))
+                        .collect();
+                    b.push_str(&format!(
+                        "  switch i32 %cidb, label %ident [ {} ]\n",
+                        rlabels.join(" ")
+                    ));
+                    for (i, owner) in &arms {
+                        b.push_str(&format!(
+                            "rc{i}:\n  call void @p2w_retain(i32 %a)\n  call void @p2w_retain(i32 %b)\n  %rr{i} = call i32 @m_{owner}___eq__(i32 %b, i32 %a)\n  ret i32 %rr{i}\n"
+                        ));
+                    }
+                }
+                b.push_str("ident:\n  %same = icmp eq i32 %a, %b\n  %ib = call i32 @p2w_bool(i1 %same)\n  ret i32 %ib\n");
+            }
+        }
+        b.push_str("bad:\n  %t = call i32 @p2w_unsupported_operand()\n  ret i32 %t\n}\n");
+    }
+    defs.push_str(&b);
     defs.push('\n');
 
     // --- dispatchers: dyn_<name>_<n>(recv, a0..an-1), everything OWNED in.

@@ -412,12 +412,25 @@ print(\"sum of evens:\", total)
         // classes or not.
         let plain = compile_to_llvm_ir("print(1)\n").unwrap();
         assert!(plain.contains("define i32 @p2w_obj_repr"), "{plain}");
-        // An operator dunder the native ops won't dispatch is an ERROR (it
-        // would otherwise be silently ignored — the deferral line from
-        // CLASSES_DESIGN.md).
-        let e = compile_to_llvm_ir("class V:\n    def __eq__(self, o):\n        return True\n")
+        // Operator dunders ARE dispatched now: __eq__ compiles, and the module
+        // generates the p2w_obj_op switch (direct, reflected, then identity —
+        // a raw compare that can't recurse into the runtime's eq).
+        let ir_eq = compile_to_llvm_ir(
+            "class V:\n    def __eq__(self, o):\n        return True\nprint(V() == V())\n",
+        )
+        .unwrap();
+        assert!(ir_eq.contains("call i32 @m_V___eq__"), "{ir_eq}");
+        assert!(ir_eq.contains("icmp eq i32 %a, %b"), "identity: {ir_eq}");
+        // A dunder the backend still doesn't dispatch stays an ERROR (never
+        // silently ignored — the deferral line from CLASSES_DESIGN.md).
+        let e =
+            compile_to_llvm_ir("class V:\n    def __setitem__(self, k, v):\n        return 0\n")
+                .unwrap_err();
+        assert!(e.contains("__setitem__"), "{e}");
+        // ...and a dispatched dunder with the wrong arity is a clean error.
+        let e_ar = compile_to_llvm_ir("class V:\n    def __eq__(self):\n        return True\n")
             .unwrap_err();
-        assert!(e.contains("__eq__"), "{e}");
+        assert!(e_ar.contains("exactly 2"), "{e_ar}");
         // Class variables are a clean native error for now.
         let e2 = compile_to_llvm_ir("class K:\n    count = 0\n").unwrap_err();
         assert!(e2.contains("class variables"), "{e2}");

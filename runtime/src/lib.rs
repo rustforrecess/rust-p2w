@@ -671,6 +671,9 @@ fn arith<FI: Fn(i64, i64) -> i64, FF: Fn(f64, f64) -> f64>(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
+    if is_obj(a) || is_obj(b) {
+        return unsafe { p2w_obj_op(OP_ADD, a, b) };
+    }
     // String + string = concatenation; otherwise numeric.
     if is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR {
         let (la, lb) = (str_len(a), str_len(b));
@@ -708,6 +711,9 @@ pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_sub(a: Value, b: Value) -> Value {
+    if is_obj(a) || is_obj(b) {
+        return unsafe { p2w_obj_op(OP_SUB, a, b) };
+    }
     if both_sets(a, b) {
         return set_difference(a as usize, b as usize); // set difference `a - b`
     }
@@ -716,6 +722,9 @@ pub extern "C" fn p2w_sub(a: Value, b: Value) -> Value {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_mul(a: Value, b: Value) -> Value {
+    if is_obj(a) || is_obj(b) {
+        return unsafe { p2w_obj_op(OP_MUL, a, b) };
+    }
     arith(a, b, |x, y| x * y, |x, y| x * y)
 }
 
@@ -826,18 +835,30 @@ fn compare<FI: Fn(i64, i64) -> bool, FF: Fn(f64, f64) -> bool>(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_lt(a: Value, b: Value) -> Value {
+    if is_obj(a) || is_obj(b) {
+        return unsafe { p2w_obj_op(OP_LT, a, b) };
+    }
     compare(a, b, |x, y| x < y, |x, y| x < y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_le(a: Value, b: Value) -> Value {
+    if is_obj(a) || is_obj(b) {
+        return unsafe { p2w_obj_op(OP_LE, a, b) };
+    }
     compare(a, b, |x, y| x <= y, |x, y| x <= y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_gt(a: Value, b: Value) -> Value {
+    if is_obj(a) || is_obj(b) {
+        return unsafe { p2w_obj_op(OP_GT, a, b) };
+    }
     compare(a, b, |x, y| x > y, |x, y| x > y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_ge(a: Value, b: Value) -> Value {
+    if is_obj(a) || is_obj(b) {
+        return unsafe { p2w_obj_op(OP_GE, a, b) };
+    }
     compare(a, b, |x, y| x >= y, |x, y| x >= y)
 }
 
@@ -851,6 +872,16 @@ pub extern "C" fn p2w_ne(a: Value, b: Value) -> Value {
 }
 
 fn value_eq(a: Value, b: Value) -> bool {
+    // Instances dispatch through the generated __eq__ logic (direct, then
+    // reflected, then identity) — this single hook covers `==`, `!=`, `in`,
+    // and dict-key lookups at once. The generated identity fallback compares
+    // raw values (never calls back here), so this can't recurse.
+    if is_obj(a) || is_obj(b) {
+        let r = unsafe { p2w_obj_op(OP_EQ, a, b) };
+        let t = p2w_truthy(r);
+        p2w_release(r);
+        return t;
+    }
     if (is_float(a) || is_float(b))
         && let (Some(x), Some(y)) = (fnum(a), fnum(b))
     {
@@ -1165,6 +1196,13 @@ fn norm_index(index: Value, n: i64) -> i64 {
 /// `len(v)` for any collection (string/list/dict all store len at +8).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_len(v: Value) -> Value {
+    if is_obj(v) {
+        let r = unsafe { p2w_obj_op(OP_LEN, v, V_NONE) };
+        if num(r).is_none() {
+            trap("__len__ must return an int");
+        }
+        return r;
+    }
     if is_heap(v)
         && matches!(
             obj_tag(v),
@@ -1179,6 +1217,9 @@ pub extern "C" fn p2w_len(v: Value) -> Value {
 /// `target[index]` — string char, list element, or dict value.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
+    if is_obj(target) {
+        return unsafe { p2w_obj_op(OP_GETITEM, target, index) };
+    }
     if !is_heap(target) {
         trap("object is not subscriptable");
     }
@@ -1239,6 +1280,33 @@ pub extern "C" fn p2w_list_append(list: Value, v: Value) -> Value {
 pub extern "C" fn p2w_no_such_method() -> Value {
     trap("this value has no method with that name (or the argument count is wrong)");
 }
+
+/// The generated operator-dunder dispatcher's dead-end: an operator applied
+/// to an instance whose class doesn't define the matching dunder (or with a
+/// non-instance left operand — no `__radd__`-style reflection yet).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_unsupported_operand() -> Value {
+    trap("these two values can't be combined with this operator");
+}
+
+/// Whether `v` is a class instance — operator sites hand those to the
+/// module-generated `p2w_obj_op` (dunder dispatch).
+fn is_obj(v: Value) -> bool {
+    is_heap(v) && obj_tag(v) == T_OBJECT
+}
+
+/// Operator codes for `p2w_obj_op` — the generated switch in
+/// `src/llvm.rs::emit_class_glue` mirrors these BY HAND; keep in sync.
+const OP_ADD: i32 = 0;
+const OP_SUB: i32 = 1;
+const OP_MUL: i32 = 2;
+const OP_EQ: i32 = 3;
+const OP_LT: i32 = 4;
+const OP_LE: i32 = 5;
+const OP_GT: i32 = 6;
+const OP_GE: i32 = 7;
+const OP_LEN: i32 = 8;
+const OP_GETITEM: i32 = 9;
 
 /// A fresh instance of class `class_id` with an empty attribute dict.
 #[unsafe(no_mangle)]
@@ -2085,6 +2153,10 @@ unsafe extern "C" {
     /// compiler (a switch over class ids calling `__str__`/`__repr__` or
     /// building the default `<Name object>`). Returns an owned heap string.
     fn p2w_obj_repr(v: Value) -> Value;
+    /// Operator-dunder dispatch for class instances — GENERATED per module
+    /// (op codes above; `__eq__` includes reflected + identity fallback).
+    /// BORROWS both operands; returns an owned value.
+    fn p2w_obj_op(op: i32, a: Value, b: Value) -> Value;
 }
 
 #[unsafe(no_mangle)]
@@ -2315,6 +2387,13 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn p2w_obj_repr(_v: Value) -> Value {
         str_alloc(b"<object>")
+    }
+
+    // ...and the operator hooks reference the module-generated p2w_obj_op
+    // (never called in unit tests — no instances are built through ops).
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_obj_op(_op: i32, _a: Value, _b: Value) -> Value {
+        panic!("p2w_obj_op is module-generated; unit tests must not reach it");
     }
 
     // The heap is one shared `static mut`, but `cargo test` runs tests in

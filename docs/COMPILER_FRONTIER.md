@@ -36,7 +36,7 @@ Reproduce with `tools/native_run.sh` (correctness oracle) and
 
 - **Zero-allocation steady state** for map pipelines and reassignment churn —
   what a sensor loop or game loop on a 520 KB-RAM device needs.
-- **180-case run-oracle**: every case's output is diffed against CPython *and*
+- **187-case run-oracle**: every case's output is diffed against CPython *and*
   the runtime's live-object counter must end at **0** (leak-free RC), including
   adversarial cases that attack each soundness guard (aliased sources,
   borrowed-param theft, freed-cell reuse corruption, container-reading

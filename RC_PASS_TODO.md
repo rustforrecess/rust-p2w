@@ -7,7 +7,7 @@ work it anticipated has SINCE LANDED (Jul 2026): last-mention liveness +
 precise drops, borrowed params, and drop-reuse in four forms (dying-source
 maps, literal reassignment, append/extend growth, interned literals) —
 measured `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4, under a
-180-case oracle + a differential fuzzer. **The living docs are
+187-case oracle + a differential fuzzer. **The living docs are
 `docs/REUSE_PLAN.md` (staging + nets) and `docs/COMPILER_FRONTIER.md` (open
 tasks: full backward liveness, type inference, escape inference, cycles).**
 The narrative below is the original bring-up record — the gate caught a real

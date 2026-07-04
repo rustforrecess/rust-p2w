@@ -301,6 +301,15 @@ run_case branch_reuse_alias 'flag = 1\nxs: list[int] = [1, 2, 3]\nzs = xs\nif fl
 run_case branch_unmentioned_arm 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [9]\nprint(ys)\n' '[9]' || fails=$((fails+1))
 run_case branch_token_slice 'flag = 1\nxs = [1, 2, 3, 4]\nif flag == 1:\n    ys = xs[1:]\nelse:\n    ys = xs[:2]\nprint(ys)\n' '[2, 3, 4]' || fails=$((fails+1))
 
+# --- operator dunders on native (p2w_obj_op: direct / reflected-eq / identity) ---
+run_case dunder_add 'class Vec:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __add__(self, o):\n        return Vec(self.x + o.x, self.y + o.y)\n    def __str__(self):\n        return "Vec(" + str(self.x) + ", " + str(self.y) + ")"\nv = Vec(1, 2) + Vec(3, 4)\nprint(v)\n' 'Vec(4, 6)' || fails=$((fails+1))
+run_case dunder_eq 'class Pt:\n    def __init__(self, x):\n        self.x = x\n    def __eq__(self, o):\n        return self.x == o.x\na = Pt(3)\nb = Pt(3)\nc = Pt(4)\nprint(a == b)\nprint(a == c)\nprint(a != c)\n' 'True\nFalse\nTrue' || fails=$((fails+1))
+run_case dunder_eq_identity 'class Tag:\n    def __init__(self):\n        self.z = 0\nt1 = Tag()\nt2 = Tag()\nprint(t1 == t1)\nprint(t1 == t2)\nprint(t1 == 5)\n' 'True\nFalse\nFalse' || fails=$((fails+1))
+run_case dunder_eq_in_list 'class Pt:\n    def __init__(self, x):\n        self.x = x\n    def __eq__(self, o):\n        return self.x == o.x\nps = [Pt(1), Pt(2)]\nprint(Pt(2) in ps)\nprint(Pt(9) in ps)\n' 'True\nFalse' || fails=$((fails+1))
+run_case dunder_lt 'class Coin:\n    def __init__(self, v):\n        self.v = v\n    def __lt__(self, o):\n        return self.v < o.v\nprint(Coin(1) < Coin(2))\nprint(Coin(3) < Coin(2))\n' 'True\nFalse' || fails=$((fails+1))
+run_case dunder_len_getitem 'class Deck:\n    def __init__(self):\n        self.cards = ["A", "K", "Q"]\n    def __len__(self):\n        return len(self.cards)\n    def __getitem__(self, i):\n        return self.cards[i]\nd = Deck()\nprint(len(d))\nprint(d[0])\nprint(d[2])\n' '3\nA\nQ' || fails=$((fails+1))
+run_case dunder_mul_sub 'class N:\n    def __init__(self, v):\n        self.v = v\n    def __mul__(self, o):\n        return N(self.v * o.v)\n    def __sub__(self, o):\n        return N(self.v - o.v)\n    def __repr__(self):\n        return "N" + str(self.v)\nprint(N(6) * N(7))\nprint(N(10) - N(3))\n' 'N42\nN7' || fails=$((fails+1))
+
 # --- lambda (desugars to def; the assigned-to-a-name form is THE form) ---
 run_case lambda_basic 'f = lambda x: x + 1\nprint(f(2))\n' '3' || fails=$((fails+1))
 run_case lambda_two 'area = lambda w, h: w * h\nprint(area(3, 4))\n' '12' || fails=$((fails+1))

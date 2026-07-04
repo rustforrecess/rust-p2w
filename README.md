@@ -66,7 +66,7 @@ Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-i
 **Validated without hardware, three ways.** Because values are i32 arena
 *offsets* (not machine pointers), the emitted IR + runtime compile with `clang`
 and run on the host. `tools/native_run.sh` is a mechanical oracle: real LLVM,
-stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **180 cases
+stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **187 cases
 green**, including adversaries that attack each reuse guard.
 `tools/reuse_bench.sh` measures allocs/peak so wins are numbers, not claims.
 `tools/fuzz_native.sh` differential-fuzzes generated programs against CPython
