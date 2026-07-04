@@ -987,6 +987,12 @@ fn free_object(o: usize) {
                 dealloc(d);
             }
         }
+        T_OBJECT => {
+            // The instance owns exactly one reference: its attribute dict
+            // (which in turn owns its keys/values — the cascade handles
+            // attribute containers and nested objects).
+            p2w_release(rd(o + 12) as Value);
+        }
         T_IARRAY | T_FARRAY => {
             // Raw scalar elements carry no refcount — just free the buffer.
             let d = coll_data(o);
@@ -1043,6 +1049,13 @@ const T_SET: u32 = 9;
 /// assignment is rejected, it prints with parentheses, and it isn't equal to a
 /// list. The emitter builds a list and then `p2w_freeze`s it to this tag.
 const T_TUPLE: u32 = 10;
+/// A class instance: `[tag][rc][class_id][attrs]` — the class id indexes the
+/// compiler-generated dispatch tables (methods are resolved by generated
+/// switch functions, not here), and `attrs` is an owned `T_DICT` of
+/// name → value. The runtime only knows how to construct, read/write
+/// attributes, release, and ask the module for a display string
+/// (`p2w_obj_repr`, generated per module).
+const T_OBJECT: u32 = 11;
 
 fn coll_len(o: usize) -> usize {
     rd(o + 8) as usize
@@ -1218,6 +1231,64 @@ pub extern "C" fn p2w_list_append(list: Value, v: Value) -> Value {
     }
     list_push(list as usize, v);
     V_NONE
+}
+
+/// The generated method dispatchers' dead-end: a receiver with no matching
+/// method at this arity (and no container fallback). A friendly trap.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_no_such_method() -> Value {
+    trap("this value has no method with that name (or the argument count is wrong)");
+}
+
+/// A fresh instance of class `class_id` with an empty attribute dict.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_obj_new(class_id: i32) -> Value {
+    let p = alloc(16);
+    if p == 0 {
+        trap("out of memory");
+    }
+    wr(p, T_OBJECT);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, class_id as u32);
+    wr(p + 12, p2w_dict_new() as u32);
+    p as Value
+}
+
+/// The instance's class id, or -1 when `v` isn't an object — the generated
+/// method dispatchers switch on this (and fall back to the name-dispatched
+/// container methods for -1).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_class_id(v: Value) -> i32 {
+    if is_heap(v) && obj_tag(v) == T_OBJECT {
+        rd(v as usize + 8) as i32
+    } else {
+        -1
+    }
+}
+
+/// `obj.attr` — BORROWS both; returns an owned (+1) value. A missing
+/// attribute is a friendly trap (no exceptions in the subset).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_getattr(obj: Value, name: Value) -> Value {
+    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
+        trap("only objects have attributes");
+    }
+    let attrs = rd(obj as usize + 12) as usize;
+    match dict_find(attrs, name) {
+        Some(i) => owned(dict_val(attrs, i)),
+        None => trap("this object has no attribute with that name"),
+    }
+}
+
+/// `obj.attr = value` — BORROWS `obj`; TRANSFERS `name` and `value` in
+/// (dict_set's ownership convention).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_setattr(obj: Value, name: Value, value: Value) {
+    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
+        trap("only objects have attributes");
+    }
+    dict_set(rd(obj as usize + 12) as usize, name, value);
 }
 
 #[unsafe(no_mangle)]
@@ -1890,6 +1961,15 @@ fn write_value(v: Value, out: &mut impl FnMut(u8)) {
             }
             out(b']');
         }
+        T_OBJECT => {
+            // The module knows the class names and __str__/__repr__ methods;
+            // ask it (generated switch), print the returned string, drop it.
+            let s = unsafe { p2w_obj_repr(v) };
+            for i in 0..str_len(s) {
+                out(str_byte(s, i));
+            }
+            p2w_release(s);
+        }
         _ => write_bytes(b"<object>", out),
     }
 }
@@ -2001,6 +2081,10 @@ unsafe extern "C" {
     /// The platform byte source (stdin / USB-CDC): next byte, or a negative
     /// value at end-of-input. (Provided at final link, like `p2w_putc`.)
     fn p2w_getc() -> i32;
+    /// The display string for a class instance — GENERATED per module by the
+    /// compiler (a switch over class ids calling `__str__`/`__repr__` or
+    /// building the default `<Name object>`). Returns an owned heap string.
+    fn p2w_obj_repr(v: Value) -> Value;
 }
 
 #[unsafe(no_mangle)]
@@ -2225,6 +2309,12 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn p2w_getc() -> i32 {
         -1
+    }
+
+    // ...and object printing references the module-generated p2w_obj_repr.
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_obj_repr(_v: Value) -> Value {
+        str_alloc(b"<object>")
     }
 
     // The heap is one shared `static mut`, but `cargo test` runs tests in
@@ -2535,6 +2625,30 @@ mod tests {
         assert_eq!(shown(ys), "[2, 3]", "b is borrowed, untouched");
         p2w_release(r);
         p2w_release(ys);
+        assert_eq!(p2w_live(), 0);
+    }
+
+    #[test]
+    fn objects_hold_attrs_and_release_them() {
+        let _g = heap_guard();
+        let obj = p2w_obj_new(3);
+        assert_eq!(p2w_class_id(obj), 3);
+        assert_eq!(p2w_class_id(p2w_int(5)), -1, "non-objects are -1");
+        // Set + read an attribute (setattr TRANSFERS name+value in; getattr
+        // BORROWS the name and returns an owned value).
+        p2w_setattr(obj, str_val("name"), str_val("Rex"));
+        let k = str_val("name");
+        let v = p2w_getattr(obj, k);
+        assert_eq!(shown(v), "Rex");
+        p2w_release(v);
+        // Overwrite releases the replaced value (dict_set semantics).
+        p2w_setattr(obj, str_val("name"), str_val("Fido"));
+        let v2 = p2w_getattr(obj, k);
+        assert_eq!(shown(v2), "Fido");
+        p2w_release(v2);
+        p2w_release(k);
+        // Releasing the instance cascades through the attr dict.
+        p2w_release(obj);
         assert_eq!(p2w_live(), 0);
     }
 

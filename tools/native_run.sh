@@ -301,6 +301,17 @@ run_case branch_reuse_alias 'flag = 1\nxs: list[int] = [1, 2, 3]\nzs = xs\nif fl
 run_case branch_unmentioned_arm 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [9]\nprint(ys)\n' '[9]' || fails=$((fails+1))
 run_case branch_token_slice 'flag = 1\nxs = [1, 2, 3, 4]\nif flag == 1:\n    ys = xs[1:]\nelse:\n    ys = xs[:2]\nprint(ys)\n' '[2, 3, 4]' || fails=$((fails+1))
 
+# --- classes (native v1): construction/attrs/methods/inheritance/super/repr ---
+run_case cls_basic 'class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + " makes a sound"\nclass Dog(Animal):\n    def __init__(self, name):\n        super().__init__(name)\n        self.tricks = []\n    def speak(self):\n        return self.name + " barks"\n    def learn(self, t):\n        self.tricks.append(t)\nd = Dog("Rex")\nd.learn("sit")\nprint(d.speak())\nprint(d.tricks)\na = Animal("Cat")\nprint(a.speak())\n' 'Rex barks\n[\x27sit\x27]\nCat makes a sound' || fails=$((fails+1))
+run_case cls_str 'class Pt:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __str__(self):\n        return "Pt(" + str(self.x) + ", " + str(self.y) + ")"\np = Pt(1, 2)\nprint(p)\nprint(str(p))\n' 'Pt(1, 2)\nPt(1, 2)' || fails=$((fails+1))
+run_case cls_repr_in_list 'class Frac:\n    def __init__(self, n):\n        self.n = n\n    def __repr__(self):\n        return "Frac " + str(self.n)\nf = Frac(3)\nprint(f)\nprint([f])\n' 'Frac 3\n[Frac 3]' || fails=$((fails+1))
+run_case cls_alias 'class Box:\n    def __init__(self):\n        self.v = 0\nb = Box()\nc = b\nc.v = 9\nprint(b.v)\n' '9' || fails=$((fails+1))
+run_case cls_in_list 'class N:\n    def __init__(self, k):\n        self.k = k\n    def get(self):\n        return self.k\nns = [N(1), N(2), N(3)]\ntotal = 0\nfor n in ns:\n    total = total + n.get()\nprint(total)\n' '6' || fails=$((fails+1))
+run_case cls_ref_to_func 'class C:\n    def __init__(self):\n        self.hits = 0\n    def hit(self):\n        self.hits = self.hits + 1\ndef poke(c):\n    c.hit()\n    c.hit()\nx = C()\npoke(x)\nprint(x.hits)\n' '2' || fails=$((fails+1))
+run_case cls_inherited_only 'class Base:\n    def __init__(self):\n        self.n = 5\n    def twice(self):\n        return self.n * 2\nclass Kid(Base):\n    def __init__(self):\n        super().__init__()\nk = Kid()\nprint(k.twice())\n' '10' || fails=$((fails+1))
+run_case cls_method_and_container 'class W:\n    def __init__(self):\n        self.x = 1\n    def append(self, v):\n        self.x = self.x + v\nw = W()\nw.append(4)\nxs = [1]\nxs.append(2)\nprint(w.x)\nprint(xs)\n' '5\n[1, 2]' || fails=$((fails+1))
+run_case cls_no_init 'class Empty:\n    def tag(self):\n        return 7\ne = Empty()\nprint(e.tag())\n' '7' || fails=$((fails+1))
+
 # --- p2w parity batch: defaults/kwargs, format specs, input(), set sort ---
 run_case default_args 'def greet(name, punct="!"):\n    return name + punct\nprint(greet("Ana"))\nprint(greet("Bo", "?"))\n' 'Ana!\nBo?' || fails=$((fails+1))
 run_case default_int 'def scale(n: int, k: int = 3) -> int:\n    return n * k\nprint(scale(5))\nprint(scale(5, 2))\n' '15\n10' || fails=$((fails+1))

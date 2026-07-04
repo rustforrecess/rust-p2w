@@ -72,6 +72,23 @@ therefore leak-free). The browser backend uses WASM-GC and is unaffected.
   (no exceptions in the subset; friendlier on a device stream). The reference
   p2w has no `input()` at all.
 
+## Classes (native v1)
+
+Construction, `__init__`, instance attributes, methods, `self`, single
+inheritance, `super().method(...)`, and `__repr__`/`__str__` in `print`/`str`
+all work (compile-time switch dispatch on a per-instance class id; reference
+semantics and leak-freedom are oracle-gated). Differences:
+
+- **Default display is `<Dog object>`**, not CPython's
+  `<__main__.Dog object at 0x...>` (no addresses on a deterministic teaching
+  device — CPython's form isn't reproducible anyway).
+- **Operator dunders (`__eq__`, `__add__`, `__lt__`, …) are a clean compile
+  error** rather than silently ignored — native operators don't dispatch to
+  them yet (`==` on instances is identity, which IS CPython's default when no
+  `__eq__` exists). The browser backend dispatches them (`CLASSES_DESIGN.md`).
+- **Class variables and first-class methods** (`f = d.speak`) are clean
+  errors for now.
+
 ## Other gaps (clean errors, not silent differences)
 
 - **f-string format specs** (`f"{x:.2f}"`, width/fill/align, `d`/`s`) work on
@@ -79,10 +96,9 @@ therefore leak-free). The browser backend uses WASM-GC and is unaffected.
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
-- **Not yet implemented on native:** classes (the **browser** backend has the
-  full v1 object model — see `CLASSES_DESIGN.md`), generators, `lambda`,
-  `*args`/`**kwargs`, exceptions. These are rejected with a clear "not in the
-  native backend yet" message rather than miscompiling.
+- **Not yet implemented on native:** generators, `lambda`, `*args`/`**kwargs`,
+  exceptions. These are rejected with a clear "not in the native backend yet"
+  message rather than miscompiling.
 
 ## What's faithful
 
@@ -90,9 +106,9 @@ For completeness, the supported subset matches CPython on: int/float arithmetic
 and comparisons, strings (`+`, indexing, slicing, `in`), f-strings (incl.
 format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (values/ops/methods — see the Sets section for the display note), tuples
-(incl. as set elements), control flow, functions + recursion + default
-arguments + keyword arguments, `for`/`while`, list & dict comprehensions
+(incl. as set elements), control flow, classes (v1 — see above), functions +
+recursion + default arguments + keyword arguments, `for`/`while`, list & dict comprehensions
 (nested, filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`,
-`input()`, and `print()` — all gated by the 166-case CPython differential
+`input()`, and `print()` — all gated by the 175-case CPython differential
 oracle (`tools/native_run.sh`), which also requires leak-freedom
 (`live == 0`).

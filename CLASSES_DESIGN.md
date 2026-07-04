@@ -1,6 +1,13 @@
 # Classes — design (implemented)
 
-Status: **v1 implemented** (5 slices, all green vs CPython). This ports the
+Status: **v1 implemented** (5 slices, all green vs CPython) — and the NATIVE
+backend now has its own classes v1 too (Jul 2026): compile-time switch
+dispatch on a per-instance class id (`src/llvm.rs` — `ClassTable`, generated
+`dyn_*` dispatchers + `p2w_obj_repr`), `T_OBJECT` in `p2w-rt` (`[tag][rc]
+[class_id][attrs-dict]`, RC-cascaded), covering construction/`__init__`/
+attrs/methods/inheritance/`super()`/`__repr__`-`__str__`; operator dunders
+and class variables are clean native errors for now (`docs/PYTHON_COMPAT.md`).
+The rest of this doc describes the browser (WASM-GC) design. This ports the
 reference p2w object model into rust-p2w, adapted to the infrastructure we
 already have. Reviewed and adjusted here *before* codegen, per the "scout the
 hard thing carefully" plan; kept as the record of what shipped.

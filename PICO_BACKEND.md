@@ -175,7 +175,7 @@ Reuses the `Vm`-shaped `DebugAdapter` surface from `DEBUGGER_ARCHITECTURE.md`:
    params, and drop-reuse in four forms (dying-source maps, literal
    reassignment, append/extend growth, interned literals) — measured
    `wl_chain` 10→3 allocs, `wl_realloc` 6→2, `wl_concat` 17→4;
-   `tools/native_run.sh` runs **166 programs** ending `live==0`, plus a
+   `tools/native_run.sh` runs **175 programs** ending `live==0`, plus a
    differential fuzzer (see `docs/REUSE_PLAN.md`). **Still to do:** cycles
    (design sketched from Nim ORC — `docs/COMPILER_FRONTIER.md` task 5),
    real device `p2w_putc` over USB-CDC, then the on-device toolchain spike
@@ -189,7 +189,7 @@ our emitted IR, and because values are i32 *arena offsets* (not machine
 pointers) the IR + `p2w-rt` link and **run on the host** with output matching
 CPython. `tools/native_run.sh` is the run-oracle: IR → `clang` `.o` → link the
 runtime staticlib (`cargo rustc --crate-type staticlib -- -C panic=abort`) + a
-`p2w_putc` stub → execute → diff (7 cases at the time; **166 today**). The runtime now carries a
+`p2w_putc` stub → execute → diff (7 cases at the time; **175 today**). The runtime now carries a
 `#[cfg(not(test))] #[panic_handler]` (needed for any no_std artifact — this lib
 and the device build). **Still device-gated:** the on-board path (`.o` → RP2350
 boot block → ELF → UF2 via `llc`/`lld`/`picotool`, run over USB-CDC) — but host

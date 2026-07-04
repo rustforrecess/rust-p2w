@@ -380,6 +380,36 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn native_classes_dispatch_and_guard_dunders() {
+        // The canonical class program emits: construction, a generated
+        // dispatcher (switch on class id), and the module's p2w_obj_repr.
+        let ir = compile_to_llvm_ir(
+            "class A:\n    def __init__(self, n):\n        self.n = n\n    def get(self):\n        return self.n\na = A(3)\nprint(a.get())\n",
+        )
+        .unwrap();
+        assert!(ir.contains("call i32 @p2w_obj_new(i32 0)"), "{ir}");
+        assert!(ir.contains("define i32 @dyn_get_0"), "dispatcher: {ir}");
+        assert!(ir.contains("define i32 @p2w_obj_repr"), "{ir}");
+        // Every module defines p2w_obj_repr (the runtime links against it),
+        // classes or not.
+        let plain = compile_to_llvm_ir("print(1)\n").unwrap();
+        assert!(plain.contains("define i32 @p2w_obj_repr"), "{plain}");
+        // An operator dunder the native ops won't dispatch is an ERROR (it
+        // would otherwise be silently ignored — the deferral line from
+        // CLASSES_DESIGN.md).
+        let e = compile_to_llvm_ir("class V:\n    def __eq__(self, o):\n        return True\n")
+            .unwrap_err();
+        assert!(e.contains("__eq__"), "{e}");
+        // Class variables are a clean native error for now.
+        let e2 = compile_to_llvm_ir("class K:\n    count = 0\n").unwrap_err();
+        assert!(e2.contains("class variables"), "{e2}");
+        // super() outside a method / unknown base are clean errors.
+        let e3 = compile_to_llvm_ir("class B(Missing):\n    def m(self):\n        return 1\n")
+            .unwrap_err();
+        assert!(e3.contains("unknown"), "{e3}");
+    }
+
+    #[test]
     fn self_slice_consumes_the_old_value() {
         // `s = s[1:]` lowers to p2w_slice_assign (the old value consumed as a
         // reuse token: in-place compaction when unique).

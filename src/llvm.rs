@@ -83,6 +83,12 @@ declare i32 @p2w_slice(i32, i32, i32, i32)
 declare i32 @p2w_slice_assign(i32, i32, i32, i32)
 declare i32 @p2w_input(i32)
 declare i32 @p2w_format(i32, i32, i32, i32, i32, i32)
+; class instances (the object model; method dispatch is generated per module)
+declare i32 @p2w_obj_new(i32)
+declare i32 @p2w_class_id(i32)
+declare i32 @p2w_getattr(i32, i32)
+declare void @p2w_setattr(i32, i32, i32)
+declare i32 @p2w_no_such_method()
 ; sets + set/bitwise operators + membership
 declare i32 @p2w_set_new()
 declare i32 @p2w_set_of(i32)
@@ -139,6 +145,86 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         }
     }
 
+    // Register classes: ids in source order, a dunder guard (an operator
+    // dunder the native ops wouldn't dispatch must be an ERROR, never
+    // silently ignored), base validation (defined + acyclic), and the
+    // signature-table entries for each method under its mangled name
+    // (`m_<Class>_<method>`, all-owned/transfer convention: every param mask
+    // false, every repr Boxed).
+    let mut classes = ClassTable::default();
+    for s in stmts {
+        if let StmtKind::ClassDef {
+            name,
+            base,
+            methods,
+            class_vars,
+        } = &s.kind
+        {
+            if !class_vars.is_empty() {
+                return Err(format!(
+                    "line {}: class variables aren't in the native backend yet",
+                    s.line
+                ));
+            }
+            let mut mmap = HashMap::new();
+            for m in methods {
+                let allowed_dunder = matches!(m.name.as_str(), "__init__" | "__repr__" | "__str__");
+                if m.name.starts_with("__") && m.name.ends_with("__") && !allowed_dunder {
+                    return Err(format!(
+                        "line {}: the native backend doesn't dispatch {} yet — defining it \
+                         would be silently ignored, so it's an error instead",
+                        s.line, m.name
+                    ));
+                }
+                if m.params.first().map(String::as_str) != Some("self") {
+                    return Err(format!(
+                        "line {}: a method's first parameter must be 'self'",
+                        s.line
+                    ));
+                }
+                mmap.insert(m.name.clone(), m.params.len());
+                let mangled = format!("m_{name}_{}", m.name);
+                borrow_masks.insert(mangled.clone(), vec![false; m.params.len()]);
+                param_reprs.insert(mangled.clone(), vec![Repr::Boxed; m.params.len()]);
+                ret_reprs.insert(mangled.clone(), Repr::Boxed);
+                func_params.insert(mangled.clone(), m.params.clone());
+                func_defaults.insert(mangled, Vec::new());
+            }
+            let id = classes.decls.len() as i32;
+            if classes.ids.insert(name.clone(), id).is_some() {
+                return Err(format!("line {}: class '{name}' is defined twice", s.line));
+            }
+            classes.decls.push(ClassDecl {
+                name: name.clone(),
+                base: base.clone(),
+                methods: mmap,
+            });
+        }
+    }
+    for d in &classes.decls {
+        if let Some(b) = &d.base
+            && !classes.ids.contains_key(b)
+        {
+            return Err(format!("class '{}' inherits from unknown '{b}'", d.name));
+        }
+    }
+    // Reject inheritance cycles (resolve() is hop-capped, but a cycle would
+    // make every lookup quietly fail — error up front instead).
+    for d in &classes.decls {
+        let mut cur = d.name.as_str();
+        for hops in 0..=classes.decls.len() {
+            match &classes.decls[classes.ids[cur] as usize].base {
+                Some(b) => {
+                    if hops == classes.decls.len() {
+                        return Err(format!("class '{}' has a circular base chain", d.name));
+                    }
+                    cur = b;
+                }
+                None => break,
+            }
+        }
+    }
+
     let mut globals = String::new();
     let mut defs = String::new();
     // Interned-literal cache slots from every function + main, released at
@@ -152,25 +238,178 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         ret_reprs: &ret_reprs,
         func_params: &func_params,
         func_defaults: &func_defaults,
+        classes: &classes,
     };
+    let mut dispatchers: Vec<(String, usize)> = Vec::new();
     for s in stmts {
         if let StmtKind::Def {
             name, params, body, ..
         } = &s.kind
         {
-            let (def, g) = emit_function(name, params, body, &sigs, &mut str_caches)?;
+            let (def, g) = emit_function(
+                name,
+                params,
+                body,
+                None,
+                &sigs,
+                &mut str_caches,
+                &mut dispatchers,
+            )?;
             defs.push_str(&def);
             defs.push('\n');
             globals.push_str(&g);
         }
+        if let StmtKind::ClassDef { name, methods, .. } = &s.kind {
+            for m in methods {
+                let mangled = format!("m_{name}_{}", m.name);
+                let (def, g) = emit_function(
+                    &mangled,
+                    &m.params,
+                    &m.body,
+                    Some(name),
+                    &sigs,
+                    &mut str_caches,
+                    &mut dispatchers,
+                )?;
+                defs.push_str(&def);
+                defs.push('\n');
+                globals.push_str(&g);
+            }
+        }
     }
 
-    let (main_def, main_g) = emit_main(stmts, &sigs, &mut str_caches)?;
+    let (main_def, main_g) = emit_main(stmts, &sigs, &mut str_caches, &mut dispatchers)?;
     globals.push_str(&main_g);
+
+    // Generated tail: the per-(name, arity) method dispatchers used anywhere
+    // in the module, and the runtime's display callback for instances.
+    let (gen_defs, gen_globals) = emit_class_glue(&classes, &dispatchers);
+    defs.push_str(&gen_defs);
+    globals.push_str(&gen_globals);
 
     Ok(format!(
         "; LLVM IR — rust-p2w native (Pico) backend\n{RUNTIME_DECLS}\n{globals}\n{defs}{main_def}"
     ))
+}
+
+/// Bytes of `s` as an LLVM private constant array + its declaration text.
+fn byte_global(name: &str, s: &str) -> String {
+    let esc: String = s.bytes().map(|b| format!("\\{b:02X}")).collect();
+    format!(
+        "@{name} = private unnamed_addr constant [{} x i8] c\"{esc}\"\n",
+        s.len()
+    )
+}
+
+/// The module's generated class glue: `p2w_obj_repr` (ALWAYS defined — the
+/// runtime references it) and one dispatcher per used (method, arity).
+fn emit_class_glue(classes: &ClassTable, dispatchers: &[(String, usize)]) -> (String, String) {
+    let mut defs = String::new();
+    let mut globals = String::new();
+
+    // --- p2w_obj_repr: switch class_id -> __str__ / __repr__ / "<Name object>".
+    globals.push_str(&byte_global("or_default", "<object>"));
+    let mut body = String::new();
+    body.push_str("define i32 @p2w_obj_repr(i32 %v) {\nentry:\n");
+    body.push_str("  %cid = call i32 @p2w_class_id(i32 %v)\n");
+    if classes.decls.is_empty() {
+        body.push_str("  %s = call i32 @p2w_str(ptr @or_default, i32 8)\n  ret i32 %s\n}\n");
+    } else {
+        let arms: Vec<String> = (0..classes.decls.len())
+            .map(|i| format!("i32 {i}, label %k{i}"))
+            .collect();
+        body.push_str(&format!(
+            "  switch i32 %cid, label %d [ {} ]\n",
+            arms.join(" ")
+        ));
+        for (i, d) in classes.decls.iter().enumerate() {
+            body.push_str(&format!("k{i}:\n"));
+            let shown = classes
+                .resolve(&d.name, "__str__")
+                .or_else(|| classes.resolve(&d.name, "__repr__"));
+            match shown {
+                Some((owner, _)) if classes.resolve(&d.name, "__str__").is_some() => {
+                    // The method consumes its (owned) self — retain first.
+                    body.push_str(&format!(
+                        "  call void @p2w_retain(i32 %v)\n  %r{i} = call i32 @m_{owner}___str__(i32 %v)\n  ret i32 %r{i}\n"
+                    ));
+                }
+                Some((owner, _)) => {
+                    body.push_str(&format!(
+                        "  call void @p2w_retain(i32 %v)\n  %r{i} = call i32 @m_{owner}___repr__(i32 %v)\n  ret i32 %r{i}\n"
+                    ));
+                }
+                None => {
+                    let text = format!("<{} object>", d.name);
+                    globals.push_str(&byte_global(&format!("orn_{i}"), &text));
+                    body.push_str(&format!(
+                        "  %s{i} = call i32 @p2w_str(ptr @orn_{i}, i32 {})\n  ret i32 %s{i}\n",
+                        text.len()
+                    ));
+                }
+            }
+        }
+        body.push_str("d:\n  %s = call i32 @p2w_str(ptr @or_default, i32 8)\n  ret i32 %s\n}\n");
+    }
+    defs.push_str(&body);
+    defs.push('\n');
+
+    // --- dispatchers: dyn_<name>_<n>(recv, a0..an-1), everything OWNED in.
+    let mut seen: HashSet<(String, usize)> = HashSet::new();
+    for (mname, nargs) in dispatchers {
+        if !seen.insert((mname.clone(), *nargs)) {
+            continue;
+        }
+        let n = *nargs;
+        let params: Vec<String> = (0..n).map(|k| format!(", i32 %a{k}")).collect();
+        let argfwd: Vec<String> = (0..n).map(|k| format!(", i32 %a{k}")).collect();
+        let mut b = format!(
+            "define i32 @dyn_{mname}_{n}(i32 %r{}) {{\nentry:\n  %cid = call i32 @p2w_class_id(i32 %r)\n",
+            params.join("")
+        );
+        // Arms: classes whose chain resolves `mname` at this arity.
+        let mut arms = Vec::new();
+        for (i, d) in classes.decls.iter().enumerate() {
+            if let Some((owner, np)) = classes.resolve(&d.name, mname)
+                && np == n + 1
+            {
+                arms.push((i, owner));
+            }
+        }
+        let labels: Vec<String> = arms
+            .iter()
+            .map(|(i, _)| format!("i32 {i}, label %k{i}"))
+            .collect();
+        b.push_str(&format!(
+            "  switch i32 %cid, label %fb [ {} ]\n",
+            labels.join(" ")
+        ));
+        for (i, owner) in &arms {
+            b.push_str(&format!(
+                "k{i}:\n  %x{i} = call i32 @m_{owner}_{mname}(i32 %r{})\n  ret i32 %x{i}\n",
+                argfwd.join("")
+            ));
+        }
+        // Fallback: not an instance (or no matching class method) — hand the
+        // call to the name-dispatched container-method runtime (which BORROWS
+        // the receiver; we own it, so release after), or trap when no such
+        // runtime entry point exists for this arity.
+        b.push_str("fb:\n");
+        if n <= 2 {
+            let g = format!("mn_{mname}_{n}");
+            globals.push_str(&byte_global(&g, mname));
+            let fwd: String = (0..n).map(|k| format!(", i32 %a{k}")).collect();
+            b.push_str(&format!(
+                "  %y = call i32 @p2w_method{n}(i32 %r, ptr @{g}, i32 {}{fwd})\n  call void @p2w_release(i32 %r)\n  ret i32 %y\n}}\n",
+                mname.len()
+            ));
+        } else {
+            b.push_str("  %y = call i32 @p2w_no_such_method()\n  ret i32 %y\n}\n");
+        }
+        defs.push_str(&b);
+        defs.push('\n');
+    }
+    (defs, globals)
 }
 
 /// The per-module signature tables every function emission needs — computed
@@ -183,16 +422,67 @@ struct Sigs<'a> {
     ret_reprs: &'a HashMap<String, Repr>,
     func_params: &'a HashMap<String, Vec<String>>,
     func_defaults: &'a HashMap<String, Vec<Expr>>,
+    classes: &'a ClassTable,
 }
 
+/// One class as the emitter sees it: its directly-defined methods (name →
+/// parameter count INCLUDING self) and its base. Method bodies are emitted as
+/// plain functions `m_<Class>_<method>` with an all-owned (transfer)
+/// convention; lookup walks the base chain at COMPILE time.
+struct ClassDecl {
+    name: String,
+    base: Option<String>,
+    methods: HashMap<String, usize>,
+}
+
+/// All classes in the module, id-ordered (the id is what `p2w_class_id`
+/// returns at runtime and what the generated dispatchers switch on).
+#[derive(Default)]
+struct ClassTable {
+    ids: HashMap<String, i32>,
+    decls: Vec<ClassDecl>,
+}
+
+impl ClassTable {
+    /// Where `class.method` resolves: the OWNING class name and the method's
+    /// parameter count (incl. self), walking the single-inheritance chain.
+    /// Hop-capped so a base cycle can't loop (registration also rejects it).
+    fn resolve(&self, class: &str, method: &str) -> Option<(String, usize)> {
+        let mut cur = class;
+        for _ in 0..=self.decls.len() {
+            let id = *self.ids.get(cur)?;
+            let d = &self.decls[id as usize];
+            if let Some(&np) = d.methods.get(method) {
+                return Some((d.name.clone(), np));
+            }
+            cur = d.base.as_deref()?;
+        }
+        None
+    }
+
+    /// Every method name any class defines — the gate that routes a
+    /// `recv.name(...)` call through a generated dispatcher instead of the
+    /// name-dispatched container-method runtime.
+    fn method_names(&self) -> HashSet<String> {
+        self.decls
+            .iter()
+            .flat_map(|d| d.methods.keys().cloned())
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_function(
     name: &str,
     params: &[String],
     body: &[Stmt],
+    current_class: Option<&str>,
     sigs: &Sigs,
     str_caches: &mut Vec<String>,
+    dispatchers: &mut Vec<(String, usize)>,
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(sigs, name);
+    f.current_class = current_class.map(str::to_string);
     let mask = sigs.borrow_masks.get(name).cloned().unwrap_or_default();
     let preprs = sigs.param_reprs.get(name).cloned().unwrap_or_default();
     f.ret_repr = sigs.ret_reprs.get(name).copied().unwrap_or(Repr::Boxed);
@@ -251,6 +541,7 @@ fn emit_function(
     // Functions never release their literal caches (they persist across
     // calls); main frees them all at exit.
     str_caches.extend(f.str_caches.iter().cloned());
+    dispatchers.extend(f.dispatchers.iter().cloned());
     Ok((def, f.globals))
 }
 
@@ -258,6 +549,7 @@ fn emit_main(
     stmts: &[Stmt],
     sigs: &Sigs,
     str_caches: &mut Vec<String>,
+    dispatchers: &mut Vec<(String, usize)>,
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(sigs, "main");
     // First-assignment slot inference for main's locals (no params here; the
@@ -267,7 +559,7 @@ fn emit_main(
     // function can run at any later point); defs themselves emit nothing here.
     let live = Liveness::analyze(stmts);
     for (idx, s) in stmts.iter().enumerate() {
-        if matches!(s.kind, StmtKind::Def { .. }) {
+        if matches!(s.kind, StmtKind::Def { .. } | StmtKind::ClassDef { .. }) {
             continue;
         }
         f.dying = live.dead_after(idx).to_vec();
@@ -291,6 +583,7 @@ fn emit_main(
         f.body.push_str("  ret i32 0\n");
     }
     let def = format!("define i32 @main() {{\nentry:\n{}{}}}\n", f.allocas, f.body);
+    dispatchers.extend(f.dispatchers.iter().cloned());
     Ok((def, f.globals))
 }
 
@@ -387,6 +680,14 @@ struct FuncEmitter<'a> {
     /// a full positional list, same convention as the WASM backend).
     func_params: &'a HashMap<String, Vec<String>>,
     func_defaults: &'a HashMap<String, Vec<Expr>>,
+    /// The module's classes (construction, attr access, method dispatch).
+    classes: &'a ClassTable,
+    /// Set while emitting a method body — `super().m(...)` resolves from this
+    /// class's base at compile time.
+    current_class: Option<String>,
+    /// The (method name, arity) dispatchers this function's call sites need;
+    /// drained by the caller and generated once per module.
+    dispatchers: Vec<(String, usize)>,
     /// This function's own parameters that are borrowed (slots we must NOT
     /// release at exit — the caller still owns them).
     borrowed_params: Vec<String>,
@@ -437,6 +738,9 @@ impl<'a> FuncEmitter<'a> {
             ret_reprs: sigs.ret_reprs,
             func_params: sigs.func_params,
             func_defaults: sigs.func_defaults,
+            classes: sigs.classes,
+            current_class: None,
+            dispatchers: Vec::new(),
             borrowed_params: Vec::new(),
             ret_repr: Repr::Boxed,
             var_reprs: HashMap::new(),
@@ -1460,6 +1764,23 @@ impl<'a> FuncEmitter<'a> {
                     Ok(())
                 }
             },
+            StmtKind::SetAttr { obj, attr, value } => {
+                // `obj.attr = value` — the attr NAME is an interned-literal
+                // handout (owned +1) and setattr TRANSFERS name + value in;
+                // the object itself is only borrowed.
+                let (ov, oo) = self.expr_borrow(obj)?;
+                let name = self.expr(&Expr {
+                    kind: ExprKind::Str(attr.clone()),
+                    line: s.line,
+                    span: (0, 0),
+                })?;
+                let v = self.expr(value)?;
+                self.line(&format!(
+                    "call void @p2w_setattr(i32 {ov}, i32 {name}, i32 {v})"
+                ));
+                self.release_if_owned(&ov, oo);
+                Ok(())
+            }
             StmtKind::SetIndex {
                 target,
                 index,
@@ -2077,6 +2398,36 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }
+                // Construction: `Dog(args)` — the class is known statically,
+                // so __init__ resolves to a DIRECT call (no dispatcher). The
+                // instance starts at rc 1; the (all-owned) __init__ consumes
+                // one ref, so retain before the call.
+                if let Some(&cid) = self.classes.ids.get(name) {
+                    let init = self.classes.resolve(name, "__init__");
+                    let expect = init.as_ref().map_or(0, |(_, np)| np - 1);
+                    if args.len() != expect {
+                        return Err(format!(
+                            "line {}: {name}() takes {expect} argument(s), got {}",
+                            e.line,
+                            args.len()
+                        ));
+                    }
+                    let o = self.call_value(&format!("call i32 @p2w_obj_new(i32 {cid})"));
+                    if let Some((owner, _)) = init {
+                        self.line(&format!("call void @p2w_retain(i32 {o})"));
+                        let mut ops = vec![format!("i32 {o}")];
+                        for a in args {
+                            let v = self.expr(a)?; // owned -> transferred
+                            ops.push(format!("i32 {v}"));
+                        }
+                        let r = self.call_value(&format!(
+                            "call i32 @m_{owner}___init__({})",
+                            ops.join(", ")
+                        ));
+                        self.release(&r); // __init__'s return value is unused
+                    }
+                    return Ok((o, Repr::Boxed));
+                }
                 if !self.funcs.contains(name) {
                     return nope(
                         "calling this function (only your own functions, len, str, set, + print)",
@@ -2278,6 +2629,20 @@ impl<'a> FuncEmitter<'a> {
                 self.release_if_owned(&st, sto);
                 Ok((r, Repr::Boxed))
             }
+            ExprKind::Attr(obj, attr) => {
+                // `obj.attr` — the object is borrowed; the interned attr-name
+                // handout is owned (+1) and getattr only borrows it.
+                let (ov, oo) = self.expr_borrow(obj)?;
+                let name = self.expr(&Expr {
+                    kind: ExprKind::Str(attr.clone()),
+                    line: e.line,
+                    span: (0, 0),
+                })?;
+                let r = self.call_value(&format!("call i32 @p2w_getattr(i32 {ov}, i32 {name})"));
+                self.release(&name);
+                self.release_if_owned(&ov, oo);
+                Ok((r, Repr::Boxed))
+            }
             ExprKind::MethodCall(obj, method, args) => {
                 Ok((self.method_call(obj, method, args)?, Repr::Boxed))
             }
@@ -2335,6 +2700,73 @@ impl<'a> FuncEmitter<'a> {
     /// `recv.method(args)` -> a name-dispatched runtime call (the runtime
     /// resolves the method on the receiver's type). 0–2 args for now.
     fn method_call(&mut self, obj: &Expr, method: &str, args: &[Expr]) -> Result<String, String> {
+        // `super().m(args)` — resolved at COMPILE time from the enclosing
+        // class's base; a direct call with the original self (methods are
+        // all-owned, so retain self before handing it over).
+        if let ExprKind::Call(n, cargs) = &obj.kind
+            && n == "super"
+            && cargs.is_empty()
+        {
+            let Some(class) = self.current_class.clone() else {
+                return Err(format!(
+                    "line {}: super() only works inside a method",
+                    obj.line
+                ));
+            };
+            let base = self.classes.decls[self.classes.ids[&class] as usize]
+                .base
+                .clone()
+                .ok_or_else(|| {
+                    format!("line {}: '{class}' has no base class for super()", obj.line)
+                })?;
+            let Some((owner, np)) = self.classes.resolve(&base, method) else {
+                return Err(format!(
+                    "line {}: super() found no method '{method}' above '{class}'",
+                    obj.line
+                ));
+            };
+            if args.len() != np - 1 {
+                return Err(format!(
+                    "line {}: super().{method}() takes {} argument(s), got {}",
+                    obj.line,
+                    np - 1,
+                    args.len()
+                ));
+            }
+            let selfv = self.call_value("load i32, ptr %v_self");
+            self.line(&format!("call void @p2w_retain(i32 {selfv})"));
+            let mut ops = vec![format!("i32 {selfv}")];
+            for a in args {
+                let v = self.expr(a)?; // owned -> transferred
+                ops.push(format!("i32 {v}"));
+            }
+            return Ok(
+                self.call_value(&format!("call i32 @m_{owner}_{method}({})", ops.join(", ")))
+            );
+        }
+        // A method name some class defines routes through the generated
+        // per-(name, arity) dispatcher: switch on class id -> direct call;
+        // non-instances fall back to the container-method runtime inside the
+        // dispatcher. Everything is passed OWNED (the method convention).
+        if self.classes.method_names().contains(method) {
+            let (recv, rrepr, rowned) = self.expr_borrow_typed(obj)?;
+            let recv = self.as_boxed(recv, rrepr);
+            let rowned = rowned || boxes_to_new_temp(rrepr);
+            if !rowned {
+                self.line(&format!("call void @p2w_retain(i32 {recv})"));
+            }
+            let mut ops = vec![format!("i32 {recv}")];
+            for a in args {
+                let v = self.expr(a)?; // owned -> transferred
+                ops.push(format!("i32 {v}"));
+            }
+            self.dispatchers.push((method.to_string(), args.len()));
+            return Ok(self.call_value(&format!(
+                "call i32 @dyn_{method}_{}({})",
+                args.len(),
+                ops.join(", ")
+            )));
+        }
         if args.len() > 2 {
             return Err(format!(
                 "line {}: the native backend handles methods with up to 2 arguments yet",

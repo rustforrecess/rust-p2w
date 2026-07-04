@@ -273,7 +273,7 @@ float/fixed-point for robotics math (M33 has an FPU).
     `wl_slice` 11→2, `wl_branch` 6→3, self-map 4→2 — map pipelines,
     reassignment churn, and peel loops run at or near zero-allocation steady
     state, no GC.
-- **Verified by three nets:** the 166-case CPython-diff + `live == 0` oracle
+- **Verified by three nets:** the 175-case CPython-diff + `live == 0` oracle
   (`tools/native_run.sh`), the alloc/peak bench (`tools/reuse_bench.sh`), and
   the differential fuzzer (`tools/fuzz_native.sh` — the generator emits slice
   shapes and type-churn adversaries; 200 seeds green).

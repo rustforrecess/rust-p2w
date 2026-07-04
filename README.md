@@ -54,16 +54,19 @@ with no boxing and no refcount traffic:
   (`x = 1` then `x = "hi"`) keeps the dynamic path, output CPython-identical
 - precise, validated RC (transfer-ownership insertion, borrow-on-read, borrowed
   params for read-only Boxed/array params)
-- the broader subset too — slices, f-strings, **sets** (set theory + methods,
-  sorted display) and **real immutable tuples** (so sets reject mutable members,
-  like CPython) — all consistent across the WASM, native, and step-debugger paths
+- the broader subset too — slices, f-strings (incl. format specs), default +
+  keyword arguments, `input()`, **classes** (v1: attrs/methods/inheritance/
+  `super()`/`__repr__` — compile-time switch dispatch, no vtables), **sets**
+  (set theory + methods, sorted display) and **real immutable tuples** (so sets
+  reject mutable members, like CPython) — consistent across the WASM, native,
+  and step-debugger paths
 
 Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-in.
 
 **Validated without hardware, three ways.** Because values are i32 arena
 *offsets* (not machine pointers), the emitted IR + runtime compile with `clang`
 and run on the host. `tools/native_run.sh` is a mechanical oracle: real LLVM,
-stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **166 cases
+stdout diffed against CPython, `p2w_live() == 0` asserted at exit — **175 cases
 green**, including adversaries that attack each reuse guard.
 `tools/reuse_bench.sh` measures allocs/peak so wins are numbers, not claims.
 `tools/fuzz_native.sh` differential-fuzzes generated programs against CPython
