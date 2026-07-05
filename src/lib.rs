@@ -97,6 +97,24 @@ pub fn set_operator_spans(source: &str) -> Vec<(usize, usize)> {
     }
 }
 
+/// Type-churn warnings, as `(line, message)` pairs — a name reused for a
+/// genuinely different *kind* of value within one scope (`x = 1` then
+/// `x = "hi"`). A **gentle lint**, never an error: the program still compiles
+/// and runs (an unannotated churning name just stays on the dynamic path,
+/// output identical to CPython). The IDE surfaces these as soft squiggles.
+/// Error-recovering parse, so a half-typed program still lints; empty when
+/// nothing lexes. See `docs/COMPILER_FRONTIER.md` task 3 for the deferred
+/// demote-vs-lint-vs-reject decision this instruments.
+pub fn type_churn_warnings(source: &str) -> Vec<(usize, String)> {
+    match lexer::lex(source) {
+        Ok(toks) => {
+            let (stmts, _) = parser::parse_recovering(&toks);
+            lint::type_churn_warnings(&stmts)
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

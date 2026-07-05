@@ -6,10 +6,195 @@
 //! itself defines is flagged, so a planned-but-undefined helper (`my_helper()`)
 //! or an unfamiliar name isn't second-guessed.
 
-use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::error::CompileError;
 use crate::parser::did_you_mean;
+use std::collections::HashMap;
 use std::collections::HashSet;
+
+/// A coarse *category* of value for the type-churn lint — NOT a real type, just
+/// "what kind of thing" a name currently holds, to spot a name being reused for
+/// a genuinely different kind of value (`x = 1` then `x = "hi"`). `Number`
+/// deliberately merges int/float/bool: `avg = 0` then `avg = total / n` is a
+/// natural numeric progression, not confusing churn, so it must NOT fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LintTy {
+    Number,
+    Text,
+    List,
+    Dict,
+    Set,
+    Tuple,
+}
+
+impl LintTy {
+    /// The kid-facing noun for a message ("a number", "a list", …).
+    fn noun(self) -> &'static str {
+        match self {
+            LintTy::Number => "a number",
+            LintTy::Text => "text (a string)",
+            LintTy::List => "a list",
+            LintTy::Dict => "a dictionary",
+            LintTy::Set => "a set",
+            LintTy::Tuple => "a tuple",
+        }
+    }
+}
+
+/// The category of an expression, when it is *knowable* from syntax alone;
+/// `None` means "don't know" (a call to a user function, a name, an index —
+/// anything dynamic), and an unknown never triggers churn (we only warn when
+/// two *known, different* categories collide). Conservative on purpose: a
+/// false "unknown" just misses a warning; it never invents one.
+fn lint_ty(e: &Expr) -> Option<LintTy> {
+    match &e.kind {
+        // (f-strings desugar in the parser to str concatenation / `str(...)`
+        // calls, so they classify as Text through those arms — no FString
+        // node here. Set literals parse as `Call("set", ...)`, handled below.)
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => Some(LintTy::Number),
+        ExprKind::Str(_) => Some(LintTy::Text),
+        ExprKind::List(_) | ExprKind::ListComp { .. } => Some(LintTy::List),
+        ExprKind::Dict(_) | ExprKind::DictComp { .. } => Some(LintTy::Dict),
+        ExprKind::Tuple(_) => Some(LintTy::Tuple),
+        ExprKind::Unary(UnOp::Neg, inner) => match lint_ty(inner) {
+            Some(LintTy::Number) => Some(LintTy::Number),
+            _ => None,
+        },
+        // Arithmetic/comparison over knowable operands stays a number; `+` is
+        // overloaded (str/list concat too), so it only stays a number when
+        // BOTH sides are known-numbers.
+        ExprKind::Bin(op, a, b) => match op {
+            BinOp::Add => match (lint_ty(a), lint_ty(b)) {
+                (Some(LintTy::Number), Some(LintTy::Number)) => Some(LintTy::Number),
+                (Some(LintTy::Text), Some(LintTy::Text)) => Some(LintTy::Text),
+                (Some(LintTy::List), Some(LintTy::List)) => Some(LintTy::List),
+                _ => None,
+            },
+            BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::FloorDiv
+            | BinOp::Mod
+            | BinOp::Pow
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::Eq
+            | BinOp::Ne => Some(LintTy::Number),
+            _ => None,
+        },
+        // The common conversion/measure builtins have a knowable result kind —
+        // this is what lets `age = input()` (text) then `age = int(age)`
+        // (number) surface, the canonical case the reject-vs-demote decision
+        // wants data on (see docs/COMPILER_FRONTIER.md task 3).
+        ExprKind::Call(name, _) => match name.as_str() {
+            "int" | "float" | "len" | "abs" | "round" | "ord" => Some(LintTy::Number),
+            "str" | "input" | "chr" => Some(LintTy::Text),
+            "list" | "sorted" => Some(LintTy::List),
+            "dict" => Some(LintTy::Dict),
+            "set" => Some(LintTy::Set),
+            "tuple" => Some(LintTy::Tuple),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Type-churn warnings: a name reused for a genuinely different *kind* of value
+/// within one scope (`x = 1` … `x = "hi"`). Each entry is `(line, message)`,
+/// kid-facing. This is a **gentle lint only** — the compiler still runs the
+/// program (an unannotated name that churns simply stays on the dynamic path,
+/// output identical to CPython). It is the teaching surface *and* the
+/// data-collection instrument for the deferred "demote vs. lint vs. reject"
+/// policy in `docs/COMPILER_FRONTIER.md` task 3: measuring how often real
+/// student code trips it (including the legit `age = int(age)` pattern) is
+/// exactly the evidence that decision waits on.
+///
+/// Each scope (module top level, and every function/method body) is analyzed
+/// independently — reusing `x` as a number in one function and text in another
+/// is not churn. Within a scope, reassignments inside `if`/`for`/`while` bodies
+/// count (they rebind the same name), but `def`/`class` bodies are separate
+/// scopes, recursed on their own.
+pub fn type_churn_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    churn_scope(stmts, &mut out);
+    out.sort_by_key(|(line, _)| *line);
+    out
+}
+
+/// Analyze one scope for churn, then recurse into nested `def`/`class` scopes.
+fn churn_scope(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+    // name -> (established category, whether we've already warned about it).
+    let mut seen: HashMap<String, (LintTy, bool)> = HashMap::new();
+    churn_walk(stmts, &mut seen, out);
+    // Nested scopes are independent.
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Def { body, .. } => churn_scope(body, out),
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    churn_scope(&m.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk the assignments of one scope (descending through control-flow bodies,
+/// which rebind names in the *same* scope, but not `def`/`class`).
+fn churn_walk(
+    stmts: &[Stmt],
+    seen: &mut HashMap<String, (LintTy, bool)>,
+    out: &mut Vec<(usize, String)>,
+) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, value) | StmtKind::AnnAssign { name, value, .. } => {
+                if let Some(ty) = lint_ty(value) {
+                    match seen.get_mut(name) {
+                        None => {
+                            seen.insert(name.clone(), (ty, false));
+                        }
+                        Some((first, warned)) if *first != ty && !*warned => {
+                            out.push((
+                                s.line,
+                                format!(
+                                    "'{name}' held {} earlier but is {} here — reusing one \
+                                     name for a different kind of value is a common source of \
+                                     confusion; a new name is usually clearer",
+                                    first.noun(),
+                                    ty.noun()
+                                ),
+                            ));
+                            *warned = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                churn_walk(body, seen, out);
+                for (_, b) in elifs {
+                    churn_walk(b, seen, out);
+                }
+                if let Some(b) = else_body {
+                    churn_walk(b, seen, out);
+                }
+            }
+            StmtKind::For { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::While { body, .. } => churn_walk(body, seen, out),
+            _ => {}
+        }
+    }
+}
 
 /// "Did you mean…?" diagnostics for calls to unknown, near-miss function names.
 /// The known-builtins set comes from the central registry ([`crate::builtins`]),
@@ -797,5 +982,51 @@ mod tests {
         assert!(op_chars("x = 6 & 3\n").is_empty());
         assert!(op_chars("n = 10 - 1\n").is_empty());
         assert!(op_chars("s = {1}\nx = s - 1\n").is_empty());
+    }
+
+    fn churn(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        type_churn_warnings(&stmts)
+    }
+
+    #[test]
+    fn churn_flags_cross_category_reuse() {
+        // number -> text: the classic confusing reuse.
+        let w = churn("x = 1\nprint(x)\nx = \"hi\"\nprint(x)\n");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, 3); // the line of the conflicting assignment
+        assert!(w[0].1.contains("'x'") && w[0].1.contains("number") && w[0].1.contains("string"));
+        // The canonical age pattern (text -> number via int()) surfaces — this
+        // is the data the reject-vs-demote decision wants.
+        assert_eq!(churn("age = input()\nage = int(age)\n").len(), 1);
+        // list -> number is churn too.
+        assert_eq!(churn("xs = [1, 2]\nxs = 5\n").len(), 1);
+    }
+
+    #[test]
+    fn churn_does_not_cry_wolf() {
+        // Numeric progression (int -> float) is NOT churn — both are numbers.
+        assert!(churn("avg = 0\navg = total / n\n").is_empty());
+        // Same-category reassignment (accumulator) — never fires.
+        assert!(churn("total = 0\ntotal = total + 5\ntotal = total * 2\n").is_empty());
+        // A dynamic source (unknown category) never triggers a warning.
+        assert!(churn("x = something()\nx = other()\n").is_empty());
+        assert!(churn("x = 1\nx = f(x)\n").is_empty());
+        // One warning per name, not one per later assignment.
+        assert_eq!(churn("x = 1\nx = \"a\"\nx = \"b\"\nx = \"c\"\n").len(), 1);
+    }
+
+    #[test]
+    fn churn_is_scoped_per_function() {
+        // `n` as a number in one function and text in another is NOT churn.
+        let src = "def a(x):\n    n = 1\n    return n\ndef b(y):\n    n = \"hi\"\n    return n\n";
+        assert!(churn(src).is_empty());
+        // But churn INSIDE a single function is caught.
+        let inside = "def f():\n    v = 1\n    v = \"x\"\n    return v\n";
+        assert_eq!(churn(inside).len(), 1);
+        // Reassignment inside a branch counts (same scope).
+        let branch = "x = 1\nif x > 0:\n    x = \"pos\"\n";
+        assert_eq!(churn(branch).len(), 1);
     }
 }

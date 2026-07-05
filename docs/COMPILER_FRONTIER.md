@@ -157,7 +157,16 @@ them so later. **Plan: add the IDE lint behind a strictness seam (the
 `STRICT_TYPES` precedent in the blocks layer; Hedy-style level-gating is the
 model), measure what the lint actually fires on in student code, and only
 then decide whether to promote it to an error — per classroom level, not
-for the language.**
+for the language.** *The lint's compiler half is LANDED* —
+`rust_p2w::type_churn_warnings(source) -> Vec<(line, message)>`
+(`src/lint.rs`): a pure, additive analysis (zero codegen/soundness surface)
+that flags a name reused across value *categories* (number/text/list/dict/
+set/tuple), deliberately NOT firing on int→float numeric progression or
+dynamic-source reassignment, and scoped per function. It classifies the
+conversion builtins (`int`/`str`/`input`/…) so the canonical
+`age = input()` / `age = int(age)` case DOES surface — that's the evidence
+we want. Remaining: the IDE surfaces it as soft squiggles + the
+level-gating dial.
 
 **Design decision — deliberately NOT Hindley–Milner (Jul 2026).** Types here
 only *gate optimizations*: `type_of` returning `None` means "stay boxed," so
