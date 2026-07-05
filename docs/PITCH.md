@@ -72,9 +72,10 @@ code, no boxing, no refcount traffic:**
 The subset is broad and **consistent across all three execution paths**: ints,
 floats, strings, lists, dicts, packed arrays, control flow, functions+recursion
 (+ default/keyword args), iteration, methods, list/dict comprehensions, slices,
-f-strings (incl. format specs), `input()`, **classes** (v1: attrs, methods,
-single inheritance, `super()`, `__repr__`/`__str__`, class variables, and
-the operator dunders — compile-time switch dispatch, no vtables), **sets** (full set theory + methods, sorted canonical
+f-strings (incl. format specs), `input()`, `lambda`, **classes** (v1: attrs,
+methods, single inheritance, `super()`, `__repr__`/`__str__`, operator
+dunders, class variables, class-name access — compile-time switch dispatch,
+no vtables), **sets** (full set theory + methods, sorted canonical
 display), and **real tuples** — a distinct *immutable* type (item-assignment is
 an error), which also lets sets reject mutable members (`{[1,2]}` → "use a
 tuple") exactly like CPython.

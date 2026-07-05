@@ -147,9 +147,12 @@ under the same `DebugAdapter`.
    real frame push, so kids step INTO their constructors and dunders — plus
    `__str__`/`__repr__` in print/str and the operator dunders
    (`__add__`-family, `__eq__` direct→reflected→identity, comparisons,
-   `__len__`, `__getitem__`), with the same clean-error guards as the native
-   backend (undispatched dunders, class vars). Instances are `Rc`-shared, so
-   aliases see each other's attribute writes (true reference semantics).
+   `__len__`, `__getitem__`), **class variables** (instance attrs shadow;
+   inheritance-chain fallback), and **class-name access** (`Counter.limit`
+   reads/writes — the instance-counter idiom), with the same clean-error
+   guards as the native backend (undispatched dunders, first-class methods).
+   Instances are `Rc`-shared, so aliases see each other's attribute writes
+   (true reference semantics).
    Debugger-only narrowings, documented here: instances nested inside a
    printed CONTAINER show the default `<Dog object>` (no user-code calls
    mid-format), and `in`/dict-key lookups compare instances by identity

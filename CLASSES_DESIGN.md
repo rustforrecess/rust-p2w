@@ -1,16 +1,31 @@
 # Classes — design (implemented)
 
-Status: **v1 implemented** (5 slices, all green vs CPython) — and the NATIVE
-backend now has its own classes v1 too (Jul 2026): compile-time switch
+Status: **v1 shipped on ALL THREE execution paths** (Jul 2026) — browser
+(WASM-GC), native (LLVM), and the `Vm` step-debugger — all green vs CPython
+and consistent with each other. The native object model: compile-time switch
 dispatch on a per-instance class id (`src/llvm.rs` — `ClassTable`, generated
-`dyn_*` dispatchers + `p2w_obj_repr`), `T_OBJECT` in `p2w-rt` (`[tag][rc]
-[class_id][attrs-dict]`, RC-cascaded), covering construction/`__init__`/
-attrs/methods/inheritance/`super()`/`__repr__`-`__str__`; operator dunders
-and class variables are clean native errors for now (`docs/PYTHON_COMPAT.md`).
-The rest of this doc describes the browser (WASM-GC) design. This ports the
-reference p2w object model into rust-p2w, adapted to the infrastructure we
-already have. Reviewed and adjusted here *before* codegen, per the "scout the
-hard thing carefully" plan; kept as the record of what shipped.
+`dyn_*` method dispatchers + the `p2w_obj_repr` / `p2w_obj_op` / `p2w_classvar`
+callbacks), `T_OBJECT` in `p2w-rt` (`[tag][rc][class_id][attrs-dict]`,
+RC-cascaded). The Vm runs the same subset via frame-push dispatch
+(`call_method_frame`), so Debug steps INTO constructors, methods, and dunders.
+
+The full v1 subset, everywhere: construction · `__init__` · instance
+attributes · methods · `self` · single inheritance · `super().method(...)` ·
+`__repr__`/`__str__` in print/str · **operator dunders**
+(`__add__`/`__sub__`/`__mul__`, `__eq__` with reflected+identity,
+`__lt__`/`__le__`/`__gt__`/`__ge__`, `__len__`, `__getitem__`) · **class
+variables** (instance attrs shadow; chain fallback) · **class-name access**
+(`Counter.limit` reads AND writes at compile time — the instance-counter
+idiom). Clean-error boundaries (uniform across paths): first-class methods
+(`f = d.speak`), a dunder the backend doesn't dispatch (e.g. `__setitem__`),
+and no-`__radd__` reflection (`5 + obj`). See `docs/PYTHON_COMPAT.md` for the
+full compatibility notes.
+
+The rest of this doc describes the browser (WASM-GC) design as originally
+scouted. This ports the reference p2w object model into rust-p2w, adapted to
+the infrastructure we already have. Reviewed and adjusted here *before*
+codegen, per the "scout the hard thing carefully" plan; kept as the record of
+what shipped.
 
 Shipped, slice by slice: (1) core — `$CLASS`/`$OBJECT`/`$METHOD`/`$MFUNC`
 types, two-pass registration, method codegen + arg-list unpack, construction,

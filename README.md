@@ -55,11 +55,13 @@ with no boxing and no refcount traffic:
 - precise, validated RC (transfer-ownership insertion, borrow-on-read, borrowed
   params for read-only Boxed/array params)
 - the broader subset too — slices, f-strings (incl. format specs), default +
-  keyword arguments, `input()`, **classes** (v1: attrs/methods/inheritance/
-  `super()`/`__repr__` — compile-time switch dispatch, no vtables), **sets**
-  (set theory + methods, sorted display) and **real immutable tuples** (so sets
-  reject mutable members, like CPython) — consistent across the WASM, native,
-  and step-debugger paths
+  keyword arguments, `input()`, `lambda`, **classes** (v1: attrs, methods,
+  single inheritance, `super()`, `__repr__`/`__str__`, operator dunders,
+  class variables, and class-name access like `Counter.limit` — compile-time
+  switch dispatch, no vtables), **sets** (set theory + methods, sorted
+  display) and **real immutable tuples** (so sets reject mutable members, like
+  CPython) — consistent across the WASM, native, and step-debugger paths (the
+  debugger steps *into* constructors, methods, and dunders)
 
 Unannotated code stays a dynamic tagged-`i32` path — the typed paths are opt-in.
 
