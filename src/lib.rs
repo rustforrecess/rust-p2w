@@ -115,6 +115,23 @@ pub fn type_churn_warnings(source: &str) -> Vec<(usize, String)> {
     }
 }
 
+/// Undefined-variable warnings, as `(line, message)` pairs — a bare-name read
+/// of a variable bound nowhere in scope (the complement of the "did you mean…?"
+/// lint for unknown *function* calls). A **gentle lint**: it over-approximates
+/// what's "bound" (assigned/param/loop-var/import/def anywhere in scope), so it
+/// only flags names defined nowhere — a real error, never a false alarm — and
+/// is not flow-sensitive (a forward reference is not flagged). Error-recovering
+/// parse; empty when nothing lexes.
+pub fn undefined_name_warnings(source: &str) -> Vec<(usize, String)> {
+    match lexer::lex(source) {
+        Ok(toks) => {
+            let (stmts, _) = parser::parse_recovering(&toks);
+            lint::undefined_name_warnings(&stmts)
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

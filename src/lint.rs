@@ -1,10 +1,16 @@
 //! Lightweight semantic lints over the parsed AST.
 //!
-//! Currently: a "did you mean…?" for a call to a function that doesn't exist
-//! but closely matches a known name (e.g. `pint(i)` → `print`). Deliberately
-//! conservative — only a near-miss of a known builtin or a function the program
-//! itself defines is flagged, so a planned-but-undefined helper (`my_helper()`)
-//! or an unfamiliar name isn't second-guessed.
+//! All deliberately conservative — a lint that cries wolf is worse than no lint
+//! in a K-12 tool. Currently:
+//! - `typo_diagnostics` — "did you mean…?" for a call to a function that doesn't
+//!   exist but near-misses a known name (`pint(i)` → `print`);
+//! - `undefined_name_warnings` — a bare-name read of a variable bound nowhere in
+//!   scope (the variable-name complement of the above), over-approximating
+//!   "bound" so only genuinely-undefined names flag;
+//! - `type_churn_warnings` — a name reused for a different *kind* of value
+//!   (`x = 1` … `x = "hi"`), the instrument for the reject-vs-demote decision;
+//! - `may_form_cycle`, `set_typed_names`, `set_operator_spans` — analysis seams
+//!   the backends / IDE consume.
 
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::error::CompileError;
@@ -813,6 +819,295 @@ fn is_set_expr(e: &Expr, sets: &HashSet<String>) -> bool {
     }
 }
 
+/// Undefined-variable warnings: a bare-name READ of a variable that is bound
+/// NOWHERE in scope — the complement of the "did you mean…?" *call-name* lint
+/// (`typo_diagnostics`), covering value names (a typo'd or never-set variable).
+/// Each entry is `(line, message)`, kid-facing, with a "did you mean…?" when
+/// the name near-misses one that IS in scope.
+///
+/// Sound-as-a-lint by **over-approximating "bound"**: a name counts as defined
+/// if it is a builtin, a `def`/`class` name, an `import`, a parameter, `self`,
+/// or assigned/bound ANYWHERE in the same-or-enclosing scope — including loop
+/// vars, unpack targets, and comprehension targets (matching Python's
+/// "assigned anywhere → local" rule). So only a name bound *nowhere* is
+/// flagged: always a real error, never a false alarm. Deliberately NOT
+/// flow-sensitive — a forward / use-before-assignment (`print(x)` then
+/// `x = 1`) is not flagged (that harder check invites false positives); this
+/// catches the common "never defined at all" case. Type/annotation positions
+/// (`x: int`, `-> bool`) are skipped — they name types, not variables.
+pub fn undefined_name_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+    let builtins: HashSet<String> = crate::builtins::names().map(String::from).collect();
+    let mut out = Vec::new();
+    check_scope_names(stmts, &builtins, &mut out);
+    out.sort_by_key(|(line, _)| *line);
+    out
+}
+
+/// Names BOUND at this scope level — through control flow, but NOT into nested
+/// `def`/`class` bodies (separate scopes).
+fn scope_bindings(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, _) | StmtKind::AnnAssign { name, .. } => {
+                out.insert(name.clone());
+            }
+            StmtKind::For { var, body, .. } | StmtKind::ForEach { var, body, .. } => {
+                out.insert(var.clone());
+                scope_bindings(body, out);
+            }
+            StmtKind::While { body, .. } => scope_bindings(body, out),
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                scope_bindings(body, out);
+                for (_, b) in elifs {
+                    scope_bindings(b, out);
+                }
+                if let Some(b) = else_body {
+                    scope_bindings(b, out);
+                }
+            }
+            StmtKind::UnpackAssign { targets, .. } => {
+                for t in targets {
+                    if let ExprKind::Name(n) = &t.kind {
+                        out.insert(n.clone());
+                    }
+                }
+            }
+            StmtKind::Def { name, .. } | StmtKind::ClassDef { name, .. } => {
+                out.insert(name.clone());
+            }
+            StmtKind::Import(names) => {
+                for n in names {
+                    out.insert(n.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check one scope's reads against `outer` (enclosing-visible names + builtins)
+/// plus this scope's own bindings, then recurse into nested `def`/`class`
+/// scopes (each seeing the accumulated outer names — over-approximate, so a
+/// closure-style read never false-flags even though we don't model closures).
+fn check_scope_names(stmts: &[Stmt], outer: &HashSet<String>, out: &mut Vec<(usize, String)>) {
+    let mut allowed = outer.clone();
+    scope_bindings(stmts, &mut allowed);
+    check_reads(stmts, &allowed, out);
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Def { params, body, .. } => {
+                let mut inner = allowed.clone();
+                inner.extend(params.iter().cloned());
+                check_scope_names(body, &inner, out);
+            }
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    let mut inner = allowed.clone();
+                    inner.extend(m.params.iter().cloned());
+                    check_scope_names(&m.body, &inner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk one scope's *value-read* positions (through control flow, but not into
+/// nested def/class bodies — those recurse as their own scope). Annotation and
+/// default-argument positions belonging to nested scopes are skipped;
+/// class-var and default expressions evaluate in THIS scope and are checked.
+fn check_reads(stmts: &[Stmt], allowed: &HashSet<String>, out: &mut Vec<(usize, String)>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(_, value) | StmtKind::AnnAssign { value, .. } => {
+                read_expr(value, allowed, out)
+            }
+            StmtKind::For {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                read_expr(start, allowed, out);
+                read_expr(end, allowed, out);
+                read_expr(step, allowed, out);
+                check_reads(body, allowed, out);
+            }
+            StmtKind::ForEach { iterable, body, .. } => {
+                read_expr(iterable, allowed, out);
+                check_reads(body, allowed, out);
+            }
+            StmtKind::While { cond, body } => {
+                read_expr(cond, allowed, out);
+                check_reads(body, allowed, out);
+            }
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                read_expr(cond, allowed, out);
+                check_reads(body, allowed, out);
+                for (c, b) in elifs {
+                    read_expr(c, allowed, out);
+                    check_reads(b, allowed, out);
+                }
+                if let Some(b) = else_body {
+                    check_reads(b, allowed, out);
+                }
+            }
+            StmtKind::Return(Some(e)) | StmtKind::Expr(e) => read_expr(e, allowed, out),
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                read_expr(target, allowed, out);
+                read_expr(index, allowed, out);
+                read_expr(value, allowed, out);
+            }
+            StmtKind::SetAttr { obj, value, .. } => {
+                read_expr(obj, allowed, out);
+                read_expr(value, allowed, out);
+            }
+            StmtKind::UnpackAssign { targets, value } => {
+                read_expr(value, allowed, out);
+                // A Name target BINDS; an Index/Attr target READS its container.
+                for t in targets {
+                    if !matches!(t.kind, ExprKind::Name(_)) {
+                        read_expr(t, allowed, out);
+                    }
+                }
+            }
+            // Class-var values + default-arg exprs evaluate in THIS scope.
+            StmtKind::ClassDef { class_vars, .. } => {
+                for (_, e) in class_vars {
+                    read_expr(e, allowed, out);
+                }
+            }
+            StmtKind::Def { defaults, .. } => {
+                for e in defaults {
+                    read_expr(e, allowed, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check the bare-name reads inside one expression against `allowed`.
+fn read_expr(e: &Expr, allowed: &HashSet<String>, out: &mut Vec<(usize, String)>) {
+    match &e.kind {
+        ExprKind::Name(n) => {
+            if !allowed.contains(n) {
+                let cands: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                let msg = match did_you_mean(n, &cands) {
+                    Some(sugg) => format!("`{n}` isn't defined — did you mean `{sugg}`?"),
+                    None => format!(
+                        "`{n}` isn't defined yet — set it first (e.g. `{n} = ...`) or check the spelling"
+                    ),
+                };
+                out.push((e.line, msg));
+            }
+        }
+        ExprKind::Unary(_, x) => read_expr(x, allowed, out),
+        ExprKind::Bin(_, a, b) => {
+            read_expr(a, allowed, out);
+            read_expr(b, allowed, out);
+        }
+        // The callee NAME is owned by the call-name typo lint; only args here.
+        ExprKind::Call(_, args) => {
+            for a in args {
+                read_expr(a, allowed, out);
+            }
+        }
+        ExprKind::Kwarg(_, v) => read_expr(v, allowed, out),
+        ExprKind::List(items) | ExprKind::Tuple(items) => {
+            for it in items {
+                read_expr(it, allowed, out);
+            }
+        }
+        ExprKind::Dict(pairs) => {
+            for (k, v) in pairs {
+                read_expr(k, allowed, out);
+                read_expr(v, allowed, out);
+            }
+        }
+        ExprKind::Index(o, i) => {
+            read_expr(o, allowed, out);
+            read_expr(i, allowed, out);
+        }
+        ExprKind::Slice {
+            obj,
+            start,
+            stop,
+            step,
+        } => {
+            read_expr(obj, allowed, out);
+            for b in [start, stop, step].into_iter().flatten() {
+                read_expr(b, allowed, out);
+            }
+        }
+        ExprKind::MethodCall(obj, _, args) => {
+            read_expr(obj, allowed, out);
+            for a in args {
+                read_expr(a, allowed, out);
+            }
+        }
+        ExprKind::Attr(obj, _) => read_expr(obj, allowed, out),
+        ExprKind::ListComp { element, clauses } => {
+            let inner = comp_allowed(allowed, clauses);
+            read_expr(element, &inner, out);
+            read_comp_clauses(clauses, &inner, out);
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => {
+            let inner = comp_allowed(allowed, clauses);
+            read_expr(key, &inner, out);
+            read_expr(value, &inner, out);
+            read_comp_clauses(clauses, &inner, out);
+        }
+        // Literals (Int/Float/Bool/Str/None) — nothing to read.
+        _ => {}
+    }
+}
+
+/// `allowed` plus every comprehension `for` target (over-approximate: even the
+/// first clause's iter may reference a comp var, which only avoids false
+/// positives).
+fn comp_allowed(allowed: &HashSet<String>, clauses: &[CompClause]) -> HashSet<String> {
+    let mut inner = allowed.clone();
+    for c in clauses {
+        if let CompClause::For { vars, .. } = c {
+            inner.extend(vars.iter().cloned());
+        }
+    }
+    inner
+}
+
+fn read_comp_clauses(
+    clauses: &[CompClause],
+    allowed: &HashSet<String>,
+    out: &mut Vec<(usize, String)>,
+) {
+    for c in clauses {
+        match c {
+            CompClause::For { iter, .. } => read_expr(iter, allowed, out),
+            CompClause::If(cond) => read_expr(cond, allowed, out),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1310,54 @@ mod tests {
         assert!(churn("x = 1\nx = f(x)\n").is_empty());
         // One warning per name, not one per later assignment.
         assert_eq!(churn("x = 1\nx = \"a\"\nx = \"b\"\nx = \"c\"\n").len(), 1);
+    }
+
+    fn undef(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        undefined_name_warnings(&stmts)
+    }
+
+    #[test]
+    fn undef_flags_never_bound_names() {
+        // A read of a name set nowhere.
+        let w = undef("print(total)\n");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, 1);
+        assert!(w[0].1.contains("`total`"));
+        // A near-miss of an in-scope name suggests it.
+        let w2 = undef("score = 10\nprint(scoer)\n");
+        assert_eq!(w2.len(), 1);
+        assert!(w2[0].1.contains("did you mean `score`"), "{}", w2[0].1);
+        // Undefined inside a function body.
+        assert_eq!(undef("def f(a):\n    return a + b\n").len(), 1);
+    }
+
+    #[test]
+    fn undef_does_not_cry_wolf() {
+        // Every legit binding form marks a name defined:
+        assert!(undef("x = 1\nprint(x)\n").is_empty()); // assign
+        assert!(undef("x: int = 1\nprint(x)\n").is_empty()); // annassign
+        assert!(undef("for i in range(3):\n    print(i)\n").is_empty()); // loop var
+        assert!(undef("for w in [1, 2]:\n    print(w)\n").is_empty()); // foreach var
+        assert!(undef("a, b = 1, 2\nprint(a + b)\n").is_empty()); // unpack targets
+        assert!(undef("def g(n):\n    return n * 2\nprint(g(3))\n").is_empty()); // param + def name
+        assert!(undef("import math\nprint(math.pi)\n").is_empty()); // import name
+        assert!(undef("ys = [x * 2 for x in [1, 2]]\nprint(ys)\n").is_empty()); // comp var
+        assert!(undef("print(len([1, 2]))\n").is_empty()); // builtin call
+        // Reassignment reading itself is fine (bound in scope).
+        assert!(undef("t = 0\nt = t + 1\nprint(t)\n").is_empty());
+        // A forward reference is deliberately NOT flagged (over-approximate).
+        assert!(undef("print(y)\ny = 5\n").is_empty());
+        // A function reads a module global.
+        assert!(undef("g = 10\ndef f():\n    return g\n").is_empty());
+        // self + attributes inside a method.
+        assert!(
+            undef("class C:\n    def __init__(self):\n        self.n = 0\n    def get(self):\n        return self.n\n")
+                .is_empty()
+        );
+        // Handler-as-value: a def name passed as an argument.
+        assert!(undef("def boom():\n    return 0\non_click(boom)\n").is_empty());
     }
 
     #[test]
