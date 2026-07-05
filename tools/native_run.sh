@@ -307,6 +307,12 @@ run_case classvar_inherit 'class Base:\n    tag = "b"\nclass Kid(Base):\n    ext
 run_case classvar_shadow_sub 'class A:\n    v = 1\nclass B(A):\n    v = 2\n    def __init__(self):\n        self.w = 0\nb = B()\nprint(b.v)\n' '2' || fails=$((fails+1))
 run_case classvar_str 'class M:\n    words = "hello"\n    def __init__(self):\n        self.x = 0\nm1 = M()\nm2 = M()\nprint(m1.words + " " + m2.words)\n' 'hello hello' || fails=$((fails+1))
 
+# --- class-NAME access (compile-time resolution; classes aren't values) ---
+run_case cn_read 'class K:\n    count = 7\nprint(K.count)\n' '7' || fails=$((fails+1))
+run_case cn_counter 'class Counter:\n    made = 0\n    def __init__(self):\n        Counter.made = Counter.made + 1\na = Counter()\nb = Counter()\nc = Counter()\nprint(Counter.made)\nprint(a.made)\n' '3\n3' || fails=$((fails+1))
+run_case cn_chain 'class Base:\n    tag = "b"\nclass Kid(Base):\n    def __init__(self):\n        self.z = 0\nprint(Kid.tag)\n' 'b' || fails=$((fails+1))
+run_case cn_shadow 'class K:\n    v = 1\nK = 5\nprint(K)\n' '5' || fails=$((fails+1))
+
 # --- operator dunders on native (p2w_obj_op: direct / reflected-eq / identity) ---
 run_case dunder_add 'class Vec:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __add__(self, o):\n        return Vec(self.x + o.x, self.y + o.y)\n    def __str__(self):\n        return "Vec(" + str(self.x) + ", " + str(self.y) + ")"\nv = Vec(1, 2) + Vec(3, 4)\nprint(v)\n' 'Vec(4, 6)' || fails=$((fails+1))
 run_case dunder_eq 'class Pt:\n    def __init__(self, x):\n        self.x = x\n    def __eq__(self, o):\n        return self.x == o.x\na = Pt(3)\nb = Pt(3)\nc = Pt(4)\nprint(a == b)\nprint(a == c)\nprint(a != c)\n' 'True\nFalse\nTrue' || fails=$((fails+1))

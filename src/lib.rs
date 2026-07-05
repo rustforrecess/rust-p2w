@@ -434,6 +434,20 @@ print(\"sum of evens:\", total)
         // Class variables: instance attrs shadow, the chain falls back.
         let cv = compile_to_llvm_ir("class K:\n    count = 0\nk = K()\nprint(k.count)\n").unwrap();
         assert!(cv.contains("@cv_K_count"), "{cv}");
+        // Class-NAME access: compile-time resolution on all three paths (the
+        // browser build must stay valid WAT too).
+        assert_valid_wasm(
+            "class Counter:\n    made = 0\n    def __init__(self):\n        Counter.made = Counter.made + 1\na = Counter()\nprint(Counter.made)\n",
+        );
+        let cn = compile_to_llvm_ir("class K:\n    count = 7\nprint(K.count)\n").unwrap();
+        assert!(cn.contains("load i32, ptr @cv_K_count"), "{cn}");
+        // A method via the class name isn't a value; writing an undeclared
+        // class attr is a compile-time error.
+        let e_m = compile_to_llvm_ir("class K:\n    def go(self):\n        return 1\nx = K.go\n")
+            .unwrap_err();
+        assert!(e_m.contains("isn't a value"), "{e_m}");
+        let e_w = compile_to_llvm_ir("class K:\n    v = 1\nK.other = 2\n").unwrap_err();
+        assert!(e_w.contains("declare it in the class body"), "{e_w}");
         // super() outside a method / unknown base are clean errors.
         let e3 = compile_to_llvm_ir("class B(Missing):\n    def m(self):\n        return 1\n")
             .unwrap_err();

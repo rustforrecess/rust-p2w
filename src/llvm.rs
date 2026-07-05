@@ -2000,6 +2000,39 @@ impl<'a> FuncEmitter<'a> {
                 }
             },
             StmtKind::SetAttr { obj, attr, value } => {
+                // `Counter.count = v` — a class-name base writes the class
+                // variable's storage directly (all instances see it; the
+                // instance-counter idiom). Only EXISTING class variables:
+                // inventing new class attrs at runtime stays out of scope.
+                if let ExprKind::Name(cn) = &obj.kind
+                    && self.classes.ids.contains_key(cn)
+                    && !self.vars.iter().any(|v| v == cn)
+                {
+                    let mut owner = None;
+                    for cd in self.classes.chain(cn) {
+                        if cd.class_vars.iter().any(|(v, _)| v == attr) {
+                            owner = Some(cd.name.clone());
+                            break;
+                        }
+                        if cd.methods.contains_key(attr) {
+                            return Err(format!(
+                                "line {}: can't assign over the method '{attr}'",
+                                s.line
+                            ));
+                        }
+                    }
+                    let Some(owner) = owner else {
+                        return Err(format!(
+                            "line {}: '{attr}' isn't a class variable of '{cn}' — declare it in the class body first",
+                            s.line
+                        ));
+                    };
+                    let v = self.expr(value)?; // owned -> stored
+                    let old = self.call_value(&format!("load i32, ptr @cv_{owner}_{attr}"));
+                    self.release(&old);
+                    self.line(&format!("store i32 {v}, ptr @cv_{owner}_{attr}"));
+                    return Ok(());
+                }
                 // `obj.attr = value` — the attr NAME is an interned-literal
                 // handout (owned +1) and setattr TRANSFERS name + value in;
                 // the object itself is only borrowed.
@@ -2865,6 +2898,33 @@ impl<'a> FuncEmitter<'a> {
                 Ok((r, Repr::Boxed))
             }
             ExprKind::Attr(obj, attr) => {
+                // `Counter.limit` — a CLASS NAME base resolves at COMPILE
+                // time (the class registry is static; classes aren't runtime
+                // values). A local variable of the same name shadows the
+                // class, like CPython.
+                if let ExprKind::Name(cn) = &obj.kind
+                    && self.classes.ids.contains_key(cn)
+                    && !self.vars.iter().any(|v| v == cn)
+                {
+                    for cd in self.classes.chain(cn) {
+                        if cd.class_vars.iter().any(|(v, _)| v == attr) {
+                            let r =
+                                self.call_value(&format!("load i32, ptr @cv_{}_{attr}", cd.name));
+                            self.line(&format!("call void @p2w_retain(i32 {r})"));
+                            return Ok((r, Repr::Boxed));
+                        }
+                        if cd.methods.contains_key(attr) {
+                            return Err(format!(
+                                "line {}: a method isn't a value yet — call it: {cn}.{attr}(...)",
+                                e.line
+                            ));
+                        }
+                    }
+                    return Err(format!(
+                        "line {}: class '{cn}' has no attribute '{attr}'",
+                        e.line
+                    ));
+                }
                 // `obj.attr` — the object is borrowed; the interned attr-name
                 // handout is owned (+1) and getattr only borrows it.
                 let (ov, oo) = self.expr_borrow(obj)?;

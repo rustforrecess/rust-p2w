@@ -76,7 +76,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         }
     }
     for s in stmts {
-        if let StmtKind::ClassDef { name, base, .. } = &s.kind {
+        if let StmtKind::ClassDef {
+            name,
+            base,
+            methods,
+            class_vars,
+        } = &s.kind
+        {
             if g.funcs.contains_key(name) || g.classes.contains_key(name) {
                 return Err(CompileError::at(
                     s.line,
@@ -92,6 +98,14 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                 ));
             }
             g.classes.insert(name.clone(), base.clone());
+            g.class_var_names.insert(
+                name.clone(),
+                class_vars.iter().map(|(v, _)| v.clone()).collect(),
+            );
+            g.class_method_names.insert(
+                name.clone(),
+                methods.iter().map(|m| m.name.clone()).collect(),
+            );
         }
     }
     for s in stmts {
@@ -5253,6 +5267,10 @@ struct Gen {
     /// User classes: name -> base class name (None if no base). Collected in
     /// pass 1 so `Cls(args)` construction is distinguished from a function call.
     classes: HashMap<String, Option<String>>,
+    /// Per-class class-variable and method NAMES (pass 1), so `Counter.limit`
+    /// resolves at compile time (classes aren't runtime values).
+    class_var_names: HashMap<String, Vec<String>>,
+    class_method_names: HashMap<String, Vec<String>>,
     /// Top-level Python variables, in definition order — WASM globals named
     /// `$g_<name>` so function bodies can read them.
     globals: Vec<String>,
@@ -5419,6 +5437,45 @@ impl Gen {
             )),
             StmtKind::SetAttr { obj, attr, value } => {
                 self.type_of(cx, value)?;
+                // Class-name base: write the class variable in the owning
+                // class's dict (all instances see it).
+                if let ExprKind::Name(cn) = &obj.kind
+                    && self.classes.contains_key(cn)
+                    && !self.globals.contains(cn)
+                {
+                    let mut owner = None;
+                    let mut cur = Some(cn.clone());
+                    let mut hops = 0;
+                    while let Some(c) = cur {
+                        hops += 1;
+                        if hops > self.classes.len() + 1 {
+                            break;
+                        }
+                        if self
+                            .class_var_names
+                            .get(&c)
+                            .is_some_and(|vs| vs.contains(attr))
+                        {
+                            owner = Some(c);
+                            break;
+                        }
+                        cur = self.classes.get(&c).cloned().flatten();
+                    }
+                    let Some(owner) = owner else {
+                        return Err(CompileError::at(
+                            s.line,
+                            format!(
+                                "'{attr}' isn't a class variable of '{cn}' — declare it in the class body first"
+                            ),
+                        ));
+                    };
+                    let v = self.value_expr(cx, value)?;
+                    out.push(format!(
+                        "(call $dict_set (struct.get $CLASS 1 (global.get $g_class_{owner})) {} {v})",
+                        str_lit(attr)
+                    ));
+                    return Ok(());
+                }
                 let o = self.value_expr(cx, obj)?;
                 let v = self.value_expr(cx, value)?;
                 out.push(format!("(call $obj_setattr {o} {} {v})", str_lit(attr)));
@@ -6563,6 +6620,47 @@ impl Gen {
                         )),
                     };
                 }
+                // `Counter.limit` — a class-name base resolves at compile
+                // time to the owning class's dict (a same-named top-level
+                // variable shadows the class, like CPython).
+                if let ExprKind::Name(cn) = &obj.kind
+                    && self.classes.contains_key(cn)
+                    && !self.globals.contains(cn)
+                {
+                    let mut cur = Some(cn.clone());
+                    let mut hops = 0;
+                    while let Some(c) = cur {
+                        hops += 1;
+                        if hops > self.classes.len() + 1 {
+                            break;
+                        }
+                        if self
+                            .class_var_names
+                            .get(&c)
+                            .is_some_and(|vs| vs.contains(name))
+                        {
+                            return Ok(format!(
+                                "(call $dict_get (struct.get $CLASS 1 (global.get $g_class_{c})) {})",
+                                str_lit(name)
+                            ));
+                        }
+                        if self
+                            .class_method_names
+                            .get(&c)
+                            .is_some_and(|ms| ms.contains(name))
+                        {
+                            return Err(CompileError::at(
+                                e.line,
+                                format!("a method isn't a value yet — call it: {cn}.{name}(...)"),
+                            ));
+                        }
+                        cur = self.classes.get(&c).cloned().flatten();
+                    }
+                    return Err(CompileError::at(
+                        e.line,
+                        format!("class '{cn}' has no attribute '{name}'"),
+                    ));
+                }
                 let o = self.value_expr(cx, obj)?;
                 Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
             }
@@ -7635,8 +7733,12 @@ impl Gen {
                 Ok(Ty::Value)
             }
             ExprKind::Attr(obj, _) => {
-                // A module attribute (`math.pi`) isn't a value-attr read.
-                if !self.is_module_ref(cx, obj) {
+                // A module attribute (`math.pi`) isn't a value-attr read, and
+                // a CLASS-NAME base (`Counter.limit`) resolves at compile
+                // time — neither walks the base as a variable.
+                let class_base = matches!(&obj.kind, ExprKind::Name(n)
+                    if self.classes.contains_key(n) && !self.globals.contains(n));
+                if !self.is_module_ref(cx, obj) && !class_base {
                     self.type_of(cx, obj)?;
                 }
                 Ok(Ty::Value)

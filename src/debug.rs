@@ -1584,6 +1584,9 @@ enum Task {
     /// (`self.tricks.append(..)`): an instance attribute dispatches a frame,
     /// a container attribute mutates in place inside the attrs cell.
     CallMethodOnAttr(String, String, usize),
+    /// Pop a value; store it as class `0`'s class variable `1`
+    /// (`Counter.count = v` — resolved to the owning class at lowering).
+    StoreClassVar(String, String),
 }
 
 impl Task {
@@ -2053,6 +2056,37 @@ impl Vm {
                 );
             }
             StmtKind::SetAttr { obj, attr, value } => {
+                // Class-name base: write the class variable itself.
+                if let ExprKind::Name(cn) = &obj.kind
+                    && self.classes.contains_key(cn)
+                    && self.lookup(cn).is_none()
+                {
+                    let mut owner = None;
+                    let mut cur = Some(cn.clone());
+                    let mut hops = 0;
+                    while let Some(cname) = cur {
+                        hops += 1;
+                        if hops > self.classes.len() + 1 {
+                            break;
+                        }
+                        let Some(c) = self.classes.get(&cname) else {
+                            break;
+                        };
+                        if c.class_vars.contains_key(attr) {
+                            owner = Some(cname);
+                            break;
+                        }
+                        cur = c.base.clone();
+                    }
+                    let Some(owner) = owner else {
+                        return Err(format!(
+                            "'{attr}' isn't a class variable of '{cn}' — declare it in the class body first"
+                        ));
+                    };
+                    self.push_task(Task::StoreClassVar(owner, attr.clone()));
+                    self.push_task(Task::Eval(Rc::new(value.clone())));
+                    return Ok(());
+                }
                 self.push_task(Task::StoreAttr(attr.clone()));
                 self.push_task(Task::Eval(Rc::new(value.clone())));
                 self.push_task(Task::Eval(Rc::new(obj.clone())));
@@ -2447,6 +2481,12 @@ impl Vm {
                     self.push_op(out);
                 }
             }
+            Task::StoreClassVar(owner, attr) => {
+                let v = self.pop_op()?;
+                if let Some(c) = self.classes.get_mut(&owner) {
+                    c.class_vars.insert(attr, v);
+                }
+            }
             Task::CallSuper(owner, method, argc) => {
                 let mut args = Vec::with_capacity(argc);
                 for _ in 0..argc {
@@ -2525,6 +2565,36 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new((**obj).clone())));
             }
             ExprKind::Attr(obj, attr) => {
+                // `Counter.limit` — a class-name base resolves against the
+                // registry (a same-named variable shadows, like CPython).
+                if let ExprKind::Name(cn) = &obj.kind
+                    && self.classes.contains_key(cn)
+                    && self.lookup(cn).is_none()
+                {
+                    let mut cur = Some(cn.clone());
+                    let mut hops = 0;
+                    while let Some(cname) = cur {
+                        hops += 1;
+                        if hops > self.classes.len() + 1 {
+                            break;
+                        }
+                        let Some(c) = self.classes.get(&cname) else {
+                            break;
+                        };
+                        if let Some(v) = c.class_vars.get(attr) {
+                            let v = v.clone();
+                            self.push_op(v);
+                            return Ok(());
+                        }
+                        if c.methods.contains_key(attr) {
+                            return Err(
+                                "a method isn't a value yet — call it: obj.method(...)".to_string()
+                            );
+                        }
+                        cur = c.base.clone();
+                    }
+                    return Err(format!("class '{cn}' has no attribute '{attr}'"));
+                }
                 self.push_task(Task::AttrGet(attr.clone()));
                 self.push_task(Task::Eval(Rc::new((**obj).clone())));
             }
@@ -3509,6 +3579,21 @@ mod tests {
             "class Base:\n    tag = \"b\"\nclass Kid(Base):\n    extra = 1\n    def __init__(self):\n        self.z = 0\nk = Kid()\nprint(k.tag)\nprint(k.extra)\n",
         );
         assert_eq!(out2, "b\n1\n");
+    }
+
+    #[test]
+    fn vm_class_name_access_reads_and_writes() {
+        // The instance-counter idiom + chain read + shadow guard.
+        let out = vm_run(
+            "class Counter:\n    made = 0\n    def __init__(self):\n        Counter.made = Counter.made + 1\na = Counter()\nb = Counter()\nprint(Counter.made)\nprint(a.made)\n",
+        );
+        assert_eq!(out, "2\n2\n");
+        let out2 = vm_run(
+            "class Base:\n    tag = \"b\"\nclass Kid(Base):\n    def __init__(self):\n        self.z = 0\nprint(Kid.tag)\n",
+        );
+        assert_eq!(out2, "b\n");
+        let out3 = vm_run("class K:\n    v = 1\nK = 5\nprint(K)\n");
+        assert_eq!(out3, "5\n");
     }
 
     #[test]

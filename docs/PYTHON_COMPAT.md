@@ -122,6 +122,6 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (incl. as set elements), control flow, classes (v1 — see above), functions +
 recursion + default arguments + keyword arguments, `for`/`while`, list & dict comprehensions
 (nested, filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`,
-`input()`, and `print()` — all gated by the 191-case CPython differential
+`input()`, and `print()` — all gated by the 195-case CPython differential
 oracle (`tools/native_run.sh`), which also requires leak-freedom
 (`live == 0`).
