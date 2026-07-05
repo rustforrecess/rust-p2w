@@ -1600,6 +1600,9 @@ impl Task {
 struct VmClass {
     base: Option<String>,
     methods: HashMap<String, VmFunc>,
+    /// Class variables (evaluated at the class statement, like function
+    /// defaults — simple constants). Instance attrs shadow these.
+    class_vars: HashMap<String, Value>,
 }
 
 /// One call frame: its own continuation + operand stacks and local scope.
@@ -1995,10 +1998,9 @@ impl Vm {
                 methods,
                 class_vars,
             } => {
-                if !class_vars.is_empty() {
-                    return Err(
-                        "class variables aren't in the step debugger yet — use Run".to_string()
-                    );
+                let mut cvs = HashMap::new();
+                for (vname, vexpr) in class_vars {
+                    cvs.insert(vname.clone(), eval_const(vexpr)?);
                 }
                 let mut mm = HashMap::new();
                 for m in methods {
@@ -2046,6 +2048,7 @@ impl Vm {
                     VmClass {
                         base: base.clone(),
                         methods: mm,
+                        class_vars: cvs,
                     },
                 );
             }
@@ -2332,13 +2335,35 @@ impl Vm {
                         type_name(&v)
                     ));
                 };
-                let got = o
-                    .attrs
-                    .borrow()
-                    .get(&attr)
-                    .cloned()
-                    .ok_or_else(|| format!("this object has no attribute '{attr}'"))?;
-                self.push_op(got);
+                // Instance attrs shadow class variables; the fallback walks
+                // the inheritance chain (nearest class first).
+                if let Some(got) = o.attrs.borrow().get(&attr).cloned() {
+                    self.push_op(got);
+                    return Ok(());
+                }
+                let mut cur = Some(o.class.clone());
+                let mut hops = 0;
+                while let Some(cname) = cur {
+                    hops += 1;
+                    if hops > self.classes.len() + 1 {
+                        break;
+                    }
+                    let Some(c) = self.classes.get(&cname) else {
+                        break;
+                    };
+                    if let Some(cv) = c.class_vars.get(&attr) {
+                        let cv = cv.clone();
+                        self.push_op(cv);
+                        return Ok(());
+                    }
+                    if c.methods.contains_key(&attr) {
+                        return Err(
+                            "a method isn't a value yet — call it: obj.method(...)".to_string()
+                        );
+                    }
+                    cur = c.base.clone();
+                }
+                return Err(format!("this object has no attribute '{attr}'"));
             }
             Task::StoreAttr(attr) => {
                 let value = self.pop_op()?;
@@ -3470,6 +3495,20 @@ mod tests {
             "class Deck:\n    def __init__(self):\n        self.cards = [\"A\", \"K\"]\n    def __len__(self):\n        return len(self.cards)\n    def __getitem__(self, i):\n        return self.cards[i]\nd = Deck()\nprint(len(d))\nprint(d[1])\n",
         );
         assert_eq!(out4, "2\nK\n");
+    }
+
+    #[test]
+    fn vm_class_variables_shadow_and_inherit() {
+        // Instance attrs shadow; the class var stays untouched for others;
+        // base-class vars are visible through the chain.
+        let out = vm_run(
+            "class Counter:\n    kind = \"counter\"\n    limit = 10\n    def __init__(self):\n        self.n = 0\nc = Counter()\nprint(c.kind)\nprint(c.limit)\nc.limit = 3\nprint(c.limit)\nd = Counter()\nprint(d.limit)\n",
+        );
+        assert_eq!(out, "counter\n10\n3\n10\n");
+        let out2 = vm_run(
+            "class Base:\n    tag = \"b\"\nclass Kid(Base):\n    extra = 1\n    def __init__(self):\n        self.z = 0\nk = Kid()\nprint(k.tag)\nprint(k.extra)\n",
+        );
+        assert_eq!(out2, "b\n1\n");
     }
 
     #[test]

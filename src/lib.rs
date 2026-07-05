@@ -431,9 +431,9 @@ print(\"sum of evens:\", total)
         let e_ar = compile_to_llvm_ir("class V:\n    def __eq__(self):\n        return True\n")
             .unwrap_err();
         assert!(e_ar.contains("exactly 2"), "{e_ar}");
-        // Class variables are a clean native error for now.
-        let e2 = compile_to_llvm_ir("class K:\n    count = 0\n").unwrap_err();
-        assert!(e2.contains("class variables"), "{e2}");
+        // Class variables: instance attrs shadow, the chain falls back.
+        let cv = compile_to_llvm_ir("class K:\n    count = 0\nk = K()\nprint(k.count)\n").unwrap();
+        assert!(cv.contains("@cv_K_count"), "{cv}");
         // super() outside a method / unknown base are clean errors.
         let e3 = compile_to_llvm_ir("class B(Missing):\n    def m(self):\n        return 1\n")
             .unwrap_err();

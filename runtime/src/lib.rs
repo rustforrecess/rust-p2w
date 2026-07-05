@@ -1345,8 +1345,36 @@ pub extern "C" fn p2w_getattr(obj: Value, name: Value) -> Value {
     let attrs = rd(obj as usize + 12) as usize;
     match dict_find(attrs, name) {
         Some(i) => owned(dict_val(attrs, i)),
-        None => trap("this object has no attribute with that name"),
+        // Instance attrs shadow class variables; a miss asks the module's
+        // generated class-namespace lookup (which traps friendly if the
+        // name is a method or genuinely absent).
+        None => unsafe { p2w_classvar(obj, name) },
     }
+}
+
+/// Byte-compare a heap string value against a literal (for the generated
+/// class-variable lookup — no allocation).
+#[unsafe(no_mangle)]
+/// # Safety
+/// `p`/`len` must describe a valid byte literal (the compiler generates the
+/// call sites from its own interned globals).
+pub unsafe extern "C" fn p2w_str_eq_lit(v: Value, p: *const u8, len: i32) -> bool {
+    if !(is_heap(v) && obj_tag(v) == T_STR) || str_len(v) != len as usize {
+        return false;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(p, len as usize) };
+    (0..len as usize).all(|i| str_byte(v, i) == bytes[i])
+}
+
+/// The generated class-namespace lookup's dead ends.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_no_such_attribute() -> Value {
+    trap("this object has no attribute with that name");
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_method_not_value() -> Value {
+    trap("a method isn't a value yet — call it: obj.method(...)");
 }
 
 /// `obj.attr = value` — BORROWS `obj`; TRANSFERS `name` and `value` in
@@ -2157,6 +2185,10 @@ unsafe extern "C" {
     /// (op codes above; `__eq__` includes reflected + identity fallback).
     /// BORROWS both operands; returns an owned value.
     fn p2w_obj_op(op: i32, a: Value, b: Value) -> Value;
+    /// Class-variable fallback for an attribute miss — GENERATED per module
+    /// (instance -> class-namespace chain; methods and true misses trap).
+    /// BORROWS both; returns an owned value.
+    fn p2w_classvar(obj: Value, name: Value) -> Value;
 }
 
 #[unsafe(no_mangle)]
@@ -2394,6 +2426,12 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn p2w_obj_op(_op: i32, _a: Value, _b: Value) -> Value {
         panic!("p2w_obj_op is module-generated; unit tests must not reach it");
+    }
+
+    // ...and attribute misses reference the module-generated p2w_classvar.
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_classvar(_obj: Value, _name: Value) -> Value {
+        trap("this object has no attribute with that name");
     }
 
     // The heap is one shared `static mut`, but `cargo test` runs tests in

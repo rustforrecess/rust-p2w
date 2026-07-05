@@ -90,6 +90,9 @@ declare i32 @p2w_getattr(i32, i32)
 declare void @p2w_setattr(i32, i32, i32)
 declare i32 @p2w_no_such_method()
 declare i32 @p2w_unsupported_operand()
+declare i1 @p2w_str_eq_lit(i32, ptr, i32)
+declare i32 @p2w_no_such_attribute()
+declare i32 @p2w_method_not_value()
 ; sets + set/bitwise operators + membership
 declare i32 @p2w_set_new()
 declare i32 @p2w_set_of(i32)
@@ -161,12 +164,6 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
             class_vars,
         } = &s.kind
         {
-            if !class_vars.is_empty() {
-                return Err(format!(
-                    "line {}: class variables aren't in the native backend yet",
-                    s.line
-                ));
-            }
             let mut mmap = HashMap::new();
             for m in methods {
                 // Dunders the backend actually dispatches; anything else is an
@@ -213,6 +210,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
                 name: name.clone(),
                 base: base.clone(),
                 methods: mmap,
+                class_vars: class_vars.clone(),
             });
         }
     }
@@ -394,6 +392,81 @@ fn emit_class_glue(classes: &ClassTable, dispatchers: &[(String, usize)]) -> (St
     defs.push_str(&body);
     defs.push('\n');
 
+    // --- class-variable globals + p2w_classvar (attr-miss fallback):
+    // instance attrs shadow these; the lookup walks the chain nearest-first,
+    // then flags method names ("a method isn't a value"), then traps.
+    // ALWAYS defined — the runtime links against it.
+    {
+        let mut name_globals: HashSet<String> = HashSet::new();
+        let mut ng = |s: &str, globals: &mut String| -> String {
+            let g = format!("cvn_{s}");
+            if name_globals.insert(s.to_string()) {
+                globals.push_str(&byte_global(&g, s));
+            }
+            g
+        };
+        for d in &classes.decls {
+            for (vname, _) in &d.class_vars {
+                globals.push_str(&format!("@cv_{}_{vname} = internal global i32 0\n", d.name));
+            }
+        }
+        let mut b = String::from("define i32 @p2w_classvar(i32 %v, i32 %n) {\nentry:\n");
+        if classes.decls.is_empty() {
+            b.push_str("  %t = call i32 @p2w_no_such_attribute()\n  ret i32 %t\n}\n");
+        } else {
+            b.push_str("  %cid = call i32 @p2w_class_id(i32 %v)\n");
+            let arms: Vec<String> = (0..classes.decls.len())
+                .map(|i| format!("i32 {i}, label %k{i}"))
+                .collect();
+            b.push_str(&format!(
+                "  switch i32 %cid, label %miss [ {} ]\n",
+                arms.join(" ")
+            ));
+            for (i, d) in classes.decls.iter().enumerate() {
+                b.push_str(&format!("k{i}:\n  br label %k{i}_0\n"));
+                // Chain vars nearest-first (subclass shadows base), then the
+                // chain's method names (a friendly not-a-value trap).
+                let mut checks: Vec<(String, String)> = Vec::new(); // (name, action)
+                let mut seen: HashSet<String> = HashSet::new();
+                for cd in classes.chain(&d.name) {
+                    for (vname, _) in &cd.class_vars {
+                        if seen.insert(vname.clone()) {
+                            checks.push((vname.clone(), format!("cv_{}_{vname}", cd.name)));
+                        }
+                    }
+                }
+                for cd in classes.chain(&d.name) {
+                    for m in cd.methods.keys() {
+                        if seen.insert(m.clone()) {
+                            checks.push((m.clone(), String::new())); // method
+                        }
+                    }
+                }
+                for (j, (name, action)) in checks.iter().enumerate() {
+                    let g = ng(name, &mut globals);
+                    b.push_str(&format!(
+                        "k{i}_{j}:\n  %e{i}_{j} = call i1 @p2w_str_eq_lit(i32 %n, ptr @{g}, i32 {})\n  br i1 %e{i}_{j}, label %h{i}_{j}, label %k{i}_{}\n",
+                        name.len(),
+                        j + 1
+                    ));
+                    if action.is_empty() {
+                        b.push_str(&format!(
+                            "h{i}_{j}:\n  %m{i}_{j} = call i32 @p2w_method_not_value()\n  ret i32 %m{i}_{j}\n"
+                        ));
+                    } else {
+                        b.push_str(&format!(
+                            "h{i}_{j}:\n  %g{i}_{j} = load i32, ptr @{action}\n  call void @p2w_retain(i32 %g{i}_{j})\n  ret i32 %g{i}_{j}\n"
+                        ));
+                    }
+                }
+                b.push_str(&format!("k{i}_{}:\n  br label %miss\n", checks.len()));
+            }
+            b.push_str("miss:\n  %t = call i32 @p2w_no_such_attribute()\n  ret i32 %t\n}\n");
+        }
+        defs.push_str(&b);
+        defs.push('\n');
+    }
+
     // --- p2w_obj_op: operator-dunder dispatch (the runtime's op hooks call
     // this for any instance operand). Per op: switch class_id(a) over the
     // classes whose chain defines the dunder -> direct call (operands
@@ -563,6 +636,10 @@ struct ClassDecl {
     name: String,
     base: Option<String>,
     methods: HashMap<String, usize>,
+    /// Class variables in source order: read via instance -> class-namespace
+    /// fallback (an attr miss); values live in per-class module globals
+    /// initialized in main's prologue.
+    class_vars: Vec<(String, Expr)>,
 }
 
 /// All classes in the module, id-ordered (the id is what `p2w_class_id`
@@ -588,6 +665,22 @@ impl ClassTable {
             cur = d.base.as_deref()?;
         }
         None
+    }
+
+    /// The inheritance chain starting at `class` (nearest first), hop-capped.
+    fn chain(&self, class: &str) -> Vec<&ClassDecl> {
+        let mut out = Vec::new();
+        let mut cur = class;
+        for _ in 0..=self.decls.len() {
+            let Some(&id) = self.ids.get(cur) else { break };
+            let d = &self.decls[id as usize];
+            out.push(d);
+            match &d.base {
+                Some(b) => cur = b,
+                None => break,
+            }
+        }
+        out
     }
 
     /// Every method name any class defines — the gate that routes a
@@ -685,6 +778,18 @@ fn emit_main(
     // First-assignment slot inference for main's locals (no params here; the
     // walker skips Def bodies — separate scopes).
     f.inferred = infer_slot_reprs(stmts, &HashMap::new(), sigs.ret_reprs);
+    // Class-variable globals: evaluated up front (declaration order), stored
+    // owned in @cv_* module globals, released at main's exit — the generated
+    // p2w_classvar reads them on an attribute miss.
+    let mut cv_slots: Vec<String> = Vec::new();
+    for d in &sigs.classes.decls {
+        for (vname, vexpr) in &d.class_vars {
+            let (v, vr) = f.eval_for_slot(Repr::Boxed, vexpr)?;
+            let v = f.as_boxed(v, vr);
+            f.line(&format!("store i32 {v}, ptr @cv_{}_{vname}", d.name));
+            cv_slots.push(format!("@cv_{}_{vname}", d.name));
+        }
+    }
     // Analyze the UNFILTERED module so def-body reads pin their globals (a
     // function can run at any later point); defs themselves emit nothing here.
     let live = Liveness::analyze(stmts);
@@ -704,7 +809,7 @@ fn emit_main(
         // ...and free the interned-literal cache (module globals filled by any
         // function or main; a never-executed literal's slot is 0 → no-op).
         str_caches.extend(f.str_caches.iter().cloned());
-        for slot in str_caches.iter() {
+        for slot in str_caches.iter().chain(cv_slots.iter()) {
             let t = f.temp();
             f.body.push_str(&format!("  {t} = load i32, ptr {slot}\n"));
             f.body
@@ -4061,11 +4166,17 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_are_clean_errors() {
-        // Classes aren't in the native backend yet.
+        // A class variable now compiles: a cv_* global + the classvar lookup.
+        let out = emit_llvm_ir(&parse("class C:\n    x = 1\nc = C()\nprint(c.x)\n")).unwrap();
+        assert!(out.contains("@cv_C_x = internal global i32 0"), "{out}");
+        assert!(out.contains("define i32 @p2w_classvar"), "{out}");
+        // A still-unsupported dunder remains a clean error.
         assert!(
-            emit_llvm_ir(&parse("class C:\n    x = 1\n"))
-                .unwrap_err()
-                .contains("native")
+            emit_llvm_ir(&parse(
+                "class D:\n    def __setitem__(self, k, v):\n        return 0\n"
+            ))
+            .unwrap_err()
+            .contains("__setitem__")
         );
     }
 

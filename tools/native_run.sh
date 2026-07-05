@@ -301,6 +301,12 @@ run_case branch_reuse_alias 'flag = 1\nxs: list[int] = [1, 2, 3]\nzs = xs\nif fl
 run_case branch_unmentioned_arm 'flag = 0\nxs: list[int] = [1, 2, 3]\nif flag == 1:\n    ys = [x * 2 for x in xs]\nelse:\n    ys = [9]\nprint(ys)\n' '[9]' || fails=$((fails+1))
 run_case branch_token_slice 'flag = 1\nxs = [1, 2, 3, 4]\nif flag == 1:\n    ys = xs[1:]\nelse:\n    ys = xs[:2]\nprint(ys)\n' '[2, 3, 4]' || fails=$((fails+1))
 
+# --- class variables (instance shadows; chain fallback; per-class storage) ---
+run_case classvar_basic 'class Counter:\n    kind = "counter"\n    limit = 10\n    def __init__(self):\n        self.n = 0\nc = Counter()\nprint(c.kind)\nprint(c.limit)\nc.limit = 3\nprint(c.limit)\nd = Counter()\nprint(d.limit)\n' 'counter\n10\n3\n10' || fails=$((fails+1))
+run_case classvar_inherit 'class Base:\n    tag = "b"\nclass Kid(Base):\n    extra = 1\n    def __init__(self):\n        self.z = 0\nk = Kid()\nprint(k.tag)\nprint(k.extra)\n' 'b\n1' || fails=$((fails+1))
+run_case classvar_shadow_sub 'class A:\n    v = 1\nclass B(A):\n    v = 2\n    def __init__(self):\n        self.w = 0\nb = B()\nprint(b.v)\n' '2' || fails=$((fails+1))
+run_case classvar_str 'class M:\n    words = "hello"\n    def __init__(self):\n        self.x = 0\nm1 = M()\nm2 = M()\nprint(m1.words + " " + m2.words)\n' 'hello hello' || fails=$((fails+1))
+
 # --- operator dunders on native (p2w_obj_op: direct / reflected-eq / identity) ---
 run_case dunder_add 'class Vec:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def __add__(self, o):\n        return Vec(self.x + o.x, self.y + o.y)\n    def __str__(self):\n        return "Vec(" + str(self.x) + ", " + str(self.y) + ")"\nv = Vec(1, 2) + Vec(3, 4)\nprint(v)\n' 'Vec(4, 6)' || fails=$((fails+1))
 run_case dunder_eq 'class Pt:\n    def __init__(self, x):\n        self.x = x\n    def __eq__(self, o):\n        return self.x == o.x\na = Pt(3)\nb = Pt(3)\nc = Pt(4)\nprint(a == b)\nprint(a == c)\nprint(a != c)\n' 'True\nFalse\nTrue' || fails=$((fails+1))

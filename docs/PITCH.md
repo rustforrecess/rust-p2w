@@ -73,8 +73,8 @@ The subset is broad and **consistent across all three execution paths**: ints,
 floats, strings, lists, dicts, packed arrays, control flow, functions+recursion
 (+ default/keyword args), iteration, methods, list/dict comprehensions, slices,
 f-strings (incl. format specs), `input()`, **classes** (v1: attrs, methods,
-single inheritance, `super()`, `__repr__`/`__str__` — compile-time switch
-dispatch, no vtables), **sets** (full set theory + methods, sorted canonical
+single inheritance, `super()`, `__repr__`/`__str__`, class variables, and
+the operator dunders — compile-time switch dispatch, no vtables), **sets** (full set theory + methods, sorted canonical
 display), and **real tuples** — a distinct *immutable* type (item-assignment is
 an error), which also lets sets reject mutable members (`{[1,2]}` → "use a
 tuple") exactly like CPython.
@@ -83,7 +83,7 @@ Memory management is **precise and validated**: the emitter inserts retain/relea
 under a documented transfer-ownership model (with borrow-on-read and borrowed
 parameters as landed optimizations); a small `no_std` runtime (`p2w-rt`)
 implements the value rep + arena + strings/lists/dicts/packed-arrays/iteration +
-RC. 27 runtime + 185 lib + 165 integration tests.
+RC. 35 runtime + 228 lib + 165 integration tests.
 
 ### It compiles to the board's actual CPU — shown, not promised
 
@@ -114,7 +114,7 @@ live-object counter (`p2w_live()`) and an allocation counter (`p2w_allocs()`), s
 each program through real LLVM, runs it, diffs stdout against CPython, asserts
 **`live_objects == 0`** at exit, and lets us *measure* the reuse win in allocations.
 
-**187 cases pass that gate**, all ending `live == 0` — including adversaries
+**191 cases pass that gate**, all ending `live == 0` — including adversaries
 that attack each reuse guard (aliased sources, borrowed-param theft, freed-cell
 corruption). It caught a real double-free during bring-up (a dict-update
 freeing a key the runtime already owned). A **differential fuzzer**
@@ -165,7 +165,7 @@ packed `list[int/float]`, control flow, functions+recursion, iteration, methods,
 list/dict comprehensions, slices, f-strings, sets, immutable tuples) with a
 **complete value model**, precise validated RC, and the **full drop-reuse
 tier** (last-mention liveness, precise drops, four reuse forms — the original
-reuse wishlist is closed). Host run-oracle green: **187 cases, `live == 0`**;
+reuse wishlist is closed). Host run-oracle green: **191 cases, `live == 0`**;
 217 lib + 31 runtime tests; differential fuzzer at 120 seeds green.
 **Cross-compiles + links to a Cortex-M33 image** (`tools/pico_build.sh`,
 ~8–9 KB) and **builds + runs as a linear-memory WASM component**

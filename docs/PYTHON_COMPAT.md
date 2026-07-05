@@ -89,8 +89,13 @@ semantics and leak-freedom are oracle-gated). Differences:
   backend doesn't dispatch (e.g. `__setitem__`) is a clean compile error, as
   is a dispatched dunder with the wrong parameter count. No reflected
   arithmetic (`__radd__`-style) yet: `5 + obj` is a clean runtime error.
-- **Class variables and first-class methods** (`f = d.speak`) are clean
-  errors for now.
+- **Class variables work** (instance attrs shadow them; the fallback walks
+  the inheritance chain, nearest class first; `c.limit = 3` writes the
+  INSTANCE, leaving the class value untouched — all CPython-matching).
+  Reading via the class name (`Counter.limit`) isn't supported yet, and in
+  the step debugger the values must be simple constants (like function
+  defaults). **First-class methods** (`f = d.speak`) stay a clean error:
+  "a method isn't a value yet — call it".
 
 ## Other gaps (clean errors, not silent differences)
 
@@ -117,6 +122,6 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (incl. as set elements), control flow, classes (v1 — see above), functions +
 recursion + default arguments + keyword arguments, `for`/`while`, list & dict comprehensions
 (nested, filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`,
-`input()`, and `print()` — all gated by the 187-case CPython differential
+`input()`, and `print()` — all gated by the 191-case CPython differential
 oracle (`tools/native_run.sh`), which also requires leak-freedom
 (`live == 0`).
