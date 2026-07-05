@@ -132,6 +132,23 @@ pub fn undefined_name_warnings(source: &str) -> Vec<(usize, String)> {
     }
 }
 
+/// Unused-local warnings, as `(line, message)` pairs — a variable assigned
+/// inside a function/method but never read anywhere in it ("you set `result`
+/// but never used it"). A **gentle lint**, scoped to the safe subset every
+/// mainstream linter uses: only plain assignments (not loop vars, unpack
+/// targets, or params), never module/class level, with reads over-approximated
+/// (a closure or another branch reading the name suppresses it) — so it never
+/// cries wolf. Error-recovering parse; empty when nothing lexes.
+pub fn unused_assignment_warnings(source: &str) -> Vec<(usize, String)> {
+    match lexer::lex(source) {
+        Ok(toks) => {
+            let (stmts, _) = parser::parse_recovering(&toks);
+            lint::unused_assignment_warnings(&stmts)
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

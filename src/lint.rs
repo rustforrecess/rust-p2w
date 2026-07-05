@@ -9,6 +9,8 @@
 //!   "bound" so only genuinely-undefined names flag;
 //! - `type_churn_warnings` — a name reused for a different *kind* of value
 //!   (`x = 1` … `x = "hi"`), the instrument for the reject-vs-demote decision;
+//! - `unused_assignment_warnings` — a function-local set but never read ("you
+//!   set `result` but never used it"), scoped to the mainstream-safe subset;
 //! - `may_form_cycle`, `set_typed_names`, `set_operator_spans` — analysis seams
 //!   the backends / IDE consume.
 
@@ -1108,6 +1110,302 @@ fn read_comp_clauses(
     }
 }
 
+/// Unused-local warnings: a variable assigned inside a function/method but
+/// never read anywhere in that function — the "you set `result` but never
+/// used it" smell (usually a forgotten `return`/`print`, or a leftover line).
+/// `(line, message)`, kid-facing.
+///
+/// Scoped to the **unimpeachably safe** subset every mainstream linter uses:
+/// - only plain `x = …` / `x: T = …` assignments (NOT loop vars, unpack
+///   targets, or parameters — an unused loop counter or unpacked half is
+///   idiomatic, and a param is part of a signature);
+/// - **module/class level is never flagged** (top-level names are, by
+///   convention, treated as usable elsewhere — and it's where an intentional
+///   discard lives);
+/// - "read" is **over-approximated** — reads inside nested `def`/`class` bodies
+///   (closures) count, so a used name is never flagged; the worst case is a
+///   *missed* warning, never a false alarm;
+/// - a `_`-prefixed name is a deliberate throwaway and is skipped;
+/// - a name that reads itself (`x = x + 1`) counts as read, so accumulators
+///   never fire.
+pub fn unused_assignment_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    // Module top level is not a flagging scope; only recurse into functions.
+    for s in stmts {
+        collect_unused_in_defs(s, &mut out);
+    }
+    out.sort_by_key(|(line, _)| *line);
+    out
+}
+
+/// Find function/method scopes under `s` and analyze each for unused locals.
+fn collect_unused_in_defs(s: &Stmt, out: &mut Vec<(usize, String)>) {
+    match &s.kind {
+        StmtKind::Def { params, body, .. } => analyze_fn_unused(body, params, out),
+        StmtKind::ClassDef { methods, .. } => {
+            for m in methods {
+                analyze_fn_unused(&m.body, &m.params, out);
+            }
+        }
+        // A def can be nested inside control flow at module level; keep looking.
+        StmtKind::If {
+            body,
+            elifs,
+            else_body,
+            ..
+        } => {
+            for st in body {
+                collect_unused_in_defs(st, out);
+            }
+            for (_, b) in elifs {
+                for st in b {
+                    collect_unused_in_defs(st, out);
+                }
+            }
+            if let Some(b) = else_body {
+                for st in b {
+                    collect_unused_in_defs(st, out);
+                }
+            }
+        }
+        StmtKind::For { body, .. }
+        | StmtKind::ForEach { body, .. }
+        | StmtKind::While { body, .. } => {
+            for st in body {
+                collect_unused_in_defs(st, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Analyze one function/method body: flag its own plain assignments to names
+/// never read anywhere in the body (nested scopes included). Then recurse into
+/// nested functions/methods for their own analysis.
+fn analyze_fn_unused(body: &[Stmt], params: &[String], out: &mut Vec<(usize, String)>) {
+    let mut reads: HashSet<String> = HashSet::new();
+    collect_all_reads(body, &mut reads);
+    flag_unused_assigns(body, params, &reads, out);
+    // Nested scopes analyze independently.
+    for s in body {
+        collect_unused_in_defs(s, out);
+    }
+}
+
+/// Flag plain assignments in this scope's statements (through control flow, NOT
+/// into nested def/class bodies) whose target is never read.
+fn flag_unused_assigns(
+    stmts: &[Stmt],
+    params: &[String],
+    reads: &HashSet<String>,
+    out: &mut Vec<(usize, String)>,
+) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, _) | StmtKind::AnnAssign { name, .. } => {
+                if !reads.contains(name)
+                    && !name.starts_with('_')
+                    && !params.iter().any(|p| p == name)
+                {
+                    out.push((
+                        s.line,
+                        format!(
+                            "`{name}` is set but never used — did you forget to use it (e.g. \
+                             `return {name}` / `print({name})`), or is it a leftover line?"
+                        ),
+                    ));
+                }
+            }
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                flag_unused_assigns(body, params, reads, out);
+                for (_, b) in elifs {
+                    flag_unused_assigns(b, params, reads, out);
+                }
+                if let Some(b) = else_body {
+                    flag_unused_assigns(b, params, reads, out);
+                }
+            }
+            StmtKind::For { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::While { body, .. } => flag_unused_assigns(body, params, reads, out),
+            _ => {}
+        }
+    }
+}
+
+/// Every bare-name read anywhere under `stmts`, **including nested def/class
+/// bodies** (a closure reading an outer local must suppress the warning). Over-
+/// approximate on purpose: a nested scope's own same-named local also counts,
+/// which only ever *misses* a warning — never invents one.
+fn collect_all_reads(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(_, value) | StmtKind::AnnAssign { value, .. } => reads_of(value, out),
+            StmtKind::For {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                reads_of(start, out);
+                reads_of(end, out);
+                reads_of(step, out);
+                collect_all_reads(body, out);
+            }
+            StmtKind::ForEach { iterable, body, .. } => {
+                reads_of(iterable, out);
+                collect_all_reads(body, out);
+            }
+            StmtKind::While { cond, body } => {
+                reads_of(cond, out);
+                collect_all_reads(body, out);
+            }
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                reads_of(cond, out);
+                collect_all_reads(body, out);
+                for (c, b) in elifs {
+                    reads_of(c, out);
+                    collect_all_reads(b, out);
+                }
+                if let Some(b) = else_body {
+                    collect_all_reads(b, out);
+                }
+            }
+            StmtKind::Return(Some(e)) | StmtKind::Expr(e) => reads_of(e, out),
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                reads_of(target, out);
+                reads_of(index, out);
+                reads_of(value, out);
+            }
+            StmtKind::SetAttr { obj, value, .. } => {
+                reads_of(obj, out);
+                reads_of(value, out);
+            }
+            StmtKind::UnpackAssign { targets, value } => {
+                reads_of(value, out);
+                for t in targets {
+                    if !matches!(t.kind, ExprKind::Name(_)) {
+                        reads_of(t, out);
+                    }
+                }
+            }
+            // Descend into nested scopes so a closure read counts.
+            StmtKind::Def { body, defaults, .. } => {
+                for e in defaults {
+                    reads_of(e, out);
+                }
+                collect_all_reads(body, out);
+            }
+            StmtKind::ClassDef {
+                methods,
+                class_vars,
+                ..
+            } => {
+                for (_, e) in class_vars {
+                    reads_of(e, out);
+                }
+                for m in methods {
+                    collect_all_reads(&m.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect the bare-name reads of one expression (callee names excluded — they
+/// aren't variable reads in this subset).
+fn reads_of(e: &Expr, out: &mut HashSet<String>) {
+    match &e.kind {
+        ExprKind::Name(n) => {
+            out.insert(n.clone());
+        }
+        ExprKind::Unary(_, x) => reads_of(x, out),
+        ExprKind::Bin(_, a, b) => {
+            reads_of(a, out);
+            reads_of(b, out);
+        }
+        ExprKind::Call(_, args) => {
+            for a in args {
+                reads_of(a, out);
+            }
+        }
+        ExprKind::Kwarg(_, v) => reads_of(v, out),
+        ExprKind::List(items) | ExprKind::Tuple(items) => {
+            for it in items {
+                reads_of(it, out);
+            }
+        }
+        ExprKind::Dict(pairs) => {
+            for (k, v) in pairs {
+                reads_of(k, out);
+                reads_of(v, out);
+            }
+        }
+        ExprKind::Index(o, i) => {
+            reads_of(o, out);
+            reads_of(i, out);
+        }
+        ExprKind::Slice {
+            obj,
+            start,
+            stop,
+            step,
+        } => {
+            reads_of(obj, out);
+            for b in [start, stop, step].into_iter().flatten() {
+                reads_of(b, out);
+            }
+        }
+        ExprKind::MethodCall(obj, _, args) => {
+            reads_of(obj, out);
+            for a in args {
+                reads_of(a, out);
+            }
+        }
+        ExprKind::Attr(obj, _) => reads_of(obj, out),
+        ExprKind::ListComp { element, clauses } => {
+            reads_of(element, out);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => reads_of(iter, out),
+                    CompClause::If(cond) => reads_of(cond, out),
+                }
+            }
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => {
+            reads_of(key, out);
+            reads_of(value, out);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => reads_of(iter, out),
+                    CompClause::If(cond) => reads_of(cond, out),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,6 +1656,55 @@ mod tests {
         );
         // Handler-as-value: a def name passed as an argument.
         assert!(undef("def boom():\n    return 0\non_click(boom)\n").is_empty());
+    }
+
+    fn unused(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        unused_assignment_warnings(&stmts)
+    }
+
+    #[test]
+    fn unused_flags_dead_locals() {
+        // A local set and never read → the forgotten-return smell.
+        let w = unused("def f():\n    result = 1 + 2\n    return 5\n");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, 2);
+        assert!(w[0].1.contains("`result`"));
+        // Inside a method too.
+        assert_eq!(
+            unused("class C:\n    def m(self):\n        tmp = 9\n        return 0\n").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unused_does_not_cry_wolf() {
+        // Used locals never fire.
+        assert!(unused("def f():\n    x = 1\n    return x\n").is_empty());
+        // Self-referential accumulator (reads itself) — not dead.
+        assert!(unused("def f():\n    t = 0\n    t = t + 1\n    return t\n").is_empty());
+        // Read in another branch counts.
+        assert!(
+            unused("def f(c):\n    x = 1\n    if c:\n        return x\n    return 0\n").is_empty()
+        );
+        // Closure read (nested function) suppresses it.
+        assert!(
+            unused(
+                "def outer():\n    n = 5\n    def inner():\n        return n\n    return inner\n"
+            )
+            .is_empty()
+        );
+        // `_`-prefixed is a deliberate throwaway.
+        assert!(unused("def f():\n    _tmp = compute()\n    return 0\n").is_empty());
+        // Loop vars, unpack targets, and params are NOT flagged.
+        assert!(unused("def f():\n    for i in range(3):\n        print(\"hi\")\n").is_empty());
+        assert!(unused("def f(pair):\n    a, b = pair\n    return a\n").is_empty());
+        assert!(unused("def f(unused_param):\n    return 1\n").is_empty());
+        // Module/class level is never flagged (conservative by design).
+        assert!(unused("answer = 42\n").is_empty());
+        // Used via attribute/index still counts as a read.
+        assert!(unused("def f():\n    xs = [1, 2]\n    return xs[0]\n").is_empty());
     }
 
     #[test]
