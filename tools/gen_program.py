@@ -37,6 +37,9 @@ class Gen:
         self.lists = {}  # name -> (length, element magnitude bound)
         self.classes = {}  # class name -> __init__ arity (excl. self)
         self.objs = {}  # instance name -> class name
+        self.dicts = {}  # name -> list of known int keys (in-bounds reads)
+        self.sets = {}  # name -> "int" | "str" (element kind)
+        self.tuples = {}  # name -> length
         self.lines = []
         self.n = 0
 
@@ -191,6 +194,112 @@ class Gen:
         src = self.r.choice(sorted(self.lists))
         self.lists[a] = self.lists[src]
         self.lines.append(f"{a} = {src}")
+
+    def _scalar(self):
+        """A small, always-safe literal element/value: a number 0-99 or a short
+        ASCII string. Only ever printed or summed, never fed into tracked
+        arithmetic, so no magnitude concern; scalar so no cycle is possible."""
+        if self.r.random() < 0.6:
+            return str(self.r.randint(0, 99))
+        return '"' + "".join(self.r.choice("abcde") for _ in range(self.r.randint(1, 3))) + '"'
+
+    def new_dict(self):
+        # int keys (0-9, so updates collide); scalar values. Display order is
+        # not diffed — only len / in-bounds reads are printed (deterministic).
+        d = self.name("d")
+        keys = self.r.sample(range(10), self.r.randint(1, 3))
+        items = ", ".join(f"{k}: {self._scalar()}" for k in keys)
+        self.dicts[d] = keys
+        self.lines.append(f"{d} = {{{items}}}")
+
+    def dict_op(self):
+        if not self.dicts:
+            return self.new_dict()
+        d = self.r.choice(sorted(self.dicts))
+        keys = self.dicts[d]
+        pick = self.r.random()
+        if pick < 0.4 and keys:
+            # Update an EXISTING key -> exercises dict_set's release-of-old.
+            k = self.r.choice(keys)
+            self.lines.append(f"{d}[{k}] = {self._scalar()}")
+        elif pick < 0.65:
+            # Insert a possibly-new key.
+            k = self.r.randint(0, 9)
+            if k not in keys:
+                keys.append(k)
+            self.lines.append(f"{d}[{k}] = {self._scalar()}")
+        elif pick < 0.85 and keys:
+            self.lines.append(f"print({d}[{self.r.choice(keys)}])")  # in-bounds read
+        else:
+            self.lines.append(f"print(len({d}))")
+
+    def new_set(self):
+        # Small element range so duplicates dedup (exercises the dedup-release).
+        # Display order differs from CPython, so a set is NEVER printed whole —
+        # only order-independent observations (len / membership / sum / op-size).
+        s = self.name("st")
+        if self.r.random() < 0.6:
+            self.sets[s] = "int"
+            elems = ", ".join(str(self.r.randint(0, 4)) for _ in range(self.r.randint(2, 5)))
+        else:
+            self.sets[s] = "str"
+            elems = ", ".join(
+                '"' + self.r.choice("abcd") + '"' for _ in range(self.r.randint(2, 5))
+            )
+        self.lines.append(f"{s} = {{{elems}}}")
+
+    def set_op(self):
+        if not self.sets:
+            return self.new_set()
+        s = self.r.choice(sorted(self.sets))
+        kind = self.sets[s]
+        peers = [t for t in sorted(self.sets) if self.sets[t] == kind and t != s]
+        pick = self.r.random()
+        if pick < 0.3:
+            self.lines.append(f"print(len({s}))")
+        elif pick < 0.55:
+            probe = str(self.r.randint(0, 5)) if kind == "int" else '"' + self.r.choice("abcde") + '"'
+            self.lines.append(f"print({probe} in {s})")
+        elif pick < 0.75 and kind == "int":
+            # Sum is commutative -> order-independent -> matches CPython.
+            acc = self.name("v")
+            e = self.name("e")
+            self.lines.append(f"{acc} = 0")
+            self.lines.append(f"for {e} in {s}:")
+            self.lines.append(f"    {acc} = {acc} + {e}")
+            self.lines.append(f"print({acc})")
+        elif peers:
+            t = self.r.choice(peers)
+            op = self.r.choice(["&", "|", "-", "^"])
+            self.lines.append(f"print(len({s} {op} {t}))")  # size is order-free
+        else:
+            self.lines.append(f"print(len({s}))")
+
+    def new_tuple(self):
+        # Tuples are ordered -> printing IS deterministic and diff-safe.
+        t = self.name("t")
+        n = self.r.randint(1, 4)
+        elems = ", ".join(self._scalar() for _ in range(n))
+        if n == 1:
+            elems += ","  # 1-tuple
+        self.tuples[t] = n
+        self.lines.append(f"{t} = ({elems})")
+
+    def tuple_op(self):
+        if not self.tuples:
+            return self.new_tuple()
+        t = self.r.choice(sorted(self.tuples))
+        n = self.tuples[t]
+        pick = self.r.random()
+        if pick < 0.35:
+            self.lines.append(f"print({t}[{self.r.randint(0, n - 1)}])")  # in-bounds
+        elif pick < 0.6:
+            self.lines.append(f"print(len({t}))")
+        elif pick < 0.8:
+            self.lines.append(f"print({t})")  # ordered display, diff-safe
+        else:
+            probe = str(self.r.randint(0, 99))
+            self.lines.append(f"print({probe} in {t})")
 
     def comprehension(self):
         # The try_reuse_map path: additive elements only (magnitude-safe).
@@ -440,6 +549,12 @@ class Gen:
             (self.churn_type, 2),
             (self.new_object, 3),
             (self.object_op, 4),
+            (self.new_dict, 2),
+            (self.dict_op, 4),
+            (self.new_set, 2),
+            (self.set_op, 4),
+            (self.new_tuple, 2),
+            (self.tuple_op, 4),
             (self.print_something, 4),
             (self.if_block, 2),
             (self.for_range, 2),
@@ -459,6 +574,10 @@ class Gen:
         # is fully observed and its RC cascade must end at live == 0.
         for o in sorted(self.objs):
             self.lines.append(f"print({o})")
+        # Tuples are ordered, so their display matches CPython; dicts/sets are
+        # observed only via len/reads/membership above (display order differs).
+        for t in sorted(self.tuples):
+            self.lines.append(f"print({t})")
         return "\n".join(self.lines) + "\n"
 
 
