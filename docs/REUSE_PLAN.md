@@ -107,8 +107,13 @@ metric) and **peak** (precise drops' metric) — not guessed.
 programs that are *safe by construction* (magnitude-tracked ints, non-negative
 `//`/`%` operands, ASCII strings, in-bounds indexing, bounded loops) and
 *weighted at the reuse machinery* (comp chains, literal reassign, append,
-aliases), then diffs CPython vs native output and gates `live == 0` per seed.
-Any DIFF/LEAK is a real finding with a one-command repro
+aliases), plus slice-steal, type-churn, and **class** shapes — the last from
+fixed safe templates (scalar-only attributes ⇒ categorically no reference
+cycles ⇒ no false leak; 0–99 args ⇒ no i32 wrap; only dispatched dunders) that
+exercise construction, method dispatch, inheritance + `super()`, `__str__`,
+`__eq__`, attribute get/set, and the **object-graph RC cascade** (release
+through the attr dict). It then diffs CPython vs native output and gates
+`live == 0` per seed. Any DIFF/LEAK is a real finding with a one-command repro
 (`python3 tools/gen_program.py <seed>`). Run a large batch after any
 reuse-path change: `FUZZ_N=200 tools/fuzz_native.sh`.
 

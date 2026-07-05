@@ -35,6 +35,8 @@ class Gen:
         self.ints = {}  # name -> magnitude bound
         self.strs = []  # names
         self.lists = {}  # name -> (length, element magnitude bound)
+        self.classes = {}  # class name -> __init__ arity (excl. self)
+        self.objs = {}  # instance name -> class name
         self.lines = []
         self.n = 0
 
@@ -356,7 +358,71 @@ class Gen:
         if self.r.random() < 0.5:
             self.lines.append(f"print({acc})")
 
+    def setup_classes(self):
+        """Emit 1-2 class definitions at the TOP of the program (Python needs
+        them before use) and record each instance's constructor arity. Fixed
+        SAFE templates: attributes are only numbers/strings (categorically no
+        reference cycles → no leak), argument values are 0-99 (a `total()` of a
+        few attrs stays < 300, no i32 wrap), and every dunder used is one the
+        backend dispatches. Also exercises inheritance + super()."""
+        base = self.name("C")
+        # Base: __init__(self, a, b), total(), __str__, __eq__ (all safe).
+        self.lines += [
+            f"class {base}:",
+            "    def __init__(self, a, b):",
+            "        self.a = a",
+            "        self.b = b",
+            "    def total(self):",
+            "        return self.a + self.b",
+            "    def __str__(self):",
+            '        return "C(" + str(self.a) + "," + str(self.b) + ")"',
+            "    def __eq__(self, o):",
+            "        return self.a == o.a",
+        ]
+        self.classes[base] = 2  # __init__ arity (excl. self)
+        if self.r.random() < 0.6:
+            sub = self.name("D")
+            self.lines += [
+                f"class {sub}({base}):",
+                "    def __init__(self, a, b, c):",
+                "        super().__init__(a, b)",
+                "        self.c = c",
+                "    def total(self):",  # override, exercises dispatch
+                "        return self.a + self.b + self.c",
+            ]
+            self.classes[sub] = 3  # inherits __str__/__eq__/a/b, adds c
+
+    def new_object(self):
+        if not self.classes:
+            return self.new_int()
+        cn = self.r.choice(sorted(self.classes))
+        args = ", ".join(str(self.r.randint(0, 99)) for _ in range(self.classes[cn]))
+        o = self.name("o")
+        self.objs[o] = cn
+        self.lines.append(f"{o} = {cn}({args})")
+
+    def object_op(self):
+        if not self.objs:
+            return self.new_object()
+        o = self.r.choice(sorted(self.objs))
+        pick = self.r.random()
+        if pick < 0.3:
+            self.lines.append(f"print({o}.total())")  # method dispatch
+        elif pick < 0.5:
+            self.lines.append(f"print({o}.a)")  # attr read (a always exists)
+        elif pick < 0.7:
+            # Attr set to a small number, then observed (dynamic dict attrs).
+            self.lines.append(f"{o}.a = {self.r.randint(0, 99)}")
+            self.lines.append(f"print({o}.a)")
+        else:
+            # __eq__ against another object of any class (both have `a`).
+            other = self.r.choice(sorted(self.objs))
+            self.lines.append(f"print({o} == {other})")
+
     def generate(self):
+        # Classes (if any) must be defined before the statement loop uses them.
+        if self.r.random() < 0.5:
+            self.setup_classes()
         stmts = [
             (self.new_int, 2),
             (self.new_str, 2),
@@ -372,6 +438,8 @@ class Gen:
             (self.slice_str, 3),
             (self.slice_list, 3),
             (self.churn_type, 2),
+            (self.new_object, 3),
+            (self.object_op, 4),
             (self.print_something, 4),
             (self.if_block, 2),
             (self.for_range, 2),
@@ -387,6 +455,10 @@ class Gen:
             self.lines.append(f"print({s})")
         for l in sorted(self.lists):
             self.lines.append(f"print({l})")
+        # Print every instance (default/inherited __str__) so the object graph
+        # is fully observed and its RC cascade must end at live == 0.
+        for o in sorted(self.objs):
+            self.lines.append(f"print({o})")
         return "\n".join(self.lines) + "\n"
 
 
