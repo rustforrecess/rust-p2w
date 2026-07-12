@@ -328,6 +328,19 @@ impl Builder {
         Ok(with_data(&json, s.line))
     }
 
+    /// An input carrying `e` — or NOTHING (empty socket) when `e` is the `None`
+    /// literal. This is the round-trip twin of the generator's rule "an empty
+    /// socket reads back as None": a half-built block writes `f(None, …)` into
+    /// the canonical text, and the debounced reload must render that as the
+    /// same block with the socket still empty — NOT drop the statement, which
+    /// yanked in-progress blocks off the canvas mid-edit.
+    fn slot_input(&mut self, name: &str, e: &Expr) -> Result<String, String> {
+        if matches!(e.kind, ExprKind::NoneLit) {
+            return Ok(String::new());
+        }
+        Ok(input(name, &self.value_block(e)?))
+    }
+
     fn stmt_block_raw(&mut self, s: &Stmt, next: &str) -> Result<String, String> {
         let unsupported = |what: &str| {
             Err(format!(
@@ -338,11 +351,11 @@ impl Builder {
         match &s.kind {
             StmtKind::Assign(name, value) | StmtKind::AnnAssign { name, value, .. } => {
                 let id = self.var_id(name);
-                let v = self.value_block(value)?;
+                let v = self.slot_input("VALUE", value)?;
                 Ok(block(
                     "variables_set",
                     &field("VAR", &var_ref(&id)),
-                    &input("VALUE", &v),
+                    &v,
                     "",
                     next,
                 ))
@@ -352,8 +365,8 @@ impl Builder {
                     if args.len() != 1 {
                         return unsupported("print() with multiple arguments");
                     }
-                    let v = self.value_block(&args[0])?;
-                    Ok(block("text_print", "", &input("TEXT", &v), "", next))
+                    let v = self.slot_input("TEXT", &args[0])?;
+                    Ok(block("text_print", "", &v, "", next))
                 }
                 // Any other named call as a statement (a void call like
                 // `greet("Bo")`) becomes our generic Python-shaped call block.
@@ -752,7 +765,12 @@ impl Builder {
                     a.line
                 ));
             }
-            ins.push(input(&format!("ARG{i}"), &self.value_block(a)?));
+            // A None arg renders as an empty socket (see slot_input); argCount
+            // below still reserves it, so the socket shows and reads back None.
+            let slot = self.slot_input(&format!("ARG{i}"), a)?;
+            if !slot.is_empty() {
+                ins.push(slot);
+            }
         }
         let ty = if statement {
             "python_call_statement"
@@ -790,7 +808,10 @@ impl Builder {
                     a.line
                 ));
             }
-            ins.push(input(&format!("ARG{i}"), &self.value_block(a)?));
+            let slot = self.slot_input(&format!("ARG{i}"), a)?;
+            if !slot.is_empty() {
+                ins.push(slot);
+            }
         }
         let ty = if statement {
             "python_method_statement"
@@ -1544,5 +1565,38 @@ mod tests {
             "valid-but-unrepresentable code must not be flagged: {:?}",
             out.error_lines
         );
+    }
+}
+
+#[cfg(test)]
+mod none_roundtrip_tests {
+    use super::*;
+
+    /// The generator's rule is "empty socket reads back as None", so the
+    /// decompiler must render `None` as that same empty socket — never drop
+    /// the statement. Dropping it made half-built blocks vanish from the
+    /// canvas when the debounced text->blocks reload fired mid-edit.
+    #[test]
+    fn none_args_round_trip_as_empty_sockets() {
+        let out = to_blocks("set_position(None, None, None)\n");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // The call block survives, reserves all three sockets, fills none.
+        assert!(out.json.contains("\"NAME\":\"set_position\""), "{}", out.json);
+        assert!(out.json.contains("\"argCount\":3"), "{}", out.json);
+        assert!(!out.json.contains("ARG0"), "{}", out.json);
+        // Partially filled: the filled socket stays, the empty one is omitted.
+        let out = to_blocks("set_position(\"#box\", None, 40)\n");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.json.contains("ARG0"), "{}", out.json);
+        assert!(!out.json.contains("ARG1"), "{}", out.json);
+        assert!(out.json.contains("ARG2"), "{}", out.json);
+    }
+
+    #[test]
+    fn none_in_print_and_assign_round_trip() {
+        let out = to_blocks("print(None)\nx = None\n");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.json.contains("text_print"), "{}", out.json);
+        assert!(out.json.contains("variables_set"), "{}", out.json);
     }
 }
