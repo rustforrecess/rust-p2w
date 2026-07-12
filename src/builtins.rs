@@ -68,6 +68,10 @@ pub const BUILTINS: &[Builtin] = &[
     b("every", "web", &["ms", "handler"]),
     b("set_attr", "web", &["selector", "name", "value"]),
     b("set_text", "web", &["selector", "text"]),
+    // Position an element in page coordinates. The designer's drag gesture
+    // *proposes* this call rather than mutating hidden markup, so layout lives
+    // in the program where it can be read, stepped over and assessed.
+    b("set_position", "web", &["selector", "x", "y"]),
     v("get_value", "web", &["selector"]),
     b("play_sound", "web", &["name"]),
     b("beep", "web", &[]),

@@ -60,6 +60,8 @@ pub enum StmtKind {
     Break,
     /// `continue` (inside a loop)
     Continue,
+    /// `pass` — an explicit no-op statement (empty-body placeholder).
+    Pass,
     /// `def name(params) [-> ret]: ...` (top level only). `defaults` holds the
     /// default expressions for the trailing parameters (so `params[params.len()
     /// - defaults.len() ..]` each have one).

@@ -371,6 +371,14 @@ impl<'a> Parser<'a> {
                 line,
             });
         }
+        if self.is_keyword("pass") {
+            self.advance();
+            self.expect(&Tok::Newline, "a new line")?;
+            return Ok(Stmt {
+                kind: StmtKind::Pass,
+                line,
+            });
+        }
         // Assignment or expression statement: parse the expression first,
         // then decide based on what follows. `expr_list` makes a bare comma
         // list (`a, b` / `1, 2`) into a tuple.

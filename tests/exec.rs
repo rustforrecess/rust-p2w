@@ -226,6 +226,23 @@ fn assert_raises(src: &str, message_contains: &str) {
     );
 }
 
+// --- pass: an explicit no-op statement ---
+
+#[test]
+fn pass_is_a_no_op() {
+    // `pass` as an empty body in a def, a loop, and an if — all no-ops. The
+    // program compiles and runs; the surrounding statements still execute.
+    assert_output(
+        "def greet():\n    pass\ngreet()\nfor i in range(3):\n    pass\nif True:\n    pass\nprint(\"done\")\n",
+        "done\n",
+    );
+    // A loop whose body is only `pass` still iterates (a counter proves it).
+    assert_output(
+        "n = 0\nfor i in range(4):\n    pass\n    n = n + 1\nprint(n)\n",
+        "4\n",
+    );
+}
+
 // --- type annotations: parsed, but runtime-ignored like Python ---
 
 #[test]

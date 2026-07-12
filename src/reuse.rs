@@ -260,7 +260,7 @@ fn stmt_mentions(s: &Stmt, out: &mut BTreeSet<String>, pinned: &mut BTreeSet<Str
             }
             vars_read(value, out);
         }
-        StmtKind::Break | StmtKind::Continue | StmtKind::Import(_) => {}
+        StmtKind::Break | StmtKind::Continue | StmtKind::Pass | StmtKind::Import(_) => {}
     }
 }
 

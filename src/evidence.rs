@@ -196,8 +196,11 @@ impl Counter {
                 }
             }
             StmtKind::Return(Some(e)) => self.walk_expr(e),
-            StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue | StmtKind::Import(_) => {
-            }
+            StmtKind::Return(None)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Pass
+            | StmtKind::Import(_) => {}
         }
     }
 

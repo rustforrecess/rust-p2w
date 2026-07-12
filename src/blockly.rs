@@ -68,6 +68,16 @@ pub fn to_blocks(source: &str) -> BlocksOutcome {
         }
     };
     let (stmts, parse_errors) = crate::parser::parse_recovering(&tokens);
+    to_blocks_parsed(&stmts, parse_errors)
+}
+
+/// The post-parse half of [`to_blocks`], callable with an already-parsed
+/// program so [`crate::analyze`] can share ONE lex+parse between the blocks
+/// conversion and the lint set (they run together on every editor keystroke).
+pub(crate) fn to_blocks_parsed(
+    stmts: &[crate::ast::Stmt],
+    parse_errors: Vec<crate::CompileError>,
+) -> BlocksOutcome {
     // Highlightable mistakes: genuine syntax errors, plus typo'd function calls
     // (`pint` -> `print`) — both are real errors. The build notes below are for
     // valid-but-unrepresentable code and must NOT flag the editor.
@@ -237,6 +247,19 @@ impl Builder {
     /// and fold that pair into a single "event hat" block, so blocks and text
     /// stay in sync for the interactive-web event seam.
     fn chain(&mut self, stmts: &[Stmt]) -> Result<String, String> {
+        // `pass` is a pure no-op: drop it so an all-`pass` body renders as an
+        // EMPTY block body. The JS generator re-emits `pass` for an empty body,
+        // so `def f(): pass` round-trips. (A `pass` with siblings is redundant
+        // and safely dropped too.) Filtering here covers every nesting level,
+        // since each nested body is rendered through `chain`.
+        if stmts.iter().any(|s| matches!(s.kind, StmtKind::Pass)) {
+            let kept: Vec<Stmt> = stmts
+                .iter()
+                .filter(|s| !matches!(s.kind, StmtKind::Pass))
+                .cloned()
+                .collect();
+            return self.chain(&kept);
+        }
         if self.tolerant {
             let mut rendered: Vec<String> = Vec::new();
             let mut i = 0;
@@ -401,24 +424,32 @@ impl Builder {
                 body,
             } => {
                 let id = self.var_id(var);
-                // Blockly's `controls_for` TO bound is inclusive, but Python's
-                // range() end is exclusive — represent it as `end - 1` ascending,
-                // `end + 1` descending.
-                let to = self.inclusive_to(end, step)?;
+                // The range-native loop: FROM/TO are `range(start, stop)`
+                // verbatim — stop stays exclusive, no ±1 fudge — so the blocks
+                // and the code read as the same thing. (Blockly's stock inclusive
+                // `controls_for` produced a phantom `end - 1` the student never
+                // wrote.) A step of exactly 1 is Python's default, so we HIDE the
+                // step socket entirely: the block reads `range(start, stop)`,
+                // mirroring how the code is normally written. Any other step
+                // shows the socket, with extraState driving the block's shape.
+                let has_step = !step_is_one(step);
                 let mut ins = vec![
                     input("FROM", &self.value_block(start)?),
-                    input("TO", &to),
-                    input("BY", &self.value_block(step)?),
+                    input("TO", &self.value_block(end)?),
                 ];
+                if has_step {
+                    ins.push(input("BY", &self.value_block(step)?));
+                }
                 let d = self.chain(body)?;
                 if !d.is_empty() {
                     ins.push(input("DO", &d));
                 }
+                let extra = if has_step { "{\"hasStep\":true}" } else { "" };
                 Ok(block(
-                    "controls_for",
+                    "python_for_range",
                     &field("VAR", &var_ref(&id)),
                     &ins.join(","),
-                    "",
+                    extra,
                     next,
                 ))
             }
@@ -436,6 +467,9 @@ impl Builder {
                 "",
                 next,
             )),
+            // `pass` is filtered out by `chain` before it reaches here (it
+            // renders as an empty body); this arm is just for exhaustiveness.
+            StmtKind::Pass => Ok(String::new()),
             StmtKind::ForEach {
                 var,
                 iterable,
@@ -463,25 +497,36 @@ impl Builder {
                 return_type,
                 body,
             } => {
-                // Defaults still round-trip through the text pane (no block yet).
-                if !defaults.is_empty() {
-                    return unsupported("a default argument");
-                }
                 // Reconstruct the signature text, folding any `: T` annotations
-                // inline (typed surfaces, roadmap layer 4). A type shape we can't
-                // render keeps the whole def in text rather than emit a broken
-                // signature.
+                // and `= default` values inline (the def block carries params as
+                // free text, so defaults ride along and round-trip through the
+                // generator). Defaults align to the trailing params. A type or
+                // default shape we can't render keeps the whole def in text rather
+                // than emit a broken signature.
+                let first_default = params.len().saturating_sub(defaults.len());
                 let mut parts = Vec::with_capacity(params.len());
-                for (p, t) in params.iter().zip(param_types.iter()) {
-                    match t {
-                        None => parts.push(p.clone()),
+                for (i, (p, t)) in params.iter().zip(param_types.iter()).enumerate() {
+                    let mut part = match t {
+                        None => p.clone(),
                         Some(ty) => {
                             let Some(src) = type_to_source(ty) else {
                                 return unsupported("this type annotation");
                             };
-                            parts.push(format!("{p}: {src}"));
+                            format!("{p}: {src}")
+                        }
+                    };
+                    if i >= first_default {
+                        let Some(dsrc) = value_to_source(&defaults[i - first_default]) else {
+                            return unsupported("this default value");
+                        };
+                        // PEP 8: spaces around `=` only when the param is annotated.
+                        if t.is_some() {
+                            part.push_str(&format!(" = {dsrc}"));
+                        } else {
+                            part.push_str(&format!("={dsrc}"));
                         }
                     }
+                    parts.push(part);
                 }
                 let params_str = parts.join(", ");
                 // The return annotation rides in extraState so the block rebuilds
@@ -542,31 +587,6 @@ impl Builder {
             StmtKind::UnpackAssign { .. } => unsupported("tuple unpacking"),
             StmtKind::Import(_) => unsupported("`import`"),
         }
-    }
-
-    /// Blockly's inclusive TO for a Python exclusive `end`: `end - 1` for an
-    /// ascending loop, `end + 1` for a descending one (negative literal step).
-    /// Folded when `end` is a literal int.
-    fn inclusive_to(&mut self, end: &Expr, step: &Expr) -> Result<String, String> {
-        let descending = step_is_negative(step);
-        if let ExprKind::Int(n) = end.kind {
-            let adjusted = if descending {
-                n as f64 + 1.0
-            } else {
-                n as f64 - 1.0
-            };
-            return Ok(number(adjusted));
-        }
-        let e = self.value_block(end)?;
-        let op = if descending { "ADD" } else { "MINUS" };
-        let ab = format!("{},{}", input("A", &e), input("B", &number(1.0)));
-        Ok(block(
-            "math_arithmetic",
-            &field("OP", &jstr(op)),
-            &ab,
-            "",
-            "",
-        ))
     }
 
     fn value_block(&mut self, e: &Expr) -> Result<String, String> {
@@ -961,20 +981,10 @@ fn var_ref(id: &str) -> String {
     format!("{{\"id\":{}}}", jstr(id))
 }
 
-/// True if `step` is a negative numeric literal (so the loop counts down).
-/// A non-literal step (e.g. a variable) has unknown sign — treated as ascending.
-fn step_is_negative(step: &Expr) -> bool {
-    match &step.kind {
-        ExprKind::Int(n) => *n < 0,
-        // `-N` parses as Neg(N), so a negated *positive* literal is a negative
-        // step (e.g. `-1` is Neg(1)).
-        ExprKind::Unary(UnOp::Neg, inner) => match inner.kind {
-            ExprKind::Int(n) => n > 0,
-            ExprKind::Float(f) => f > 0.0,
-            _ => false,
-        },
-        _ => false,
-    }
+/// True if `step` is the literal `1` — Python's default — so the loop's step
+/// socket can be hidden and the block reads `range(start, stop)`.
+fn step_is_one(step: &Expr) -> bool {
+    matches!(step.kind, ExprKind::Int(1))
 }
 
 /// A `math_number` block. Whole values serialize without a trailing `.0`.
@@ -1007,6 +1017,50 @@ fn type_to_source(e: &Expr) -> Option<String> {
         ExprKind::Tuple(items) => {
             let parts: Option<Vec<String>> = items.iter().map(type_to_source).collect();
             parts?.join(", ")
+        }
+        _ => return None,
+    })
+}
+
+/// Render a simple *value* expression back to Python source for a default
+/// argument (`def f(x=<here>)`). Handles the common K-12 defaults — literals, a
+/// name, a negated number, and simple containers — and returns `None` for
+/// anything more exotic (a call, an expression, a comprehension), so the caller
+/// keeps that def in the text pane rather than emit a broken signature.
+fn value_to_source(e: &Expr) -> Option<String> {
+    Some(match &e.kind {
+        ExprKind::Int(n) => n.to_string(),
+        ExprKind::Float(f) if f.is_finite() => {
+            if f.fract() == 0.0 {
+                format!("{f:.1}") // keep it a float: 1.0, not 1
+            } else {
+                format!("{f}")
+            }
+        }
+        ExprKind::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+        ExprKind::NoneLit => "None".to_string(),
+        ExprKind::Str(s) => jstr(s), // JSON string == Python double-quoted literal here
+        ExprKind::Name(n) => n.clone(),
+        ExprKind::Unary(UnOp::Neg, inner) => format!("-{}", value_to_source(inner)?),
+        ExprKind::List(items) => {
+            let parts: Option<Vec<String>> = items.iter().map(value_to_source).collect();
+            format!("[{}]", parts?.join(", "))
+        }
+        ExprKind::Tuple(items) => {
+            let parts: Option<Vec<String>> = items.iter().map(value_to_source).collect();
+            let parts = parts?;
+            if parts.len() == 1 {
+                format!("({},)", parts[0]) // 1-tuple keeps its trailing comma
+            } else {
+                format!("({})", parts.join(", "))
+            }
+        }
+        ExprKind::Dict(pairs) => {
+            let mut parts = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                parts.push(format!("{}: {}", value_to_source(k)?, value_to_source(v)?));
+            }
+            format!("{{{}}}", parts.join(", "))
         }
         _ => return None,
     })
@@ -1128,23 +1182,41 @@ mod tests {
         let json = to_blockly_json("while x < 10:\n    x = x + 1").unwrap();
         assert!(json.contains("\"type\":\"controls_whileUntil\""));
 
-        // range(1, 5) -> controls_for with inclusive TO = 4.
+        // range(1, 5) -> python_for_range mirroring the code: TO stays the
+        // exclusive stop 5 (no phantom `- 1`), and the default step of 1 hides
+        // the step socket entirely — the block reads `range(1, 5)`.
         let json = to_blockly_json("for i in range(1, 5):\n    print(i)").unwrap();
-        assert!(json.contains("\"type\":\"controls_for\""));
-        assert!(json.contains("\"NUM\":4"));
+        assert!(json.contains("\"type\":\"python_for_range\""));
+        assert!(
+            json.contains("\"TO\":{\"block\":{\"type\":\"math_number\",\"fields\":{\"NUM\":5}}}"),
+            "expected exclusive TO of 5: {json}"
+        );
+        assert!(
+            !json.contains("\"BY\""),
+            "step of 1 must hide the socket: {json}"
+        );
+        assert!(
+            !json.contains("hasStep"),
+            "no step -> no extraState: {json}"
+        );
     }
 
     #[test]
-    fn for_descending_range_inclusive_to_is_end_plus_one() {
-        // range(10, 0, -1) is 10..1; Blockly's TO is inclusive, so for a
-        // descending loop it must be end + 1 = 1 (NOT end - 1 = -1). The BY
-        // input is legitimately -1, so check the TO input specifically.
+    fn for_descending_range_mirrors_range_stop() {
+        // range(10, 0, -1): the block mirrors `range()` exactly — TO is the
+        // exclusive stop 0 (no +1), and a non-1 step shows the socket (BY = -1)
+        // with extraState flagging the shape.
         let json = to_blockly_json("for i in range(10, 0, -1):\n    print(i)").unwrap();
-        assert!(json.contains("\"type\":\"controls_for\""), "{json}");
+        assert!(json.contains("\"type\":\"python_for_range\""), "{json}");
         assert!(
-            json.contains("\"TO\":{\"block\":{\"type\":\"math_number\",\"fields\":{\"NUM\":1}}}"),
-            "expected inclusive TO of 1: {json}"
+            json.contains("\"TO\":{\"block\":{\"type\":\"math_number\",\"fields\":{\"NUM\":0}}}"),
+            "expected exclusive TO of 0: {json}"
         );
+        assert!(
+            json.contains("\"hasStep\":true"),
+            "non-1 step needs the socket: {json}"
+        );
+        assert!(json.contains("\"BY\""), "expected a step socket: {json}");
     }
 
     #[test]
@@ -1238,11 +1310,43 @@ mod tests {
     }
 
     #[test]
-    fn function_default_arg_has_no_block_yet() {
-        // Defaults aren't representable in Layer 1 — a clean error keeps the
-        // text canonical instead of silently dropping the default.
-        let err = to_blockly_json("def f(x=1):\n    return x").unwrap_err();
-        assert!(err.contains("default argument"), "{err}");
+    fn function_default_arg_rides_in_params() {
+        // A default value folds into the free-text PARAMS field and round-trips
+        // through the generator — no dedicated block needed. Unannotated default:
+        let j1 = to_blockly_json("def f(x=None):\n    return x").unwrap();
+        assert!(j1.contains("\"type\":\"python_def\""), "{j1}");
+        assert!(j1.contains("\"PARAMS\":\"x=None\""), "{j1}");
+        // Annotated default gets PEP-8 spacing around `=`.
+        let j2 = to_blockly_json("def f(n: int = 0):\n    return n").unwrap();
+        assert!(j2.contains("\"PARAMS\":\"n: int = 0\""), "{j2}");
+        // A string default renders (and stays a def block, not an error).
+        let j3 = to_blockly_json("def greet(name=\"friend\"):\n    return name").unwrap();
+        assert!(
+            j3.contains("\"type\":\"python_def\"") && j3.contains("friend"),
+            "{j3}"
+        );
+        // A default we can't render (a call) keeps the whole def in text.
+        let err = to_blockly_json("def f(x=make()):\n    return x").unwrap_err();
+        assert!(err.contains("default value"), "{err}");
+    }
+
+    #[test]
+    fn pass_body_renders_as_an_empty_block() {
+        // `def f(): pass` -> a def block with an EMPTY body; the JS generator
+        // re-emits `pass` for an empty body, so it round-trips. `pass` produces
+        // no block of its own and no "no block yet" note.
+        let out = to_blocks("def f():\n    pass\n");
+        assert!(out.json.contains("\"type\":\"python_def\""), "{}", out.json);
+        assert!(
+            out.errors.is_empty(),
+            "pass must not be a note: {:?}",
+            out.errors
+        );
+        assert!(
+            !out.json.contains("controls_flow"),
+            "pass should not render a block: {}",
+            out.json
+        );
     }
 
     #[test]
@@ -1409,7 +1513,7 @@ mod tests {
         // its body) even though one body line (a tuple) can't be a block yet.
         let out = to_blocks("for i in range(3):\n    print(i)\n    y = (1, 2)\n");
         assert!(
-            out.json.contains("\"type\":\"controls_for\""),
+            out.json.contains("\"type\":\"python_for_range\""),
             "{}",
             out.json
         );

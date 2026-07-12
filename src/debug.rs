@@ -718,6 +718,7 @@ impl Stepper {
                 }
                 Ok(())
             }
+            StmtKind::Pass => Ok(()),
             // Stepping over a `def` registers the function; calls to it run
             // atomically (see eval_call). The body isn't entered here.
             StmtKind::Def {
@@ -968,6 +969,9 @@ impl Stepper {
                 }
                 Ok(Value::None)
             }
+            // Designer-authored layout call (see the Vm's twin arm): trace as a
+            // no-op — the real move happens under Run.
+            ("set_position", [_sel, _x, _y]) => Ok(Value::None),
             _ => Err(format!(
                 "calling {name}() isn't in the step debugger yet — use Run for that"
             )),
@@ -1199,6 +1203,7 @@ impl Stepper {
             }
             StmtKind::Break => Ok(Flow::Break),
             StmtKind::Continue => Ok(Flow::Continue),
+            StmtKind::Pass => Ok(Flow::Normal),
             StmtKind::Return(opt) => {
                 let v = match opt {
                     Some(e) => Self::eval_in(funcs, scope, out, e)?,
@@ -1945,6 +1950,7 @@ impl Vm {
             }
             StmtKind::Break => self.push_task(Task::Break),
             StmtKind::Continue => self.push_task(Task::Continue),
+            StmtKind::Pass => {}
             StmtKind::Return(opt) => {
                 self.push_task(Task::Return);
                 let e = match opt {
@@ -3222,6 +3228,11 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         ("show", [_value]) => Ok(Value::None),
         ("set_field", [_key, _value]) => Ok(Value::None),
         ("get_field", [_key]) => Ok(Value::Str(String::new())),
+        // The designer's drag feature AUTHORS module-level set_position calls
+        // (the IDE's pycode::upsert_position), so any drag-touched program hits
+        // this on its first steps — it must trace as a no-op, not kill the
+        // session (the feature's whole point is that layout is steppable).
+        ("set_position", [_sel, _x, _y]) => Ok(Value::None),
         _ => Err(format!(
             "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
         )),

@@ -361,6 +361,8 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         for imp in [
             r#"(import "env" "dom_set_attr" (func $dom_set_attr))"#,
             r#"(import "env" "dom_set_text" (func $dom_set_text))"#,
+            // set_position(sel, x, y): selector via the arg stack, x/y as i32.
+            r#"(import "env" "set_position" (func $set_position (param i32) (param i32)))"#,
             r#"(import "env" "play_sound" (func $play_sound))"#,
             r#"(import "env" "dom_on" (func $dom_on (param i32)))"#,
             // Reverse marshalling: JS fetches the element's value into a buffer
@@ -5567,6 +5569,8 @@ impl Gen {
                     "'continue' can only be used inside a loop",
                 )),
             },
+            // `pass` — a no-op: emit no instructions.
+            StmtKind::Pass => Ok(()),
         }
     }
 
@@ -7186,6 +7190,17 @@ impl Gen {
                                 "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {text}) (call $dom_set_text) (global.get $NONE))"
                             ));
                         }
+                        // set_position(sel, x, y): the selector goes through the
+                        // string arg stack; x/y ride the WASM stack as plain i32s.
+                        "set_position" if args.len() == 3 => {
+                            self.uses_dom_str = true;
+                            let sel = self.value_expr(cx, &args[0])?;
+                            let x = self.i32_expr(cx, &args[1])?;
+                            let y = self.i32_expr(cx, &args[2])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $set_position {x} {y}) (global.get $NONE))"
+                            ));
+                        }
                         "play_sound" if args.len() == 1 => {
                             self.uses_dom_str = true;
                             let name = self.value_expr(cx, &args[0])?;
@@ -7802,6 +7817,21 @@ mod tests {
         assert!(wat.contains("(call $py_mul (ref.i31 (i32.const 3)) (ref.i31 (i32.const 4)))"));
         assert!(wat.contains("(call $py_add (ref.i31 (i32.const 2))"));
         assert!(wat.contains("(call $print_value"));
+    }
+
+    #[test]
+    fn set_position_marshals_selector_and_passes_xy_as_i32() {
+        let wat = compile(r##"set_position("#box", 120, 80)"##).unwrap();
+        // The selector rides the string arg stack; x/y ride the WASM stack.
+        assert!(
+            wat.contains(r#"(import "env" "set_position" (func $set_position (param i32) (param i32)))"#),
+            "{wat}"
+        );
+        assert!(wat.contains("(call $marshal_str"), "{wat}");
+        assert!(
+            wat.contains("(call $set_position (i32.const 120) (i32.const 80))"),
+            "{wat}"
+        );
     }
 
     #[test]

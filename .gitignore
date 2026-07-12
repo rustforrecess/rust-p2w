@@ -1,1 +1,4 @@
 /target
+
+# Unrelated local data files (coursework ARFF datasets) — never commit.
+*.arff

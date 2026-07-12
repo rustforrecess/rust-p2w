@@ -97,56 +97,95 @@ pub fn set_operator_spans(source: &str) -> Vec<(usize, usize)> {
     }
 }
 
-/// Type-churn warnings, as `(line, message)` pairs — a name reused for a
-/// genuinely different *kind* of value within one scope (`x = 1` then
-/// `x = "hi"`). A **gentle lint**, never an error: the program still compiles
-/// and runs (an unannotated churning name just stays on the dynamic path,
-/// output identical to CPython). The IDE surfaces these as soft squiggles.
-/// Error-recovering parse, so a half-typed program still lints; empty when
-/// nothing lexes. See `docs/COMPILER_FRONTIER.md` task 3 for the deferred
-/// demote-vs-lint-vs-reject decision this instruments.
-pub fn type_churn_warnings(source: &str) -> Vec<(usize, String)> {
-    match lexer::lex(source) {
-        Ok(toks) => {
-            let (stmts, _) = parser::parse_recovering(&toks);
-            lint::type_churn_warnings(&stmts)
-        }
-        Err(_) => Vec::new(),
-    }
+pub use lint::{LintKind, Scaffold, scaffold};
+
+/// A single gentle lint, tagged with which diagnostic produced it so the IDE can
+/// attach the right fix scaffold ([`scaffold`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lint {
+    pub line: usize,
+    pub message: String,
+    pub kind: LintKind,
 }
 
-/// Undefined-variable warnings, as `(line, message)` pairs — a bare-name read
-/// of a variable bound nowhere in scope (the complement of the "did you mean…?"
-/// lint for unknown *function* calls). A **gentle lint**: it over-approximates
-/// what's "bound" (assigned/param/loop-var/import/def anywhere in scope), so it
-/// only flags names defined nowhere — a real error, never a false alarm — and
-/// is not flow-sensitive (a forward reference is not flagged). Error-recovering
-/// parse; empty when nothing lexes.
-pub fn undefined_name_warnings(source: &str) -> Vec<(usize, String)> {
-    match lexer::lex(source) {
-        Ok(toks) => {
-            let (stmts, _) = parser::parse_recovering(&toks);
-            lint::undefined_name_warnings(&stmts)
-        }
-        Err(_) => Vec::new(),
-    }
+/// Run every gentle warning-style lint over `source` and return them tagged by
+/// kind, line-sorted — one call for the IDE's Suggestions panel. (The call-name
+/// typo lint is a `CompileError` surfaced through the blocks/error path, not
+/// here.) Each is a pure over-approximating analysis; see the `lint` module.
+/// Error-recovering parse; empty when nothing lexes.
+pub fn lints(source: &str) -> Vec<Lint> {
+    let Ok(toks) = lexer::lex(source) else {
+        return Vec::new();
+    };
+    let (stmts, _) = parser::parse_recovering(&toks);
+    lints_parsed(&stmts)
 }
 
-/// Unused-local warnings, as `(line, message)` pairs — a variable assigned
-/// inside a function/method but never read anywhere in it ("you set `result`
-/// but never used it"). A **gentle lint**, scoped to the safe subset every
-/// mainstream linter uses: only plain assignments (not loop vars, unpack
-/// targets, or params), never module/class level, with reads over-approximated
-/// (a closure or another branch reading the name suppresses it) — so it never
-/// cries wolf. Error-recovering parse; empty when nothing lexes.
-pub fn unused_assignment_warnings(source: &str) -> Vec<(usize, String)> {
-    match lexer::lex(source) {
-        Ok(toks) => {
-            let (stmts, _) = parser::parse_recovering(&toks);
-            lint::unused_assignment_warnings(&stmts)
+/// Blocks conversion + the full lint set from ONE lex+parse. This pair runs on
+/// every editor keystroke; calling [`to_blocks`] and [`lints`] separately parses
+/// the identical source twice, which is pure waste on the IDE's hottest path.
+pub fn analyze(source: &str) -> (blockly::BlocksOutcome, Vec<Lint>) {
+    let toks = match lexer::lex(source) {
+        Ok(t) => t,
+        Err(e) => {
+            // Same shape to_blocks reports for a lex error; nothing to lint.
+            return (
+                blockly::BlocksOutcome {
+                    json: "{\"blocks\":{\"languageVersion\":0,\"blocks\":[]}}".to_string(),
+                    error_lines: e.line.into_iter().collect(),
+                    error_spans: e.span.into_iter().collect(),
+                    errors: vec![e],
+                },
+                Vec::new(),
+            );
         }
-        Err(_) => Vec::new(),
+    };
+    let (stmts, parse_errors) = parser::parse_recovering(&toks);
+    let lints = lints_parsed(&stmts);
+    (blockly::to_blocks_parsed(&stmts, parse_errors), lints)
+}
+
+/// The post-parse half of [`lints`] (see [`analyze`]).
+fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
+    let groups: [(LintKind, Vec<(usize, String)>); 7] = [
+        (
+            LintKind::UndefinedName,
+            lint::undefined_name_warnings(&stmts),
+        ),
+        (LintKind::TypeChurn, lint::type_churn_warnings(&stmts)),
+        (
+            LintKind::UnusedLocal,
+            lint::unused_assignment_warnings(&stmts),
+        ),
+        (
+            LintKind::MutableDefault,
+            lint::mutable_default_warnings(&stmts),
+        ),
+        (
+            LintKind::UnreachableCode,
+            lint::unreachable_code_warnings(&stmts),
+        ),
+        (
+            LintKind::ShadowedBuiltin,
+            lint::shadowed_builtin_warnings(&stmts),
+        ),
+        (
+            LintKind::SelfComparison,
+            lint::self_comparison_warnings(&stmts),
+        ),
+    ];
+    let mut out: Vec<Lint> = Vec::new();
+    for (kind, warns) in groups {
+        for (line, message) in warns {
+            out.push(Lint {
+                line,
+                message,
+                kind,
+            });
+        }
     }
+    out.sort_by_key(|l| l.line);
+    out
 }
 
 #[cfg(test)]

@@ -11,6 +11,14 @@
 //!   (`x = 1` … `x = "hi"`), the instrument for the reject-vs-demote decision;
 //! - `unused_assignment_warnings` — a function-local set but never read ("you
 //!   set `result` but never used it"), scoped to the mainstream-safe subset;
+//! - `mutable_default_warnings` — a list/dict/set as a function default arg (the
+//!   shared-and-mutated footgun), suggesting the `=None` fix;
+//! - `unreachable_code_warnings` — a statement that can never run after a
+//!   `return`/`break`/`continue` in the same block;
+//! - `shadowed_builtin_warnings` — a variable named after a built-in type/
+//!   function (`list = …`), curated to the never-a-good-variable-name set;
+//! - `self_comparison_warnings` — comparing/assigning something to itself
+//!   (`x == x`, `x = x`), pure operands only;
 //! - `may_form_cycle`, `set_typed_names`, `set_operator_spans` — analysis seams
 //!   the backends / IDE consume.
 
@@ -335,8 +343,11 @@ fn walk_stmts(stmts: &[Stmt], known: &[&str], out: &mut Vec<CompileError>) {
                 }
                 walk_expr(value, known, out);
             }
-            StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue | StmtKind::Import(_) => {
-            }
+            StmtKind::Return(None)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Pass
+            | StmtKind::Import(_) => {}
         }
     }
 }
@@ -663,8 +674,11 @@ fn spans_in_stmts(stmts: &[Stmt], sets: &HashSet<String>, out: &mut Vec<crate::a
                 }
                 spans_in_expr(value, sets, out);
             }
-            StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue | StmtKind::Import(_) => {
-            }
+            StmtKind::Return(None)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Pass
+            | StmtKind::Import(_) => {}
         }
     }
 }
@@ -1406,6 +1420,506 @@ fn reads_of(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
+// --- shared AST visitors (for the teaching lints below) --------------------
+
+/// Apply `f` to each nested statement block of `s` — every control-flow body and
+/// every function/method/class body. Lets the lints below recurse without each
+/// re-spelling the whole `StmtKind` match.
+fn for_each_child_block(s: &Stmt, mut f: impl FnMut(&[Stmt])) {
+    match &s.kind {
+        StmtKind::If {
+            body,
+            elifs,
+            else_body,
+            ..
+        } => {
+            f(body);
+            for (_, b) in elifs {
+                f(b);
+            }
+            if let Some(b) = else_body {
+                f(b);
+            }
+        }
+        StmtKind::For { body, .. }
+        | StmtKind::ForEach { body, .. }
+        | StmtKind::While { body, .. }
+        | StmtKind::Def { body, .. } => f(body),
+        StmtKind::ClassDef { methods, .. } => {
+            for m in methods {
+                f(&m.body);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Call `f` on each expression a statement evaluates *in place* (NOT descending
+/// into nested blocks — those are walked via [`for_each_child_block`]).
+fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
+    match &s.kind {
+        StmtKind::Expr(e)
+        | StmtKind::Assign(_, e)
+        | StmtKind::AnnAssign { value: e, .. }
+        | StmtKind::Return(Some(e)) => f(e),
+        StmtKind::If { cond, elifs, .. } => {
+            f(cond);
+            for (c, _) in elifs {
+                f(c);
+            }
+        }
+        StmtKind::For {
+            start, end, step, ..
+        } => {
+            f(start);
+            f(end);
+            f(step);
+        }
+        StmtKind::ForEach { iterable, .. } => f(iterable),
+        StmtKind::While { cond, .. } => f(cond),
+        StmtKind::SetIndex {
+            target,
+            index,
+            value,
+        } => {
+            f(target);
+            f(index);
+            f(value);
+        }
+        StmtKind::SetAttr { obj, value, .. } => {
+            f(obj);
+            f(value);
+        }
+        StmtKind::UnpackAssign { targets, value } => {
+            for t in targets {
+                f(t);
+            }
+            f(value);
+        }
+        StmtKind::Def { defaults, .. } => {
+            for d in defaults {
+                f(d);
+            }
+        }
+        StmtKind::ClassDef { class_vars, .. } => {
+            for (_, e) in class_vars {
+                f(e);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Call `f` on each direct child expression of `e` (one level; recurse by
+/// calling this again inside `f`).
+fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    match &e.kind {
+        ExprKind::Unary(_, x) | ExprKind::Attr(x, _) | ExprKind::Kwarg(_, x) => f(x),
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {
+            f(a);
+            f(b);
+        }
+        ExprKind::Call(_, args) => {
+            for a in args {
+                f(a);
+            }
+        }
+        ExprKind::MethodCall(recv, _, args) => {
+            f(recv);
+            for a in args {
+                f(a);
+            }
+        }
+        ExprKind::List(xs) | ExprKind::Tuple(xs) => {
+            for x in xs {
+                f(x);
+            }
+        }
+        ExprKind::Dict(pairs) => {
+            for (k, v) in pairs {
+                f(k);
+                f(v);
+            }
+        }
+        ExprKind::Slice {
+            obj,
+            start,
+            stop,
+            step,
+        } => {
+            f(obj);
+            for o in [start, stop, step].into_iter().flatten() {
+                f(o);
+            }
+        }
+        ExprKind::ListComp { element, clauses } => {
+            f(element);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => f(iter),
+                    CompClause::If(x) => f(x),
+                }
+            }
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => {
+            f(key);
+            f(value);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => f(iter),
+                    CompClause::If(x) => f(x),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// --- mutable default arguments ---------------------------------------------
+
+/// `def f(x, acc=[])`: a list/dict/set default is created ONCE (when the `def`
+/// runs) and shared by every call, so mutations silently leak between calls —
+/// the classic Python surprise. Flags the `def` line and points at the standard
+/// `=None` + make-a-fresh-one-inside fix. Only *mutable* defaults fire; a number,
+/// string, `None`, or tuple default is fine and never flagged.
+pub fn mutable_default_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    walk_mutable_defaults(stmts, &mut out);
+    out.sort_by_key(|(line, _)| *line);
+    out
+}
+
+/// The kid-facing noun if `e` is a *mutable* default value, else `None`. Covers
+/// literals (`[]`, `{}`, `{1: 2}`) and the constructor calls (`list()`, `dict()`,
+/// `set()`, and `{1, 2}` which the parser desugars to `set(...)`).
+fn mutable_default_noun(e: &Expr) -> Option<&'static str> {
+    match &e.kind {
+        ExprKind::List(_) => Some("a list"),
+        ExprKind::Dict(_) => Some("a dictionary"),
+        ExprKind::Call(name, _) => match name.as_str() {
+            "list" => Some("a list"),
+            "dict" => Some("a dictionary"),
+            "set" => Some("a set"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn walk_mutable_defaults(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+    for s in stmts {
+        if let StmtKind::Def {
+            params, defaults, ..
+        } = &s.kind
+        {
+            // defaults align to the trailing params (Python rule).
+            let first = params.len().saturating_sub(defaults.len());
+            for (i, d) in defaults.iter().enumerate() {
+                if let Some(noun) = mutable_default_noun(d) {
+                    let p = params.get(first + i).map(String::as_str).unwrap_or("it");
+                    out.push((
+                        s.line,
+                        format!(
+                            "`{p}` uses {noun} as its default — that default is created once and \
+                             SHARED by every call, so changes to it leak between calls. Use \
+                             `{p}=None` and make a fresh one inside the function instead."
+                        ),
+                    ));
+                }
+            }
+        }
+        for_each_child_block(s, |b| walk_mutable_defaults(b, out));
+    }
+}
+
+// --- unreachable code ------------------------------------------------------
+
+/// A statement that unconditionally follows a `return`/`break`/`continue` in the
+/// SAME block can never run. Only same-level exits count — a `return` inside an
+/// `if` doesn't kill the code after the `if` — so every hit is a true finding.
+/// Reports the first dead line per block (the rest below it is dead too).
+pub fn unreachable_code_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    walk_unreachable(stmts, &mut out);
+    out.sort_by_key(|(line, _)| *line);
+    out
+}
+
+/// The keyword if `s` is an unconditional block-exit, else `None`.
+fn terminator_kw(s: &Stmt) -> Option<&'static str> {
+    match &s.kind {
+        StmtKind::Return(_) => Some("return"),
+        StmtKind::Break => Some("break"),
+        StmtKind::Continue => Some("continue"),
+        _ => None,
+    }
+}
+
+fn walk_unreachable(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+    let mut flagged = false;
+    for (i, s) in stmts.iter().enumerate() {
+        if !flagged
+            && i > 0
+            && let Some(kw) = terminator_kw(&stmts[i - 1])
+        {
+            out.push((
+                s.line,
+                format!(
+                    "this line can't run — the `{kw}` just above always exits first. Move it above \
+                     the `{kw}`, or remove it."
+                ),
+            ));
+            flagged = true;
+        }
+        for_each_child_block(s, |b| walk_unreachable(b, out));
+    }
+}
+
+// --- shadowed built-ins ----------------------------------------------------
+
+/// Built-ins that are essentially never a good variable name, so binding one is
+/// almost always an accidental shadow (`list = [...]` then `list(...)` breaks).
+/// Deliberately EXCLUDES built-ins that ARE common, sensible variable names
+/// (`sum`, `min`, `max`, `type`, `id`, `input`, `abs`, `round`, `open`,
+/// `format`) so the lint never cries wolf over `sum = 0`.
+const SHADOW_DANGEROUS: &[&str] = &[
+    "list",
+    "dict",
+    "set",
+    "str",
+    "int",
+    "float",
+    "tuple",
+    "bool",
+    "range",
+    "len",
+    "print",
+    "sorted",
+    "reversed",
+    "enumerate",
+    "zip",
+    "map",
+    "filter",
+];
+
+/// Binding a name that shadows a common built-in type/function. Deduped to one
+/// warning per shadowed name across the program, to stay calm.
+pub fn shadowed_builtin_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    walk_shadow(stmts, &mut seen, &mut out);
+    out.sort_by_key(|(line, _)| *line);
+    out
+}
+
+fn shadow_check(
+    name: &str,
+    line: usize,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<(usize, String)>,
+) {
+    if SHADOW_DANGEROUS.contains(&name) && seen.insert(name.to_string()) {
+        out.push((
+            line,
+            format!(
+                "`{name}` is the name of a built-in — using it as a variable means you can't call \
+                 `{name}(...)` afterwards. A name like `items` or `values` avoids the clash."
+            ),
+        ));
+    }
+}
+
+fn walk_shadow(stmts: &[Stmt], seen: &mut HashSet<String>, out: &mut Vec<(usize, String)>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, _) | StmtKind::AnnAssign { name, .. } => {
+                shadow_check(name, s.line, seen, out)
+            }
+            StmtKind::For { var, .. } | StmtKind::ForEach { var, .. } => {
+                shadow_check(var, s.line, seen, out)
+            }
+            _ => {}
+        }
+        for_each_child_block(s, |b| walk_shadow(b, seen, out));
+    }
+}
+
+// --- self-comparison / no-op self-assignment -------------------------------
+
+/// Comparing something to itself (`if x == x:` — always the same answer) or
+/// assigning a variable to itself (`x = x` — does nothing). Only fires on *pure*
+/// operands that contain a variable, so `random() == random()` (two calls, not
+/// self-comparison) and constant folds like `1 == 1` are left alone.
+pub fn self_comparison_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    walk_self_cmp(stmts, &mut out);
+    out.sort_by_key(|(line, _)| *line);
+    out
+}
+
+/// No calls anywhere inside — so evaluating `e` twice yields the same value with
+/// no side effects (the precondition for calling `a <op> a` redundant).
+fn is_pure(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
+        | ExprKind::NoneLit
+        | ExprKind::Name(_) => true,
+        ExprKind::Unary(_, x) | ExprKind::Attr(x, _) => is_pure(x),
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => is_pure(a) && is_pure(b),
+        _ => false,
+    }
+}
+
+/// Whether `e` references at least one variable (so `x == x` flags but `1 == 1`,
+/// a constant comparison, does not — the "compare to itself" wording fits only
+/// the variable case).
+fn expr_has_name(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Name(_) => true,
+        ExprKind::Unary(_, x) | ExprKind::Attr(x, _) => expr_has_name(x),
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => expr_has_name(a) || expr_has_name(b),
+        _ => false,
+    }
+}
+
+/// The constant result of a self-comparison `a <op> a`, for comparison ops only.
+fn self_cmp_verdict(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Eq | BinOp::Le | BinOp::Ge => Some("always True"),
+        BinOp::Ne | BinOp::Lt | BinOp::Gt => Some("always False"),
+        _ => None,
+    }
+}
+
+fn walk_self_cmp(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+    for s in stmts {
+        // No-op self-assignment: `x = x`.
+        if let StmtKind::Assign(name, value) = &s.kind
+            && matches!(&value.kind, ExprKind::Name(n) if n == name)
+        {
+            out.push((
+                s.line,
+                format!(
+                    "`{name} = {name}` doesn't do anything — a variable assigned to itself is \
+                     unchanged. Did you mean to change it, or is it a leftover line?"
+                ),
+            ));
+        }
+        // Self-comparisons anywhere in the statement's expressions.
+        stmt_exprs(s, &mut |e| find_self_cmp(e, out));
+        for_each_child_block(s, |b| walk_self_cmp(b, out));
+    }
+}
+
+fn find_self_cmp(e: &Expr, out: &mut Vec<(usize, String)>) {
+    if let ExprKind::Bin(op, a, b) = &e.kind
+        && let Some(verdict) = self_cmp_verdict(*op)
+        && is_pure(a)
+        && expr_has_name(a)
+        && a == b
+    {
+        out.push((
+            e.line,
+            format!(
+                "this compares something to itself, so it's {verdict} — did you mean to compare \
+                 two different things?"
+            ),
+        ));
+    }
+    each_child_expr(e, &mut |c| find_self_cmp(c, out));
+}
+
+// --- scaffolded fix ladders ------------------------------------------------
+//
+// Each concept-bearing lint carries a *fading hint ladder*: a guiding question,
+// then a narrower hint, then the concrete fix. The student escalates only as far
+// as they need, so they do the reasoning (self-explanation) without being
+// stranded (completion-problem scaffolding). Two roles beyond teaching:
+//   1. Assessment instrument — how far down the ladder a student goes is a
+//      proficiency signal (Evidence-Centered Design / stealth assessment), the
+//      kind of evidence the activity `report()` channel carries.
+//   2. AI-tutor seam — the ladders are authored here as DATA (deterministic,
+//      glass-box, offline). A future adaptive tutor can regenerate the rungs per
+//      student; the "every diagnostic has a fading scaffold" contract is stable.
+// Mechanical lints (a typo, a dead line) have no concept to teach, so they get
+// no ladder (`scaffold` returns `None`) — a one-click fix, not a question.
+
+/// Which diagnostic produced a lint — used to look up its fix scaffold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintKind {
+    Typo,
+    UndefinedName,
+    TypeChurn,
+    UnusedLocal,
+    MutableDefault,
+    UnreachableCode,
+    ShadowedBuiltin,
+    SelfComparison,
+}
+
+/// A fading hint ladder for a concept-bearing lint. Rungs are least-help-first;
+/// the student stops at whichever they can solve from.
+#[derive(Debug, Clone, Copy)]
+pub struct Scaffold {
+    /// A guiding question that orients attention to the concept (no answer).
+    pub question: &'static str,
+    /// A narrower nudge for a student still stuck after the question.
+    pub hint: &'static str,
+    /// The concrete fix, shown only on request (the escape hatch).
+    pub fix: &'static str,
+}
+
+/// The fix scaffold for a lint kind, or `None` for the mechanical / advisory
+/// lints with no single concept to teach (a spelling typo, dead code after a
+/// `return`, an undefined name, a type churn).
+pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
+    Some(match kind {
+        LintKind::MutableDefault => Scaffold {
+            question: "This list (or dict) is made once and shared by EVERY call to the \
+                       function. How could you give each call its own fresh one?",
+            hint: "Start the parameter at `None` instead of `[]`, then create the list on the \
+                   first line inside the function.",
+            fix: "Change the default to `None` (e.g. `acc=None`), then make the first line \
+                  `if acc is None:` and set `acc = []` inside it.",
+        },
+        LintKind::ShadowedBuiltin => Scaffold {
+            question: "This variable has the same name as a built-in tool. If you renamed it, \
+                       what name would still say what it holds?",
+            hint: "Pick a name that describes the data — like `items`, `values`, or `numbers` \
+                   — instead of the built-in's name.",
+            fix: "Rename the variable everywhere it appears (e.g. `list` → `items`) so the \
+                  built-in still works.",
+        },
+        LintKind::UnusedLocal => Scaffold {
+            question: "You set this variable but nothing ever uses its value. What did you plan \
+                       to do with it?",
+            hint: "Did you mean to send it back with `return`, show it with `print(...)`, or \
+                   use it on the next line?",
+            fix: "Either use the value (e.g. `return <name>` / `print(<name>)`), or delete the \
+                  line if it was left over.",
+        },
+        LintKind::SelfComparison => Scaffold {
+            question: "This compares (or assigns) something to itself, so the result never \
+                       changes. What did you actually mean to use on one side?",
+            hint: "Look at both sides — one of them is probably meant to be a different \
+                   variable or value.",
+            fix: "Replace one side with what you meant to check against (e.g. `count == limit`, \
+                  not `count == count`).",
+        },
+        LintKind::Typo
+        | LintKind::UndefinedName
+        | LintKind::UnreachableCode
+        | LintKind::TypeChurn => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,6 +2219,173 @@ mod tests {
         assert!(unused("answer = 42\n").is_empty());
         // Used via attribute/index still counts as a read.
         assert!(unused("def f():\n    xs = [1, 2]\n    return xs[0]\n").is_empty());
+    }
+
+    fn mut_def(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        mutable_default_warnings(&stmts)
+    }
+
+    #[test]
+    fn mutable_default_flags_shared_containers() {
+        // The classic footgun: a list default shared across calls.
+        let w = mut_def("def add(x, acc=[]):\n    acc.append(x)\n    return acc\n");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, 1);
+        assert!(
+            w[0].1.contains("`acc`") && w[0].1.contains("a list"),
+            "{}",
+            w[0].1
+        );
+        // Dict and set literals + constructor calls also fire, on the right param.
+        assert_eq!(mut_def("def f(a, b={}):\n    return b\n").len(), 1);
+        assert_eq!(mut_def("def f(s=set()):\n    return s\n").len(), 1);
+        assert_eq!(mut_def("def f(d=dict()):\n    return d\n").len(), 1);
+    }
+
+    #[test]
+    fn mutable_default_does_not_cry_wolf() {
+        // Immutable defaults are all fine.
+        assert!(
+            mut_def("def f(n=0, name=\"x\", flag=None, pair=(1, 2)):\n    return n\n").is_empty()
+        );
+        // No defaults at all.
+        assert!(mut_def("def f(a, b):\n    return a + b\n").is_empty());
+    }
+
+    fn unreach(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        unreachable_code_warnings(&stmts)
+    }
+
+    #[test]
+    fn unreachable_flags_code_after_exit() {
+        // After a return in the same block.
+        let w = unreach("def f():\n    return 1\n    print(\"never\")\n");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].0, 3);
+        assert!(w[0].1.contains("return"));
+        // break / continue in a loop too.
+        assert_eq!(
+            unreach("for i in range(3):\n    break\n    print(i)\n").len(),
+            1
+        );
+        assert_eq!(
+            unreach("for i in range(3):\n    continue\n    print(i)\n").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unreachable_does_not_cry_wolf() {
+        // A return as the last statement is fine.
+        assert!(unreach("def f():\n    x = 1\n    return x\n").is_empty());
+        // A return INSIDE an if does NOT kill code after the if (the else path
+        // continues) — this is the precision that keeps it honest.
+        assert!(unreach("def f(c):\n    if c:\n        return 1\n    return 2\n").is_empty());
+        // Code before the return is reachable.
+        assert!(unreach("def f():\n    print(\"hi\")\n    return 1\n").is_empty());
+    }
+
+    fn shadow(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        shadowed_builtin_warnings(&stmts)
+    }
+
+    #[test]
+    fn shadow_flags_dangerous_builtins() {
+        let w = shadow("list = [1, 2, 3]\n");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].1.contains("`list`"));
+        // A loop variable named after a builtin shadows it too.
+        assert_eq!(
+            shadow("for str in [\"a\", \"b\"]:\n    print(str)\n").len(),
+            1
+        );
+        // Deduped: one warning per shadowed name.
+        assert_eq!(shadow("dict = {}\ndict = {1: 2}\n").len(), 1);
+    }
+
+    #[test]
+    fn shadow_does_not_cry_wolf() {
+        // Builtins that ARE common variable names are deliberately allowed.
+        assert!(shadow("sum = 0\nfor x in [1, 2]:\n    sum = sum + x\n").is_empty());
+        assert!(shadow("max = 10\ntype = \"circle\"\ninput = get()\n").is_empty());
+        // An ordinary name is fine.
+        assert!(shadow("total = 0\nitems = []\n").is_empty());
+    }
+
+    fn selfcmp(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        self_comparison_warnings(&stmts)
+    }
+
+    #[test]
+    fn self_comparison_flags_redundant_checks() {
+        // x == x is always True.
+        let w = selfcmp("x = 5\nif x == x:\n    print(\"yes\")\n");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].1.contains("always True"), "{}", w[0].1);
+        // != is always False; attribute/index self-compares count.
+        assert!(
+            selfcmp("if a != a:\n    pass\n")[0]
+                .1
+                .contains("always False")
+        );
+        assert_eq!(selfcmp("if obj.x == obj.x:\n    pass\n").len(), 1);
+        // No-op self-assignment.
+        let a = selfcmp("x = 1\nx = x\n");
+        assert_eq!(a.len(), 1);
+        assert!(a[0].1.contains("doesn't do anything"), "{}", a[0].1);
+    }
+
+    #[test]
+    fn self_comparison_does_not_cry_wolf() {
+        // Two calls are NOT self-comparison (could differ / have effects).
+        assert!(selfcmp("if roll() == roll():\n    pass\n").is_empty());
+        // Comparing two different things is fine.
+        assert!(selfcmp("if a == b:\n    pass\n").is_empty());
+        // Constant folds (no variable) are left alone.
+        assert!(selfcmp("if 1 == 1:\n    pass\n").is_empty());
+        // A real reassignment is not a no-op.
+        assert!(selfcmp("x = 1\nx = x + 1\n").is_empty());
+    }
+
+    #[test]
+    fn scaffolds_cover_concept_lints_only() {
+        // Concept-bearing lints have a 3-rung ladder.
+        for k in [
+            LintKind::MutableDefault,
+            LintKind::ShadowedBuiltin,
+            LintKind::UnusedLocal,
+            LintKind::SelfComparison,
+        ] {
+            let s = scaffold(k).expect("concept lint should have a scaffold");
+            assert!(!s.question.is_empty() && !s.hint.is_empty() && !s.fix.is_empty());
+        }
+        // Mechanical / advisory lints have none (nothing to teach, or no single fix).
+        for k in [
+            LintKind::Typo,
+            LintKind::UnreachableCode,
+            LintKind::UndefinedName,
+            LintKind::TypeChurn,
+        ] {
+            assert!(scaffold(k).is_none(), "{k:?} should have no scaffold");
+        }
+    }
+
+    #[test]
+    fn pass_is_never_flagged() {
+        // `pass` is a statement, not a name — the undefined-variable lint (which
+        // used to see `Name("pass")`) must not touch it, in a def or a loop.
+        assert!(undef("def f():\n    pass\n").is_empty());
+        assert!(undef("for i in range(3):\n    pass\n").is_empty());
+        // And a `pass` before a `return` is reachable (no unreachable warning).
+        assert!(unreach("def f():\n    pass\n    return 1\n").is_empty());
     }
 
     #[test]
