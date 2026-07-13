@@ -557,6 +557,71 @@ pub fn set_typed_names(stmts: &[Stmt]) -> Vec<String> {
     out
 }
 
+/// Names that hold strings, by the same fixed-point scheme as
+/// [`infer_set_names`]: seeded from string literals and string-returning
+/// builtins, then propagated through assignment and `+` (concatenation) until
+/// nothing new is learned. Deliberately an UNDER-approximation — a miss only
+/// means the blocks decompiler renders a `+` as the numeric block instead of
+/// "join text", never wrong code.
+pub(crate) fn str_typed_names(stmts: &[Stmt]) -> HashSet<String> {
+    let mut assigns: Vec<(String, &Expr)> = Vec::new();
+    let mut seen = HashSet::new(); // unused set-seed slot; reuse the collector
+    collect_assigns(stmts, &mut assigns, &mut seen);
+    let mut strs: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, rhs) in &assigns {
+            if !strs.contains(name) && is_str_expr(rhs, &strs) {
+                strs.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    strs
+}
+
+/// Whether `e` is string-valued, given the names already known to be strings.
+/// Conservative: only shapes that are certainly strings count.
+pub(crate) fn is_str_expr(e: &Expr, strs: &HashSet<String>) -> bool {
+    match &e.kind {
+        ExprKind::Str(_) => true,
+        ExprKind::Name(n) => strs.contains(n),
+        // Concatenation: `+` with a known-string side is string-valued (with a
+        // non-string other side it would be a runtime error, not a number).
+        ExprKind::Bin(BinOp::Add, a, b) => is_str_expr(a, strs) || is_str_expr(b, strs),
+        // Builtins that return strings.
+        ExprKind::Call(name, _) => {
+            matches!(name.as_str(), "str" | "repr" | "input" | "chr" | "get_value" | "get_field")
+        }
+        // String methods that return strings, on a string receiver.
+        ExprKind::MethodCall(obj, method, _) => {
+            is_str_expr(obj, strs)
+                && matches!(
+                    method.as_str(),
+                    "upper"
+                        | "lower"
+                        | "strip"
+                        | "lstrip"
+                        | "rstrip"
+                        | "replace"
+                        | "title"
+                        | "capitalize"
+                        | "swapcase"
+                        | "zfill"
+                        | "center"
+                        | "ljust"
+                        | "rjust"
+                        | "format"
+                        | "join"
+                )
+        }
+        _ => false,
+    }
+}
+
 /// The fixed-point set-name inference shared by `set_typed_names` and
 /// `set_operator_spans`. `c = a & b` only resolves once a and b are known, so we
 /// iterate until nothing new is learned (bounded by the number of names).

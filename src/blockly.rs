@@ -93,6 +93,7 @@ pub(crate) fn to_blocks_parsed(
 
     let mut b = Builder {
         tolerant: true,
+        str_names: crate::lint::str_typed_names(stmts),
         ..Default::default()
     };
     let tops = b.build_program(&stmts);
@@ -125,7 +126,10 @@ pub(crate) fn to_blocks_parsed(
 pub fn to_blockly_json(source: &str) -> Result<String, String> {
     let tokens = crate::lexer::lex(source).map_err(|e| e.to_string())?;
     let stmts = crate::parser::parse(&tokens).map_err(|e| e.to_string())?;
-    let mut b = Builder::default();
+    let mut b = Builder {
+        str_names: crate::lint::str_typed_names(&stmts),
+        ..Default::default()
+    };
     // `chain` registers every variable it references via `var_id`, and
     // `variables_json` runs afterwards, so the variable list is complete with no
     // separate pre-pass.
@@ -156,6 +160,11 @@ struct Builder {
     tolerant: bool,
     /// Notes gathered while tolerant: statements that couldn't be represented.
     notes: Vec<CompileError>,
+    /// Names inferred to hold strings (`lint::str_typed_names`), so a string
+    /// `+` decompiles to the String-typed text_join block instead of the
+    /// Number-typed math block — which the honest connection checker would
+    /// (rightly) refuse to accept a text operand into.
+    str_names: std::collections::HashSet<String>,
 }
 
 impl Builder {
@@ -708,7 +717,38 @@ impl Builder {
         }
     }
 
+    /// Left-flatten a `+` chain (`a + b + c` parses as `Add(Add(a, b), c)`)
+    /// into its operands, in source order — string concat renders as ONE
+    /// variadic text_join, not a nest of two-item joins.
+    fn flatten_add<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        if let ExprKind::Bin(BinOp::Add, x, y) = &e.kind {
+            Self::flatten_add(x, out);
+            Self::flatten_add(y, out);
+        } else {
+            out.push(e);
+        }
+    }
+
     fn bin_block(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<String, String> {
+        // String concatenation gets the String-typed "join text" block. The
+        // Number-typed math block was a lie the connection checker had to be
+        // globally loosened to tolerate; with text_join the checker can stay
+        // honest. Under-approximating inference: an unknown-typed `+` still
+        // renders as math (safe — the checker is permissive during OUR loads).
+        if matches!(op, BinOp::Add)
+            && (crate::lint::is_str_expr(a, &self.str_names)
+                || crate::lint::is_str_expr(b, &self.str_names))
+        {
+            let mut items: Vec<&Expr> = Vec::new();
+            Self::flatten_add(a, &mut items);
+            Self::flatten_add(b, &mut items);
+            let mut ins = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                ins.push(input(&format!("ADD{i}"), &self.value_block(item)?));
+            }
+            let extra = format!("{{\"itemCount\":{}}}", items.len());
+            return Ok(block("text_join", "", &ins.join(","), &extra, ""));
+        }
         let av = self.value_block(a)?;
         let bv = self.value_block(b)?;
         let ab = format!("{},{}", input("A", &av), input("B", &bv));
@@ -1598,5 +1638,39 @@ mod none_roundtrip_tests {
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert!(out.json.contains("text_print"), "{}", out.json);
         assert!(out.json.contains("variables_set"), "{}", out.json);
+    }
+}
+
+#[cfg(test)]
+mod text_join_tests {
+    use super::*;
+
+    #[test]
+    fn string_concat_decompiles_to_text_join_not_math() {
+        // Literal on the left (the report(0, "answered " + answer) shape).
+        let out = to_blocks("msg = \"answered \" + answer\n");
+        assert!(out.json.contains("\"type\":\"text_join\""), "{}", out.json);
+        assert!(!out.json.contains("math_arithmetic"), "{}", out.json);
+        // Chained concat flattens to ONE variadic join, in source order.
+        let out = to_blocks("msg = \"a\" + name + \"c\"\n");
+        assert!(out.json.contains("\"itemCount\":3"), "{}", out.json);
+        assert_eq!(out.json.matches("text_join").count(), 1, "{}", out.json);
+    }
+
+    #[test]
+    fn string_typing_propagates_through_names_fixed_point() {
+        // b is a string only via a; the join must still be recognized.
+        let out = to_blocks("a = \"hi\"\nb = a\nc = b + x\n");
+        assert!(out.json.contains("text_join"), "{}", out.json);
+        // String-returning builtins seed the inference too.
+        let out = to_blocks("ans = get_value(\"#answer\")\nmsg = \"you said \" + ans\n");
+        assert!(out.json.contains("text_join"), "{}", out.json);
+    }
+
+    #[test]
+    fn numeric_add_still_decompiles_to_math() {
+        let out = to_blocks("x = 1 + 2\ny = a + b\n");
+        assert!(!out.json.contains("text_join"), "{}", out.json);
+        assert!(out.json.contains("math_arithmetic"), "{}", out.json);
     }
 }
