@@ -362,10 +362,13 @@ fn walk_expr(e: &Expr, known: &[&str], out: &mut Vec<CompileError>) {
                 // The parser records the callee name's span on Call nodes, so the
                 // editor can squiggle exactly the misspelled name. `(0, 0)` means
                 // unset (e.g. a desugared call) — fall back to line-only.
-                out.push(match e.span {
-                    (0, 0) => CompileError::at(e.line, message),
-                    span => CompileError::at_span(e.line, span, message),
-                });
+                out.push(
+                    match e.span {
+                        (0, 0) => CompileError::at(e.line, message),
+                        span => CompileError::at_span(e.line, span, message),
+                    }
+                    .with_kind(crate::error::ErrorKind::Name),
+                );
             }
             for a in args {
                 walk_expr(a, known, out);

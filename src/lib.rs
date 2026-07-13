@@ -26,7 +26,7 @@ pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
 pub use builtins::{BUILTINS, Builtin, builtins_json};
 pub use debug::{Status, Stepper, Value, Vm};
-pub use error::CompileError;
+pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
 
 /// Compile Python (the supported subset) to WebAssembly text (WAT).
@@ -683,5 +683,21 @@ for i in range(1, 16):
         print(i)
 ";
         assert_valid_wasm(src);
+    }
+}
+
+#[cfg(test)]
+mod error_kind_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_name_classifies_as_name_error_not_syntax() {
+        // An undefined variable is a NAME problem — labeling it "syntax"
+        // points a student at punctuation instead of the missing definition.
+        let e = try_compile("msg = \"answered \" + answer\n").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Name, "{e}");
+        // A genuine parse error stays Syntax.
+        let e = try_compile("if answer\n    print(1)\n").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Syntax, "{e}");
     }
 }

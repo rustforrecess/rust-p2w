@@ -6430,7 +6430,8 @@ impl Gen {
                         ),
                     ))
                 } else {
-                    Err(CompileError::at(e.line, format!("unknown name '{n}'")))
+                    Err(CompileError::at(e.line, format!("unknown name '{n}'"))
+                        .with_kind(crate::error::ErrorKind::Name))
                 }
             }
             ExprKind::Unary(UnOp::Neg, inner) => {
@@ -7728,7 +7729,8 @@ impl Gen {
                     Err(CompileError::at(
                         e.line,
                         format!("unknown name '{n}' (define it with `{n} = ...` first)"),
-                    ))
+                    )
+                    .with_kind(crate::error::ErrorKind::Name))
                 }
             }
             ExprKind::Call(_, args) => {
