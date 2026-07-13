@@ -144,71 +144,54 @@ fn churn_scope(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
     // name -> (established category, whether we've already warned about it).
     let mut seen: HashMap<String, (LintTy, bool)> = HashMap::new();
     churn_walk(stmts, &mut seen, out);
-    // Nested scopes are independent.
+    // Nested scopes are independent: descend only NEW-scope child blocks with
+    // a fresh `seen` (same-scope blocks were handled inside churn_walk).
     for s in stmts {
-        match &s.kind {
-            StmtKind::Def { body, .. } => churn_scope(body, out),
-            StmtKind::ClassDef { methods, .. } => {
-                for m in methods {
-                    churn_scope(&m.body, out);
-                }
+        for_each_child_block(s, |b, scope| {
+            if scope == BlockScope::New {
+                churn_scope(b, out);
             }
-            _ => {}
-        }
+        });
     }
 }
 
-/// Walk the assignments of one scope (descending through control-flow bodies,
-/// which rebind names in the *same* scope, but not `def`/`class`).
+/// Walk the assignments of one scope: same-scope child blocks (if/for/while
+/// bodies rebind names in THIS scope) via the shared walker; `def`/`class`
+/// bodies are separate scopes, handled by [`churn_scope`].
 fn churn_walk(
     stmts: &[Stmt],
     seen: &mut HashMap<String, (LintTy, bool)>,
     out: &mut Vec<(usize, String)>,
 ) {
     for s in stmts {
-        match &s.kind {
-            StmtKind::Assign(name, value) | StmtKind::AnnAssign { name, value, .. } => {
-                if let Some(ty) = lint_ty(value) {
-                    match seen.get_mut(name) {
-                        None => {
-                            seen.insert(name.clone(), (ty, false));
-                        }
-                        Some((first, warned)) if *first != ty && !*warned => {
-                            out.push((
-                                s.line,
-                                format!(
-                                    "'{name}' held {} earlier but is {} here — reusing one \
-                                     name for a different kind of value is a common source of \
-                                     confusion; a new name is usually clearer",
-                                    first.noun(),
-                                    ty.noun()
-                                ),
-                            ));
-                            *warned = true;
-                        }
-                        _ => {}
-                    }
+        if let StmtKind::Assign(name, value) | StmtKind::AnnAssign { name, value, .. } = &s.kind
+            && let Some(ty) = lint_ty(value)
+        {
+            match seen.get_mut(name) {
+                None => {
+                    seen.insert(name.clone(), (ty, false));
                 }
+                Some((first, warned)) if *first != ty && !*warned => {
+                    out.push((
+                        s.line,
+                        format!(
+                            "'{name}' held {} earlier but is {} here — reusing one \
+                                 name for a different kind of value is a common source of \
+                                 confusion; a new name is usually clearer",
+                            first.noun(),
+                            ty.noun()
+                        ),
+                    ));
+                    *warned = true;
+                }
+                _ => {}
             }
-            StmtKind::If {
-                body,
-                elifs,
-                else_body,
-                ..
-            } => {
-                churn_walk(body, seen, out);
-                for (_, b) in elifs {
-                    churn_walk(b, seen, out);
-                }
-                if let Some(b) = else_body {
-                    churn_walk(b, seen, out);
-                }
-            }
-            StmtKind::For { body, .. }
-            | StmtKind::ForEach { body, .. }
-            | StmtKind::While { body, .. } => churn_walk(body, seen, out),
-            _ => {}
         }
+        for_each_child_block(s, |b, scope| {
+            if scope == BlockScope::Same {
+                churn_walk(b, seen, out);
+            }
+        });
     }
 }
 
@@ -231,213 +214,40 @@ pub fn typo_diagnostics(stmts: &[Stmt]) -> Vec<CompileError> {
 fn collect_defs(stmts: &[Stmt], defs: &mut Vec<String>) {
     for s in stmts {
         match &s.kind {
-            StmtKind::Def { name, body, .. } => {
+            StmtKind::Def { name, .. } | StmtKind::ClassDef { name, .. } => {
                 defs.push(name.clone());
-                collect_defs(body, defs);
             }
-            StmtKind::ClassDef { name, methods, .. } => {
-                defs.push(name.clone());
-                for m in methods {
-                    collect_defs(&m.body, defs);
-                }
-            }
-            StmtKind::If {
-                body,
-                elifs,
-                else_body,
-                ..
-            } => {
-                collect_defs(body, defs);
-                for (_, b) in elifs {
-                    collect_defs(b, defs);
-                }
-                if let Some(b) = else_body {
-                    collect_defs(b, defs);
-                }
-            }
-            StmtKind::For { body, .. }
-            | StmtKind::ForEach { body, .. }
-            | StmtKind::While { body, .. } => collect_defs(body, defs),
             _ => {}
         }
+        for_each_child_block(s, |b, _| collect_defs(b, defs));
     }
 }
 
 fn walk_stmts(stmts: &[Stmt], known: &[&str], out: &mut Vec<CompileError>) {
     for s in stmts {
-        match &s.kind {
-            StmtKind::Expr(e) | StmtKind::Assign(_, e) | StmtKind::AnnAssign { value: e, .. } => {
-                walk_expr(e, known, out)
-            }
-            StmtKind::Return(Some(e)) => walk_expr(e, known, out),
-            StmtKind::If {
-                cond,
-                body,
-                elifs,
-                else_body,
-            } => {
-                walk_expr(cond, known, out);
-                walk_stmts(body, known, out);
-                for (c, b) in elifs {
-                    walk_expr(c, known, out);
-                    walk_stmts(b, known, out);
-                }
-                if let Some(b) = else_body {
-                    walk_stmts(b, known, out);
-                }
-            }
-            StmtKind::For {
-                start,
-                end,
-                step,
-                body,
-                ..
-            } => {
-                walk_expr(start, known, out);
-                walk_expr(end, known, out);
-                walk_expr(step, known, out);
-                walk_stmts(body, known, out);
-            }
-            StmtKind::ForEach { iterable, body, .. } => {
-                walk_expr(iterable, known, out);
-                walk_stmts(body, known, out);
-            }
-            StmtKind::While { cond, body } => {
-                walk_expr(cond, known, out);
-                walk_stmts(body, known, out);
-            }
-            StmtKind::Def { defaults, body, .. } => {
-                for d in defaults {
-                    walk_expr(d, known, out);
-                }
-                walk_stmts(body, known, out);
-            }
-            StmtKind::ClassDef {
-                methods,
-                class_vars,
-                ..
-            } => {
-                for (_, e) in class_vars {
-                    walk_expr(e, known, out);
-                }
-                for m in methods {
-                    walk_stmts(&m.body, known, out);
-                }
-            }
-            StmtKind::SetIndex {
-                target,
-                index,
-                value,
-            } => {
-                walk_expr(target, known, out);
-                walk_expr(index, known, out);
-                walk_expr(value, known, out);
-            }
-            StmtKind::SetAttr { obj, value, .. } => {
-                walk_expr(obj, known, out);
-                walk_expr(value, known, out);
-            }
-            StmtKind::UnpackAssign { targets, value } => {
-                for t in targets {
-                    walk_expr(t, known, out);
-                }
-                walk_expr(value, known, out);
-            }
-            StmtKind::Return(None)
-            | StmtKind::Break
-            | StmtKind::Continue
-            | StmtKind::Pass
-            | StmtKind::Import(_) => {}
-        }
+        stmt_exprs(s, &mut |e| walk_expr(e, known, out));
+        for_each_child_block(s, |b, _| walk_stmts(b, known, out));
     }
 }
 
 fn walk_expr(e: &Expr, known: &[&str], out: &mut Vec<CompileError>) {
-    match &e.kind {
-        ExprKind::Call(name, args) => {
-            if !known.contains(&name.as_str())
-                && let Some(sugg) = did_you_mean(name, known)
-            {
-                let message = format!("`{name}` isn't defined — did you mean `{sugg}`?");
-                // The parser records the callee name's span on Call nodes, so the
-                // editor can squiggle exactly the misspelled name. `(0, 0)` means
-                // unset (e.g. a desugared call) — fall back to line-only.
-                out.push(
-                    match e.span {
-                        (0, 0) => CompileError::at(e.line, message),
-                        span => CompileError::at_span(e.line, span, message),
-                    }
-                    .with_kind(crate::error::ErrorKind::Name),
-                );
+    if let ExprKind::Call(name, _) = &e.kind
+        && !known.contains(&name.as_str())
+        && let Some(sugg) = did_you_mean(name, known)
+    {
+        let message = format!("`{name}` isn't defined — did you mean `{sugg}`?");
+        // The parser records the callee name's span on Call nodes, so the
+        // editor can squiggle exactly the misspelled name. `(0, 0)` means
+        // unset (e.g. a desugared call) — fall back to line-only.
+        out.push(
+            match e.span {
+                (0, 0) => CompileError::at(e.line, message),
+                span => CompileError::at_span(e.line, span, message),
             }
-            for a in args {
-                walk_expr(a, known, out);
-            }
-        }
-        ExprKind::MethodCall(recv, _, args) => {
-            walk_expr(recv, known, out);
-            for a in args {
-                walk_expr(a, known, out);
-            }
-        }
-        ExprKind::Unary(_, x) | ExprKind::Attr(x, _) | ExprKind::Kwarg(_, x) => {
-            walk_expr(x, known, out)
-        }
-        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {
-            walk_expr(a, known, out);
-            walk_expr(b, known, out);
-        }
-        ExprKind::List(xs) | ExprKind::Tuple(xs) => {
-            for x in xs {
-                walk_expr(x, known, out);
-            }
-        }
-        ExprKind::Dict(pairs) => {
-            for (k, v) in pairs {
-                walk_expr(k, known, out);
-                walk_expr(v, known, out);
-            }
-        }
-        ExprKind::Slice {
-            obj,
-            start,
-            stop,
-            step,
-        } => {
-            walk_expr(obj, known, out);
-            for o in [start, stop, step].into_iter().flatten() {
-                walk_expr(o, known, out);
-            }
-        }
-        ExprKind::ListComp { element, clauses } => {
-            walk_expr(element, known, out);
-            walk_clauses(clauses, known, out);
-        }
-        ExprKind::DictComp {
-            key,
-            value,
-            clauses,
-        } => {
-            walk_expr(key, known, out);
-            walk_expr(value, known, out);
-            walk_clauses(clauses, known, out);
-        }
-        ExprKind::Int(_)
-        | ExprKind::Float(_)
-        | ExprKind::Bool(_)
-        | ExprKind::NoneLit
-        | ExprKind::Str(_)
-        | ExprKind::Name(_) => {}
+            .with_kind(crate::error::ErrorKind::Name),
+        );
     }
-}
-
-fn walk_clauses(clauses: &[CompClause], known: &[&str], out: &mut Vec<CompileError>) {
-    for c in clauses {
-        match c {
-            CompClause::For { iter, .. } => walk_expr(iter, known, out),
-            CompClause::If(e) => walk_expr(e, known, out),
-        }
-    }
+    each_child_expr(e, &mut |c| walk_expr(c, known, out));
 }
 
 // --- cycle-freedom analysis ------------------------------------------------
@@ -597,7 +407,10 @@ pub(crate) fn is_str_expr(e: &Expr, strs: &HashSet<String>) -> bool {
         ExprKind::Bin(BinOp::Add, a, b) => is_str_expr(a, strs) || is_str_expr(b, strs),
         // Builtins that return strings.
         ExprKind::Call(name, _) => {
-            matches!(name.as_str(), "str" | "repr" | "input" | "chr" | "get_value" | "get_field")
+            matches!(
+                name.as_str(),
+                "str" | "repr" | "input" | "chr" | "get_value" | "get_field"
+            )
         }
         // String methods that return strings, on a string receiver.
         ExprKind::MethodCall(obj, method, _) => {
@@ -664,90 +477,8 @@ pub fn set_operator_spans(stmts: &[Stmt]) -> Vec<crate::ast::Span> {
 
 fn spans_in_stmts(stmts: &[Stmt], sets: &HashSet<String>, out: &mut Vec<crate::ast::Span>) {
     for s in stmts {
-        match &s.kind {
-            StmtKind::Expr(e)
-            | StmtKind::Assign(_, e)
-            | StmtKind::AnnAssign { value: e, .. }
-            | StmtKind::Return(Some(e)) => spans_in_expr(e, sets, out),
-            StmtKind::If {
-                cond,
-                body,
-                elifs,
-                else_body,
-            } => {
-                spans_in_expr(cond, sets, out);
-                spans_in_stmts(body, sets, out);
-                for (c, b) in elifs {
-                    spans_in_expr(c, sets, out);
-                    spans_in_stmts(b, sets, out);
-                }
-                if let Some(b) = else_body {
-                    spans_in_stmts(b, sets, out);
-                }
-            }
-            StmtKind::For {
-                start,
-                end,
-                step,
-                body,
-                ..
-            } => {
-                spans_in_expr(start, sets, out);
-                spans_in_expr(end, sets, out);
-                spans_in_expr(step, sets, out);
-                spans_in_stmts(body, sets, out);
-            }
-            StmtKind::ForEach { iterable, body, .. } => {
-                spans_in_expr(iterable, sets, out);
-                spans_in_stmts(body, sets, out);
-            }
-            StmtKind::While { cond, body } => {
-                spans_in_expr(cond, sets, out);
-                spans_in_stmts(body, sets, out);
-            }
-            StmtKind::Def { defaults, body, .. } => {
-                for d in defaults {
-                    spans_in_expr(d, sets, out);
-                }
-                spans_in_stmts(body, sets, out);
-            }
-            StmtKind::ClassDef {
-                methods,
-                class_vars,
-                ..
-            } => {
-                for (_, e) in class_vars {
-                    spans_in_expr(e, sets, out);
-                }
-                for m in methods {
-                    spans_in_stmts(&m.body, sets, out);
-                }
-            }
-            StmtKind::SetIndex {
-                target,
-                index,
-                value,
-            } => {
-                spans_in_expr(target, sets, out);
-                spans_in_expr(index, sets, out);
-                spans_in_expr(value, sets, out);
-            }
-            StmtKind::SetAttr { obj, value, .. } => {
-                spans_in_expr(obj, sets, out);
-                spans_in_expr(value, sets, out);
-            }
-            StmtKind::UnpackAssign { targets, value } => {
-                for t in targets {
-                    spans_in_expr(t, sets, out);
-                }
-                spans_in_expr(value, sets, out);
-            }
-            StmtKind::Return(None)
-            | StmtKind::Break
-            | StmtKind::Continue
-            | StmtKind::Pass
-            | StmtKind::Import(_) => {}
-        }
+        stmt_exprs(s, &mut |e| spans_in_expr(e, sets, out));
+        for_each_child_block(s, |b, _| spans_in_stmts(b, sets, out));
     }
 }
 
@@ -855,31 +586,9 @@ fn collect_assigns<'a>(
                 }
                 assigns.push((name.clone(), value));
             }
-            StmtKind::If {
-                body,
-                elifs,
-                else_body,
-                ..
-            } => {
-                collect_assigns(body, assigns, sets);
-                for (_, b) in elifs {
-                    collect_assigns(b, assigns, sets);
-                }
-                if let Some(b) = else_body {
-                    collect_assigns(b, assigns, sets);
-                }
-            }
-            StmtKind::For { body, .. }
-            | StmtKind::ForEach { body, .. }
-            | StmtKind::While { body, .. }
-            | StmtKind::Def { body, .. } => collect_assigns(body, assigns, sets),
-            StmtKind::ClassDef { methods, .. } => {
-                for m in methods {
-                    collect_assigns(&m.body, assigns, sets);
-                }
-            }
             _ => {}
         }
+        for_each_child_block(s, |b, _| collect_assigns(b, assigns, sets));
     }
 }
 
@@ -1493,7 +1202,29 @@ fn reads_of(e: &Expr, out: &mut HashSet<String>) {
 /// Apply `f` to each nested statement block of `s` — every control-flow body and
 /// every function/method/class body. Lets the lints below recurse without each
 /// re-spelling the whole `StmtKind` match.
-fn for_each_child_block(s: &Stmt, mut f: impl FnMut(&[Stmt])) {
+/// Whether a child block runs in the SAME variable scope as its parent
+/// (if/for/while bodies) or opens a NEW one (def/method bodies). Scope-aware
+/// lints (type churn, shadowing, unused locals) filter on this; purely
+/// structural walks ignore it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockScope {
+    Same,
+    New,
+}
+
+/// THE single encoding of "which child blocks does a statement have".
+/// Exhaustive on purpose — no `_` arm — so adding an AST statement variant
+/// fails compilation HERE (one audit point) instead of being silently skipped
+/// by half a dozen hand-rolled walkers (an invisible lint false negative).
+///
+/// When you add an arm here, also audit the walkers that keep custom recursion
+/// because their semantics are interwoven with scope/fold logic: the
+/// undefined-name family (`scope_bindings`/`check_reads`/`read_expr`), the
+/// unused-local family (`collect_all_reads`/`reads_of`), and the cycle
+/// analysis (`stmt_may_cycle` — conservative-true, so a miss there is sound
+/// but imprecise). Everything else traverses through this function,
+/// [`stmt_exprs`], and [`each_child_expr`].
+fn for_each_child_block<'a>(s: &'a Stmt, mut f: impl FnMut(&'a [Stmt], BlockScope)) {
     match &s.kind {
         StmtKind::If {
             body,
@@ -1501,24 +1232,35 @@ fn for_each_child_block(s: &Stmt, mut f: impl FnMut(&[Stmt])) {
             else_body,
             ..
         } => {
-            f(body);
+            f(body, BlockScope::Same);
             for (_, b) in elifs {
-                f(b);
+                f(b, BlockScope::Same);
             }
             if let Some(b) = else_body {
-                f(b);
+                f(b, BlockScope::Same);
             }
         }
         StmtKind::For { body, .. }
         | StmtKind::ForEach { body, .. }
-        | StmtKind::While { body, .. }
-        | StmtKind::Def { body, .. } => f(body),
+        | StmtKind::While { body, .. } => f(body, BlockScope::Same),
+        StmtKind::Def { body, .. } => f(body, BlockScope::New),
         StmtKind::ClassDef { methods, .. } => {
             for m in methods {
-                f(&m.body);
+                f(&m.body, BlockScope::New);
             }
         }
-        _ => {}
+        // No child blocks. Listed explicitly (not `_`) — see the doc comment.
+        StmtKind::Expr(_)
+        | StmtKind::Assign(..)
+        | StmtKind::AnnAssign { .. }
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass
+        | StmtKind::Return(_)
+        | StmtKind::SetIndex { .. }
+        | StmtKind::SetAttr { .. }
+        | StmtKind::UnpackAssign { .. }
+        | StmtKind::Import(_) => {}
     }
 }
 
@@ -1574,7 +1316,13 @@ fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
                 f(e);
             }
         }
-        _ => {}
+        // No in-place expressions. Explicit (not `_`) so a new statement
+        // variant must be classified here — see for_each_child_block.
+        StmtKind::Return(None)
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Pass
+        | StmtKind::Import(_) => {}
     }
 }
 
@@ -1643,7 +1391,14 @@ fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 }
             }
         }
-        _ => {}
+        // Leaves. Explicit (not `_`) so a new expression variant must be
+        // classified here — see for_each_child_block.
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::NoneLit
+        | ExprKind::Str(_)
+        | ExprKind::Name(_) => {}
     }
 }
 
@@ -1700,7 +1455,7 @@ fn walk_mutable_defaults(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
                 }
             }
         }
-        for_each_child_block(s, |b| walk_mutable_defaults(b, out));
+        for_each_child_block(s, |b, _| walk_mutable_defaults(b, out));
     }
 }
 
@@ -1743,7 +1498,7 @@ fn walk_unreachable(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
             ));
             flagged = true;
         }
-        for_each_child_block(s, |b| walk_unreachable(b, out));
+        for_each_child_block(s, |b, _| walk_unreachable(b, out));
     }
 }
 
@@ -1812,7 +1567,7 @@ fn walk_shadow(stmts: &[Stmt], seen: &mut HashSet<String>, out: &mut Vec<(usize,
             }
             _ => {}
         }
-        for_each_child_block(s, |b| walk_shadow(b, seen, out));
+        for_each_child_block(s, |b, _| walk_shadow(b, seen, out));
     }
 }
 
@@ -1882,7 +1637,7 @@ fn walk_self_cmp(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
         }
         // Self-comparisons anywhere in the statement's expressions.
         stmt_exprs(s, &mut |e| find_self_cmp(e, out));
-        for_each_child_block(s, |b| walk_self_cmp(b, out));
+        for_each_child_block(s, |b, _| walk_self_cmp(b, out));
     }
 }
 

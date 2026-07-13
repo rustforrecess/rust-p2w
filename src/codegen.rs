@@ -7826,7 +7826,9 @@ mod tests {
         let wat = compile(r##"set_position("#box", 120, 80)"##).unwrap();
         // The selector rides the string arg stack; x/y ride the WASM stack.
         assert!(
-            wat.contains(r#"(import "env" "set_position" (func $set_position (param i32) (param i32)))"#),
+            wat.contains(
+                r#"(import "env" "set_position" (func $set_position (param i32) (param i32)))"#
+            ),
             "{wat}"
         );
         assert!(wat.contains("(call $marshal_str"), "{wat}");

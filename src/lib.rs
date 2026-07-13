@@ -150,28 +150,28 @@ fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
     let groups: [(LintKind, Vec<(usize, String)>); 7] = [
         (
             LintKind::UndefinedName,
-            lint::undefined_name_warnings(&stmts),
+            lint::undefined_name_warnings(stmts),
         ),
-        (LintKind::TypeChurn, lint::type_churn_warnings(&stmts)),
+        (LintKind::TypeChurn, lint::type_churn_warnings(stmts)),
         (
             LintKind::UnusedLocal,
-            lint::unused_assignment_warnings(&stmts),
+            lint::unused_assignment_warnings(stmts),
         ),
         (
             LintKind::MutableDefault,
-            lint::mutable_default_warnings(&stmts),
+            lint::mutable_default_warnings(stmts),
         ),
         (
             LintKind::UnreachableCode,
-            lint::unreachable_code_warnings(&stmts),
+            lint::unreachable_code_warnings(stmts),
         ),
         (
             LintKind::ShadowedBuiltin,
-            lint::shadowed_builtin_warnings(&stmts),
+            lint::shadowed_builtin_warnings(stmts),
         ),
         (
             LintKind::SelfComparison,
-            lint::self_comparison_warnings(&stmts),
+            lint::self_comparison_warnings(stmts),
         ),
     ];
     let mut out: Vec<Lint> = Vec::new();

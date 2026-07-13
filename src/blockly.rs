@@ -85,7 +85,7 @@ pub(crate) fn to_blocks_parsed(
     let mut error_spans: Vec<(usize, usize)> = parse_errors.iter().filter_map(|e| e.span).collect();
     let mut errors = parse_errors;
 
-    let typos = crate::lint::typo_diagnostics(&stmts);
+    let typos = crate::lint::typo_diagnostics(stmts);
     let typo_lines: Vec<usize> = typos.iter().filter_map(|e| e.line).collect();
     error_lines.extend(typo_lines.iter().copied());
     error_spans.extend(typos.iter().filter_map(|e| e.span));
@@ -96,7 +96,7 @@ pub(crate) fn to_blocks_parsed(
         str_names: crate::lint::str_typed_names(stmts),
         ..Default::default()
     };
-    let tops = b.build_program(&stmts);
+    let tops = b.build_program(stmts);
     let json = b.document(&tops);
     for note in b.notes {
         // A typo'd call already has a clearer "did you mean" message on this
@@ -1621,7 +1621,11 @@ mod none_roundtrip_tests {
         let out = to_blocks("set_position(None, None, None)\n");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         // The call block survives, reserves all three sockets, fills none.
-        assert!(out.json.contains("\"NAME\":\"set_position\""), "{}", out.json);
+        assert!(
+            out.json.contains("\"NAME\":\"set_position\""),
+            "{}",
+            out.json
+        );
         assert!(out.json.contains("\"argCount\":3"), "{}", out.json);
         assert!(!out.json.contains("ARG0"), "{}", out.json);
         // Partially filled: the filled socket stays, the empty one is omitted.
