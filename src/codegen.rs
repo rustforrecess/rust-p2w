@@ -8214,8 +8214,14 @@ mod dynamic_dom_tests {
         let wat = compile(
             "def d():\n    add_element(\"#s\", \"circle\", \"dot\")\n    set_attr(\"#dot\", \"cx\", str(pointer_x()))\non(\"#s\", \"mousedown\", d)\n",
         );
-        assert!(wat.contains(r#"(import "env" "add_element" (func $add_element))"#), "{wat}");
-        assert!(wat.contains(r#"(import "env" "pointer_x" (func $pointer_x (result i32)))"#), "{wat}");
+        assert!(
+            wat.contains(r#"(import "env" "add_element" (func $add_element))"#),
+            "{wat}"
+        );
+        assert!(
+            wat.contains(r#"(import "env" "pointer_x" (func $pointer_x (result i32)))"#),
+            "{wat}"
+        );
         assert!(wat.contains("(call $add_element)"), "{wat}");
         assert!(wat.contains("(call $box (call $pointer_x))"), "{wat}");
     }

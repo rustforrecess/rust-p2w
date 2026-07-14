@@ -323,7 +323,11 @@ impl Builder {
             HatKind::Click(sel) => ("python_when_click", field("SELECTOR", &jstr(sel))),
             HatKind::Event(sel, ev) => (
                 "python_when_event",
-                format!("{},{}", field("EVENT", &jstr(ev)), field("SELECTOR", &jstr(sel))),
+                format!(
+                    "{},{}",
+                    field("EVENT", &jstr(ev)),
+                    field("SELECTOR", &jstr(sel))
+                ),
             ),
             HatKind::Key(key) => ("python_when_key", field("KEY", &jstr(key))),
             HatKind::Every(ms) => ("python_every", field("MS", &jstr(ms))),
@@ -1713,11 +1717,14 @@ mod annotation_roundtrip_tests {
     /// them verbatim, so blocks -> text regenerates them) — they're the WIT
     /// type source for component conversion (LESSON_PLAYER.md step 5).
     #[test]
-    fn def_param_annotations_ride_the_params_field()  {
-        let out = to_blocks("def set_cell(row: int, col: int, value: str):\n    set_text(\"#g\", value)\n");
+    fn def_param_annotations_ride_the_params_field() {
+        let out = to_blocks(
+            "def set_cell(row: int, col: int, value: str):\n    set_text(\"#g\", value)\n",
+        );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert!(
-            out.json.contains("\"PARAMS\":\"row: int, col: int, value: str\""),
+            out.json
+                .contains("\"PARAMS\":\"row: int, col: int, value: str\""),
             "{}",
             out.json
         );
@@ -1733,11 +1740,13 @@ mod event_hat_tests {
     /// a readable def + on() pair (they work, they just don't fold).
     #[test]
     fn pointer_events_fold_into_the_generic_event_hat() {
-        let out = to_blocks(
-            "def trail():\n    beep()\non(\"#draw\", \"mousemove\", trail)\n",
-        );
+        let out = to_blocks("def trail():\n    beep()\non(\"#draw\", \"mousemove\", trail)\n");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert!(out.json.contains("\"type\":\"python_when_event\""), "{}", out.json);
+        assert!(
+            out.json.contains("\"type\":\"python_when_event\""),
+            "{}",
+            out.json
+        );
         assert!(out.json.contains("\"EVENT\":\"mousemove\""), "{}", out.json);
         assert!(out.json.contains("\"SELECTOR\":\"#draw\""), "{}", out.json);
         // click keeps its dedicated hat…
@@ -1758,7 +1767,11 @@ mod frame_hat_tests {
     fn on_frame_pairs_fold_into_the_frame_hat() {
         let out = to_blocks("def tick():\n    beep()\non_frame(tick)\n");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert!(out.json.contains("\"type\":\"python_every_frame\""), "{}", out.json);
+        assert!(
+            out.json.contains("\"type\":\"python_every_frame\""),
+            "{}",
+            out.json
+        );
         assert!(out.json.contains("\"NAME\":\"tick\""), "{}", out.json);
     }
 }
