@@ -1228,7 +1228,7 @@ pub(crate) enum BlockScope {
 /// analysis (`stmt_may_cycle` — conservative-true, so a miss there is sound
 /// but imprecise). Everything else traverses through this function,
 /// [`stmt_exprs`], and [`each_child_expr`].
-fn for_each_child_block<'a>(s: &'a Stmt, mut f: impl FnMut(&'a [Stmt], BlockScope)) {
+pub(crate) fn for_each_child_block<'a>(s: &'a Stmt, mut f: impl FnMut(&'a [Stmt], BlockScope)) {
     match &s.kind {
         StmtKind::If {
             body,
@@ -1270,7 +1270,7 @@ fn for_each_child_block<'a>(s: &'a Stmt, mut f: impl FnMut(&'a [Stmt], BlockScop
 
 /// Call `f` on each expression a statement evaluates *in place* (NOT descending
 /// into nested blocks — those are walked via [`for_each_child_block`]).
-fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
+pub(crate) fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
     match &s.kind {
         StmtKind::Expr(e)
         | StmtKind::Assign(_, e)
@@ -1332,7 +1332,7 @@ fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
 
 /// Call `f` on each direct child expression of `e` (one level; recurse by
 /// calling this again inside `f`).
-fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+pub(crate) fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     match &e.kind {
         ExprKind::Unary(_, x) | ExprKind::Attr(x, _) | ExprKind::Kwarg(_, x) => f(x),
         ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {

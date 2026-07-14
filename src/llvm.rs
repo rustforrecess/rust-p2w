@@ -28,8 +28,28 @@ use crate::reuse::{Liveness, stmt_mentions_name};
 
 /// The runtime ABI the emitted module depends on (implemented by the device
 /// runtime). Declared at the top of every module.
+/// Host capabilities that cross the component seam (LESSON_PLAYER.md step
+/// 5e): `(builtin name, arity)`. Each lowers to a `call void @p2w_host_*`
+/// with ALL arguments boxed; the symbol is deliberately left undefined —
+/// under `wasm-ld --allow-undefined` it becomes an env import that the
+/// generated component shim resolves (the same seam as `p2w_putc`).
+/// LOCKSTEP with `component::CAPS` — the shim only implements these.
+pub(crate) const HOST_CAPS: &[(&str, usize)] = &[
+    ("set_text", 2),
+    ("set_attr", 3),
+    ("set_position", 3),
+    ("set_field", 2),
+    ("evidence", 2),
+];
+
 const RUNTIME_DECLS: &str = "\
 ; runtime ABI — values are opaque tagged i32; the device runtime owns the rep.
+; host capabilities (component seam) — resolved by the component shim:
+declare void @p2w_host_set_text(i32, i32)
+declare void @p2w_host_set_attr(i32, i32, i32)
+declare void @p2w_host_set_position(i32, i32, i32)
+declare void @p2w_host_set_field(i32, i32)
+declare void @p2w_host_evidence(i32, i32)
 declare i32 @p2w_int(i32)
 declare i32 @p2w_unbox_int(i32)
 declare i32 @p2w_float(double)
@@ -2664,6 +2684,34 @@ impl<'a> FuncEmitter<'a> {
                         i32::from(isf)
                     ));
                     self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // Host capabilities (the component seam): a void call on an
+                // undefined `p2w_host_*` symbol the shim resolves. Args cross
+                // boxed and BORROWED (the shim only reads them); the value of
+                // the expression is None, like every effect builtin.
+                if let Some(&(_, arity)) = HOST_CAPS.iter().find(|(n, _)| n == name) {
+                    if args.len() != arity {
+                        return Err(format!(
+                            "line {}: {name}() takes {arity} argument(s), got {}",
+                            e.line,
+                            args.len()
+                        ));
+                    }
+                    let mut vals = Vec::new();
+                    for a in args {
+                        vals.push(self.expr_borrow(a)?);
+                    }
+                    let call_args: Vec<String> =
+                        vals.iter().map(|(v, _)| format!("i32 {v}")).collect();
+                    self.line(&format!(
+                        "call void @p2w_host_{name}({})",
+                        call_args.join(", ")
+                    ));
+                    for (v, o) in vals {
+                        self.release_if_owned(&v, o);
+                    }
+                    let r = self.call_value("call i32 @p2w_none()");
                     return Ok((r, Repr::Boxed));
                 }
                 // Construction: `Dog(args)` — the class is known statically,

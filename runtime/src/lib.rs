@@ -1366,6 +1366,29 @@ pub unsafe extern "C" fn p2w_str_eq_lit(v: Value, p: *const u8, len: i32) -> boo
     (0..len as usize).all(|i| str_byte(v, i) == bytes[i])
 }
 
+/// The byte pointer of a string value in linear memory — the component
+/// shim's unmarshalling seam (canonical-ABI strings are `(ptr, len)` pairs;
+/// see LESSON_PLAYER.md step 5e). Borrows `v`; traps on a non-string, since
+/// the compiler only routes string-typed values here.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_str_ptr(v: Value) -> i32 {
+    if !(is_heap(v) && obj_tag(v) == T_STR) {
+        trap("p2w_str_ptr on a non-string");
+    }
+    // Values are HEAP-relative offsets; the canonical ABI wants the ABSOLUTE
+    // linear-memory address of the bytes.
+    (heap_base() as usize + v as usize + 12) as i32
+}
+
+/// The byte length of a string value (see `p2w_str_ptr`).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_str_len(v: Value) -> i32 {
+    if !(is_heap(v) && obj_tag(v) == T_STR) {
+        trap("p2w_str_len on a non-string");
+    }
+    str_len(v) as i32
+}
+
 /// The generated class-namespace lookup's dead ends.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_no_such_attribute() -> Value {
