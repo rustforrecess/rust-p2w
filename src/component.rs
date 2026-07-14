@@ -365,7 +365,11 @@ fn wit_world(instance: &str, exports: &[WitExport], imports: &[&'static str]) ->
         }
         w.push_str(";\n");
     }
-    w.push_str("  export live: func() -> s32;\n}\n");
+    w.push_str("  export live: func() -> s32;\n");
+    // Teardown: frees the literal caches main's exit epilogue would have
+    // freed (a resident component never runs main), resetting the slots so
+    // the component stays usable. After dispose, live must be 0.
+    w.push_str("  export dispose: func();\n}\n");
     w
 }
 
@@ -485,6 +489,10 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
     }
 
     c.push_str("__attribute__((export_name(\"live\")))\nint x_live(void) { return p2w_live(); }\n");
+    c.push_str(
+        "extern void p2w_dispose(void);\n\
+         __attribute__((export_name(\"dispose\")))\nvoid x_dispose(void) { p2w_dispose(); }\n",
+    );
     c
 }
 
@@ -548,9 +556,42 @@ mod tests {
             "{}",
             x.shim_c
         );
-        // The world is the instance, kebab-cased, with the RC oracle.
+        // The world is the instance, kebab-cased, with the RC oracle and the
+        // resident-teardown export.
         assert!(x.wit.contains("world grid {"), "{}", x.wit);
         assert!(x.wit.contains("export live: func() -> s32;"), "{}", x.wit);
+        assert!(x.wit.contains("export dispose: func();"), "{}", x.wit);
+        assert!(
+            x.shim_c.contains("export_name(\"dispose\")"),
+            "{}",
+            x.shim_c
+        );
+    }
+
+    #[test]
+    fn dispose_releases_and_resets_every_cache_slot() {
+        // The emitted module carries p2w_dispose: for each literal-cache slot,
+        // release THEN reset to 0 — so a resident component can prove live==0
+        // at teardown and still keep working (next call re-interns).
+        let toks = crate::lexer::lex(GRID).unwrap();
+        let stmts = crate::parser::parse(&toks).unwrap();
+        let ir = crate::llvm::emit_llvm_ir(&stmts).expect("emit");
+        let dispose = ir
+            .split("define void @p2w_dispose()")
+            .nth(1)
+            .expect("dispose emitted");
+        let dispose = &dispose[..dispose.find('}').unwrap()];
+        // GRID interns two literals ("#grid_" and "_") — both released + zeroed.
+        assert_eq!(
+            dispose.matches("call void @p2w_release").count(),
+            2,
+            "{dispose}"
+        );
+        assert_eq!(
+            dispose.matches("store i32 0, ptr @").count(),
+            2,
+            "{dispose}"
+        );
     }
 
     #[test]

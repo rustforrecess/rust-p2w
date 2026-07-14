@@ -39,25 +39,34 @@ export function setText(selector, text) { calls.push([selector, text]); }
 EOF
 
 cat > "$OUT/jco/driver.mjs" <<'EOF'
-import { set, live } from './grid.component.js';
+import { set, live, dispose } from './grid.component.js';
 import { calls } from './host.js';
 set(0, 0, "hi");
 set(2, 1, "42");
 const want = JSON.stringify([["#grid_0_0", "hi"], ["#grid_2_1", "42"]]);
 const got = JSON.stringify(calls);
 if (got !== want) { console.error(`FAIL: got ${got} want ${want}`); process.exit(1); }
-// The memory oracle for a RESIDENT component is steady state, not live==0:
-// a component never exits, so the per-call-site literal caches ("#grid_",
-// "_") stay warm by design — main's exit epilogue (which frees them) never
-// runs. What must NOT happen is per-call growth: every value a call creates
-// must be freed by that call's end.
+// Memory contract for a RESIDENT component, both halves:
+// 1) STEADY STATE while running — the per-call-site literal caches stay
+//    warm by design, but live must not grow per call.
 const warm = live();
 for (let i = 0; i < 50; i++) set(i % 3, i % 3, "x" + i);
 if (live() !== warm) {
   console.error(`FAIL: live grew ${warm} -> ${live()} across 50 calls (per-call leak)`);
   process.exit(1);
 }
-console.log(`PASS [grid-exec]  set() crossed the boundary as set-text; live steady at ${warm} (literal caches) across 52 calls`);
+// 2) live == 0 AT TEARDOWN — dispose() frees what main's exit epilogue
+//    would have (a component never runs main), and resets the cache slots
+//    so the component still works after; a second teardown returns to 0.
+dispose();
+if (live() !== 0) { console.error(`FAIL: live=${live()} after dispose()`); process.exit(1); }
+set(1, 1, "post");
+if (calls[calls.length - 1][0] !== "#grid_1_1") {
+  console.error("FAIL: set() broken after dispose()"); process.exit(1);
+}
+dispose();
+if (live() !== 0) { console.error(`FAIL: live=${live()} after second dispose()`); process.exit(1); }
+console.log(`PASS [grid-exec]  set-text crossed the boundary; live steady at ${warm} across 52 calls; dispose() -> live=0, still usable, redispose -> 0`);
 EOF
 
 node "$OUT/jco/driver.mjs" || exit 1

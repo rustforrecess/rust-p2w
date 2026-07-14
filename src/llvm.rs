@@ -823,12 +823,12 @@ fn emit_main(
             f.early_releases(live.dead_after(idx));
         }
     }
+    str_caches.extend(f.str_caches.iter().cloned());
     if !f.terminated {
         // Release all top-level locals so a finished program ends at live==0.
         f.emit_exit_releases();
         // ...and free the interned-literal cache (module globals filled by any
         // function or main; a never-executed literal's slot is 0 → no-op).
-        str_caches.extend(f.str_caches.iter().cloned());
         for slot in str_caches.iter().chain(cv_slots.iter()) {
             let t = f.temp();
             f.body.push_str(&format!("  {t} = load i32, ptr {slot}\n"));
@@ -837,7 +837,20 @@ fn emit_main(
         }
         f.body.push_str("  ret i32 0\n");
     }
-    let def = format!("define i32 @main() {{\nentry:\n{}{}}}\n", f.allocas, f.body);
+    let mut def = format!("define i32 @main() {{\nentry:\n{}{}}}\n", f.allocas, f.body);
+    // Teardown for RESIDENT programs (a component never runs main, so main's
+    // freeing epilogue never fires): release every literal-cache and class-var
+    // slot AND reset it to 0, so the program stays usable after — the next
+    // call re-interns. This is what lets a component host assert live == 0 at
+    // dispose instead of settling for a steady-state check. Dead code in a
+    // normal native build (nothing references it; the linker drops it).
+    def.push_str("define void @p2w_dispose() {\nentry:\n");
+    for (n, slot) in str_caches.iter().chain(cv_slots.iter()).enumerate() {
+        def.push_str(&format!(
+            "  %d{n} = load i32, ptr {slot}\n  call void @p2w_release(i32 %d{n})\n  store i32 0, ptr {slot}\n"
+        ));
+    }
+    def.push_str("  ret void\n}\n");
     dispatchers.extend(f.dispatchers.iter().cloned());
     Ok((def, f.globals))
 }
