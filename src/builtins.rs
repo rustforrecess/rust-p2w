@@ -66,6 +66,9 @@ pub const BUILTINS: &[Builtin] = &[
     b("on", "web", &["selector", "event", "handler"]),
     b("on_key", "web", &["key", "handler"]),
     b("every", "web", &["ms", "handler"]),
+    // The requestAnimationFrame game loop (once per displayed frame) — the
+    // right tick for games; every(ms) drifts and fires in hidden tabs.
+    b("on_frame", "web", &["handler"]),
     b("set_attr", "web", &["selector", "name", "value"]),
     b("set_text", "web", &["selector", "text"]),
     // Position an element in page coordinates. The designer's drag gesture

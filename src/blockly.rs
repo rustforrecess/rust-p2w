@@ -327,8 +327,14 @@ impl Builder {
             ),
             HatKind::Key(key) => ("python_when_key", field("KEY", &jstr(key))),
             HatKind::Every(ms) => ("python_every", field("MS", &jstr(ms))),
+            // The frame hat has no event-specific field — just the name.
+            HatKind::Frame => ("python_every_frame", String::new()),
         };
-        let fields = format!("{},{}", event_field, field("NAME", &jstr(name)));
+        let fields = if event_field.is_empty() {
+            field("NAME", &jstr(name))
+        } else {
+            format!("{},{}", event_field, field("NAME", &jstr(name)))
+        };
         Ok(with_data(&block(ty, &fields, &inputs, "", next), line))
     }
 
@@ -907,6 +913,8 @@ enum HatKind {
     Key(String),
     /// `every(ms, handler)` — a timer / game-loop tick (ms as source text).
     Every(String),
+    /// `on_frame(handler)` — the requestAnimationFrame tick (no parameters).
+    Frame,
 }
 
 /// If `stmts` begins with the event-handler pattern — a zero-argument `def`
@@ -964,6 +972,7 @@ fn match_event_hat(stmts: &[Stmt]) -> Option<(HatKind, &str, &[Stmt])> {
         }
         ("on_key", [key, h]) if refers(h) => HatKind::Key(str_of(key)?),
         ("every", [ms, h]) if refers(h) => HatKind::Every(num_text(ms)?),
+        ("on_frame", [h]) if refers(h) => HatKind::Frame,
         _ => return None,
     };
     Some((kind, name, body))
@@ -1738,5 +1747,18 @@ mod event_hat_tests {
         let out = to_blocks("def w():\n    beep()\non(\"#b\", \"wheel\", w)\n");
         assert!(!out.json.contains("python_when_event"), "{}", out.json);
         assert!(out.json.contains("python_def"), "{}", out.json);
+    }
+}
+
+#[cfg(test)]
+mod frame_hat_tests {
+    use super::*;
+
+    #[test]
+    fn on_frame_pairs_fold_into_the_frame_hat() {
+        let out = to_blocks("def tick():\n    beep()\non_frame(tick)\n");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.json.contains("\"type\":\"python_every_frame\""), "{}", out.json);
+        assert!(out.json.contains("\"NAME\":\"tick\""), "{}", out.json);
     }
 }

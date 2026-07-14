@@ -493,6 +493,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module
             .imports
             .push(r#"(import "env" "every" (func $every (param i32) (param i32)))"#.into());
+        module
+            .imports
+            .push(r#"(import "env" "on_frame" (func $on_frame (param i32)))"#.into());
     }
     Ok(module.render())
 }
@@ -7261,6 +7264,17 @@ impl Gen {
                         // the animation/game loop. State persists across ticks in
                         // module globals (the instance stays alive). Numeric args,
                         // so no string marshalling. See INTERACTIVE_WEB.md.
+                        // on_frame(handler): the requestAnimationFrame game
+                        // loop — once per displayed frame, pauses when hidden,
+                        // never drifts or backlogs (unlike every(16)).
+                        "on_frame" if args.len() == 1 => {
+                            self.uses_dom = true; // handler dispatch
+                            self.uses_timer = true;
+                            let h = self.value_expr(cx, &args[0])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $on_frame (call $unbox {h})) (global.get $NONE))"
+                            ));
+                        }
                         "every" if args.len() == 2 => {
                             self.uses_dom = true; // handler dispatch
                             self.uses_timer = true;

@@ -974,6 +974,7 @@ impl Stepper {
             ("set_position", [_sel, _x, _y]) => Ok(Value::None),
             ("add_element", [_parent, _tag, _id]) => Ok(Value::None),
             ("pointer_x", []) | ("pointer_y", []) => Ok(Value::Int(0)),
+            ("on_frame", [_h]) => Ok(Value::None),
             _ => Err(format!(
                 "calling {name}() isn't in the step debugger yet — use Run for that"
             )),
@@ -3237,6 +3238,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         ("set_position", [_sel, _x, _y]) => Ok(Value::None),
         ("add_element", [_parent, _tag, _id]) => Ok(Value::None),
         ("pointer_x", []) | ("pointer_y", []) => Ok(Value::Int(0)),
+        ("on_frame", [_h]) => Ok(Value::None),
         _ => Err(format!(
             "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
         )),
