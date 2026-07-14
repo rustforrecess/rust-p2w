@@ -321,6 +321,10 @@ impl Builder {
         };
         let (ty, event_field) = match kind {
             HatKind::Click(sel) => ("python_when_click", field("SELECTOR", &jstr(sel))),
+            HatKind::Event(sel, ev) => (
+                "python_when_event",
+                format!("{},{}", field("EVENT", &jstr(ev)), field("SELECTOR", &jstr(sel))),
+            ),
             HatKind::Key(key) => ("python_when_key", field("KEY", &jstr(key))),
             HatKind::Every(ms) => ("python_every", field("MS", &jstr(ms))),
         };
@@ -894,6 +898,11 @@ fn block(ty: &str, fields: &str, inputs: &str, extra_state: &str, next: &str) ->
 enum HatKind {
     /// `on(selector, "click", handler)` — a click handler on an element.
     Click(String),
+    /// `on(selector, EVENT, handler)` for the pointer events kids reach for
+    /// (mousedown/mousemove/mouseup/mouseenter/mouseleave) — the generic
+    /// "when EVENT on SELECTOR" hat. Other event names stay a plain
+    /// def + on() pair (they still work; they just don't fold).
+    Event(String, String),
     /// `on_key(key, handler)` — a keyboard handler.
     Key(String),
     /// `every(ms, handler)` — a timer / game-loop tick (ms as source text).
@@ -940,10 +949,18 @@ fn match_event_hat(stmts: &[Stmt]) -> Option<(HatKind, &str, &[Stmt])> {
         _ => None,
     };
     let kind = match (reg.as_str(), args.as_slice()) {
-        ("on", [sel, ev, h])
-            if refers(h) && matches!(&ev.kind, ExprKind::Str(s) if s == "click") =>
-        {
-            HatKind::Click(str_of(sel)?)
+        ("on", [sel, ev, h]) if refers(h) => {
+            let event = str_of(ev)?;
+            match event.as_str() {
+                "click" => HatKind::Click(str_of(sel)?),
+                // Must stay in lockstep with the python_when_event dropdown in
+                // assets/blockly-init.js — an unknown dropdown value would
+                // fail the workspace load.
+                "mousedown" | "mousemove" | "mouseup" | "mouseenter" | "mouseleave" => {
+                    HatKind::Event(str_of(sel)?, event)
+                }
+                _ => return None,
+            }
         }
         ("on_key", [key, h]) if refers(h) => HatKind::Key(str_of(key)?),
         ("every", [ms, h]) if refers(h) => HatKind::Every(num_text(ms)?),
@@ -1695,5 +1712,31 @@ mod annotation_roundtrip_tests {
             "{}",
             out.json
         );
+    }
+}
+
+#[cfg(test)]
+mod event_hat_tests {
+    use super::*;
+
+    /// Pointer events fold into the generic "when EVENT on SELECTOR" hat, so
+    /// blocks-first kids can discover mousemove & friends; unknown events stay
+    /// a readable def + on() pair (they work, they just don't fold).
+    #[test]
+    fn pointer_events_fold_into_the_generic_event_hat() {
+        let out = to_blocks(
+            "def trail():\n    beep()\non(\"#draw\", \"mousemove\", trail)\n",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.json.contains("\"type\":\"python_when_event\""), "{}", out.json);
+        assert!(out.json.contains("\"EVENT\":\"mousemove\""), "{}", out.json);
+        assert!(out.json.contains("\"SELECTOR\":\"#draw\""), "{}", out.json);
+        // click keeps its dedicated hat…
+        let out = to_blocks("def go():\n    beep()\non(\"#b\", \"click\", go)\n");
+        assert!(out.json.contains("python_when_click"), "{}", out.json);
+        // …and an event outside the dropdown whitelist stays def + call.
+        let out = to_blocks("def w():\n    beep()\non(\"#b\", \"wheel\", w)\n");
+        assert!(!out.json.contains("python_when_event"), "{}", out.json);
+        assert!(out.json.contains("python_def"), "{}", out.json);
     }
 }
