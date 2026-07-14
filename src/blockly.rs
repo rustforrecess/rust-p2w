@@ -1678,3 +1678,22 @@ mod text_join_tests {
         assert!(out.json.contains("math_arithmetic"), "{}", out.json);
     }
 }
+
+#[cfg(test)]
+mod annotation_roundtrip_tests {
+    use super::*;
+
+    /// Param annotations must survive text -> blocks (the PARAMS field carries
+    /// them verbatim, so blocks -> text regenerates them) — they're the WIT
+    /// type source for component conversion (LESSON_PLAYER.md step 5).
+    #[test]
+    fn def_param_annotations_ride_the_params_field()  {
+        let out = to_blocks("def set_cell(row: int, col: int, value: str):\n    set_text(\"#g\", value)\n");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(
+            out.json.contains("\"PARAMS\":\"row: int, col: int, value: str\""),
+            "{}",
+            out.json
+        );
+    }
+}
