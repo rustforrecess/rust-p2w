@@ -121,6 +121,36 @@ pub fn lints(source: &str) -> Vec<Lint> {
     lints_parsed(&stmts)
 }
 
+/// Component-clean lints for every stamped instance of the given component
+/// kinds (LESSON_PLAYER.md step 5d). `specs` = one `(id-prefix, recorded API)`
+/// pair per component kind; instances (`grid`, `grid2`, …) are discovered from
+/// the parsed top-level defs, so ONE parse covers every widget — this rides
+/// the IDE's per-keystroke path next to [`analyze`]. Kind is always
+/// [`LintKind::ComponentUnclean`], which carries the encapsulation scaffold.
+pub fn component_lints(source: &str, specs: &[(String, Vec<String>)]) -> Vec<Lint> {
+    let Ok(toks) = lexer::lex(source) else {
+        return Vec::new();
+    };
+    let (stmts, _) = parser::parse_recovering(&toks);
+    let mut out = Vec::new();
+    for (prefix, api) in specs {
+        for inst in lint::component_instances(&stmts, api, prefix) {
+            // The whole namespace, not just the API list: stamped internal
+            // helpers (Draw's pen handlers) are checked AND callable siblings.
+            let group = lint::component_group(&stmts, &inst);
+            for (line, message) in lint::component_clean_warnings(&stmts, &group, &inst) {
+                out.push(Lint {
+                    line,
+                    message,
+                    kind: LintKind::ComponentUnclean,
+                });
+            }
+        }
+    }
+    out.sort_by_key(|l| l.line);
+    out
+}
+
 /// Blocks conversion + the full lint set from ONE lex+parse. This pair runs on
 /// every editor keystroke; calling [`to_blocks`] and [`lints`] separately parses
 /// the identical source twice, which is pure waste on the IDE's hottest path.

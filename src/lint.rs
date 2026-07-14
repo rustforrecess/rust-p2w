@@ -17,6 +17,10 @@
 //!   `return`/`break`/`continue` in the same block;
 //! - `shadowed_builtin_warnings` — a variable named after a built-in type/
 //!   function (`list = …`), curated to the never-a-good-variable-name set;
+//! - `component_clean_warnings` — a stamped component's API def reaching
+//!   outside the component (foreign names, un-namespaced selectors or field
+//!   keys) — the encapsulation teacher AND the WIT/PXC conversion
+//!   precondition (LESSON_PLAYER.md step 5d);
 //! - `self_comparison_warnings` — comparing/assigning something to itself
 //!   (`x == x`, `x = x`), pure operands only;
 //! - `may_form_cycle`, `set_typed_names`, `set_operator_spans` — analysis seams
@@ -1659,6 +1663,266 @@ fn find_self_cmp(e: &Expr, out: &mut Vec<(usize, String)>) {
     each_child_expr(e, &mut |c| find_self_cmp(c, out));
 }
 
+// --- component-clean (acornstem/LESSON_PLAYER.md step 5d) -------------------
+//
+// A stamped component's API defs must be liftable onto ANY page: the WIT/PXC
+// conversion precondition (step 5e extracts exactly these defs) and the
+// encapsulation lesson are the same property, checked once here.
+
+/// Builtins whose first argument names something on the PAGE — a `"#id"`
+/// selector or a shared field key. These are the two doors through which a
+/// def can reach outside its component's own markup and state.
+const SELECTOR_ARG0: &[&str] = &[
+    "on",
+    "set_text",
+    "set_attr",
+    "set_position",
+    "get_value",
+    "add_element",
+];
+const FIELD_ARG0: &[&str] = &["set_field", "get_field", "evidence"];
+
+/// The stamped instances of one component kind present in `stmts`: top-level
+/// defs named `<X>_<first-api-name>` where `X` is `prefix` or `prefix` plus
+/// digits (the designer's unique-id scheme: `grid`, `grid2`, …). Returns each
+/// instance id `X`. Shared by the component-clean lint (below) and the
+/// WIT/PXC converter's def-group discovery.
+pub fn component_instances(stmts: &[Stmt], api: &[String], prefix: &str) -> Vec<String> {
+    let Some(first) = api.first() else {
+        return Vec::new();
+    };
+    let suffix = format!("_{first}");
+    let mut out: Vec<String> = Vec::new();
+    for s in stmts {
+        if let StmtKind::Def { name, .. } = &s.kind {
+            let Some(x) = name.strip_suffix(&suffix) else {
+                continue;
+            };
+            let Some(rest) = x.strip_prefix(prefix) else {
+                continue;
+            };
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                out.push(x.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every top-level def in `instance`'s namespace (`<instance>_…`) — the API
+/// defs plus any stamped internal helpers (e.g. Draw's pen handlers, which
+/// its registry row does NOT export). This is the def group the clean check
+/// runs over and the converter extracts: a helper must be as liftable as the
+/// exports it serves, and it is a legitimate sibling to call.
+pub fn component_group(stmts: &[Stmt], instance: &str) -> Vec<String> {
+    let pre = format!("{instance}_");
+    stmts
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StmtKind::Def { name, .. } if name.starts_with(&pre) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The component-clean check. Each def in `group` (one instance's API defs,
+/// e.g. `grid_set`/`grid_show` for instance `grid`) may touch only: its own
+/// parameters and locals, sibling defs in the group, builtins, and page ids /
+/// field keys namespaced under the instance id. Anything else is a reach
+/// outside the component — code that breaks the moment the component lands on
+/// someone else's page, and exactly what the converter cannot lift.
+///
+/// Selector/field-key checks fire only on a PROVEN-foreign literal head (an
+/// f-string or `+`-chain whose leading literal already mismatches the
+/// namespace); fully computed keys pass — conservative, per the module rule.
+pub fn component_clean_warnings(
+    stmts: &[Stmt],
+    group: &[String],
+    instance: &str,
+) -> Vec<(usize, String)> {
+    let mut base: HashSet<String> = crate::builtins::names().map(String::from).collect();
+    // `format` is the f-string desugar target — callable, not registry-listed.
+    base.insert("format".to_string());
+    base.extend(group.iter().cloned());
+    let mut out = Vec::new();
+    for s in stmts {
+        if let StmtKind::Def {
+            name, params, body, ..
+        } = &s.kind
+        {
+            if !group.contains(name) {
+                continue;
+            }
+            let mut scope = base.clone();
+            scope.extend(params.iter().cloned());
+            scope_bindings(body, &mut scope);
+            component_body(body, &scope, instance, &mut out);
+        }
+    }
+    out.sort_by_key(|(line, _)| *line);
+    out.dedup();
+    out
+}
+
+/// Walk one group def's body. Differs from the undefined-name walk in three
+/// ways: callee NAMES are checked (calling a foreign def is a reach-out),
+/// selector and field-key first arguments get the namespace check, and nested
+/// defs EXTEND the scope rather than restarting it (over-approximate — a
+/// closure-style read never false-flags).
+fn component_body(
+    stmts: &[Stmt],
+    scope: &HashSet<String>,
+    instance: &str,
+    out: &mut Vec<(usize, String)>,
+) {
+    for s in stmts {
+        stmt_exprs(s, &mut |e| component_expr(e, scope, instance, out));
+        match &s.kind {
+            StmtKind::Def { params, body, .. } => {
+                let mut inner = scope.clone();
+                inner.extend(params.iter().cloned());
+                scope_bindings(body, &mut inner);
+                component_body(body, &inner, instance, out);
+            }
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    let mut inner = scope.clone();
+                    inner.extend(m.params.iter().cloned());
+                    scope_bindings(&m.body, &mut inner);
+                    component_body(&m.body, &inner, instance, out);
+                }
+            }
+            // Def/ClassDef are the only New-scope blocks, so the generic
+            // recursion below only ever sees Same-scope bodies, whose
+            // bindings `scope` already holds (scope_bindings recurses).
+            _ => for_each_child_block(s, |b, _| component_body(b, scope, instance, out)),
+        }
+    }
+}
+
+fn component_expr(
+    e: &Expr,
+    scope: &HashSet<String>,
+    instance: &str,
+    out: &mut Vec<(usize, String)>,
+) {
+    match &e.kind {
+        ExprKind::Name(n) => {
+            if !scope.contains(n) {
+                out.push((e.line, outside_msg(n, instance)));
+            }
+        }
+        ExprKind::Call(f, args) => {
+            if !scope.contains(f) {
+                out.push((e.line, outside_msg(f, instance)));
+            }
+            if let Some(arg0) = args.first() {
+                if SELECTOR_ARG0.contains(&f.as_str()) {
+                    check_namespaced(arg0, instance, true, out);
+                } else if FIELD_ARG0.contains(&f.as_str()) {
+                    check_namespaced(arg0, instance, false, out);
+                }
+            }
+            for a in args {
+                component_expr(a, scope, instance, out);
+            }
+            return;
+        }
+        ExprKind::ListComp { element, clauses } => {
+            let inner = comp_allowed(scope, clauses);
+            component_expr(element, &inner, instance, out);
+            component_comp_clauses(clauses, &inner, instance, out);
+            return;
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => {
+            let inner = comp_allowed(scope, clauses);
+            component_expr(key, &inner, instance, out);
+            component_expr(value, &inner, instance, out);
+            component_comp_clauses(clauses, &inner, instance, out);
+            return;
+        }
+        _ => {}
+    }
+    each_child_expr(e, &mut |c| component_expr(c, scope, instance, out));
+}
+
+fn component_comp_clauses(
+    clauses: &[CompClause],
+    scope: &HashSet<String>,
+    instance: &str,
+    out: &mut Vec<(usize, String)>,
+) {
+    for c in clauses {
+        match c {
+            CompClause::For { iter, .. } => component_expr(iter, scope, instance, out),
+            CompClause::If(cond) => component_expr(cond, scope, instance, out),
+        }
+    }
+}
+
+fn outside_msg(name: &str, instance: &str) -> String {
+    format!(
+        "`{name}` lives outside this component — `{instance}`'s defs should only \
+         use their own parameters, locals and sibling defs (pass outside values \
+         in as parameters)"
+    )
+}
+
+/// The leading string literal of a `"lit" + expr + …` chain (which is also
+/// what an f-string desugars to), or the literal itself. `None` when the
+/// expression starts with anything computed — then we can't prove anything.
+fn literal_head(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Str(s) => Some(s),
+        ExprKind::Bin(BinOp::Add, l, _) => literal_head(l),
+        _ => None,
+    }
+}
+
+/// Flag a selector / field-key argument whose literal head PROVABLY names
+/// something outside `instance`'s namespace (`instance` itself, or
+/// `instance_…`). A head that is a prefix of `instance` is an incomplete
+/// literal — unprovable, so it passes.
+fn check_namespaced(arg: &Expr, instance: &str, selector: bool, out: &mut Vec<(usize, String)>) {
+    let Some(head) = literal_head(arg) else {
+        return;
+    };
+    let key = if selector {
+        match head.strip_prefix('#') {
+            Some(k) => k,
+            // Tag/class selectors and non-`#` heads: out of scope here.
+            None => return,
+        }
+    } else {
+        head
+    };
+    let ok = key == instance
+        || key
+            .strip_prefix(instance)
+            .is_some_and(|r| r.starts_with('_'))
+        || instance.starts_with(key);
+    if !ok {
+        let msg = if selector {
+            format!(
+                "`{head}` is not one of this component's own ids — `{instance}` \
+                 should only touch ids that start with `#{instance}`"
+            )
+        } else {
+            format!(
+                "`{head}` is a shared field key from outside this component — \
+                 `{instance}` should only use keys that start with `{instance}_`"
+            )
+        };
+        out.push((arg.line, msg));
+    }
+}
+
 // --- scaffolded fix ladders ------------------------------------------------
 //
 // Each concept-bearing lint carries a *fading hint ladder*: a guiding question,
@@ -1685,6 +1949,9 @@ pub enum LintKind {
     UnreachableCode,
     ShadowedBuiltin,
     SelfComparison,
+    /// A component API def reaching outside its component (step 5d) — the
+    /// encapsulation teacher and the WIT/PXC conversion precondition.
+    ComponentUnclean,
 }
 
 /// A fading hint ladder for a concept-bearing lint. Rungs are least-help-first;
@@ -1735,6 +2002,17 @@ pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
                    variable or value.",
             fix: "Replace one side with what you meant to check against (e.g. `count == limit`, \
                   not `count == count`).",
+        },
+        LintKind::ComponentUnclean => Scaffold {
+            question: "One of this component's defs reaches for something outside the \
+                       component. If someone dropped the component onto a DIFFERENT page, \
+                       would that thing be there?",
+            hint: "A component may only use its own parameters and locals, its sibling defs, \
+                   built-in tools, and ids or field keys that start with its own name. \
+                   Anything from outside must come in through a parameter.",
+            fix: "Add a parameter for the outside value and pass it in where the def is \
+                  called — or, if it's an id or field key, rename it to start with the \
+                  component's own id.",
         },
         LintKind::Typo
         | LintKind::UndefinedName
@@ -2222,5 +2500,123 @@ mod tests {
         // Reassignment inside a branch counts (same scope).
         let branch = "x = 1\nif x > 0:\n    x = \"pos\"\n";
         assert_eq!(churn(branch).len(), 1);
+    }
+
+    // --- component-clean (step 5d) ---
+
+    fn parse(src: &str) -> Vec<Stmt> {
+        let toks = crate::lexer::lex(src).unwrap();
+        crate::parser::parse_recovering(&toks).0
+    }
+
+    fn clean(src: &str, group: &[&str], instance: &str) -> Vec<String> {
+        let g: Vec<String> = group.iter().map(|s| s.to_string()).collect();
+        component_clean_warnings(&parse(src), &g, instance)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    #[test]
+    fn component_instances_follow_the_unique_id_scheme() {
+        let src = "def grid_set(row, col, value):\n    pass\n\
+                   def grid2_set(row, col, value):\n    pass\n\
+                   def gridx_set(a):\n    pass\n\
+                   def poll_set(a):\n    pass\n";
+        let api = vec!["set".to_string(), "show".to_string()];
+        // `grid` + `grid2` match; `gridx` (non-digit tail) and `poll` don't.
+        assert_eq!(
+            component_instances(&parse(src), &api, "grid"),
+            vec!["grid", "grid2"]
+        );
+        assert!(component_instances(&parse(src), &[], "grid").is_empty());
+    }
+
+    #[test]
+    fn clean_component_passes() {
+        // The Grid showcase shape: namespaced selector head, sibling call,
+        // params, locals, loop vars, builtins — no warnings.
+        let src = "def grid_set(row, col, value):\n    set_text(\"#grid_\" + str(row) + \"_\" + str(col), value)\n\
+                   def grid_show(data):\n    for r in range(len(data)):\n        for c in range(len(data[r])):\n            grid_set(r, c, str(data[r][c]))\n";
+        assert_eq!(
+            clean(src, &["grid_set", "grid_show"], "grid"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn foreign_name_and_foreign_call_flag() {
+        let src = "total = 0\ndef helper():\n    pass\n\
+                   def grid_set(v):\n    x = total + 1\n    helper()\n    set_text(\"#grid\", str(x))\n";
+        let msgs = clean(src, &["grid_set"], "grid");
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(msgs[0].contains("`total` lives outside"), "{msgs:?}");
+        assert!(msgs[1].contains("`helper` lives outside"), "{msgs:?}");
+    }
+
+    #[test]
+    fn foreign_selector_and_field_key_flag() {
+        let src = "def grid_set(v):\n    set_text(\"#msg\", v)\n    set_field(\"score\", v)\n";
+        let msgs = clean(src, &["grid_set"], "grid");
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(
+            msgs[0].contains("`#msg` is not one of this component's own ids"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs[1].contains("`score` is a shared field key"),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_instance_is_still_foreign() {
+        // `grid` touching `grid2`'s cell: the digit boundary must catch it.
+        let src = "def grid_set(v):\n    set_text(\"#grid2_0_0\", v)\n";
+        assert_eq!(clean(src, &["grid_set"], "grid").len(), 1);
+    }
+
+    #[test]
+    fn own_namespace_and_unprovable_heads_pass() {
+        let src = "def poll_bump(option):\n    n = get_field(\"poll_\" + option)\n    set_field(\"poll_\" + option, n)\n    set_text(\"#poll\", n)\n    set_text(\"#\" + option, n)\n    set_text(option, n)\n";
+        // Own field key, own root id, computed head (`\"#\" + …`, bare param):
+        // nothing provably foreign, so nothing flags.
+        assert_eq!(clean(src, &["poll_bump"], "poll"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn fstring_selector_heads_are_seen_through_the_desugar() {
+        // f"#msg_{v}" desugars to "#msg_" + str(v) — the head still convicts.
+        let src = "def grid_set(v):\n    set_text(f\"#msg_{v}\", v)\n";
+        assert_eq!(clean(src, &["grid_set"], "grid").len(), 1);
+        // f"#grid_{v}" is inside the namespace.
+        let ok = "def grid_set(v):\n    set_text(f\"#grid_{v}\", v)\n";
+        assert_eq!(clean(ok, &["grid_set"], "grid"), Vec::<String>::new());
+        // …and the format(x, "spec") desugar of `{x:spec}` is not a foreign call.
+        let spec = "def grid_set(v):\n    set_text(f\"#grid_{v:>3}\", v)\n";
+        assert_eq!(clean(spec, &["grid_set"], "grid"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn helpers_join_the_group_and_are_held_to_it() {
+        let src = "def draw_dot(x, y):\n    set_text(\"#draw\", str(x))\n\
+                   def draw_move():\n    draw_dot(1, 2)\n    set_text(\"#msg\", \"hi\")\n";
+        // draw_move isn't in Draw's recorded API, but it's in the namespace:
+        // calling draw_dot is fine (sibling), touching #msg is not.
+        let group = component_group(&parse(src), "draw");
+        assert_eq!(group, vec!["draw_dot", "draw_move"]);
+        let g: Vec<String> = group;
+        let msgs: Vec<String> = component_clean_warnings(&parse(src), &g, "draw")
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("`#msg`"), "{msgs:?}");
+    }
+
+    #[test]
+    fn component_unclean_has_a_ladder() {
+        let sc = scaffold(LintKind::ComponentUnclean).expect("concept-bearing");
+        assert!(sc.question.contains("DIFFERENT page"));
     }
 }
