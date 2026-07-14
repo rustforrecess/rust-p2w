@@ -363,6 +363,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             r#"(import "env" "dom_set_text" (func $dom_set_text))"#,
             // set_position(sel, x, y): selector via the arg stack, x/y as i32.
             r#"(import "env" "set_position" (func $set_position (param i32) (param i32)))"#,
+            // add_element(parent, tag, id): three strings via the arg stack.
+            r#"(import "env" "add_element" (func $add_element))"#,
+            // The current event's target-relative pointer position.
+            r#"(import "env" "pointer_x" (func $pointer_x (result i32)))"#,
+            r#"(import "env" "pointer_y" (func $pointer_y (result i32)))"#,
             r#"(import "env" "play_sound" (func $play_sound))"#,
             r#"(import "env" "dom_on" (func $dom_on (param i32)))"#,
             // Reverse marshalling: JS fetches the element's value into a buffer
@@ -7183,6 +7188,29 @@ impl Gen {
                                 "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {name}) (call $marshal_str {val}) (call $dom_set_attr) (global.get $NONE))"
                             ));
                         }
+                        // add_element(parent, tag, id): dynamic DOM/SVG creation —
+                        // the enabling primitive for drawing surfaces and growing
+                        // widgets. Three strings via the arg stack, like set_attr.
+                        "add_element" if args.len() == 3 => {
+                            self.uses_dom_str = true;
+                            let parent = self.value_expr(cx, &args[0])?;
+                            let tag = self.value_expr(cx, &args[1])?;
+                            let id = self.value_expr(cx, &args[2])?;
+                            return Ok(format!(
+                                "(block (result (ref null eq)) (call $marshal_str {parent}) (call $marshal_str {tag}) (call $marshal_str {id}) (call $add_element) (global.get $NONE))"
+                            ));
+                        }
+                        // pointer_x()/pointer_y(): the current event's pointer
+                        // position, target-relative (host captures offsetX/Y at
+                        // dispatch). Plain i32 reads, like seed().
+                        "pointer_x" if args.is_empty() => {
+                            self.uses_dom_str = true;
+                            return Ok("(call $box (call $pointer_x))".to_string());
+                        }
+                        "pointer_y" if args.is_empty() => {
+                            self.uses_dom_str = true;
+                            return Ok("(call $box (call $pointer_y))".to_string());
+                        }
                         "set_text" if args.len() == 2 => {
                             self.uses_dom_str = true;
                             let sel = self.value_expr(cx, &args[0])?;
@@ -8155,5 +8183,26 @@ mod tests {
         let wat = compile("x = None\nprint(x == None)\n").unwrap();
         assert!(wat.contains("(global.set $g_x (global.get $NONE))"));
         assert!(wat.contains("(type $NONE_T (struct))"));
+    }
+}
+
+#[cfg(test)]
+mod dynamic_dom_tests {
+    use super::*;
+    use crate::{lexer::lex, parser::parse};
+
+    fn compile(src: &str) -> String {
+        generate(&parse(&lex(src).unwrap()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn add_element_and_pointer_lower_to_host_imports() {
+        let wat = compile(
+            "def d():\n    add_element(\"#s\", \"circle\", \"dot\")\n    set_attr(\"#dot\", \"cx\", str(pointer_x()))\non(\"#s\", \"mousedown\", d)\n",
+        );
+        assert!(wat.contains(r#"(import "env" "add_element" (func $add_element))"#), "{wat}");
+        assert!(wat.contains(r#"(import "env" "pointer_x" (func $pointer_x (result i32)))"#), "{wat}");
+        assert!(wat.contains("(call $add_element)"), "{wat}");
+        assert!(wat.contains("(call $box (call $pointer_x))"), "{wat}");
     }
 }

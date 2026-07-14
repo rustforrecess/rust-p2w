@@ -972,6 +972,8 @@ impl Stepper {
             // Designer-authored layout call (see the Vm's twin arm): trace as a
             // no-op — the real move happens under Run.
             ("set_position", [_sel, _x, _y]) => Ok(Value::None),
+            ("add_element", [_parent, _tag, _id]) => Ok(Value::None),
+            ("pointer_x", []) | ("pointer_y", []) => Ok(Value::Int(0)),
             _ => Err(format!(
                 "calling {name}() isn't in the step debugger yet — use Run for that"
             )),
@@ -3233,6 +3235,8 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         // this on its first steps — it must trace as a no-op, not kill the
         // session (the feature's whole point is that layout is steppable).
         ("set_position", [_sel, _x, _y]) => Ok(Value::None),
+        ("add_element", [_parent, _tag, _id]) => Ok(Value::None),
+        ("pointer_x", []) | ("pointer_y", []) => Ok(Value::Int(0)),
         _ => Err(format!(
             "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
         )),

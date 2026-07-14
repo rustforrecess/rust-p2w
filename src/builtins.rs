@@ -72,6 +72,14 @@ pub const BUILTINS: &[Builtin] = &[
     // *proposes* this call rather than mutating hidden markup, so layout lives
     // in the program where it can be read, stepped over and assessed.
     b("set_position", "web", &["selector", "x", "y"]),
+    // Create an element at run time (SVG or HTML by tag) — THE enabling
+    // primitive for dynamic widgets: drawing surfaces, growing tables, list
+    // views. See acornstem/LESSON_PLAYER.md (step 5).
+    b("add_element", "web", &["parent", "tag", "id"]),
+    // Where the pointer was during the CURRENT event, relative to the event's
+    // target element (offsetX/offsetY) — what a draw/game handler needs.
+    v("pointer_x", "web", &[]),
+    v("pointer_y", "web", &[]),
     v("get_value", "web", &["selector"]),
     b("play_sound", "web", &["name"]),
     b("beep", "web", &[]),
