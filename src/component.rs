@@ -21,7 +21,9 @@
 //!
 //! Type mapping (as-built): `int -> s32` (the linear-memory runtime's int
 //! width today — the spec's `s64` arrives when the value model widens),
-//! `float -> f64`, `str -> string`. An API def with any other param shape
+//! `float -> f64`, `str -> string`, `list[T] -> list<T>` (nested, marshalled
+//! by generated `mk_list_of_*` builders from the canonical `(ptr, len)`
+//! layout). An API def with an unannotated or otherwise-unmappable param
 //! stays INTERNAL (compiled, callable from exports, just not exported);
 //! a def group that exports nothing is an error, not a silent empty world.
 
@@ -128,21 +130,59 @@ const UNSUPPORTED_CAPS: &[&str] = &[
     "input",
 ];
 
+/// A WIT type the converter can carry across the canonical ABI (from a
+/// Python annotation): scalars plus (possibly nested) lists. `list[int]` ->
+/// `List(S32)`, `list[list[int]]` -> `List(List(S32))`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitType {
+    S32,
+    F64,
+    Str,
+    List(Box<WitType>),
+}
+
+impl WitType {
+    /// The WIT surface syntax (`s32`, `f64`, `string`, `list<...>`).
+    pub fn wit(&self) -> String {
+        match self {
+            WitType::S32 => "s32".to_string(),
+            WitType::F64 => "f64".to_string(),
+            WitType::Str => "string".to_string(),
+            WitType::List(e) => format!("list<{}>", e.wit()),
+        }
+    }
+    /// A C-identifier fragment for naming generated helpers (`s32`, `string`,
+    /// `list_of_s32`, `list_of_list_of_s32`).
+    fn c_frag(&self) -> String {
+        match self {
+            WitType::S32 => "s32".to_string(),
+            WitType::F64 => "f64".to_string(),
+            WitType::Str => "string".to_string(),
+            WitType::List(e) => format!("list_of_{}", e.c_frag()),
+        }
+    }
+    /// Crosses the LLVM seam BOXED (an i32 p2w Value) vs. unboxed. `int` and
+    /// lists/strings are boxed i32; `float` is a raw double.
+    fn is_double(&self) -> bool {
+        matches!(self, WitType::F64)
+    }
+}
+
 /// One exported function of the component: the recorded API name (`set`),
 /// the def it binds to (`grid_set`), and the WIT-typed signature.
 #[derive(Debug)]
 pub struct WitExport {
     pub api_name: String,
     pub def_name: String,
-    /// `(param name, wit type)` — wit type is one of `s32`/`f64`/`string`.
-    pub params: Vec<(String, &'static str)>,
+    /// `(param name, wit type)`.
+    pub params: Vec<(String, WitType)>,
     /// Per-param borrow mask under the emitted calling convention: `true` =
     /// the def BORROWS it (a non-escaping heap param), so the shim — the
-    /// caller — must release the string it built AFTER the call; `false` =
+    /// caller — must release the value it built AFTER the call; `false` =
     /// the def consumes it. Positional with `params`.
     pub param_borrowed: Vec<bool>,
-    /// `Some("s32"|"f64")` for an annotated scalar return, else `None`.
-    pub result: Option<&'static str>,
+    /// The annotated scalar return type, or `None` for a value-less export.
+    pub result: Option<WitType>,
 }
 
 /// One event wiring the HOST must set up (LESSON_PLAYER.md step 5e-c): a
@@ -431,18 +471,21 @@ fn find_def<'a>(
     })
 }
 
-/// The scalar WIT type of an annotation, or `None` for anything v1 can't
-/// carry across the canonical ABI (bool needs an i1 story, lists need
-/// canonical lowering into p2w values).
-fn wit_ty(ann: &Option<Expr>) -> Option<&'static str> {
-    match ann {
-        Some(e) => match &e.kind {
-            ExprKind::Name(n) if n == "int" => Some("s32"),
-            ExprKind::Name(n) if n == "float" => Some("f64"),
-            ExprKind::Name(n) if n == "str" => Some("string"),
-            _ => None,
-        },
-        None => None,
+/// The WIT type of an annotation, or `None` for anything the ABI can't carry
+/// yet (bool needs an i1 story). `int`/`float`/`str` -> scalars;
+/// `list[T]` (subscript of `list`) -> `List(wit_ty(T))`, nested.
+fn wit_ty(ann: &Option<Expr>) -> Option<WitType> {
+    let e = ann.as_ref()?;
+    match &e.kind {
+        ExprKind::Name(n) if n == "int" => Some(WitType::S32),
+        ExprKind::Name(n) if n == "float" => Some(WitType::F64),
+        ExprKind::Name(n) if n == "str" => Some(WitType::Str),
+        // `list[T]` parses as a subscript of the name `list`.
+        ExprKind::Index(base, elem) if matches!(&base.kind, ExprKind::Name(n) if n == "list") => {
+            let inner = wit_ty(&Some((**elem).clone()))?;
+            Some(WitType::List(Box::new(inner)))
+        }
+        _ => None,
     }
 }
 
@@ -461,7 +504,7 @@ fn export_sig(
             Some(t) => sig.push((p.clone(), t)),
             None => {
                 return Err(format!(
-                    "parameter `{p}` needs an int / float / str annotation"
+                    "parameter `{p}` needs an int / float / str / list[...] annotation"
                 ));
             }
         }
@@ -469,8 +512,11 @@ fn export_sig(
     let result = match return_type {
         None => None,
         Some(_) => match wit_ty(return_type) {
-            Some("string") => {
+            Some(WitType::Str) => {
                 return Err("str returns need canonical lowering (later slice)".to_string());
+            }
+            Some(WitType::List(_)) => {
+                return Err("list returns need canonical lowering (later slice)".to_string());
             }
             Some(t) => Some(t),
             None => return Err("the return annotation must be int or float".to_string()),
@@ -487,6 +533,30 @@ fn export_sig(
 
 fn kebab(name: &str) -> String {
     name.replace('_', "-")
+}
+
+/// Collect every `List(...)` subtype of `t` into `out`, INNER shapes first
+/// and deduped — the order the shim emits `mk_list_of_*` builders so a nested
+/// builder's dependency is already defined above it.
+fn collect_list_types(t: &WitType, out: &mut Vec<WitType>) {
+    if let WitType::List(elem) = t {
+        collect_list_types(elem, out);
+        if !out.contains(t) {
+            out.push(t.clone());
+        }
+    }
+}
+
+/// The C expression that builds ONE p2w element value from the canonical list
+/// buffer `a` (an `int*` over guest memory) at index `i`. Scalars stride one
+/// slot; string/list elements stride two (a canonical `(ptr, len)` pair).
+fn list_elem_expr(elem: &WitType) -> String {
+    match elem {
+        WitType::S32 => "p2w_int(a[i])".to_string(),
+        WitType::F64 => "p2w_float(((double*)ptr)[i])".to_string(),
+        WitType::Str => "p2w_str((const unsigned char*)a[i * 2], a[i * 2 + 1])".to_string(),
+        WitType::List(_) => format!("mk_{}(a[i * 2], a[i * 2 + 1])", elem.c_frag()),
+    }
 }
 
 /// WIT keywords and built-in type names — using one as an identifier needs
@@ -573,12 +643,12 @@ fn wit_world(instance: &str, exports: &[WitExport], imports: &[&'static str]) ->
         let ps: Vec<String> = x
             .params
             .iter()
-            .map(|(n, t)| format!("{}: {t}", wit_ident(n)))
+            .map(|(n, t)| format!("{}: {}", wit_ident(n), t.wit()))
             .collect();
         w.push_str(&ps.join(", "));
         w.push(')');
-        if let Some(r) = x.result {
-            w.push_str(&format!(" -> {r}"));
+        if let Some(r) = &x.result {
+            w.push_str(&format!(" -> {}", r.wit()));
         }
         w.push_str(";\n");
     }
@@ -598,10 +668,13 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
     let mut c = String::from(
         "/* generated by rust-p2w's component converter (LESSON_PLAYER.md step 5e) */\n\
          extern int p2w_int(int n);\n\
+         extern int p2w_float(double x);\n\
          extern int p2w_str(const unsigned char* p, int len);\n\
          extern int p2w_str_ptr(int v);\n\
          extern int p2w_str_len(int v);\n\
          extern int p2w_unbox_int(int v);\n\
+         extern int p2w_list_new(void);\n\
+         extern int p2w_list_append(int list, int v);\n\
          extern void p2w_release(int v);\n\
          extern int p2w_live(void);\n\
          int p2w_getc(void) { return -1; } /* components have no stdin */\n\n\
@@ -638,50 +711,84 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
         }
     }
 
+    // List params cross as canonical `(ptr, len)` into guest memory (jco
+    // lowers them via our cabi_realloc BEFORE the export runs). Generate one
+    // `mk_list_of_*` builder per distinct list shape (inner shapes first, so
+    // a nested builder can call the shape it depends on) that reads the
+    // canonical layout and constructs an OWNED p2w list — p2w_list_append
+    // transfers each element in, so nothing leaks.
+    let mut list_types: Vec<WitType> = Vec::new();
     for x in exports {
-        // The compiled def's C-visible signature: annotated int params are
-        // UNBOXED i32 (Repr::Int), float are double, str are boxed Values.
+        for (_, t) in &x.params {
+            collect_list_types(t, &mut list_types);
+        }
+    }
+    for lt in &list_types {
+        let WitType::List(elem) = lt else { continue };
+        let elem_expr = list_elem_expr(elem);
+        c.push_str(&format!(
+            "static int mk_{}(int ptr, int len) {{\n  \
+               int lst = p2w_list_new();\n  int* a = (int*)ptr; (void)a;\n  \
+               for (int i = 0; i < len; i++) p2w_list_append(lst, {elem_expr});\n  \
+               return lst;\n}}\n\n",
+            lt.c_frag()
+        ));
+    }
+
+    for x in exports {
+        // The compiled def's C-visible signature: `int`-annotated params are
+        // UNBOXED i32 (Repr::Int), `float` is a double, everything else
+        // (string, list) is a boxed Value (i32).
         let ext_params: Vec<&str> = x
             .params
             .iter()
-            .map(|(_, t)| match *t {
-                "f64" => "double",
-                _ => "int", // s32 (unboxed) and string (boxed Value) are both i32
-            })
+            .map(|(_, t)| if t.is_double() { "double" } else { "int" })
             .collect();
-        let ret_c = match x.result {
-            Some("f64") => "double",
-            Some(_) => "int",
-            None => "int", // un-annotated defs return a boxed Value (released below)
+        let ret_c = if matches!(x.result, Some(WitType::F64)) {
+            "double"
+        } else {
+            "int"
         };
         c.push_str(&format!(
             "extern {ret_c} {}({});\n",
             x.def_name,
             ext_params.join(", ")
         ));
-        // The canonical export wrapper. String params bind to temps because
-        // ownership is per-param (the def's borrow mask): an OWNED param is
-        // consumed by the call, a BORROWED one stays ours — release it after
-        // the call or it leaks once per call (the poll_bump lesson).
+        // The canonical export wrapper. String/list params bind to temps
+        // because ownership is per-param (the def's borrow mask): an OWNED
+        // param is consumed by the call, a BORROWED one stays ours — release
+        // it after the call or it leaks once per call (the poll_bump lesson).
         let mut sig = Vec::new();
         let mut pre = String::new();
         let mut args = Vec::new();
         let mut post = String::new();
         for (i, (_, t)) in x.params.iter().enumerate() {
-            match *t {
-                "string" => {
+            let borrowed = x.param_borrowed.get(i).copied().unwrap_or(false);
+            match t {
+                WitType::Str => {
                     sig.push(format!("unsigned char* p{i}, int p{i}_len"));
                     pre.push_str(&format!("  int s{i} = p2w_str(p{i}, p{i}_len);\n"));
                     args.push(format!("s{i}"));
-                    if x.param_borrowed.get(i).copied().unwrap_or(false) {
+                    if borrowed {
                         post.push_str(&format!("  p2w_release(s{i});\n"));
                     }
                 }
-                "f64" => {
+                WitType::List(_) => {
+                    sig.push(format!("int p{i}, int p{i}_len"));
+                    pre.push_str(&format!(
+                        "  int s{i} = mk_{}(p{i}, p{i}_len);\n",
+                        t.c_frag()
+                    ));
+                    args.push(format!("s{i}"));
+                    if borrowed {
+                        post.push_str(&format!("  p2w_release(s{i});\n"));
+                    }
+                }
+                WitType::F64 => {
                     sig.push(format!("double p{i}"));
                     args.push(format!("p{i}"));
                 }
-                _ => {
+                WitType::S32 => {
                     sig.push(format!("int p{i}"));
                     args.push(format!("p{i}"));
                 }
@@ -692,9 +799,9 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
             kebab(&x.api_name)
         ));
         let call = format!("{}({})", x.def_name, args.join(", "));
-        match x.result {
+        match &x.result {
             Some(r) => {
-                let rc = if r == "f64" { "double" } else { "int" };
+                let rc = if r.is_double() { "double" } else { "int" };
                 c.push_str(&format!(
                     "{rc} x_{}({}) {{\n  cabi_off = 0;\n{pre}  {rc} r = {call};\n{post}  return r;\n}}\n\n",
                     x.api_name,
@@ -841,6 +948,72 @@ mod tests {
         assert!(
             ir.contains("declare void @p2w_host_set_text(i32, i32)"),
             "{ir}"
+        );
+    }
+
+    #[test]
+    fn list_params_export_and_the_shim_marshals_nested_lists() {
+        // Grid's show, now annotated: list[list[int]] crosses as list<list<s32>>.
+        let src = "def grid_set(row: int, col: int, value: str):\n    set_text(\"#grid_\" + str(row) + \"_\" + str(col), value)\n\ndef grid_show(data: list[list[int]]):\n    for r in range(len(data)):\n        for c in range(len(data[r])):\n            grid_set(r, c, str(data[r][c]))\n";
+        let x = to_component(src, "grid", &api(&["set", "show"])).expect("convert");
+        // Both defs export now — show is no longer internal.
+        assert_eq!(x.exports.len(), 2, "{:?}", x.skipped);
+        assert!(
+            x.wit.contains("export show: func(data: list<list<s32>>);"),
+            "{}",
+            x.wit
+        );
+        // The shim emits the nested builders inner-first, and the outer one
+        // calls the inner (dependency defined above it).
+        let inner = x
+            .shim_c
+            .find("mk_list_of_s32(int ptr")
+            .expect("inner builder");
+        let outer = x
+            .shim_c
+            .find("mk_list_of_list_of_s32(int ptr")
+            .expect("outer builder");
+        assert!(
+            inner < outer,
+            "inner builder must precede outer:\n{}",
+            x.shim_c
+        );
+        assert!(
+            x.shim_c
+                .contains("p2w_list_append(lst, mk_list_of_s32(a[i * 2], a[i * 2 + 1]))"),
+            "{}",
+            x.shim_c
+        );
+        assert!(
+            x.shim_c.contains("p2w_list_append(lst, p2w_int(a[i]))"),
+            "{}",
+            x.shim_c
+        );
+        // The list param binds to a temp and (borrowed — data doesn't escape)
+        // is released after the call.
+        assert!(
+            x.shim_c
+                .contains("int s0 = mk_list_of_list_of_s32(p0, p0_len);"),
+            "{}",
+            x.shim_c
+        );
+    }
+
+    #[test]
+    fn flat_list_of_strings_marshals() {
+        let src = "def tags_load(items: list[str]):\n    for t in items:\n        set_text(\"#tags\", t)\n";
+        let x = to_component(src, "tags", &api(&["load"])).expect("convert");
+        assert!(
+            x.wit.contains("export load: func(items: list<string>);"),
+            "{}",
+            x.wit
+        );
+        assert!(
+            x.shim_c.contains(
+                "p2w_list_append(lst, p2w_str((const unsigned char*)a[i * 2], a[i * 2 + 1]))"
+            ),
+            "{}",
+            x.shim_c
         );
     }
 

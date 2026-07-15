@@ -15,7 +15,7 @@ cat > "$OUT/grid.py" <<'EOF'
 def grid_set(row: int, col: int, value: str):
     set_text("#grid_" + str(row) + "_" + str(col), value)
 
-def grid_show(data):
+def grid_show(data: list[list[int]]):
     for r in range(len(data)):
         for c in range(len(data[r])):
             grid_set(r, c, str(data[r][c]))
@@ -39,13 +39,28 @@ export function setText(selector, text) { calls.push([selector, text]); }
 EOF
 
 cat > "$OUT/jco/driver.mjs" <<'EOF'
-import { set, live, dispose } from './grid.component.js';
+import { set, show, live, dispose } from './grid.component.js';
 import { calls } from './host.js';
 set(0, 0, "hi");
 set(2, 1, "42");
 const want = JSON.stringify([["#grid_0_0", "hi"], ["#grid_2_1", "42"]]);
 const got = JSON.stringify(calls);
 if (got !== want) { console.error(`FAIL: got ${got} want ${want}`); process.exit(1); }
+
+// LIST PARAMS: show(data: list[list[int]]) — a nested list crosses the
+// boundary; the host passes [[...],[...]], the shim marshals it into a p2w
+// list-of-lists, and show fills all nine cells via set-text.
+calls.length = 0;
+show([[1, 2, 3], [4, 5, 6], [7, 8, 9]]);
+const grid = {};
+for (const [sel, text] of calls) grid[sel] = text;
+if (grid["#grid_0_0"] !== "1" || grid["#grid_1_2"] !== "6" || grid["#grid_2_2"] !== "9"
+    || calls.length !== 9) {
+  console.error(`FAIL: show() nested-list marshalling wrong: ${JSON.stringify(calls)}`);
+  process.exit(1);
+}
+console.log("  show([[…]]) filled 9 cells — nested list<list<s32>> crossed the boundary");
+
 // Memory contract for a RESIDENT component, both halves:
 // 1) STEADY STATE while running — the per-call-site literal caches stay
 //    warm by design, but live must not grow per call.
