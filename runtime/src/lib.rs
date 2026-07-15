@@ -1287,6 +1287,16 @@ pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
             let i = norm_index(index, coll_len(o) as i64);
             owned(list_get(o, i as usize)) // hand the caller an owned ref
         }
+        // Packed arrays (list[int]/list[float]) hold RAW scalars — box the
+        // element into a value on read, mirroring the list arm.
+        T_IARRAY => {
+            let i = norm_index(index, coll_len(o) as i64);
+            make_int(list_get(o, i as usize) as i32 as i64)
+        }
+        T_FARRAY => {
+            let i = norm_index(index, coll_len(o) as i64);
+            float_alloc(farray_get(o, i as usize))
+        }
         T_DICT => match dict_find(o, index) {
             Some(i) => owned(dict_val(o, i)),
             None => trap("key not found"),
