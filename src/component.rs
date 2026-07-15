@@ -512,14 +512,16 @@ fn export_sig(
     let result = match return_type {
         None => None,
         Some(_) => match wit_ty(return_type) {
-            Some(WitType::Str) => {
-                return Err("str returns need canonical lowering (later slice)".to_string());
-            }
+            // A string return spills to the canonical return area + cabi_post
+            // (see shim_c). List returns still wait — lowering a p2w list OUT
+            // into canonical memory is the harder direction.
             Some(WitType::List(_)) => {
                 return Err("list returns need canonical lowering (later slice)".to_string());
             }
             Some(t) => Some(t),
-            None => return Err("the return annotation must be int or float".to_string()),
+            None => {
+                return Err("the return annotation must be int / float / str".to_string());
+            }
         },
     };
     Ok(WitExport {
@@ -794,23 +796,41 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
                 }
             }
         }
-        c.push_str(&format!(
-            "__attribute__((export_name(\"{}\")))\n",
-            kebab(&x.api_name)
-        ));
+        let kebab_name = kebab(&x.api_name);
         let call = format!("{}({})", x.def_name, args.join(", "));
         match &x.result {
+            // A string result spills to a canonical return area: the export
+            // returns a pointer to [ptr, len] over the p2w string's bytes, and
+            // `cabi_post_<name>` (which the host calls after copying the
+            // string out) releases the value. The bytes stay valid across that
+            // window because the value is only released in cabi_post.
+            Some(WitType::Str) => {
+                c.push_str(&format!(
+                    "static int {api}_ret[2];\nstatic int {api}_saved;\n\
+                     __attribute__((export_name(\"{kebab}\")))\n\
+                     int x_{api}({sig}) {{\n  cabi_off = 0;\n{pre}  int v = {call};\n{post}  \
+                     {api}_saved = v;\n  {api}_ret[0] = p2w_str_ptr(v);\n  \
+                     {api}_ret[1] = p2w_str_len(v);\n  return (int){api}_ret;\n}}\n\
+                     __attribute__((export_name(\"cabi_post_{kebab}\")))\n\
+                     void cabi_post_x_{api}(int ptr) {{ (void)ptr; p2w_release({api}_saved); }}\n\n",
+                    api = x.api_name,
+                    kebab = kebab_name,
+                    sig = sig.join(", "),
+                ));
+            }
             Some(r) => {
                 let rc = if r.is_double() { "double" } else { "int" };
                 c.push_str(&format!(
-                    "{rc} x_{}({}) {{\n  cabi_off = 0;\n{pre}  {rc} r = {call};\n{post}  return r;\n}}\n\n",
+                    "__attribute__((export_name(\"{kebab_name}\")))\n\
+                     {rc} x_{}({}) {{\n  cabi_off = 0;\n{pre}  {rc} r = {call};\n{post}  return r;\n}}\n\n",
                     x.api_name,
                     sig.join(", "),
                 ));
             }
             None => {
                 c.push_str(&format!(
-                    "void x_{}({}) {{\n  cabi_off = 0;\n{pre}  p2w_release({call});\n{post}}}\n\n",
+                    "__attribute__((export_name(\"{kebab_name}\")))\n\
+                     void x_{}({}) {{\n  cabi_off = 0;\n{pre}  p2w_release({call});\n{post}}}\n\n",
                     x.api_name,
                     sig.join(", "),
                 ));
@@ -1156,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_returns_export_and_string_returns_wait() {
+    fn scalar_and_string_returns_export() {
         let src = "def calc_area(w: int, h: int) -> int:\n    return w * h\n";
         let x = to_component(src, "calc", &api(&["area"])).expect("convert");
         assert!(
@@ -1164,15 +1184,48 @@ mod tests {
             "{}",
             x.wit
         );
-        // A value-returning export returns the unboxed result — no release.
+        // A scalar-returning export returns the unboxed result — no release.
         assert!(
             x.shim_c.contains("int r = calc_area(p0, p1);"),
             "{}",
             x.shim_c
         );
 
-        let bad = "def calc_name(w: int) -> str:\n    return str(w)\n";
-        let err = to_component(bad, "calc", &api(&["name"])).unwrap_err();
+        // A STRING return spills to the canonical return area + cabi_post.
+        let s = "def calc_label(n: int) -> str:\n    return \"n=\" + str(n)\n";
+        let x = to_component(s, "calc", &api(&["label"])).expect("convert");
+        assert!(
+            x.wit.contains("export label: func(n: s32) -> string;"),
+            "{}",
+            x.wit
+        );
+        // Return area holds [ptr, len] over the p2w string's bytes…
+        assert!(
+            x.shim_c.contains("label_ret[0] = p2w_str_ptr(v);"),
+            "{}",
+            x.shim_c
+        );
+        assert!(
+            x.shim_c.contains("label_ret[1] = p2w_str_len(v);"),
+            "{}",
+            x.shim_c
+        );
+        assert!(x.shim_c.contains("return (int)label_ret;"), "{}", x.shim_c);
+        // …and cabi_post frees the stashed value AFTER the host copies it out.
+        assert!(
+            x.shim_c.contains("export_name(\"cabi_post_label\")"),
+            "{}",
+            x.shim_c
+        );
+        assert!(
+            x.shim_c.contains("p2w_release(label_saved);"),
+            "{}",
+            x.shim_c
+        );
+
+        // List returns still wait (the harder direction).
+        let bad = "def calc_row(n: int) -> list[int]:\n    return [n]\n";
+        let err = to_component(bad, "calc", &api(&["row"])).unwrap_err();
         assert!(err.contains("later slice"), "{err}");
     }
 }
