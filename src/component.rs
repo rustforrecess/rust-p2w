@@ -512,15 +512,10 @@ fn export_sig(
     let result = match return_type {
         None => None,
         Some(_) => match wit_ty(return_type) {
-            // A string / flat-list return spills to the canonical return area +
-            // cabi_post (see shim_c). NESTED list returns still wait — keeping
-            // the inner lists' string elements alive across the boundary is the
-            // subtle part; flat lists (numbers, strings) cover the common case.
-            Some(WitType::List(elem)) if matches!(*elem, WitType::List(_)) => {
-                return Err(
-                    "nested list returns aren't supported yet — return a flat list".to_string(),
-                );
-            }
+            // A string / list return (any nesting) spills to the canonical
+            // return area + cabi_post (see shim_c). The whole returned tree is
+            // kept alive until cabi_post, so element bytes at every depth
+            // survive the host's copy.
             Some(t) => Some(t),
             None => {
                 return Err(
@@ -583,8 +578,18 @@ fn lower_list_elem(elem: &WitType) -> (&'static str, usize, usize, String) {
             4,
             "buf[i * 2] = p2w_str_ptr(e); buf[i * 2 + 1] = p2w_str_len(e);".to_string(),
         ),
-        // Guarded out in export_sig (nested list returns are refused).
-        WitType::List(_) => ("int", 8, 4, String::new()),
+        // A nested list element: recursively lower the inner list into its own
+        // canonical buffer (it stays alive via the outer list until cabi_post),
+        // then store its (ptr, len) pair.
+        WitType::List(_) => (
+            "int",
+            8,
+            4,
+            format!(
+                "int elen; buf[i * 2] = lower_{}(e, &elen); buf[i * 2 + 1] = elen;",
+                elem.c_frag()
+            ),
+        ),
     }
 }
 
@@ -768,15 +773,14 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
     }
 
     // List RESULTS lower the other way: read a p2w list into a canonical
-    // `(ptr, len)` buffer the host copies out. One `lower_list_of_*` per flat
-    // result shape. The p2w list stays alive until cabi_post (string elements
-    // point into it); numeric elements are copied by value.
+    // `(ptr, len)` buffer the host copies out. One `lower_list_of_*` per list
+    // shape, inner shapes first (a nested builder calls the shape it holds).
+    // The whole returned tree stays alive until cabi_post — string elements at
+    // every depth point into it; numbers are copied by value.
     let mut result_lists: Vec<WitType> = Vec::new();
     for x in exports {
-        if let Some(t @ WitType::List(_)) = &x.result {
-            if !result_lists.contains(t) {
-                result_lists.push(t.clone());
-            }
+        if let Some(t) = &x.result {
+            collect_list_types(t, &mut result_lists);
         }
     }
     for lt in &result_lists {
@@ -1298,10 +1302,50 @@ mod tests {
             x.shim_c
         );
 
-        // NESTED list returns still wait (inner-element lifetime); flat ones work.
-        let bad = "def grid_rows(n: int) -> list[list[int]]:\n    return [[n]]\n";
-        let err = to_component(bad, "grid", &api(&["rows"])).unwrap_err();
-        assert!(err.contains("nested list returns"), "{err}");
+        // A non-list/str/scalar return annotation is still rejected.
+        let bad = "def calc_it(n: int) -> bytes:\n    return n\n";
+        let err = to_component(bad, "calc", &api(&["it"])).unwrap_err();
+        assert!(err.contains("must be int / float / str / list"), "{err}");
+    }
+
+    #[test]
+    fn nested_list_returns_lower_inner_first() {
+        // `-> list[list[int]]` — the whole tree stays alive until cabi_post, so
+        // inner buffers are safe. Builders emit inner-first (dependency order).
+        let src = "def grid_rows(a: int, b: int) -> list[list[int]]:\n    return [[a], [b]]\n";
+        let x = to_component(src, "grid", &api(&["rows"])).expect("convert");
+        assert!(
+            x.wit
+                .contains("export rows: func(a: s32, b: s32) -> list<list<s32>>;"),
+            "{}",
+            x.wit
+        );
+        let inner = x
+            .shim_c
+            .find("lower_list_of_s32(int list")
+            .expect("inner builder");
+        let outer = x
+            .shim_c
+            .find("lower_list_of_list_of_s32(int list")
+            .expect("outer builder");
+        assert!(
+            inner < outer,
+            "inner builder must precede outer:\n{}",
+            x.shim_c
+        );
+        // The outer builder lowers each inner list recursively.
+        assert!(
+            x.shim_c
+                .contains("buf[i * 2] = lower_list_of_s32(e, &elen);"),
+            "{}",
+            x.shim_c
+        );
+        assert!(
+            x.shim_c
+                .contains("lower_list_of_list_of_s32(v, &rows_len);"),
+            "{}",
+            x.shim_c
+        );
     }
 
     #[test]

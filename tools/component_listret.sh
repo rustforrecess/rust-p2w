@@ -17,9 +17,12 @@ def seq_nums(a: int, b: int, c: int) -> list[int]:
 
 def seq_words() -> list[str]:
     return ["hi", "yo", "sup"]
+
+def seq_matrix(a: int, b: int) -> list[list[int]]:
+    return [[a, a], [b, b]]
 EOF
 
-bash tools/componentize.sh "$OUT/seq.py" seq nums,words || exit 1
+bash tools/componentize.sh "$OUT/seq.py" seq nums,words,matrix || exit 1
 [ -f "$OUT/seq.component.wasm" ] || { echo "SKIP: no component built"; exit 0; }
 
 ( cd "$OUT" && npx --yes @bytecodealliance/jco transpile seq.component.wasm \
@@ -31,7 +34,7 @@ export function p2wPutc(b) {}
 EOF
 
 cat > "$OUT/jco/driver.mjs" <<'EOF'
-import { nums, words, live, dispose } from './seq.component.js';
+import { nums, words, matrix, live, dispose } from './seq.component.js';
 
 const a = nums(4, 5, 6);
 if (JSON.stringify([...a]) !== JSON.stringify([4, 5, 6])) {
@@ -41,19 +44,24 @@ const w = words();
 if (JSON.stringify([...w]) !== JSON.stringify(["hi", "yo", "sup"])) {
   console.error(`FAIL: words returned ${JSON.stringify([...w])}`); process.exit(1);
 }
+// Nested: list<list<s32>> — the whole tree crosses the boundary.
+const m = matrix(7, 9).map(r => [...r]);
+if (JSON.stringify(m) !== JSON.stringify([[7, 7], [9, 9]])) {
+  console.error(`FAIL: matrix returned ${JSON.stringify(m)}`); process.exit(1);
+}
 
 // The cleanup contract: cabi_post frees each returned list, so repeated calls
 // don't grow live, and dispose lands at 0.
-for (let i = 0; i < 50; i++) { nums(i, i, i); words(); }
+for (let i = 0; i < 50; i++) { nums(i, i, i); words(); matrix(i, i); }
 const warm = live();
-for (let i = 0; i < 50; i++) { nums(i, i, i); words(); }
+for (let i = 0; i < 50; i++) { nums(i, i, i); words(); matrix(i, i); }
 if (live() !== warm) {
   console.error(`FAIL: live grew ${warm} -> ${live()} — cabi_post isn't freeing returned lists`);
   process.exit(1);
 }
 dispose();
 if (live() !== 0) { console.error(`FAIL: live=${live()} after dispose`); process.exit(1); }
-console.log(`PASS [seq-return]  computed list<s32> + list<string> crossed guest->host; cabi_post freed them (live steady ${warm}); dispose -> live=0`);
+console.log(`PASS [seq-return]  computed list<s32> + list<string> + list<list<s32>> crossed guest->host; cabi_post freed them (live steady ${warm}); dispose -> live=0`);
 EOF
 
 node "$OUT/jco/driver.mjs" || exit 1
