@@ -28,6 +28,9 @@ fn main() {
             std::fs::write(outdir.join("component.py"), &x.python).expect("write py");
             std::fs::write(outdir.join("component.wit"), &x.wit).expect("write wit");
             std::fs::write(outdir.join("shim.c"), &x.shim_c).expect("write shim");
+            // The host's event-wiring manifest (5e-c): (selector, event,
+            // handler-export) rows the host installs DOM listeners from.
+            std::fs::write(outdir.join("wiring.json"), x.wiring_json()).expect("write wiring");
             println!(
                 "exports: {}",
                 x.exports
@@ -37,6 +40,9 @@ fn main() {
                     .join(", ")
             );
             println!("imports: {}", x.imports.join(", "));
+            for w in &x.wiring {
+                println!("wire: {} {} -> {}", w.selector, w.event, w.handler);
+            }
             for (name, why) in &x.skipped {
                 println!("internal: {name} ({why})");
             }

@@ -145,6 +145,21 @@ pub struct WitExport {
     pub result: Option<&'static str>,
 }
 
+/// One event wiring the HOST must set up (LESSON_PLAYER.md step 5e-c): a
+/// component is a WIT component with no DOM of its own, so a top-level
+/// `on("#poll_a", "click", poll_vote_a)` is not component BEHAVIOR — it's an
+/// instruction to the host. It becomes `(selector, event, handler-export)`:
+/// the host listens for `event` on `selector` and calls the named no-arg
+/// export. Reuses the delegated-stage-events model (match by `closest()` at
+/// event time), just calling a component export instead of a Python closure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WitWiring {
+    pub selector: String,
+    /// The exported (kebab) handler name the host calls when the event fires.
+    pub handler: String,
+    pub event: String,
+}
+
 /// The converter's output: everything the native chain needs, plus the
 /// surface lists for display.
 #[derive(Debug)]
@@ -155,8 +170,50 @@ pub struct ComponentExtract {
     pub exports: Vec<WitExport>,
     /// Host capability builtin names the group uses (WIT imports).
     pub imports: Vec<&'static str>,
+    /// Event wirings the host installs (see [`WitWiring`]); empty for a
+    /// component with no top-level `on(...)` calls.
+    pub wiring: Vec<WitWiring>,
     /// API defs kept internal (present but not exportable in v1), with why.
     pub skipped: Vec<(String, String)>,
+}
+
+impl ComponentExtract {
+    /// The wiring manifest as JSON (`[{"selector","event","handler"}, …]`) —
+    /// the sidecar the host reads to install DOM listeners. Hand-rolled to
+    /// stay serde-free like the rest of the crate.
+    pub fn wiring_json(&self) -> String {
+        let mut s = String::from("[");
+        for (i, w) in self.wiring.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"selector\":{},\"event\":{},\"handler\":{}}}",
+                json_str(&w.selector),
+                json_str(&w.event),
+                json_str(&w.handler)
+            ));
+        }
+        s.push(']');
+        s
+    }
+}
+
+/// Minimal JSON string escaping (quotes + backslashes + control chars we can
+/// hit in a selector). No serde in this crate.
+fn json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Convert one stamped instance. `instance` is the stamped id (`grid`,
@@ -215,6 +272,31 @@ pub fn to_component(
             Err(why) => skipped.push((a.clone(), why)),
         }
     }
+    // Event wiring (5e-c): top-level `on("#sel", "event", handler)` calls are
+    // host instructions, not component behavior. Capture them as the wiring
+    // manifest and AUTO-EXPORT each referenced no-arg handler def (it's in the
+    // group, so it's already convertible — it just wasn't in the recorded
+    // API). The host installs the listeners and calls the export on the event.
+    let mut wiring = Vec::new();
+    for (sel, event, handler) in scan_wiring(&stmts, &group) {
+        if !exports.iter().any(|x| x.def_name == handler) {
+            // A no-arg handler exports as `func()` — no annotations needed.
+            let mask = crate::llvm::param_borrow_mask(&stmts, &handler);
+            match export_sig(&handler, &handler, &[], &[], &None, mask) {
+                Ok(x) => exports.push(x),
+                Err(why) => {
+                    skipped.push((handler.clone(), format!("event handler: {why}")));
+                    continue;
+                }
+            }
+        }
+        wiring.push(WitWiring {
+            selector: sel,
+            event,
+            handler: kebab(&handler),
+        });
+    }
+
     if exports.is_empty() {
         return Err(format!(
             "none of the API defs are exportable — annotate their parameters \
@@ -235,8 +317,43 @@ pub fn to_component(
         shim_c,
         exports,
         imports,
+        wiring,
         skipped,
     })
+}
+
+/// Top-level `on("#sel", "event", handler)` calls whose handler is a no-arg
+/// def in this instance's group: returns `(selector, event, handler_def)` for
+/// each. Only literal selector+event and a bare-name handler are captured — a
+/// computed wiring can't be a static manifest, so it's left for the (self-
+/// wiring) unsupported path. `on()` INSIDE a def body is not wiring; it's
+/// self-wiring and still blocks via `scan_caps`.
+fn scan_wiring(stmts: &[Stmt], group: &[String]) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for s in stmts {
+        let StmtKind::Expr(e) = &s.kind else { continue };
+        let ExprKind::Call(f, args) = &e.kind else {
+            continue;
+        };
+        if f != "on" || args.len() != 3 {
+            continue;
+        }
+        let (ExprKind::Str(sel), ExprKind::Str(event), ExprKind::Name(handler)) =
+            (&args[0].kind, &args[1].kind, &args[2].kind)
+        else {
+            continue;
+        };
+        if !group.contains(handler) {
+            continue;
+        }
+        // Only no-arg handlers can be driven by a plain DOM event.
+        if let Some((params, _, _)) = find_def(stmts, handler) {
+            if params.is_empty() {
+                out.push((sel.clone(), event.clone(), handler.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Walk the group defs' bodies collecting used capability names; the first
@@ -725,6 +842,61 @@ mod tests {
             ir.contains("declare void @p2w_host_set_text(i32, i32)"),
             "{ir}"
         );
+    }
+
+    #[test]
+    fn top_level_on_becomes_a_wiring_manifest_with_exported_handlers() {
+        // The full Poll shape, incl. its top-level wiring. bump is the api;
+        // vote_a/vote_b are no-arg handlers referenced by on() — they get
+        // auto-exported and the on() calls become the manifest.
+        let src = "def poll_bump(option: str):\n    n = get_field(\"poll_\" + option)\n    if n == \"\":\n        n = \"0\"\n    set_field(\"poll_\" + option, str(int(n) + 1))\n\ndef poll_vote_a():\n    poll_bump(\"a\")\n\ndef poll_vote_b():\n    poll_bump(\"b\")\n\non(\"#poll_a\", \"click\", poll_vote_a)\non(\"#poll_b\", \"click\", poll_vote_b)\n";
+        let x = to_component(src, "poll", &api(&["bump"])).expect("convert");
+        // The manifest names host wirings, handler kebab-cased.
+        assert_eq!(x.wiring.len(), 2, "{:?}", x.wiring);
+        assert_eq!(
+            x.wiring[0],
+            WitWiring {
+                selector: "#poll_a".into(),
+                event: "click".into(),
+                handler: "poll-vote-a".into(),
+            }
+        );
+        assert!(
+            x.wiring_json().contains(
+                "{\"selector\":\"#poll_a\",\"event\":\"click\",\"handler\":\"poll-vote-a\"}"
+            ),
+            "{}",
+            x.wiring_json()
+        );
+        // The handlers are now EXPORTS (no-arg funcs), alongside the api.
+        // (`option` is a WIT keyword → %-escaped, the 5e-b fix.)
+        assert!(
+            x.wit.contains("export bump: func(%option: string);"),
+            "{}",
+            x.wit
+        );
+        assert!(x.wit.contains("export poll-vote-a: func();"), "{}", x.wit);
+        assert!(x.wit.contains("export poll-vote-b: func();"), "{}", x.wit);
+        // …and the shim wraps them (no-arg, result released).
+        assert!(
+            x.shim_c.contains("export_name(\"poll-vote-a\")"),
+            "{}",
+            x.shim_c
+        );
+        assert!(
+            x.shim_c.contains("p2w_release(poll_vote_a());"),
+            "{}",
+            x.shim_c
+        );
+        // The wiring is NOT dragged into the component's own source.
+        assert!(!x.python.contains("on("), "{}", x.python);
+    }
+
+    #[test]
+    fn a_component_with_no_wiring_has_an_empty_manifest() {
+        let x = to_component(GRID, "grid", &api(&["set", "show"])).expect("convert");
+        assert!(x.wiring.is_empty());
+        assert_eq!(x.wiring_json(), "[]");
     }
 
     #[test]
