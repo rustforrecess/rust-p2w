@@ -101,6 +101,29 @@ pub fn set_operator_spans(source: &str) -> Vec<(usize, usize)> {
 
 pub use lint::{LintKind, Scaffold, scaffold};
 
+/// The zero-argument top-level functions, sorted by name — their index is the
+/// stable `__dispatch` id the WASM-GC backend assigns to each (see codegen's
+/// `handler_defs`). A browser host driving a CONVERTED component's events
+/// (LESSON_PLAYER.md step 5e-c / browser host-side wiring) reads `wiring.json`
+/// for `(selector, event, handler)`, resolves the handler name to its index
+/// here, and calls the module's `__dispatch(index)` when the event fires.
+/// Empty when `source` doesn't parse.
+pub fn event_handler_names(source: &str) -> Vec<String> {
+    let Ok(toks) = lexer::lex(source) else {
+        return Vec::new();
+    };
+    let (stmts, _) = parser::parse_recovering(&toks);
+    let mut hs: Vec<String> = stmts
+        .iter()
+        .filter_map(|s| match &s.kind {
+            ast::StmtKind::Def { name, params, .. } if params.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    hs.sort();
+    hs
+}
+
 /// A single gentle lint, tagged with which diagnostic produced it so the IDE can
 /// attach the right fix scaffold ([`scaffold`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -232,6 +255,17 @@ mod tests {
     }
 
     #[test]
+    fn event_handler_names_are_the_sorted_zero_arg_defs() {
+        // Poll's extract: bump takes an arg (not a handler); vote_a/vote_b are
+        // the zero-arg handlers, sorted -> dispatch ids 0 and 1.
+        let src = "def poll_bump(o: str):\n    pass\ndef poll_vote_b():\n    poll_bump(\"b\")\ndef poll_vote_a():\n    poll_bump(\"a\")\n";
+        assert_eq!(
+            event_handler_names(src),
+            vec!["poll_vote_a".to_string(), "poll_vote_b".to_string()]
+        );
+    }
+
+    #[test]
     fn end_to_end_math_and_strings() {
         let src = "print(\"answer:\", 6 * 7)\nprint(100 - 1)";
         let wat = compile_to_wat(src).unwrap();
@@ -320,6 +354,24 @@ print(\"sum of evens:\", total)
         assert_valid_wasm(src);
         // A normal program emits none of the DOM imports (host stays minimal).
         assert!(!compile_to_wat("print(1)\n").unwrap().contains("on_click"));
+    }
+
+    #[test]
+    fn zero_arg_handlers_export_dispatch_even_without_on() {
+        // A converted component's extracted source has NO on() calls (they
+        // became the host's wiring manifest), yet the HOST must still drive the
+        // handlers by id — so __dispatch is emitted whenever zero-arg handlers
+        // exist, not only when this source wires them. (Browser host-side
+        // wiring, LESSON_PLAYER.md.)
+        let src = "def poll_vote_a():\n    set_field(\"poll_a\", \"1\")\n";
+        let wat = compile_to_wat(src).unwrap();
+        assert!(wat.contains(r#"(export "__dispatch")"#), "{wat}");
+        assert!(wat.contains("(call $f_poll_vote_a)"), "{wat}");
+        // But NOT the on_click/flash/beep host imports (this source uses none).
+        assert!(!wat.contains(r#"(import "env" "on_click""#), "{wat}");
+        assert_valid_wasm(src);
+        // A program with no zero-arg defs still emits no __dispatch.
+        assert!(!compile_to_wat("print(1)\n").unwrap().contains("__dispatch"));
     }
 
     #[test]

@@ -307,8 +307,14 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module
             .imports
             .push(r#"(import "env" "beep" (func $beep))"#.into());
-        // `__dispatch(id)`: the JS side calls this on an event to run the
-        // registered zero-arg handler. Ids match `handler_id` (sorted defs).
+    }
+    // `__dispatch(id)`: the JS side calls this on an event to run the registered
+    // zero-arg handler. Ids match `handler_id` (sorted defs). Emitted whenever
+    // there ARE zero-arg handlers — NOT only when this source wires them with
+    // on(): a converted component's handlers are wired by the HOST from its
+    // manifest (browser host-side wiring, LESSON_PLAYER.md), so the extracted
+    // source has no on() calls yet the host still needs to drive the exports.
+    if !g.handler_defs().is_empty() {
         let mut b = Body::new();
         for (id, name) in g.handler_defs().iter().enumerate() {
             b.push(format!(
