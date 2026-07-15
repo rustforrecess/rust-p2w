@@ -569,6 +569,60 @@ fn str_alloc(bytes: &[u8]) -> Value {
     p as Value
 }
 
+/// `int(x)` — identity for ints, truncates floats toward zero, True/False →
+/// 1/0, and parses strings (optional surrounding whitespace, optional sign,
+/// decimal digits — CPython's accepted shape). BORROWS `v`; returns owned.
+/// Mirrors the WAT backend's `$py_int` so both backends agree.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_int_of(v: Value) -> Value {
+    if is_int(v) {
+        return make_int(as_int(v));
+    }
+    if v == V_TRUE {
+        return make_int(1);
+    }
+    if v == V_FALSE {
+        return make_int(0);
+    }
+    if is_float(v) {
+        return make_int(as_f64(v) as i64);
+    }
+    if is_heap(v) && obj_tag(v) == T_STR {
+        let (mut i, mut j) = (0usize, str_len(v));
+        while i < j && str_byte(v, i).is_ascii_whitespace() {
+            i += 1;
+        }
+        while j > i && str_byte(v, j - 1).is_ascii_whitespace() {
+            j -= 1;
+        }
+        let mut neg = false;
+        if i < j && matches!(str_byte(v, i), b'+' | b'-') {
+            neg = str_byte(v, i) == b'-';
+            i += 1;
+        }
+        if i == j {
+            trap("int() got text that isn't a whole number");
+        }
+        let mut n: i64 = 0;
+        while i < j {
+            let b = str_byte(v, i);
+            if !b.is_ascii_digit() {
+                trap("int() got text that isn't a whole number");
+            }
+            n = n * 10 + (b - b'0') as i64;
+            // i32 is the value model's int width; -2^31 is reachable only
+            // through the negative sign, so allow one past MAX while digits
+            // accumulate and let make_int's wrap settle the sign.
+            if n > i32::MAX as i64 + 1 {
+                trap("int() result is too large for this computer's numbers");
+            }
+            i += 1;
+        }
+        return make_int(if neg { -n } else { n });
+    }
+    trap("int() needs a number or a numeric string")
+}
+
 // --- floats (heap-boxed f64) -----------------------------------------------
 
 fn is_float(v: Value) -> bool {

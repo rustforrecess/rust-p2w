@@ -29,17 +29,24 @@ use crate::reuse::{Liveness, stmt_mentions_name};
 /// The runtime ABI the emitted module depends on (implemented by the device
 /// runtime). Declared at the top of every module.
 /// Host capabilities that cross the component seam (LESSON_PLAYER.md step
-/// 5e): `(builtin name, arity)`. Each lowers to a `call void @p2w_host_*`
-/// with ALL arguments boxed; the symbol is deliberately left undefined —
-/// under `wasm-ld --allow-undefined` it becomes an env import that the
-/// generated component shim resolves (the same seam as `p2w_putc`).
+/// 5e): `(builtin name, arity, returns a value)`. Each lowers to a call on
+/// `@p2w_host_*` with ALL arguments boxed; readers return an OWNED boxed
+/// Value the shim built (`p2w_str`/`p2w_int` — rc 1, ours to release). The
+/// symbol is deliberately left undefined — under `wasm-ld --allow-undefined`
+/// it becomes an env import that the generated component shim resolves (the
+/// same seam as `p2w_putc`).
 /// LOCKSTEP with `component::CAPS` — the shim only implements these.
-pub(crate) const HOST_CAPS: &[(&str, usize)] = &[
-    ("set_text", 2),
-    ("set_attr", 3),
-    ("set_position", 3),
-    ("set_field", 2),
-    ("evidence", 2),
+pub(crate) const HOST_CAPS: &[(&str, usize, bool)] = &[
+    ("set_text", 2, false),
+    ("set_attr", 3, false),
+    ("set_position", 3, false),
+    ("set_field", 2, false),
+    ("evidence", 2, false),
+    ("add_element", 3, false),
+    ("get_field", 1, true),
+    ("get_value", 1, true),
+    ("pointer_x", 0, true),
+    ("pointer_y", 0, true),
 ];
 
 const RUNTIME_DECLS: &str = "\
@@ -50,6 +57,11 @@ declare void @p2w_host_set_attr(i32, i32, i32)
 declare void @p2w_host_set_position(i32, i32, i32)
 declare void @p2w_host_set_field(i32, i32)
 declare void @p2w_host_evidence(i32, i32)
+declare void @p2w_host_add_element(i32, i32, i32)
+declare i32 @p2w_host_get_field(i32)
+declare i32 @p2w_host_get_value(i32)
+declare i32 @p2w_host_pointer_x()
+declare i32 @p2w_host_pointer_y()
 declare i32 @p2w_int(i32)
 declare i32 @p2w_unbox_int(i32)
 declare i32 @p2w_float(double)
@@ -99,6 +111,7 @@ declare i32 @p2w_index(i32, i32)
 declare void @p2w_setindex(i32, i32, i32)
 declare i32 @p2w_len(i32)
 declare i32 @p2w_str_of(i32)
+declare i32 @p2w_int_of(i32)
 declare i32 @p2w_slice(i32, i32, i32, i32)
 declare i32 @p2w_slice_assign(i32, i32, i32, i32)
 declare i32 @p2w_input(i32)
@@ -712,6 +725,25 @@ impl ClassTable {
             .flat_map(|d| d.methods.keys().cloned())
             .collect()
     }
+}
+
+/// The borrow mask of one def's params under the emitted calling convention:
+/// `true` = BORROWED (a non-escaping heap param — the callee does NOT release
+/// it, the CALLER keeps ownership). The component shim is such a caller, so
+/// it must release exactly these after the call (LESSON_PLAYER.md step 5e —
+/// assuming all-owned leaked one string per call on borrowed-mask defs).
+pub(crate) fn param_borrow_mask(stmts: &[Stmt], def_name: &str) -> Vec<bool> {
+    for s in stmts {
+        if let StmtKind::Def {
+            name, params, body, ..
+        } = &s.kind
+        {
+            if name == def_name {
+                return params.iter().map(|p| !param_escapes(body, p)).collect();
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2640,6 +2672,17 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&v, o); // len borrows its argument
                     return Ok((r, Repr::Boxed));
                 }
+                // int(x): number/bool/numeric-string -> int (p2w_int_of
+                // mirrors the WAT backend's $py_int).
+                if name == "int" {
+                    if args.len() != 1 {
+                        return nope("int() with other than one argument");
+                    }
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let r = self.call_value(&format!("call i32 @p2w_int_of(i32 {v})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
                 // str(x): the value's display form as a fresh string. This is also
                 // what f-strings desugar to (`f"{x}"` -> str(x) concatenation).
                 if name == "str" {
@@ -2699,11 +2742,12 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }
-                // Host capabilities (the component seam): a void call on an
+                // Host capabilities (the component seam): a call on an
                 // undefined `p2w_host_*` symbol the shim resolves. Args cross
-                // boxed and BORROWED (the shim only reads them); the value of
-                // the expression is None, like every effect builtin.
-                if let Some(&(_, arity)) = HOST_CAPS.iter().find(|(n, _)| n == name) {
+                // boxed and BORROWED (the shim only reads them). Effect caps
+                // evaluate to None like every effect builtin; reader caps
+                // return the OWNED Value the shim built (rc 1, ours).
+                if let Some(&(_, arity, returns)) = HOST_CAPS.iter().find(|(n, _, _)| n == name) {
                     if args.len() != arity {
                         return Err(format!(
                             "line {}: {name}() takes {arity} argument(s), got {}",
@@ -2717,14 +2761,26 @@ impl<'a> FuncEmitter<'a> {
                     }
                     let call_args: Vec<String> =
                         vals.iter().map(|(v, _)| format!("i32 {v}")).collect();
-                    self.line(&format!(
-                        "call void @p2w_host_{name}({})",
-                        call_args.join(", ")
-                    ));
+                    let r = if returns {
+                        self.call_value(&format!(
+                            "call i32 @p2w_host_{name}({})",
+                            call_args.join(", ")
+                        ))
+                    } else {
+                        self.line(&format!(
+                            "call void @p2w_host_{name}({})",
+                            call_args.join(", ")
+                        ));
+                        String::new()
+                    };
                     for (v, o) in vals {
                         self.release_if_owned(&v, o);
                     }
-                    let r = self.call_value("call i32 @p2w_none()");
+                    let r = if returns {
+                        r
+                    } else {
+                        self.call_value("call i32 @p2w_none()")
+                    };
                     return Ok((r, Repr::Boxed));
                 }
                 // Construction: `Dog(args)` — the class is known statically,

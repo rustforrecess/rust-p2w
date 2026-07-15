@@ -53,7 +53,10 @@ clang --target=wasm32 -Wno-override-module -nostdlib -O2 -Wl,--no-entry \
   "$OUT/component.ll" "$OUT/shim.c" "$LIB" -o "$OUT/core.wasm" 2>"$OUT/link.err" || {
   echo "FAIL: clang/wasm-ld"; cat "$OUT/link.err"; exit 1; }
 
-wasm-tools component embed "$OUT/component.wit" --world "$INSTANCE" "$OUT/core.wasm" \
+# The WIT world name is the kebab of the instance id (underscores are not
+# valid WIT identifiers): open_response -> world open-response.
+WORLD=${INSTANCE//_/-}
+wasm-tools component embed "$OUT/component.wit" --world "$WORLD" "$OUT/core.wasm" \
   -o "$OUT/embed.wasm" 2>"$OUT/wt.err" \
   && wasm-tools component new "$OUT/embed.wasm" -o "$OUT/$INSTANCE.component.wasm" 2>>"$OUT/wt.err" \
   && wasm-tools validate --features component-model "$OUT/$INSTANCE.component.wasm" 2>>"$OUT/wt.err" || {

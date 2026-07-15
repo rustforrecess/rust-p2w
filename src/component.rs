@@ -14,8 +14,10 @@
 //!   annotations; imports = exactly the host capabilities the group uses
 //!   (plus `p2w-putc`, the runtime's own output seam).
 //! - **`shim_c`** — the canonical-ABI shim: `cabi_realloc` (bump), import
-//!   wrappers (p2w string Value → ptr/len), export wrappers (canonical
-//!   params → p2w values, all-owned call, release the result).
+//!   wrappers (p2w string Value → ptr/len; readers rebuild returned strings
+//!   from the retptr), export wrappers (canonical params → p2w values,
+//!   call per the def's BORROW MASK — borrowed strings released post-call —
+//!   and release the result).
 //!
 //! Type mapping (as-built): `int -> s32` (the linear-memory runtime's int
 //! width today — the spec's `s64` arrives when the value model widens),
@@ -69,23 +71,53 @@ const CAPS: &[Cap] = &[
         c_import: "extern void imp_evidence(int kp, int kl, int vp, int vl);",
         c_wrapper: "void p2w_host_evidence(int key, int val) {\n  imp_evidence(p2w_str_ptr(key), p2w_str_len(key), p2w_str_ptr(val), p2w_str_len(val));\n}",
     },
+    Cap {
+        name: "add_element",
+        wit: "add-element: func(parent: string, tag: string, id: string);",
+        c_import: "extern void imp_add_element(int pp, int pl, int tp, int tl, int ip, int il);",
+        c_wrapper: "void p2w_host_add_element(int parent, int tag, int id) {\n  imp_add_element(p2w_str_ptr(parent), p2w_str_len(parent), p2w_str_ptr(tag), p2w_str_len(tag), p2w_str_ptr(id), p2w_str_len(id));\n}",
+    },
+    // Readers: a canonical string RETURN flows host -> guest through a
+    // retptr — jco lands the bytes in guest memory via our cabi_realloc and
+    // writes [ptr, len] at the retarea; the wrapper copies them into an
+    // OWNED p2w string (rc 1 — the LLVM caller releases it downstream).
+    Cap {
+        name: "get_field",
+        wit: "get-field: func(key: string) -> string;",
+        c_import: "extern void imp_get_field(int kp, int kl, int* ret);",
+        c_wrapper: "static int gf_ret[2];\nint p2w_host_get_field(int key) {\n  imp_get_field(p2w_str_ptr(key), p2w_str_len(key), gf_ret);\n  return p2w_str((const unsigned char*)gf_ret[0], gf_ret[1]);\n}",
+    },
+    Cap {
+        name: "get_value",
+        wit: "get-value: func(selector: string) -> string;",
+        c_import: "extern void imp_get_value(int sp, int sl, int* ret);",
+        c_wrapper: "static int gv_ret[2];\nint p2w_host_get_value(int sel) {\n  imp_get_value(p2w_str_ptr(sel), p2w_str_len(sel), gv_ret);\n  return p2w_str((const unsigned char*)gv_ret[0], gv_ret[1]);\n}",
+    },
+    Cap {
+        name: "pointer_x",
+        wit: "pointer-x: func() -> s32;",
+        c_import: "extern int imp_pointer_x(void);",
+        c_wrapper: "int p2w_host_pointer_x(void) { return p2w_int(imp_pointer_x()); }",
+    },
+    Cap {
+        name: "pointer_y",
+        wit: "pointer-y: func() -> s32;",
+        c_import: "extern int imp_pointer_y(void);",
+        c_wrapper: "int p2w_host_pointer_y(void) { return p2w_int(imp_pointer_y()); }",
+    },
 ];
 
-/// Host builtins a component def may NOT use in v1 — each needs machinery the
-/// converter doesn't generate yet (callbacks need an event bridge; readers
-/// need canonical string returns). The message names the cap so the fix is
-/// obvious. Everything else non-cap (print, len, str, …) compiles normally.
+/// Host builtins a component def may NOT use yet — callbacks need an event
+/// bridge design (how does a host deliver events INTO a component?), and the
+/// rest are app/activity-level, not component-level. The message names the
+/// cap so the fix is obvious. Everything else non-cap (print, len, str, …)
+/// compiles normally.
 const UNSUPPORTED_CAPS: &[&str] = &[
     "on",
     "on_click",
     "on_key",
     "every",
     "on_frame",
-    "add_element",
-    "pointer_x",
-    "pointer_y",
-    "get_value",
-    "get_field",
     "play_sound",
     "beep",
     "flash",
@@ -104,6 +136,11 @@ pub struct WitExport {
     pub def_name: String,
     /// `(param name, wit type)` — wit type is one of `s32`/`f64`/`string`.
     pub params: Vec<(String, &'static str)>,
+    /// Per-param borrow mask under the emitted calling convention: `true` =
+    /// the def BORROWS it (a non-escaping heap param), so the shim — the
+    /// caller — must release the string it built AFTER the call; `false` =
+    /// the def consumes it. Positional with `params`.
+    pub param_borrowed: Vec<bool>,
     /// `Some("s32"|"f64")` for an annotated scalar return, else `None`.
     pub result: Option<&'static str>,
 }
@@ -172,7 +209,8 @@ pub fn to_component(
             skipped.push((a.clone(), "no such def in this instance".to_string()));
             continue;
         };
-        match export_sig(a, &def_name, params, param_types, return_type) {
+        let mask = crate::llvm::param_borrow_mask(&stmts, &def_name);
+        match export_sig(a, &def_name, params, param_types, return_type, mask) {
             Ok(x) => exports.push(x),
             Err(why) => skipped.push((a.clone(), why)),
         }
@@ -297,6 +335,7 @@ fn export_sig(
     params: &[String],
     param_types: &[Option<Expr>],
     return_type: &Option<Expr>,
+    param_borrowed: Vec<bool>,
 ) -> Result<WitExport, String> {
     let mut sig = Vec::new();
     for (i, p) in params.iter().enumerate() {
@@ -324,12 +363,73 @@ fn export_sig(
         api_name: api_name.to_string(),
         def_name: def_name.to_string(),
         params: sig,
+        param_borrowed,
         result,
     })
 }
 
 fn kebab(name: &str) -> String {
     name.replace('_', "-")
+}
+
+/// WIT keywords and built-in type names — using one as an identifier needs
+/// the explicit-identifier `%` prefix (`option: string` is a parse error,
+/// `%option: string` is fine). Kids' param names hit these constantly
+/// (`option`, `list`, `type`, `result`, …). Over-listing is harmless: `%` on
+/// a non-keyword is still a legal identifier.
+const WIT_KEYWORDS: &[&str] = &[
+    "use",
+    "type",
+    "resource",
+    "func",
+    "record",
+    "enum",
+    "flags",
+    "variant",
+    "static",
+    "interface",
+    "world",
+    "import",
+    "export",
+    "package",
+    "include",
+    "constructor",
+    "as",
+    "from",
+    "with",
+    "own",
+    "borrow",
+    "async",
+    "option",
+    "result",
+    "list",
+    "tuple",
+    "string",
+    "bool",
+    "char",
+    "future",
+    "stream",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "s8",
+    "s16",
+    "s32",
+    "s64",
+    "f32",
+    "f64",
+];
+
+/// A name as a WIT identifier: kebab-cased, `%`-escaped if it collides with
+/// a WIT keyword.
+fn wit_ident(name: &str) -> String {
+    let k = kebab(name);
+    if WIT_KEYWORDS.contains(&k.as_str()) {
+        format!("%{k}")
+    } else {
+        k
+    }
 }
 
 /// The WIT world text. One `host` import interface carrying exactly the used
@@ -351,12 +451,12 @@ fn wit_world(instance: &str, exports: &[WitExport], imports: &[&'static str]) ->
     w.push_str(" {\n  import host;\n");
     for x in exports {
         w.push_str("  export ");
-        w.push_str(&kebab(&x.api_name));
+        w.push_str(&wit_ident(&x.api_name));
         w.push_str(": func(");
         let ps: Vec<String> = x
             .params
             .iter()
-            .map(|(n, t)| format!("{}: {t}", kebab(n)))
+            .map(|(n, t)| format!("{}: {t}", wit_ident(n)))
             .collect();
         w.push_str(&ps.join(", "));
         w.push(')');
@@ -442,14 +542,23 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
             x.def_name,
             ext_params.join(", ")
         ));
-        // The canonical export wrapper.
+        // The canonical export wrapper. String params bind to temps because
+        // ownership is per-param (the def's borrow mask): an OWNED param is
+        // consumed by the call, a BORROWED one stays ours — release it after
+        // the call or it leaks once per call (the poll_bump lesson).
         let mut sig = Vec::new();
+        let mut pre = String::new();
         let mut args = Vec::new();
+        let mut post = String::new();
         for (i, (_, t)) in x.params.iter().enumerate() {
             match *t {
                 "string" => {
                     sig.push(format!("unsigned char* p{i}, int p{i}_len"));
-                    args.push(format!("p2w_str(p{i}, p{i}_len)"));
+                    pre.push_str(&format!("  int s{i} = p2w_str(p{i}, p{i}_len);\n"));
+                    args.push(format!("s{i}"));
+                    if x.param_borrowed.get(i).copied().unwrap_or(false) {
+                        post.push_str(&format!("  p2w_release(s{i});\n"));
+                    }
                 }
                 "f64" => {
                     sig.push(format!("double p{i}"));
@@ -465,24 +574,21 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
             "__attribute__((export_name(\"{}\")))\n",
             kebab(&x.api_name)
         ));
+        let call = format!("{}({})", x.def_name, args.join(", "));
         match x.result {
             Some(r) => {
                 let rc = if r == "f64" { "double" } else { "int" };
                 c.push_str(&format!(
-                    "{rc} x_{}({}) {{\n  cabi_off = 0;\n  return {}({});\n}}\n\n",
+                    "{rc} x_{}({}) {{\n  cabi_off = 0;\n{pre}  {rc} r = {call};\n{post}  return r;\n}}\n\n",
                     x.api_name,
                     sig.join(", "),
-                    x.def_name,
-                    args.join(", ")
                 ));
             }
             None => {
                 c.push_str(&format!(
-                    "void x_{}({}) {{\n  cabi_off = 0;\n  p2w_release({}({}));\n}}\n\n",
+                    "void x_{}({}) {{\n  cabi_off = 0;\n{pre}  p2w_release({call});\n{post}}}\n\n",
                     x.api_name,
                     sig.join(", "),
-                    x.def_name,
-                    args.join(", ")
                 ));
             }
         }
@@ -545,8 +651,12 @@ mod tests {
         // The shim wires the canonical shapes.
         assert!(x.shim_c.contains("export_name(\"set\")"), "{}", x.shim_c);
         assert!(
+            x.shim_c.contains("int s2 = p2w_str(p2, p2_len);"),
+            "{}",
             x.shim_c
-                .contains("p2w_release(grid_set(p0, p1, p2w_str(p2, p2_len)))"),
+        );
+        assert!(
+            x.shim_c.contains("p2w_release(grid_set(p0, p1, s2));"),
             "{}",
             x.shim_c
         );
@@ -599,7 +709,7 @@ mod tests {
         // component::CAPS (WIT + shim) and llvm::HOST_CAPS (the lowering)
         // must agree exactly, or a cap converts on one side only.
         let here: Vec<&str> = CAPS.iter().map(|c| c.name).collect();
-        let llvm: Vec<&str> = crate::llvm::HOST_CAPS.iter().map(|(n, _)| *n).collect();
+        let llvm: Vec<&str> = crate::llvm::HOST_CAPS.iter().map(|(n, _, _)| *n).collect();
         assert_eq!(here, llvm);
     }
 
@@ -627,10 +737,9 @@ mod tests {
 
     #[test]
     fn unsupported_caps_are_named() {
-        let src =
-            "def grid_set(v: str):\n    set_text(\"#grid_a\", v)\n    x = get_field(\"grid_n\")\n";
+        let src = "def grid_set(v: str):\n    set_text(\"#grid_a\", v)\n    on_frame(grid_set)\n";
         let err = to_component(src, "grid", &api(&["set"])).unwrap_err();
-        assert!(err.contains("`get_field`"), "{err}");
+        assert!(err.contains("`on_frame`"), "{err}");
         assert!(
             err.contains("can't cross the component boundary yet"),
             "{err}"
@@ -646,6 +755,62 @@ mod tests {
     }
 
     #[test]
+    fn reader_caps_convert_with_canonical_string_returns() {
+        // The Poll shape: a def that READS host state (get_field) and writes
+        // it back — the canonical-string-return machinery end to end.
+        let src = "def poll_bump(option: str):\n    n = get_field(\"poll_\" + option)\n    if n == \"\":\n        n = \"0\"\n    set_field(\"poll_\" + option, str(int(n) + 1))\n    set_text(\"#poll_count_\" + option, str(int(n) + 1))\n";
+        let x = to_component(src, "poll", &api(&["bump"])).expect("convert");
+        assert!(
+            x.wit.contains("get-field: func(key: string) -> string;"),
+            "{}",
+            x.wit
+        );
+        // The reader wrapper goes retptr -> owned p2w string…
+        assert!(
+            x.shim_c
+                .contains("imp_get_field(p2w_str_ptr(key), p2w_str_len(key), gf_ret)"),
+            "{}",
+            x.shim_c
+        );
+        assert!(
+            x.shim_c
+                .contains("return p2w_str((const unsigned char*)gf_ret[0], gf_ret[1])"),
+            "{}",
+            x.shim_c
+        );
+        // …and the IR calls it as a VALUE (not void).
+        let toks = crate::lexer::lex(src).unwrap();
+        let stmts = crate::parser::parse(&toks).unwrap();
+        let ir = crate::llvm::emit_llvm_ir(&stmts).expect("emit");
+        assert!(ir.contains("call i32 @p2w_host_get_field(i32"), "{ir}");
+        // poll_bump's `option` is BORROW-masked (it never escapes), so the
+        // shim — the caller — must release the string it built, or one
+        // string leaks per call (found by the live oracle under jco).
+        assert_eq!(
+            x.exports[0].param_borrowed,
+            vec![true],
+            "{:?}",
+            x.exports[0]
+        );
+        assert!(
+            x.shim_c.contains("p2w_release(poll_bump(s0));")
+                || x.shim_c.contains("p2w_release(s0);"),
+            "borrowed param must be released post-call:\n{}",
+            x.shim_c
+        );
+        // pointer caps ride the same table: no-arg s32 readers.
+        let draw = "def draw_dot():\n    add_element(\"#draw\", \"circle\", \"draw_d1\")\n    set_attr(\"#draw_d1\", \"cx\", str(pointer_x()))\n";
+        let d = to_component(draw, "draw", &api(&["dot"])).expect("convert draw");
+        assert!(d.wit.contains("pointer-x: func() -> s32;"), "{}", d.wit);
+        assert!(
+            d.wit
+                .contains("add-element: func(parent: string, tag: string, id: string);"),
+            "{}",
+            d.wit
+        );
+    }
+
+    #[test]
     fn scalar_returns_export_and_string_returns_wait() {
         let src = "def calc_area(w: int, h: int) -> int:\n    return w * h\n";
         let x = to_component(src, "calc", &api(&["area"])).expect("convert");
@@ -654,9 +819,9 @@ mod tests {
             "{}",
             x.wit
         );
-        // A value-returning export returns directly — no release of unboxed.
+        // A value-returning export returns the unboxed result — no release.
         assert!(
-            x.shim_c.contains("return calc_area(p0, p1);"),
+            x.shim_c.contains("int r = calc_area(p0, p1);"),
             "{}",
             x.shim_c
         );
