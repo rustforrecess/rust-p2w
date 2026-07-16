@@ -2334,3 +2334,16 @@ fn sequence_repetition_str_and_list() {
     assert_output("print(2 * [1, 2])", "[1, 2, 1, 2]\n");
     assert_output("row = [\"_\"] * 3\nprint(row)", "['_', '_', '_']\n");
 }
+
+#[test]
+fn list_tuple_dict_constructors() {
+    assert_output("print(list(\"abc\"))", "['a', 'b', 'c']\n");
+    assert_output("print(list(range(4)))", "[0, 1, 2, 3]\n");
+    assert_output("print(list())", "[]\n");
+    assert_output("xs = [1, 2, 3]\nys = list(xs)\nys.append(4)\nprint(xs)\nprint(ys)", "[1, 2, 3]\n[1, 2, 3, 4]\n");
+    assert_output("print(tuple([1, 2, 3]))", "(1, 2, 3)\n");
+    assert_output("print(tuple())", "()\n");
+    assert_output("d = dict()\nd[\"a\"] = 1\nprint(d)", "{'a': 1}\n");
+    assert_output("print(len(dict()))", "0\n");
+    assert_output("print(sorted(list(\"cba\")))", "['a', 'b', 'c']\n");
+}

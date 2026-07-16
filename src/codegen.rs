@@ -1237,6 +1237,42 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $py_list: build a list from an iterable (list() / list(iterable)). Walks
+    // the generic len+index protocol, so any sequence/set/dict/range works.
+    let mut b = Body::new();
+    b.push("(local.set $l (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))");
+    b.push("(if (ref.is_null (local.get $it)) (then (return (local.get $l))))");
+    b.push("(local.set $n (call $py_len (local.get $it)))");
+    b.push("(block $done (loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(drop (call $list_append (local.get $l) (call $py_index (local.get $it) (local.get $i))))",
+    );
+    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(2, "(br $next)))");
+    b.push("(local.get $l)");
+    fs.push(Func {
+        signature: "(func $py_list (param $it (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![
+            "(local $l (ref null $LIST))".into(),
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $py_tuple: `tuple(iterable)` — materialize like a list, then re-tag the
+    // same backing store as a $TUPLE (identical shape; only display differs).
+    let mut b = Body::new();
+    b.push("(local.set $l (ref.cast (ref $LIST) (call $py_list (local.get $it))))");
+    b.push("(struct.new $TUPLE (struct.get $LIST 0 (local.get $l)) (struct.get $LIST 1 (local.get $l)))");
+    fs.push(Func {
+        signature: "(func $py_tuple (param $it (ref null eq)) (result (ref null eq))".into(),
+        locals: vec!["(local $l (ref null $LIST))".into()],
+        body: b,
+    });
+
     // $set_eq: same size and every element of `a` is in `b`.
     let mut b = Body::new();
     b.push("(local.set $n (struct.get $SET 0 (local.get $a)))");
@@ -7234,6 +7270,22 @@ impl Gen {
                                 "(ref.null eq)".to_string()
                             };
                             return Ok(format!("(call $py_set {it})"));
+                        }
+                        // list() / list(iterable) and tuple() / tuple(iterable):
+                        // materialize any iterable via the same len+index walk.
+                        "list" | "tuple" if args.len() <= 1 => {
+                            let it = if args.len() == 1 {
+                                self.value_expr(cx, &args[0])?
+                            } else {
+                                "(ref.null eq)".to_string()
+                            };
+                            let h = if n == "list" { "$py_list" } else { "$py_tuple" };
+                            return Ok(format!("(call {h} {it})"));
+                        }
+                        // dict() — empty mapping (the idiomatic spelling of `{}`).
+                        // dict(arg) (copy/from-pairs) isn't supported yet.
+                        "dict" if args.is_empty() => {
+                            return Ok("(struct.new $DICT (i32.const 0) (array.new_fixed $ITEMS 0) (array.new_fixed $ITEMS 0))".to_string());
                         }
                         // format(value, "spec") — spec must be a string literal
                         // (always is, from an f-string `{x:spec}`).

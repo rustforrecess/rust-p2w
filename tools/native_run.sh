@@ -185,6 +185,9 @@ run_case starunpack  'a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)\n*init, las
 run_case reversed_seq  'for x in reversed([1, 2, 3]):\n    print(x)\nfor c in reversed("abc"):\n    print(c)\n' '3\n2\n1\nc\nb\na' || fails=$((fails+1))
 # sequence repetition — str and list, both orders; the fresh copies are freed (live==0).
 run_case seqrepeat  'print("=" * 5)\nprint(3 * "ab")\nprint("x" * 0)\nprint([0] * 3)\nprint(2 * [1, 2])\n' '=====\nababab\n\n[0, 0, 0]\n[1, 2, 1, 2]' || fails=$((fails+1))
+# list()/tuple()/dict() constructors — materialize an iterable; all copies freed (live==0).
+# (list(range(n)) needs range-as-value, a separate native gap — covered on wasm.)
+run_case constructors  'print(list("abc"))\nprint(tuple([1, 2, 3]))\nxs = list([9, 8])\nxs.append(7)\nprint(xs)\nprint(list())\nd = dict()\nd["a"] = 1\nprint(d)\n' "['a', 'b', 'c']\n(1, 2, 3)\n[9, 8, 7]\n[]\n{'a': 1}" || fails=$((fails+1))
 # --- precise-drop adversaries: early release must not corrupt live data -----
 # inner's SLOT dies after stmt 1 (its last mention) but the OBJECT survives via
 # outer's container refs; junk's allocation must not clobber it (rc must be 2).

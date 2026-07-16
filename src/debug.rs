@@ -968,6 +968,11 @@ impl Stepper {
             ("bool", [v]) => Ok(Value::Bool(v.truthy())),
             ("set", []) => Ok(Value::Set(Vec::new())),
             ("set", [v]) => make_set(v),
+            ("list", []) => Ok(Value::List(Vec::new())),
+            ("list", [v]) => Ok(Value::List(to_elements(v)?)),
+            ("tuple", []) => Ok(Value::Tuple(Vec::new())),
+            ("tuple", [v]) => Ok(Value::Tuple(to_elements(v)?)),
+            ("dict", []) => Ok(Value::Dict(Vec::new())),
             ("print", _) => {
                 // print used as a value: write, return None.
                 if let Some(sink) = out {
@@ -3050,13 +3055,19 @@ fn check_set_elem(v: &Value) -> Result<(), String> {
 
 /// Build a set from any iterable value, de-duplicating by Python equality and
 /// keeping first-seen (insertion) order — matching the compiled backends.
+/// The elements of any iterable value, in order (dicts yield keys) — shared by
+/// `set()`, `list()`, and `tuple()`.
+fn to_elements(v: &Value) -> Result<Vec<Value>, String> {
+    match v {
+        Value::List(x) | Value::Set(x) | Value::Tuple(x) => Ok(x.clone()),
+        Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
+        Value::Dict(d) => Ok(d.iter().map(|(k, _)| k.clone()).collect()),
+        _ => Err(format!("{} object is not iterable", type_name(v))),
+    }
+}
+
 fn make_set(v: &Value) -> Result<Value, String> {
-    let items: Vec<Value> = match v {
-        Value::List(x) | Value::Set(x) | Value::Tuple(x) => x.clone(),
-        Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
-        Value::Dict(d) => d.iter().map(|(k, _)| k.clone()).collect(),
-        _ => return Err(format!("{} object is not iterable", type_name(v))),
-    };
+    let items = to_elements(v)?;
     let mut out: Vec<Value> = Vec::new();
     for it in items {
         check_set_elem(&it)?;
@@ -3274,6 +3285,11 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         ("bool", [v]) => Ok(Value::Bool(v.truthy())),
         ("set", []) => Ok(Value::Set(Vec::new())),
         ("set", [v]) => make_set(v),
+        ("list", []) => Ok(Value::List(Vec::new())),
+        ("list", [v]) => Ok(Value::List(to_elements(v)?)),
+        ("tuple", []) => Ok(Value::Tuple(Vec::new())),
+        ("tuple", [v]) => Ok(Value::Tuple(to_elements(v)?)),
+        ("dict", []) => Ok(Value::Dict(Vec::new())),
         // Host-capability builtins (seed/report lower to env.* at runtime). The
         // step debugger has no host, so they no-op with a placeholder — the
         // control flow still traces; the real effect happens under Run.
@@ -3376,6 +3392,14 @@ mod tests {
     #[test]
     fn steps_assignment_and_print() {
         assert_eq!(run_to_end("x = 5\nprint(x)\n"), "5\n");
+    }
+
+    #[test]
+    fn list_tuple_dict_constructors_in_the_step_debugger() {
+        assert_eq!(run_to_end("print(list(\"abc\"))\n"), "['a', 'b', 'c']\n");
+        assert_eq!(run_to_end("print(tuple([1, 2]))\n"), "(1, 2)\n");
+        assert_eq!(run_to_end("print(list())\n"), "[]\n");
+        assert_eq!(run_to_end("d = dict()\nd[\"a\"] = 1\nprint(d)\n"), "{'a': 1}\n");
     }
 
     #[test]

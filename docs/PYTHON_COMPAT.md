@@ -104,6 +104,13 @@ semantics and leak-freedom are oracle-gated). Differences:
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
+- **`list()` / `tuple()` / `dict()`** work: empty (`list()`, `dict()`) or from
+  any iterable (`list("abc")`, `list(range(n))`, `tuple(a_set)`). `dict()` is
+  empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or
+  a dict comprehension). `list(range(n))` works on the browser backend but not
+  yet on native or in the step debugger (both lack `range` as a first-class
+  value — materialize with a comprehension there); every other iterable form
+  works on all three.
 - **`reversed(seq)`** desugars to the reverse slice `seq[::-1]`, so it works on
   both compiled backends (lists, strings, tuples). It yields a reversed *copy*
   rather than CPython's lazy iterator — identical when you iterate it, and
@@ -138,7 +145,8 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (`a if cond else b` — right-associative, only the taken branch evaluated),
 classes (v1 — see above), functions + recursion + default arguments + keyword
 arguments, **sequence repetition** (`"=" * 40`, `[0] * n`, either order;
-`n <= 0` gives an empty copy), `for`/`while`, **list, dict, and set
+`n <= 0` gives an empty copy), the **`list()` / `tuple()` / `dict()`
+constructors** (see the note below), `for`/`while`, **list, dict, and set
 comprehensions** (nested,
 filters, `range`, tuple targets), tuple unpacking (incl. **starred** — `a, *rest = xs`, `*init, last = xs`,
 `a, *mid, b = xs`; see the note below), **chained assignment**

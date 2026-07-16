@@ -1385,6 +1385,37 @@ pub extern "C" fn p2w_list_new() -> Value {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn p2w_tuple_new() -> Value {
+    coll_new(T_TUPLE)
+}
+
+/// `list(iterable)` / `tuple(iterable)` — materialize any iterable into a fresh
+/// owned list or tuple (identical shape; only the tag/display differ). Elements
+/// arrive owned from `element_at`, so no extra retain.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_list_of(iterable: Value) -> Value {
+    seq_of(iterable, T_LIST, "list() needs an iterable")
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_tuple_of(iterable: Value) -> Value {
+    seq_of(iterable, T_TUPLE, "tuple() needs an iterable")
+}
+
+fn seq_of(iterable: Value, tag: u32, err: &str) -> Value {
+    if !(is_heap(iterable)
+        && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    {
+        trap(err);
+    }
+    let r = coll_new(tag);
+    for i in 0..container_len(iterable) {
+        list_push(r as usize, element_at(iterable, i));
+    }
+    r
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn p2w_list_append(list: Value, v: Value) -> Value {
     if !(is_heap(list) && obj_tag(list) == T_LIST) {
         trap("append() expects a list");

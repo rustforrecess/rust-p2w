@@ -129,6 +129,9 @@ declare i32 @p2w_method_not_value()
 ; sets + set/bitwise operators + membership
 declare i32 @p2w_set_new()
 declare i32 @p2w_set_of(i32)
+declare i32 @p2w_tuple_new()
+declare i32 @p2w_list_of(i32)
+declare i32 @p2w_tuple_of(i32)
 declare i32 @p2w_band(i32, i32)
 declare i32 @p2w_bor(i32, i32)
 declare i32 @p2w_bxor(i32, i32)
@@ -2707,6 +2710,29 @@ impl<'a> FuncEmitter<'a> {
                         _ => return nope("set() with more than one argument"),
                     };
                     return Ok((r, Repr::Boxed));
+                }
+                // list()/list(iterable) and tuple()/tuple(iterable).
+                if name == "list" || name == "tuple" {
+                    let (new_fn, of_fn) = if name == "list" {
+                        ("p2w_list_new", "p2w_list_of")
+                    } else {
+                        ("p2w_tuple_new", "p2w_tuple_of")
+                    };
+                    let r = match args.len() {
+                        0 => self.call_value(&format!("call i32 @{new_fn}()")),
+                        1 => {
+                            let (v, o) = self.expr_borrow(&args[0])?;
+                            let r = self.call_value(&format!("call i32 @{of_fn}(i32 {v})"));
+                            self.release_if_owned(&v, o);
+                            r
+                        }
+                        _ => return nope("list()/tuple() with more than one argument"),
+                    };
+                    return Ok((r, Repr::Boxed));
+                }
+                // dict() — empty mapping. dict(arg) isn't supported yet.
+                if name == "dict" && args.is_empty() {
+                    return Ok((self.call_value("call i32 @p2w_dict_new()"), Repr::Boxed));
                 }
                 if name == "input" {
                     // input([prompt]): write the prompt raw, read one line.
