@@ -779,7 +779,62 @@ pub extern "C" fn p2w_mul(a: Value, b: Value) -> Value {
     if is_obj(a) || is_obj(b) {
         return unsafe { p2w_obj_op(OP_MUL, a, b) };
     }
+    // Sequence repetition `seq * int` / `int * seq` (str or list, either order).
+    // Both operands are borrowed; we return a fresh owned copy.
+    if let Some(n) = num(a)
+        && is_heap(b)
+        && matches!(obj_tag(b), T_STR | T_LIST)
+    {
+        return seq_repeat(b, n);
+    }
+    if let Some(n) = num(b)
+        && is_heap(a)
+        && matches!(obj_tag(a), T_STR | T_LIST)
+    {
+        return seq_repeat(a, n);
+    }
     arith(a, b, |x, y| x * y, |x, y| x * y)
+}
+
+/// `seq * n` for a borrowed string or list — a fresh owned copy repeated `n`
+/// times (`n <= 0` → empty). List elements are shared (retained per copy),
+/// exactly like `xs + xs`.
+fn seq_repeat(seq: Value, n: i64) -> Value {
+    let n = if n < 0 { 0 } else { n as usize };
+    let o = seq as usize;
+    let len = coll_len(o);
+    match obj_tag(seq) {
+        T_STR => {
+            let total = len * n;
+            let p = alloc(12 + total);
+            if p == 0 {
+                trap("out of memory");
+            }
+            wr(p, T_STR);
+            wr(p + 4, 1);
+            live_inc();
+            wr(p + 8, total as u32);
+            let mut w = 0;
+            for _ in 0..n {
+                for i in 0..len {
+                    wr_byte(p + 12 + w, str_byte(seq, i));
+                    w += 1;
+                }
+            }
+            p as Value
+        }
+        _ => {
+            // T_LIST: push a retained reference to each element, n times.
+            let out = coll_new(T_LIST);
+            let oo = out as usize;
+            for _ in 0..n {
+                for i in 0..len {
+                    list_push(oo, owned(list_get(o, i)));
+                }
+            }
+            out
+        }
+    }
 }
 
 /// True division (`/`) is *always* float in Python: `4 / 2 == 2.0`.

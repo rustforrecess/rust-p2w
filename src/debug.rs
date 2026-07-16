@@ -1389,6 +1389,28 @@ fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     if op == BinOp::Sub && matches!((l, r), (Value::Set(_), Value::Set(_))) {
         return set_binop(BinOp::Sub, l, r);
     }
+    // `seq * int` / `int * seq` — sequence repetition (str or list, either side).
+    if op == BinOp::Mul {
+        let rep = |seq: &Value, n: i64| {
+            let n = n.max(0) as usize;
+            match seq {
+                Value::Str(s) => Value::Str(s.repeat(n)),
+                Value::List(xs) => {
+                    Value::List(xs.iter().cloned().cycle().take(xs.len() * n).collect())
+                }
+                _ => unreachable!("guarded to str/list"),
+            }
+        };
+        match (l, r) {
+            (Value::Str(_) | Value::List(_), _) if as_int(r).is_some() => {
+                return Ok(rep(l, as_int(r).unwrap()));
+            }
+            (_, Value::Str(_) | Value::List(_)) if as_int(l).is_some() => {
+                return Ok(rep(r, as_int(l).unwrap()));
+            }
+            _ => {}
+        }
+    }
     let (x, y) = match (as_num(l), as_num(r)) {
         (Some(x), Some(y)) => (x, y),
         _ => {
@@ -3354,6 +3376,14 @@ mod tests {
     #[test]
     fn steps_assignment_and_print() {
         assert_eq!(run_to_end("x = 5\nprint(x)\n"), "5\n");
+    }
+
+    #[test]
+    fn sequence_repetition_in_the_step_debugger() {
+        assert_eq!(run_to_end("print(\"=\" * 5)\n"), "=====\n");
+        assert_eq!(run_to_end("print(3 * \"ab\")\n"), "ababab\n");
+        assert_eq!(run_to_end("print([0] * 3)\n"), "[0, 0, 0]\n");
+        assert_eq!(run_to_end("print(2 * [1, 2])\n"), "[1, 2, 1, 2]\n");
     }
 
     #[test]

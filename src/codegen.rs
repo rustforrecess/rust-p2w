@@ -3026,6 +3026,79 @@ fn runtime_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $seq_repeat: `seq * n` for a string or list (Python's sequence repetition).
+    // n <= 0 yields an empty copy. Elements are shared references (GC keeps them
+    // alive), exactly like `xs + xs`.
+    let mut b = Body::new();
+    b.push("(if (i32.lt_s (local.get $n) (i32.const 0)) (then (local.set $n (i32.const 0))))");
+    // String: copy the bytes n times into one fresh array.
+    b.push("(if (ref.test (ref $STR) (local.get $s))");
+    b.push_in(1, "(then");
+    b.push_in(2, "(local.set $sstr (ref.cast (ref $STR) (local.get $s)))");
+    b.push_in(2, "(local.set $len (array.len (local.get $sstr)))");
+    b.push_in(
+        2,
+        "(local.set $ostr (array.new_default $STR (i32.mul (local.get $len) (local.get $n))))",
+    );
+    b.push_in(2, "(local.set $i (i32.const 0))");
+    b.push_in(2, "(block $ds (loop $Ls");
+    b.push_in(3, "(br_if $ds (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        3,
+        "(array.copy $STR $STR (local.get $ostr) (i32.mul (local.get $i) (local.get $len)) (local.get $sstr) (i32.const 0) (local.get $len))",
+    );
+    b.push_in(3, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(3, "(br $Ls)))");
+    b.push_in(2, "(return (local.get $ostr))");
+    b.push_in(1, ")");
+    b.push(")");
+    // List: copy the backing items n times into one fresh array.
+    b.push("(if (ref.test (ref $LIST) (local.get $s))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $src (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $s))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $len (struct.get $LIST 0 (ref.cast (ref $LIST) (local.get $s))))",
+    );
+    b.push_in(
+        2,
+        "(local.set $items (array.new_default $ITEMS (i32.mul (local.get $len) (local.get $n))))",
+    );
+    b.push_in(2, "(local.set $i (i32.const 0))");
+    b.push_in(2, "(block $dl (loop $Ll");
+    b.push_in(3, "(br_if $dl (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        3,
+        "(array.copy $ITEMS $ITEMS (local.get $items) (i32.mul (local.get $i) (local.get $len)) (local.get $src) (i32.const 0) (local.get $len))",
+    );
+    b.push_in(3, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(3, "(br $Ll)))");
+    b.push_in(
+        2,
+        "(return (struct.new $LIST (i32.mul (local.get $len) (local.get $n)) (local.get $items)))",
+    );
+    b.push_in(1, ")");
+    b.push(")");
+    // Not a repeatable sequence: hand it back unchanged (callers guard this).
+    b.push("(local.get $s)");
+    fs.push(Func {
+        signature:
+            "(func $seq_repeat (param $s (ref null eq)) (param $n i32) (result (ref null eq))"
+                .into(),
+        locals: vec![
+            "(local $len i32)".into(),
+            "(local $i i32)".into(),
+            "(local $sstr (ref null $STR))".into(),
+            "(local $ostr (ref null $STR))".into(),
+            "(local $src (ref null $ITEMS))".into(),
+            "(local $items (ref null $ITEMS))".into(),
+        ],
+        body: b,
+    });
+
     // $py_add: Python `+` — a left operand's __add__ first, then list/string
     // concatenation when both sides match, numeric addition otherwise.
     let mut b = Body::new();
@@ -3098,6 +3171,13 @@ fn runtime_helpers() -> Vec<Func> {
         // `set - set` is set difference (mode 3); other `-` is numeric.
         if name == "$py_sub" {
             b.push("(if (i32.and (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b))) (then (return (call $py_setop (local.get $a) (local.get $b) (i32.const 3)))))");
+        }
+        // `seq * int` / `int * seq` — sequence repetition (str or list). The
+        // int side may be inline (i31) or a boxed $INT; guard so a str/list on
+        // the other side never reaches the numeric unbox path.
+        if name == "$py_mul" {
+            b.push("(if (i32.and (i32.or (ref.test (ref $STR) (local.get $a)) (ref.test (ref $LIST) (local.get $a))) (i32.or (ref.test (ref i31) (local.get $b)) (ref.test (ref $INT) (local.get $b)))) (then (return (call $seq_repeat (local.get $a) (call $unbox (local.get $b))))))");
+            b.push("(if (i32.and (i32.or (ref.test (ref $STR) (local.get $b)) (ref.test (ref $LIST) (local.get $b))) (i32.or (ref.test (ref i31) (local.get $a)) (ref.test (ref $INT) (local.get $a)))) (then (return (call $seq_repeat (local.get $b) (call $unbox (local.get $a))))))");
         }
         b.push(format!(
             "(if (call $obj_has (local.get $a) {n}) (then (return (call $obj_call1 (local.get $a) (local.get $b) {n}))))",
@@ -7777,6 +7857,18 @@ impl Gen {
                         (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Err(CompileError::at(
                             e.line,
                             "can't add text and a number together",
+                        )),
+                        (Ty::Num, Ty::Num) => Ok(Ty::Num),
+                        _ => Ok(Ty::Value),
+                    },
+                    // `str * int` / `int * str` is repetition (result is text);
+                    // two strings can't be multiplied. List/tuple repetition is
+                    // dynamic (`Ty::Value`) and validated at runtime.
+                    BinOp::Mul => match (ta, tb) {
+                        (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Ok(Ty::Str),
+                        (Ty::Str, Ty::Str) => Err(CompileError::at(
+                            e.line,
+                            "can't multiply one string by another",
                         )),
                         (Ty::Num, Ty::Num) => Ok(Ty::Num),
                         _ => Ok(Ty::Value),

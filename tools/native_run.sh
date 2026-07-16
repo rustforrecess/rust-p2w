@@ -183,6 +183,8 @@ run_case delitem   'xs = [1, 2, 3, 4]\ndel xs[1]\nprint(xs)\nd = {"a": 1, "b": 2
 run_case starunpack  'a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)\n*init, last = [1, 2, 3]\nprint(init)\nprint(last)\nx, *mid, y = [1, 2, 3, 4, 5]\nprint(mid)\n' '1\n[2, 3, 4]\n[1, 2]\n3\n[2, 3, 4]' || fails=$((fails+1))
 # reversed(seq) — desugars to the reverse slice; the temp copy is freed (live==0).
 run_case reversed_seq  'for x in reversed([1, 2, 3]):\n    print(x)\nfor c in reversed("abc"):\n    print(c)\n' '3\n2\n1\nc\nb\na' || fails=$((fails+1))
+# sequence repetition — str and list, both orders; the fresh copies are freed (live==0).
+run_case seqrepeat  'print("=" * 5)\nprint(3 * "ab")\nprint("x" * 0)\nprint([0] * 3)\nprint(2 * [1, 2])\n' '=====\nababab\n\n[0, 0, 0]\n[1, 2, 1, 2]' || fails=$((fails+1))
 # --- precise-drop adversaries: early release must not corrupt live data -----
 # inner's SLOT dies after stmt 1 (its last mention) but the OBJECT survives via
 # outer's container refs; junk's allocation must not clobber it (rc must be 2).

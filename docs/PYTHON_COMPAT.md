@@ -137,7 +137,9 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (incl. as set elements), control flow, the **conditional expression**
 (`a if cond else b` — right-associative, only the taken branch evaluated),
 classes (v1 — see above), functions + recursion + default arguments + keyword
-arguments, `for`/`while`, **list, dict, and set comprehensions** (nested,
+arguments, **sequence repetition** (`"=" * 40`, `[0] * n`, either order;
+`n <= 0` gives an empty copy), `for`/`while`, **list, dict, and set
+comprehensions** (nested,
 filters, `range`, tuple targets), tuple unpacking (incl. **starred** — `a, *rest = xs`, `*init, last = xs`,
 `a, *mid, b = xs`; see the note below), **chained assignment**
 (`x = y = value` — value evaluated once, all names bound to it), **`del`** of a

@@ -2323,3 +2323,14 @@ fn reversed_iterates_and_prints_in_reverse() {
     assert_output("for c in reversed(\"abc\"):\n    print(c)", "c\nb\na\n");
     assert_output("print(reversed([1, 2, 3]))", "[3, 2, 1]\n");
 }
+
+#[test]
+fn sequence_repetition_str_and_list() {
+    assert_output("print(\"ab\" * 3)", "ababab\n");
+    assert_output("print(3 * \"ab\")", "ababab\n");
+    assert_output("print(\"=\" * 5)", "=====\n");
+    assert_output("print(\"x\" * 0)", "\n");
+    assert_output("print([0] * 3)", "[0, 0, 0]\n");
+    assert_output("print(2 * [1, 2])", "[1, 2, 1, 2]\n");
+    assert_output("row = [\"_\"] * 3\nprint(row)", "['_', '_', '_']\n");
+}
