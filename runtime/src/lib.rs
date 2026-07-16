@@ -2392,6 +2392,20 @@ pub extern "C" fn p2w_print(v: Value) {
     unsafe { p2w_putc(b'\n') };
 }
 
+/// Write one value's `str()` form with NO trailing newline — the building block
+/// for `print(a, b, …)`, which interleaves single spaces and ends with one
+/// newline (all emitted by the caller via [`p2w_write_char`]). Borrows `v`.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_write(v: Value) {
+    write_value(v, &mut |c| unsafe { p2w_putc(c) });
+}
+
+/// Emit a single byte (a `print` separator space or the closing newline).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_write_char(c: i32) {
+    unsafe { p2w_putc(c as u8) };
+}
+
 /// `input(prompt)` — write the prompt (no newline), then read one line from
 /// the platform byte source into a fresh heap string. The trailing newline is
 /// stripped (and `\r` ignored, for CRLF hosts); end-of-input yields whatever

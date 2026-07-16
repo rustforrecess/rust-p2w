@@ -181,6 +181,8 @@ run_case chainassign 'x = y = z = 5\nprint(x + y + z)\na = b = [1, 2]\na.append(
 run_case delitem   'xs = [1, 2, 3, 4]\ndel xs[1]\nprint(xs)\nd = {"a": 1, "b": 2}\ndel d["a"]\nprint(len(d))\nprint(d["b"])\n' '[1, 3, 4]\n1\n2' || fails=$((fails+1))
 # starred unpack — the temp + the fresh star list are all released (live==0).
 run_case starunpack  'a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)\n*init, last = [1, 2, 3]\nprint(init)\nprint(last)\nx, *mid, y = [1, 2, 3, 4, 5]\nprint(mid)\n' '1\n[2, 3, 4]\n[1, 2]\n3\n[2, 3, 4]' || fails=$((fails+1))
+# multi-arg print — space-separated, one trailing newline; each arg borrowed (live==0).
+run_case printmulti  'print(1, 2, 3)\nprint("x", 5, True)\nprint("a", [1, 2])\nprint()\nprint("done")\n' '1 2 3\nx 5 True\na [1, 2]\n\ndone' || fails=$((fails+1))
 # reversed(seq) — desugars to the reverse slice; the temp copy is freed (live==0).
 run_case reversed_seq  'for x in reversed([1, 2, 3]):\n    print(x)\nfor c in reversed("abc"):\n    print(c)\n' '3\n2\n1\nc\nb\na' || fails=$((fails+1))
 # sequence repetition — str and list, both orders; the fresh copies are freed (live==0).

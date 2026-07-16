@@ -86,6 +86,8 @@ declare i32 @p2w_ne(i32, i32)
 declare i32 @p2w_not(i32)
 declare i1 @p2w_truthy(i32)
 declare void @p2w_print(i32)
+declare void @p2w_write(i32)
+declare void @p2w_write_char(i32)
 ; reference counting (no-ops for inline int/bool/None at runtime)
 declare void @p2w_retain(i32)
 declare void @p2w_release(i32)
@@ -2050,12 +2052,7 @@ impl<'a> FuncEmitter<'a> {
             }
             StmtKind::Expr(e) => match &e.kind {
                 ExprKind::Call(name, args) if name == "print" => {
-                    if args.len() != 1 {
-                        return nope("print() with multiple arguments");
-                    }
-                    let (v, o) = self.expr_borrow(&args[0])?;
-                    self.line(&format!("call void @p2w_print(i32 {v})"));
-                    self.release_if_owned(&v, o); // print borrows the operand
+                    self.emit_print(args)?;
                     Ok(())
                 }
                 // Any other expression statement (a call, a method call like
@@ -2226,6 +2223,22 @@ impl<'a> FuncEmitter<'a> {
 
     /// `a, b = value` (and `a, b = b, a`): evaluate the right-hand tuple/list once
     /// into a hidden slot, then assign each target from `__unpack[i]`.
+    /// `print(a, b, …)` — write each argument's `str()` form separated by a
+    /// single space, then one newline (CPython's default `sep`/`end`). Zero
+    /// args prints a bare newline. Each argument is borrowed.
+    fn emit_print(&mut self, args: &[Expr]) -> Result<(), String> {
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                self.line("call void @p2w_write_char(i32 32)"); // separator space
+            }
+            let (v, o) = self.expr_borrow(arg)?;
+            self.line(&format!("call void @p2w_write(i32 {v})"));
+            self.release_if_owned(&v, o);
+        }
+        self.line("call void @p2w_write_char(i32 10)"); // trailing newline
+        Ok(())
+    }
+
     fn emit_unpack(&mut self, targets: &[Expr], value: &Expr, line: usize) -> Result<(), String> {
         let (v, vr) = self.expr_typed(value)?;
         let id = self.next_label;

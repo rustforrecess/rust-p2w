@@ -157,5 +157,7 @@ filters, `range`, tuple targets), tuple unpacking (incl. **starred** — `a, *re
 (`x = y = value` — value evaluated once, all names bound to it), **`del`** of a
 list/dict item (`del xs[i]`, `del d[key]` — deleting a whole variable isn't
 supported), `str()`, `len()`,
-`input()`, and `print()` — all gated by the CPython differential oracle
+`input()`, and `print()` (**multiple arguments** — space-separated, one
+trailing newline — on all backends) — all gated by the CPython differential
+oracle
 (`tools/native_run.sh`), which also requires leak-freedom (`live == 0`).
