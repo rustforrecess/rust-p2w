@@ -135,6 +135,11 @@ semantics and leak-freedom are oracle-gated). Differences:
   values. Any other lambda position is a friendly, specific error. Defaults
   work (`lambda n, k=10: ...`); blocks/text round-trips canonicalize the
   spelling to `def`.
+- **Numeric builtins on native:** `abs`, `round` (1- and 2-arg), `sum`, `min`,
+  and `max` all work on the native backend now (matching the browser), with
+  `min`/`max` over an iterable or several positional args and CPython's
+  ties-to-even `round`. `sorted`, `enumerate`, `zip`, and `range` as a
+  first-class value are still browser-only (tracked).
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.

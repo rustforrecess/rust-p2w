@@ -134,6 +134,12 @@ declare i32 @p2w_set_of(i32)
 declare i32 @p2w_tuple_new()
 declare i32 @p2w_list_of(i32)
 declare i32 @p2w_tuple_of(i32)
+declare i32 @p2w_abs(i32)
+declare i32 @p2w_round1(i32)
+declare i32 @p2w_round2(i32, i32)
+declare i32 @p2w_sum(i32)
+declare i32 @p2w_min(i32)
+declare i32 @p2w_max(i32)
 declare i32 @p2w_band(i32, i32)
 declare i32 @p2w_bor(i32, i32)
 declare i32 @p2w_bxor(i32, i32)
@@ -2753,6 +2759,53 @@ impl<'a> FuncEmitter<'a> {
                 // dict() — empty mapping. dict(arg) isn't supported yet.
                 if name == "dict" && args.is_empty() {
                     return Ok((self.call_value("call i32 @p2w_dict_new()"), Repr::Boxed));
+                }
+                // abs(x) / round(x[, n]) / sum(iterable) — one-argument numerics.
+                if name == "abs" && args.len() == 1 {
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let r = self.call_value(&format!("call i32 @p2w_abs(i32 {v})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                if name == "round" && (1..=2).contains(&args.len()) {
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let r = if args.len() == 2 {
+                        let (nd, no) = self.expr_borrow(&args[1])?;
+                        let r = self.call_value(&format!("call i32 @p2w_round2(i32 {v}, i32 {nd})"));
+                        self.release_if_owned(&nd, no);
+                        r
+                    } else {
+                        self.call_value(&format!("call i32 @p2w_round1(i32 {v})"))
+                    };
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                if name == "sum" && args.len() == 1 {
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let r = self.call_value(&format!("call i32 @p2w_sum(i32 {v})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // min/max: one iterable, or several positional args (wrapped in a
+                // temp list). The winner comes back owned; the temp list is freed.
+                if (name == "min" || name == "max") && !args.is_empty() {
+                    let f = if name == "min" { "p2w_min" } else { "p2w_max" };
+                    let r = if args.len() == 1 {
+                        let (v, o) = self.expr_borrow(&args[0])?;
+                        let r = self.call_value(&format!("call i32 @{f}(i32 {v})"));
+                        self.release_if_owned(&v, o);
+                        r
+                    } else {
+                        let lst = self.call_value("call i32 @p2w_list_new()");
+                        for a in args {
+                            let v = self.expr(a)?; // owned -> transferred into the list
+                            self.line(&format!("call i32 @p2w_list_append(i32 {lst}, i32 {v})"));
+                        }
+                        let r = self.call_value(&format!("call i32 @{f}(i32 {lst})"));
+                        self.release(&lst);
+                        r
+                    };
+                    return Ok((r, Repr::Boxed));
                 }
                 if name == "input" {
                     // input([prompt]): write the prompt raw, read one line.

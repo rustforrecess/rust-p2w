@@ -1705,6 +1705,128 @@ pub extern "C" fn p2w_set_of(iterable: Value) -> Value {
     r
 }
 
+/// `abs(x)` — |int| or |float|, matching the WAT `$py_abs`.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_abs(v: Value) -> Value {
+    if is_float(v) {
+        return float_alloc(libm::fabs(as_f64(v)));
+    }
+    match num(v) {
+        Some(n) => make_int(if n < 0 { -n } else { n }),
+        None => trap("abs() needs a number"),
+    }
+}
+
+/// `round(x)` — nearest integer, ties to even (CPython's rule; `rint` == the
+/// WAT `f64.nearest`). `round(x, n)` rounds to n decimals and stays a float.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_round1(v: Value) -> Value {
+    match fnum(v) {
+        Some(x) => make_int(libm::rint(x) as i64),
+        None => trap("round() needs a number"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_round2(v: Value, ndigits: Value) -> Value {
+    let x = match fnum(v) {
+        Some(x) => x,
+        None => trap("round() needs a number"),
+    };
+    let n = num(ndigits).unwrap_or(0);
+    let mut scale = 1.0_f64;
+    if n >= 0 {
+        for _ in 0..n {
+            scale *= 10.0;
+        }
+    } else {
+        for _ in 0..(-n) {
+            scale *= 0.1;
+        }
+    }
+    float_alloc(libm::rint(x * scale) / scale)
+}
+
+/// `sum(iterable)` — numeric sum starting from 0 (int unless a float appears),
+/// via `p2w_add`. Both the accumulator and each element are released each step
+/// (leak-free; oracle-gated).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_sum(iterable: Value) -> Value {
+    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    {
+        trap("sum() needs an iterable");
+    }
+    let mut acc = make_int(0);
+    for i in 0..container_len(iterable) {
+        let el = element_at(iterable, i);
+        let next = p2w_add(acc, el);
+        p2w_release(acc);
+        p2w_release(el);
+        acc = next;
+    }
+    acc
+}
+
+/// `a < b` for `min`/`max` (and, later, native `sorted`): lexicographic for two
+/// strings, else numeric — the same ordering as the WAT `$sort_lt`.
+fn value_lt(a: Value, b: Value) -> bool {
+    if is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR {
+        let (la, lb) = (str_len(a), str_len(b));
+        let n = if la < lb { la } else { lb };
+        for i in 0..n {
+            let (x, y) = (str_byte(a, i), str_byte(b, i));
+            if x != y {
+                return x < y;
+            }
+        }
+        return la < lb;
+    }
+    match (fnum(a), fnum(b)) {
+        (Some(x), Some(y)) => x < y,
+        _ => trap("min()/max() need numbers or strings"),
+    }
+}
+
+/// `min(iterable)` / `max(iterable)` — the winning ORIGINAL element (so
+/// `min(1, 2.0)` is the int 1). Empty is an error, like CPython. The winner is
+/// returned owned; losers are released as we go.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_min(iterable: Value) -> Value {
+    min_max(iterable, true)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_max(iterable: Value) -> Value {
+    min_max(iterable, false)
+}
+
+fn min_max(iterable: Value, want_min: bool) -> Value {
+    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    {
+        trap("min()/max() need an iterable");
+    }
+    let n = container_len(iterable);
+    if n == 0 {
+        trap("min()/max() arg is an empty sequence");
+    }
+    let mut acc = element_at(iterable, 0);
+    for i in 1..n {
+        let el = element_at(iterable, i);
+        let take = if want_min {
+            value_lt(el, acc)
+        } else {
+            value_lt(acc, el)
+        };
+        if take {
+            p2w_release(acc);
+            acc = el;
+        } else {
+            p2w_release(el);
+        }
+    }
+    acc
+}
+
 /// Add `v` (transferred); a duplicate is dropped (its ref released).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_set_add(set: Value, v: Value) {
