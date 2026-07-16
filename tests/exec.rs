@@ -307,6 +307,37 @@ fn del_removes_list_and_dict_items() {
     assert_output("xs = [10, 20, 30, 40]\ndel xs[0], xs[0]\nprint(xs)", "[30, 40]\n");
 }
 
+// --- starred unpacking ---
+
+#[test]
+fn starred_unpack_splits_leading_middle_trailing() {
+    // `a, *rest = xs` — head plus the remainder as a list.
+    assert_output(
+        "a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)",
+        "1\n[2, 3, 4]\n",
+    );
+    // `*init, last = xs` — everything but the last, plus the last.
+    assert_output(
+        "*init, last = [1, 2, 3, 4]\nprint(init)\nprint(last)",
+        "[1, 2, 3]\n4\n",
+    );
+    // `a, *mid, b = xs` — both ends fixed, the middle captured.
+    assert_output(
+        "a, *mid, b = [1, 2, 3, 4, 5]\nprint(a)\nprint(mid)\nprint(b)",
+        "1\n[2, 3, 4]\n5\n",
+    );
+    // The star can capture nothing (empty list), not an error.
+    assert_output(
+        "a, *rest, b = [1, 2]\nprint(a)\nprint(rest)\nprint(b)",
+        "1\n[]\n2\n",
+    );
+    // The RHS is evaluated once (single side effect).
+    assert_output(
+        "def make():\n    print(\"made\")\n    return [1, 2, 3]\na, *rest = make()\nprint(rest)",
+        "made\n[2, 3]\n",
+    );
+}
+
 // --- chained assignment ---
 
 #[test]

@@ -3357,6 +3357,23 @@ mod tests {
     }
 
     #[test]
+    fn starred_unpack_degrades_cleanly_in_the_step_debugger() {
+        // The starred form desugars to a slice for the star target, and slicing
+        // isn't in the stepper yet — so it fails with the same clean "use Run"
+        // message as slicing itself, not a panic or a wrong answer.
+        let mut s = Stepper::new("a, *rest = [1, 2, 3, 4]\n").unwrap();
+        while s.is_paused() {
+            s.step();
+        }
+        match s.status() {
+            Status::Error { message, .. } => {
+                assert!(message.contains("step debugger"), "{message}")
+            }
+            other => panic!("expected a clean stepper error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn del_removes_list_and_dict_items() {
         // `del` desugars to a discarded `.pop(...)`; the step debugger must
         // execute both the list-index and dict-key forms.

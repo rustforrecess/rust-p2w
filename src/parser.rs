@@ -433,9 +433,17 @@ impl<'a> Parser<'a> {
             });
         }
         // Assignment or expression statement: parse the expression first,
-        // then decide based on what follows. `expr_list` makes a bare comma
-        // list (`a, b` / `1, 2`) into a tuple.
-        let e = self.expr_list()?;
+        // then decide based on what follows. `target_list` makes a bare comma
+        // list (`a, b` / `1, 2`) into a tuple and allows one starred target.
+        let (e, star) = self.target_list()?;
+        // A starred target is only meaningful as the left of `a, *rest = xs`.
+        // Anywhere else (`*x += 1`, `*x`, `*x: T`) it's a mistake.
+        if star.is_some() && !matches!(self.peek(), Tok::Eq) {
+            return Err(CompileError::at(
+                line,
+                "a starred target (*x) is only allowed on the left of an unpacking assignment, like `a, *rest = xs`",
+            ));
+        }
         // Augmented assignment `target OP= rhs` desugars to `target = target OP
         // rhs` (the target is read once textually; a side-effecting index is
         // re-evaluated — a documented v1 simplification).
@@ -585,6 +593,14 @@ impl<'a> Parser<'a> {
                 return Ok(first);
             }
             self.expect(&Tok::Newline, "a new line")?;
+            // A star is only valid inside a tuple target (`*a = xs` is an error,
+            // caught here now that we know `e` isn't a `Tuple`).
+            if star.is_some() && !matches!(e.kind, ExprKind::Tuple(_)) {
+                return Err(CompileError::at(
+                    line,
+                    "a starred target (*x) must be part of a list, like `*rest, last = xs`",
+                ));
+            }
             return match e.kind {
                 ExprKind::Name(name) => Ok(Stmt {
                     kind: StmtKind::Assign(name, value),
@@ -619,10 +635,13 @@ impl<'a> Parser<'a> {
                             ));
                         }
                     }
-                    Ok(Stmt {
-                        kind: StmtKind::UnpackAssign { targets, value },
-                        line,
-                    })
+                    match star {
+                        None => Ok(Stmt {
+                            kind: StmtKind::UnpackAssign { targets, value },
+                            line,
+                        }),
+                        Some(k) => self.build_starred_unpack(targets, k, value, line),
+                    }
                 }
                 ExprKind::Slice { .. } => Err(CompileError::at(
                     line,
@@ -1001,6 +1020,151 @@ impl<'a> Parser<'a> {
             kind: ExprKind::Tuple(items),
             line,
             span: (0, 0),
+        })
+    }
+
+    /// Like [`expr_list`], but for the *left* side of a possible assignment: one
+    /// element may be starred (`a, *rest = xs`). Returns the target expression
+    /// plus the index of the starred element within a `Tuple`, if any. The star
+    /// is consumed here (the inner target keeps its plain kind); the caller
+    /// decides whether a star is legal in the context it ended up in.
+    fn target_list(&mut self) -> Result<(Expr, Option<usize>)> {
+        let line = self.line();
+        let mut star = None;
+        let first = if matches!(self.peek(), Tok::Star) {
+            self.advance();
+            star = Some(0);
+            self.expr(0)?
+        } else {
+            self.expr(0)?
+        };
+        if !matches!(self.peek(), Tok::Comma) {
+            return Ok((first, star));
+        }
+        let mut items = vec![first];
+        while matches!(self.peek(), Tok::Comma) {
+            self.advance();
+            if matches!(
+                self.peek(),
+                Tok::Newline | Tok::Eq | Tok::Colon | Tok::RParen | Tok::Eof
+            ) {
+                break; // trailing comma
+            }
+            if matches!(self.peek(), Tok::Star) {
+                self.advance();
+                if star.is_some() {
+                    return Err(CompileError::at(
+                        self.line(),
+                        "only one starred target (*x) is allowed in an unpacking assignment",
+                    ));
+                }
+                star = Some(items.len());
+            }
+            items.push(self.expr(0)?);
+        }
+        Ok((
+            Expr {
+                kind: ExprKind::Tuple(items),
+                line,
+                span: (0, 0),
+            },
+            star,
+        ))
+    }
+
+    /// Desugar a starred unpack `a, *mid, b = value` into a temp plus indexed /
+    /// sliced assignments — reusing existing `Assign`/`SetIndex`/`Slice` nodes,
+    /// so every backend (and the step debugger) gets it for free. The value is
+    /// evaluated once into a fresh `.u` temp; leading targets read `t[i]`, the
+    /// star reads the slice `t[lead:len-trail]`, trailing targets read the
+    /// negative indices `t[-k]`. The first statement is returned; the rest ride
+    /// the `pending` queue.
+    fn build_starred_unpack(
+        &mut self,
+        targets: Vec<Expr>,
+        star: usize,
+        value: Expr,
+        line: usize,
+    ) -> Result<Stmt> {
+        if !matches!(targets[star].kind, ExprKind::Name(_)) {
+            return Err(CompileError::at(
+                line,
+                "the starred target (*x) must be a simple variable",
+            ));
+        }
+        let n = targets.len();
+        let n_trail = n - star - 1;
+        let tmp = self.fresh_tmp();
+        let mk = |k: ExprKind| Expr {
+            kind: k,
+            line,
+            span: (0, 0),
+        };
+        let tmp_ref = |mk: &dyn Fn(ExprKind) -> Expr| mk(ExprKind::Name(tmp.clone()));
+        let mut stmts = vec![Stmt {
+            kind: StmtKind::Assign(tmp.clone(), value),
+            line,
+        }];
+        for (i, target) in targets.into_iter().enumerate() {
+            let elem = if i < star {
+                mk(ExprKind::Index(
+                    Box::new(tmp_ref(&mk)),
+                    Box::new(mk(ExprKind::Int(i as i64))),
+                ))
+            } else if i == star {
+                // t[lead:]  (no trailing) or t[lead:-trail]  (some trailing).
+                let stop = (n_trail > 0)
+                    .then(|| Box::new(mk(ExprKind::Int(-(n_trail as i64)))));
+                mk(ExprKind::Slice {
+                    obj: Box::new(tmp_ref(&mk)),
+                    start: Some(Box::new(mk(ExprKind::Int(star as i64)))),
+                    stop,
+                    step: None,
+                })
+            } else {
+                // trailing: count from the end so length is irrelevant.
+                mk(ExprKind::Index(
+                    Box::new(tmp_ref(&mk)),
+                    Box::new(mk(ExprKind::Int(-((n - i) as i64)))),
+                ))
+            };
+            stmts.push(Self::target_assign_stmt(target, elem, line)?);
+        }
+        let first = stmts.remove(0);
+        self.pending.extend(stmts);
+        Ok(first)
+    }
+
+    /// Build the assignment statement that binds `value` to a single unpack
+    /// target (`Name` / `Index` / `Attr`).
+    fn target_assign_stmt(target: Expr, value: Expr, line: usize) -> Result<Stmt> {
+        Ok(match target.kind {
+            ExprKind::Name(n) => Stmt {
+                kind: StmtKind::Assign(n, value),
+                line,
+            },
+            ExprKind::Index(o, idx) => Stmt {
+                kind: StmtKind::SetIndex {
+                    target: *o,
+                    index: *idx,
+                    value,
+                },
+                line,
+            },
+            ExprKind::Attr(o, a) => Stmt {
+                kind: StmtKind::SetAttr {
+                    obj: *o,
+                    attr: a,
+                    value,
+                },
+                line,
+            },
+            _ => {
+                return Err(CompileError::at(
+                    line,
+                    "unpacking targets must be variables, indices, or attributes",
+                ))
+            }
         })
     }
 
@@ -1870,6 +2034,28 @@ mod tests {
         // A non-name chained target is a clean error, not a miscompile.
         let err = parse_src("x = xs[0] = 5\n").unwrap_err();
         assert!(err.to_string().contains("simple names"), "{err}");
+    }
+
+    #[test]
+    fn starred_unpack_desugars_and_is_position_checked() {
+        // `a, *rest = xs` -> temp assign + a=t[0] + rest=t[1:].
+        let stmts = parse_src("a, *rest = xs\n").unwrap();
+        assert_eq!(stmts.len(), 3, "temp + two targets");
+        // first: `.u0 = xs`
+        assert!(matches!(&stmts[0].kind, StmtKind::Assign(n, _) if n.starts_with(".u")));
+        // rest gets a slice, not a plain index.
+        let StmtKind::Assign(rest_name, rest_val) = &stmts[2].kind else {
+            panic!("expected rest = <slice>");
+        };
+        assert_eq!(rest_name, "rest");
+        assert!(matches!(rest_val.kind, ExprKind::Slice { .. }));
+        // Every legal shape parses.
+        assert_eq!(parse_src("*init, last = xs\n").unwrap().len(), 3);
+        assert_eq!(parse_src("a, *mid, b = xs\n").unwrap().len(), 4);
+        // Two stars is an error; a star outside an unpack is an error.
+        assert!(parse_src("a, *b, *c = xs\n").is_err());
+        assert!(parse_src("*a = xs\n").is_err());
+        assert!(parse_src("*a\n").is_err());
     }
 
     #[test]

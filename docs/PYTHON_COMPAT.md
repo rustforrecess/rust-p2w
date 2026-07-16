@@ -104,6 +104,14 @@ semantics and leak-freedom are oracle-gated). Differences:
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
+- **Starred unpacking** (`a, *rest = xs`) desugars to a temp plus indexed and
+  sliced reads, so it runs on both compiled backends (but not the step
+  debugger — it needs slicing, which the stepper doesn't have yet; use Run).
+  With *too few* values and fixed targets on **both** sides (`a, *mid, b = [1]`),
+  CPython raises `ValueError`; here the end targets can alias instead of
+  erroring (the same length-leniency the plain unpack already has on native).
+  Provide enough elements — the common `a, *rest` / `*init, last` forms bind
+  exactly like CPython.
 - **`lambda` works only as `name = lambda params: expr`** (all backends) — it
   desugars to the equivalent `def`, so functions still aren't first-class
   values. Any other lambda position is a friendly, specific error. Defaults
@@ -123,7 +131,8 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (`a if cond else b` — right-associative, only the taken branch evaluated),
 classes (v1 — see above), functions + recursion + default arguments + keyword
 arguments, `for`/`while`, **list, dict, and set comprehensions** (nested,
-filters, `range`, tuple targets), tuple unpacking, **chained assignment**
+filters, `range`, tuple targets), tuple unpacking (incl. **starred** — `a, *rest = xs`, `*init, last = xs`,
+`a, *mid, b = xs`; see the note below), **chained assignment**
 (`x = y = value` — value evaluated once, all names bound to it), **`del`** of a
 list/dict item (`del xs[i]`, `del d[key]` — deleting a whole variable isn't
 supported), `str()`, `len()`,
