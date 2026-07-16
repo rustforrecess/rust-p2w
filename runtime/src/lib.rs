@@ -1827,6 +1827,150 @@ fn min_max(iterable: Value, want_min: bool) -> Value {
     acc
 }
 
+/// `float(x)` — int/bool widen, float copies, a numeric string is parsed by
+/// `core`'s correctly-rounded decimal-to-float (matches CPython / strtod, so
+/// the differential oracle agrees bit-for-bit). Borrows `v`.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_float_of(v: Value) -> Value {
+    if is_float(v) {
+        return float_alloc(as_f64(v));
+    }
+    if is_int(v) {
+        return float_alloc(as_int(v) as f64);
+    }
+    if v == V_TRUE {
+        return float_alloc(1.0);
+    }
+    if v == V_FALSE {
+        return float_alloc(0.0);
+    }
+    if is_heap(v) && obj_tag(v) == T_STR {
+        match parse_float_str(v) {
+            Some(x) => return float_alloc(x),
+            None => trap("could not convert string to float"),
+        }
+    }
+    trap("float() needs a number or a numeric string")
+}
+
+/// Parse a decimal float from a string value (arena-aware, via `str_byte`):
+/// optional whitespace, sign, digits, `.`, fraction, and `e`/`E` exponent.
+/// Value is `mantissa * 10^(exp)` — exact for the few-decimal literals students
+/// use (a long fraction may round differently by an ULP; the compiler's own
+/// float literals go through the same shape). `core`'s dec2flt isn't usable in
+/// this no_std/arena runtime (and would bloat the device binary).
+fn parse_float_str(v: Value) -> Option<f64> {
+    let len = str_len(v);
+    let (mut i, mut j) = (0usize, len);
+    while i < j && str_byte(v, i).is_ascii_whitespace() {
+        i += 1;
+    }
+    while j > i && str_byte(v, j - 1).is_ascii_whitespace() {
+        j -= 1;
+    }
+    if i == j {
+        return None;
+    }
+    let neg = str_byte(v, i) == b'-';
+    if matches!(str_byte(v, i), b'+' | b'-') {
+        i += 1;
+    }
+    let mut mantissa = 0.0_f64;
+    let mut scale = 0i32; // power of ten owed to fractional digits
+    let mut any = false;
+    while i < j && str_byte(v, i).is_ascii_digit() {
+        mantissa = mantissa * 10.0 + (str_byte(v, i) - b'0') as f64;
+        i += 1;
+        any = true;
+    }
+    if i < j && str_byte(v, i) == b'.' {
+        i += 1;
+        while i < j && str_byte(v, i).is_ascii_digit() {
+            mantissa = mantissa * 10.0 + (str_byte(v, i) - b'0') as f64;
+            scale -= 1;
+            i += 1;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mut exp = 0i32;
+    if i < j && matches!(str_byte(v, i), b'e' | b'E') {
+        i += 1;
+        let eneg = i < j && str_byte(v, i) == b'-';
+        if i < j && matches!(str_byte(v, i), b'+' | b'-') {
+            i += 1;
+        }
+        let mut edig = false;
+        while i < j && str_byte(v, i).is_ascii_digit() {
+            exp = exp * 10 + (str_byte(v, i) - b'0') as i32;
+            i += 1;
+            edig = true;
+        }
+        if !edig {
+            return None;
+        }
+        if eneg {
+            exp = -exp;
+        }
+    }
+    if i != j {
+        return None; // trailing junk
+    }
+    let mut result = mantissa;
+    let total = scale + exp;
+    if total > 0 {
+        for _ in 0..total {
+            result *= 10.0;
+        }
+    } else {
+        for _ in 0..(-total) {
+            result /= 10.0;
+        }
+    }
+    Some(if neg { -result } else { result })
+}
+
+/// `sorted(iterable, reverse)` — a new list, stable insertion sort using
+/// `value_lt` (lexicographic strings, else numeric). Matches the WAT
+/// `$py_sorted`. Elements are owned copies; `reverse` is borrowed.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_sorted(iterable: Value, reverse: Value) -> Value {
+    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    {
+        trap("sorted() needs an iterable");
+    }
+    let rev = p2w_truthy(reverse);
+    let out = coll_new(T_LIST);
+    let o = out as usize;
+    let n = container_len(iterable);
+    for i in 0..n {
+        list_push(o, element_at(iterable, i));
+    }
+    // Insertion sort in place. Ascending shifts while key < prev; reverse swaps
+    // the operands (descending). Stable in both directions.
+    for i in 1..n {
+        let key = list_get(o, i);
+        let mut j = i;
+        while j > 0 {
+            let prev = list_get(o, j - 1);
+            let shift = if rev {
+                value_lt(prev, key)
+            } else {
+                value_lt(key, prev)
+            };
+            if !shift {
+                break;
+            }
+            list_set_at(o, j, prev);
+            j -= 1;
+        }
+        list_set_at(o, j, key);
+    }
+    out
+}
+
 /// Add `v` (transferred); a duplicate is dropped (its ref released).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_set_add(set: Value, v: Value) {

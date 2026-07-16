@@ -183,6 +183,8 @@ run_case delitem   'xs = [1, 2, 3, 4]\ndel xs[1]\nprint(xs)\nd = {"a": 1, "b": 2
 run_case starunpack  'a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)\n*init, last = [1, 2, 3]\nprint(init)\nprint(last)\nx, *mid, y = [1, 2, 3, 4, 5]\nprint(mid)\n' '1\n[2, 3, 4]\n[1, 2]\n3\n[2, 3, 4]' || fails=$((fails+1))
 # numeric builtins on native — abs/round/sum/min/max (all borrow; winners owned; live==0).
 run_case numbuiltins  'print(abs(-5))\nprint(abs(-3.5))\nprint(round(3.7))\nprint(round(2.5))\nprint(round(3.14159, 2))\nprint(sum([1, 2, 3]))\nprint(sum([1.5, 2.5]))\nprint(min([3, 1, 2]))\nprint(max([3, 1, 2]))\nprint(min(4, 2, 8))\nprint(max("apple", "pear"))\n' '5\n3.5\n4\n2\n3.14\n6\n4.0\n1\n3\n2\npear' || fails=$((fails+1))
+# native sorted (+reverse=), bool(), float() — all borrow; results owned (live==0).
+run_case sortbool  'print(sorted([3, 1, 2]))\nprint(sorted([3, 1, 2], reverse=True))\nprint(sorted("cabd"))\nprint(bool(0))\nprint(bool([1]))\nprint(bool(""))\nprint(float("1.5"))\nprint(float(3))\nprint(float("-2.25"))\n' "[1, 2, 3]\n[3, 2, 1]\n['a', 'b', 'c', 'd']\nFalse\nTrue\nFalse\n1.5\n3.0\n-2.25" || fails=$((fails+1))
 # multi-arg print — space-separated, one trailing newline; each arg borrowed (live==0).
 run_case printmulti  'print(1, 2, 3)\nprint("x", 5, True)\nprint("a", [1, 2])\nprint()\nprint("done")\n' '1 2 3\nx 5 True\na [1, 2]\n\ndone' || fails=$((fails+1))
 # reversed(seq) — desugars to the reverse slice; the temp copy is freed (live==0).

@@ -140,6 +140,8 @@ declare i32 @p2w_round2(i32, i32)
 declare i32 @p2w_sum(i32)
 declare i32 @p2w_min(i32)
 declare i32 @p2w_max(i32)
+declare i32 @p2w_sorted(i32, i32)
+declare i32 @p2w_float_of(i32)
 declare i32 @p2w_band(i32, i32)
 declare i32 @p2w_bor(i32, i32)
 declare i32 @p2w_bxor(i32, i32)
@@ -2783,6 +2785,47 @@ impl<'a> FuncEmitter<'a> {
                 if name == "sum" && args.len() == 1 {
                     let (v, o) = self.expr_borrow(&args[0])?;
                     let r = self.call_value(&format!("call i32 @p2w_sum(i32 {v})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // bool(x) — truthiness boxed to True/False.
+                if name == "bool" && args.len() == 1 {
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let t = self.call_value(&format!("call i1 @p2w_truthy(i32 {v})"));
+                    let r = self.call_value(&format!("call i32 @p2w_bool(i1 {t})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // float(x) — int/bool widen, float copies, numeric string parses.
+                if name == "float" && args.len() == 1 {
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let r = self.call_value(&format!("call i32 @p2w_float_of(i32 {v})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // sorted(iterable[, reverse=<bool>]) — a new list; key= isn't
+                // supported yet (needs first-class functions).
+                if name == "sorted" && (1..=2).contains(&args.len()) {
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let rev = if args.len() == 2 {
+                        let ExprKind::Kwarg(k, ve) = &args[1].kind else {
+                            return Err(format!(
+                                "line {}: sorted()'s second argument must be reverse=... (key= isn't supported yet)",
+                                e.line
+                            ));
+                        };
+                        if k != "reverse" {
+                            return Err(format!(
+                                "line {}: sorted() doesn't take a '{k}=' argument — only reverse=",
+                                e.line
+                            ));
+                        }
+                        self.expr_borrow(ve)?
+                    } else {
+                        (self.call_value("call i32 @p2w_none()"), true)
+                    };
+                    let r = self.call_value(&format!("call i32 @p2w_sorted(i32 {v}, i32 {})", rev.0));
+                    self.release_if_owned(&rev.0, rev.1);
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }

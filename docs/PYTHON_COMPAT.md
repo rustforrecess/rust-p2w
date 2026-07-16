@@ -136,10 +136,14 @@ semantics and leak-freedom are oracle-gated). Differences:
   work (`lambda n, k=10: ...`); blocks/text round-trips canonicalize the
   spelling to `def`.
 - **Numeric builtins on native:** `abs`, `round` (1- and 2-arg), `sum`, `min`,
-  and `max` all work on the native backend now (matching the browser), with
-  `min`/`max` over an iterable or several positional args and CPython's
-  ties-to-even `round`. `sorted`, `enumerate`, `zip`, and `range` as a
-  first-class value are still browser-only (tracked).
+  `max`, `sorted` (incl. `reverse=`), `bool()`, and `float()` all work on the
+  native backend now (matching the browser), with `min`/`max` over an iterable
+  or several positional args and CPython's ties-to-even `round`. `float("1.5")`
+  parses via a compact hand-rolled decimal reader (exact for the few-decimal
+  literals students write; a long fraction may round differently by an ULP —
+  `core`'s dec2flt isn't usable in the no_std/arena runtime and would bloat the
+  device binary). `enumerate`, `zip`, and `range` as a first-class value are
+  still browser-only (tracked).
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.
