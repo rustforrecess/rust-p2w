@@ -17,6 +17,7 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>> {
         recovering: false,
         errors: Vec::new(),
         suppress_ternary: false,
+        pending: Vec::new(),
     };
     p.program()
 }
@@ -37,6 +38,7 @@ pub fn parse_recovering(tokens: &[Token]) -> (Vec<Stmt>, Vec<CompileError>) {
         recovering: true,
         errors: Vec::new(),
         suppress_ternary: false,
+        pending: Vec::new(),
     };
     p.program_recovering()
 }
@@ -51,6 +53,7 @@ pub fn parse_expression(tokens: &[Token]) -> Result<Expr> {
         recovering: false,
         errors: Vec::new(),
         suppress_ternary: false,
+        pending: Vec::new(),
     };
     let e = p.expr(0)?;
     // Allow a trailing newline/EOF (the lexer appends one), but nothing else —
@@ -82,6 +85,10 @@ struct Parser<'a> {
     /// grammar forbids a bare ternary there; it needs parens). The element of
     /// a comprehension IS a full test, so ternary is allowed there.
     suppress_ternary: bool,
+    /// Extra statements a single `statement()` desugared into (e.g. the tail of
+    /// a chained assignment `x = y = e`). `take_statement` drains these after
+    /// the primary statement, so `program`/`block` see them in order.
+    pending: Vec<Stmt>,
 }
 
 impl<'a> Parser<'a> {
@@ -220,6 +227,9 @@ impl<'a> Parser<'a> {
         match self.statement() {
             Ok(s) => {
                 stmts.push(s);
+                // Drain any statements the primary one desugared into (chained
+                // assignment tail), preserving order.
+                stmts.append(&mut self.pending);
                 Ok(())
             }
             Err(e) => {
@@ -490,6 +500,56 @@ impl<'a> Parser<'a> {
                 return self.lambda_def(name, line);
             }
             let value = self.expr_list()?;
+            // Chained assignment `x = y = … = value`: the just-parsed `value` is
+            // actually another TARGET when another `=` follows. Collect the whole
+            // chain; the last item is the real value.
+            if matches!(self.peek(), Tok::Eq) {
+                let mut chain = vec![e, value];
+                while matches!(self.peek(), Tok::Eq) {
+                    self.advance();
+                    chain.push(self.expr_list()?);
+                }
+                self.expect(&Tok::Newline, "a new line")?;
+                let value = chain.pop().expect("chain has the value");
+                // Targets must be simple names (the K-12 form). Extract them.
+                let mut names = Vec::with_capacity(chain.len());
+                for t in chain {
+                    match t.kind {
+                        ExprKind::Name(n) => names.push(n),
+                        _ => {
+                            return Err(CompileError::at(
+                                line,
+                                "chained assignment (a = b = …) only works with simple names",
+                            ));
+                        }
+                    }
+                }
+                // Bind every name to `value`, evaluated ONCE: the last name takes
+                // the value, each earlier name copies from the next. (Binding
+                // order is unobservable for plain names, and this keeps refcounts
+                // exact — every name owns one reference.)
+                let last = names.pop().expect("at least two targets");
+                let first = Stmt {
+                    kind: StmtKind::Assign(last.clone(), value),
+                    line,
+                };
+                let mut prev = last;
+                for name in names.into_iter().rev() {
+                    self.pending.push(Stmt {
+                        kind: StmtKind::Assign(
+                            name.clone(),
+                            Expr {
+                                kind: ExprKind::Name(prev),
+                                line,
+                                span: (0, 0),
+                            },
+                        ),
+                        line,
+                    });
+                    prev = name;
+                }
+                return Ok(first);
+            }
             self.expect(&Tok::Newline, "a new line")?;
             return match e.kind {
                 ExprKind::Name(name) => Ok(Stmt {
@@ -1566,6 +1626,7 @@ fn parse_fragment(src: &str, line: usize) -> Result<Expr> {
         recovering: false,
         errors: Vec::new(),
         suppress_ternary: false,
+        pending: Vec::new(),
     };
     let mut e = p.expr(0).map_err(|e| CompileError::at(line, e.message))?;
     if !matches!(p.peek(), Tok::Newline | Tok::Eof) {
@@ -1749,6 +1810,27 @@ mod tests {
 
     fn parse_src(src: &str) -> Result<Vec<Stmt>> {
         parse(&lex(src).unwrap())
+    }
+
+    #[test]
+    fn chained_assignment_desugars_to_sequential_assigns() {
+        // `x = y = z = 5` -> `z = 5; y = z; x = y` (single eval, exact order).
+        let stmts = parse_src("x = y = z = 5\n").unwrap();
+        assert_eq!(stmts.len(), 3);
+        let names: Vec<(&str, &ExprKind)> = stmts
+            .iter()
+            .map(|s| match &s.kind {
+                StmtKind::Assign(n, v) => (n.as_str(), &v.kind),
+                other => panic!("expected assign, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names[0].0, "z");
+        assert_eq!(names[0].1, &ExprKind::Int(5));
+        assert_eq!(names[1], ("y", &ExprKind::Name("z".into())));
+        assert_eq!(names[2], ("x", &ExprKind::Name("y".into())));
+        // A non-name chained target is a clean error, not a miscompile.
+        let err = parse_src("x = xs[0] = 5\n").unwrap_err();
+        assert!(err.to_string().contains("simple names"), "{err}");
     }
 
     /// Build an expectation node; line is irrelevant (PartialEq ignores it).

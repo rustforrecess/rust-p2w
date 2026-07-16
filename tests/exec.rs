@@ -294,6 +294,21 @@ fn truthiness_in_conditions() {
     );
 }
 
+// --- chained assignment ---
+
+#[test]
+fn chained_assignment_binds_all_targets() {
+    assert_output("x = y = z = 5\nprint(x)\nprint(y)\nprint(z)", "5\n5\n5\n");
+    // The value is evaluated exactly once (the call prints a single side effect).
+    assert_output(
+        "def make():\n    print(\"made\")\n    return [1, 2]\na = b = make()\nprint(len(a) + len(b))",
+        "made\n4\n",
+    );
+    // Both names refer to the SAME object (shared list); mutating through one
+    // shows through the other.
+    assert_output("a = b = []\na.append(9)\nprint(b)", "[9]\n");
+}
+
 // --- conditional expression (ternary) ---
 
 #[test]
