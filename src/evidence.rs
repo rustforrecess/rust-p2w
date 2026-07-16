@@ -318,6 +318,19 @@ impl Counter {
                 self.walk_expr(value);
                 self.walk_clauses(clauses);
             }
+            ExprKind::SetComp { element, clauses } => {
+                self.bump("comprehension");
+                self.walk_expr(element);
+                self.walk_clauses(clauses);
+            }
+            ExprKind::IfExp { cond, then, orelse } => {
+                // A conditional EXPRESSION is still branching — same concept as
+                // an `if` statement.
+                self.bump("conditional");
+                self.walk_expr(cond);
+                self.walk_expr(then);
+                self.walk_expr(orelse);
+            }
         }
     }
 

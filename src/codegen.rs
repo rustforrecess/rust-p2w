@@ -6715,6 +6715,34 @@ impl Gen {
                     "(block (result (ref null eq))\n{s}(local.get ${acc}))"
                 ))
             }
+            ExprKind::SetComp { element, clauses } => {
+                // Lower as `set([element for …])`: keep the AST first-class (so
+                // `{…}` round-trips) but reuse the list-comp + set-constructor
+                // machinery. The dedup is the set constructor's job.
+                let listcomp = Expr {
+                    kind: ExprKind::ListComp {
+                        element: element.clone(),
+                        clauses: clauses.clone(),
+                    },
+                    line: e.line,
+                    span: e.span,
+                };
+                let set_call = Expr {
+                    kind: ExprKind::Call("set".into(), vec![listcomp]),
+                    line: e.line,
+                    span: e.span,
+                };
+                self.value_expr(cx, &set_call)
+            }
+            ExprKind::IfExp { cond, then, orelse } => {
+                // `then if cond else orelse` — only the taken branch runs.
+                let c = self.value_expr(cx, cond)?;
+                let t = self.value_expr(cx, then)?;
+                let o = self.value_expr(cx, orelse)?;
+                Ok(format!(
+                    "(if (result (ref null eq)) (call $truthy {c}) (then {t}) (else {o}))"
+                ))
+            }
             ExprKind::MethodCall(recv, method, args) => {
                 if args.iter().any(|a| matches!(a.kind, ExprKind::Kwarg(..))) {
                     return Err(CompileError::at(
@@ -7834,7 +7862,15 @@ impl Gen {
             }
             // Comprehensions bind their own variables, which aren't in scope
             // here — checking happens during codegen where they're bound.
-            ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => Ok(Ty::Value),
+            ExprKind::ListComp { .. } | ExprKind::DictComp { .. } | ExprKind::SetComp { .. } => {
+                Ok(Ty::Value)
+            }
+            ExprKind::IfExp { cond, then, orelse } => {
+                self.type_of(cx, cond)?;
+                self.type_of(cx, then)?;
+                self.type_of(cx, orelse)?;
+                Ok(Ty::Value)
+            }
             ExprKind::MethodCall(recv, _, args) => {
                 // A module receiver (`math`) isn't a value — don't type it.
                 if !self.is_module_ref(cx, recv) {

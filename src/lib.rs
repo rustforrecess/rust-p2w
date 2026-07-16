@@ -357,6 +357,51 @@ print(\"sum of evens:\", total)
     }
 
     #[test]
+    fn ternary_compiles_on_both_backends() {
+        // `then if cond else orelse` — WASM-GC + native, valid on both.
+        let src = "x = 5\ny = \"big\" if x > 3 else \"small\"\nprint(y)\n";
+        let wat = compile_to_wat(src).unwrap();
+        assert!(
+            wat.contains("$truthy"),
+            "ternary uses the truthiness test: {wat}"
+        );
+        assert_valid_wasm(src);
+        // native path: emits a branch with a result slot (only the taken branch).
+        let ir = compile_to_llvm_ir(src).unwrap();
+        assert!(ir.contains("alloca i32") && ir.contains("br i1"), "{ir}");
+        // Right-associative and nestable, and works in a comprehension element.
+        assert_valid_wasm(
+            "xs = [1, -2, 3]\nsigns = [\"+\" if v > 0 else \"-\" for v in xs]\nprint(signs)\n",
+        );
+        assert_valid_wasm(
+            "g = 85\nletter = \"A\" if g >= 90 else \"B\" if g >= 80 else \"C\"\nprint(letter)\n",
+        );
+    }
+
+    #[test]
+    fn set_comprehension_is_first_class_and_compiles() {
+        // `{elem for …}` is a SetComp node (not the old `set([…])` desugar), on
+        // both backends.
+        let src = "s = {x * x for x in range(4)}\nprint(len(s))\n";
+        assert_valid_wasm(src);
+        compile_to_llvm_ir(src).unwrap();
+        // The parser keeps it a SetComp (round-trips as `{…}`, not `set([…])`).
+        let toks = lexer::lex("s = {x for x in range(3)}\n").unwrap();
+        let stmts = parser::parse(&toks).unwrap();
+        let ast::StmtKind::Assign(_, val) = &stmts[0].kind else {
+            panic!("expected assign");
+        };
+        assert!(
+            matches!(val.kind, ast::ExprKind::SetComp { .. }),
+            "set comp should be a first-class SetComp node, got {:?}",
+            val.kind
+        );
+        // A multi-filter comprehension still parses (the ternary suppression
+        // in comprehension clauses must not swallow the second `if`).
+        assert_valid_wasm("xs = range(10)\nys = [x for x in xs if x > 2 if x < 8]\nprint(ys)\n");
+    }
+
+    #[test]
     fn zero_arg_handlers_export_dispatch_even_without_on() {
         // A converted component's extracted source has NO on() calls (they
         // became the host's wiring manifest), yet the HOST must still drive the

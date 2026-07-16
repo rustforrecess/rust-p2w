@@ -860,6 +860,14 @@ impl Stepper {
             ExprKind::MethodCall(obj, method, args) => {
                 Self::eval_method(funcs, scope, out, obj, method, args)
             }
+            ExprKind::IfExp { cond, then, orelse } => {
+                let taken = if Self::eval_in(funcs, scope, out, cond)?.truthy() {
+                    then
+                } else {
+                    orelse
+                };
+                Self::eval_in(funcs, scope, out, taken)
+            }
             _ => Err(format!(
                 "{} isn't in the step debugger yet — use Run for that",
                 describe_expr(&e.kind)
@@ -1479,7 +1487,9 @@ fn describe_expr(k: &ExprKind) -> &'static str {
         ExprKind::Tuple(_) => "tuples",
         ExprKind::Slice { .. } => "slicing",
         ExprKind::Attr(..) => "attribute access",
-        ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => "comprehensions",
+        ExprKind::ListComp { .. } | ExprKind::DictComp { .. } | ExprKind::SetComp { .. } => {
+            "comprehensions"
+        }
         _ => "this expression",
     }
 }
@@ -1524,6 +1534,8 @@ enum Task {
     /// Short-circuit `and`/`or`: inspect the operand on top, maybe eval the rhs.
     AndThen(Rc<Expr>),
     OrElse(Rc<Expr>),
+    /// Conditional expression: pop the condition, eval `then` or `orelse`.
+    Ternary(Rc<Expr>, Rc<Expr>),
     /// Pop a value and bind it to a name in the current scope.
     Store(String),
     /// Pop `n` values and print them (space-joined + newline).
@@ -2152,6 +2164,10 @@ impl Vm {
                     self.push_task(Task::Eval(b));
                 }
             }
+            Task::Ternary(then, orelse) => {
+                let c = self.pop_op()?;
+                self.push_task(Task::Eval(if c.truthy() { then } else { orelse }));
+            }
             Task::Store(name) => {
                 let v = self.pop_op()?;
                 self.top().scope.insert(name, v);
@@ -2536,6 +2552,13 @@ impl Vm {
             ExprKind::Bin(BinOp::Or, a, b) => {
                 self.push_task(Task::OrElse(Rc::new((**b).clone())));
                 self.push_task(Task::Eval(Rc::new((**a).clone())));
+            }
+            ExprKind::IfExp { cond, then, orelse } => {
+                self.push_task(Task::Ternary(
+                    Rc::new((**then).clone()),
+                    Rc::new((**orelse).clone()),
+                ));
+                self.push_task(Task::Eval(Rc::new((**cond).clone())));
             }
             ExprKind::Bin(op, a, b) => {
                 self.push_task(Task::Bin(*op));
@@ -3753,6 +3776,22 @@ mod tests {
             vm_run("def inc(x, by=1):\n    return x + by\nprint(inc(5))\nprint(inc(5, 10))\n"),
             "6\n15\n"
         );
+    }
+
+    #[test]
+    fn vm_evaluates_a_ternary() {
+        // The CPS machine handles `then if cond else orelse` via Task::Ternary.
+        let mut vm = Vm::new("x = 5\ny = \"big\" if x > 3 else \"small\"\nprint(y)\n").unwrap();
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(vm.output(), "big\n");
+        // The other branch is never evaluated (would divide by zero here).
+        let mut vm2 = Vm::new("x = 0\nprint(-1 if x == 0 else 7 // x)\n").unwrap();
+        while vm2.is_paused() {
+            vm2.step();
+        }
+        assert_eq!(vm2.output(), "-1\n");
     }
 
     #[test]

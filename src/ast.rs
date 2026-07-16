@@ -186,6 +186,18 @@ pub enum ExprKind {
         value: Box<Expr>,
         clauses: Vec<CompClause>,
     },
+    /// `{element for x in it if cond ...}` — a set comprehension (deduped).
+    SetComp {
+        element: Box<Expr>,
+        clauses: Vec<CompClause>,
+    },
+    /// A conditional expression `then if cond else orelse` (Python's ternary).
+    /// Only the taken branch is evaluated.
+    IfExp {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        orelse: Box<Expr>,
+    },
 }
 
 /// One clause of a comprehension: a `for` binding or an `if` filter, in source

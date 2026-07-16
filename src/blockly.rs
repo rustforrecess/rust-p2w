@@ -725,7 +725,10 @@ impl Builder {
             }
             ExprKind::Slice { .. } => unsupported("slicing"),
             ExprKind::Attr(..) => unsupported("an attribute"),
-            ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => unsupported("a comprehension"),
+            ExprKind::ListComp { .. } | ExprKind::DictComp { .. } | ExprKind::SetComp { .. } => {
+                unsupported("a comprehension")
+            }
+            ExprKind::IfExp { .. } => unsupported("a conditional expression"),
             ExprKind::NoneLit => unsupported("None"),
             ExprKind::Kwarg(..) => unsupported("a keyword argument"),
         }

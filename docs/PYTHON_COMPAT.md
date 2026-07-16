@@ -119,9 +119,10 @@ For completeness, the supported subset matches CPython on: int/float arithmetic
 and comparisons, strings (`+`, indexing, slicing, `in`), f-strings (incl.
 format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 (values/ops/methods — see the Sets section for the display note), tuples
-(incl. as set elements), control flow, classes (v1 — see above), functions +
-recursion + default arguments + keyword arguments, `for`/`while`, list & dict comprehensions
-(nested, filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`,
-`input()`, and `print()` — all gated by the 195-case CPython differential
-oracle (`tools/native_run.sh`), which also requires leak-freedom
-(`live == 0`).
+(incl. as set elements), control flow, the **conditional expression**
+(`a if cond else b` — right-associative, only the taken branch evaluated),
+classes (v1 — see above), functions + recursion + default arguments + keyword
+arguments, `for`/`while`, **list, dict, and set comprehensions** (nested,
+filters, `range`, tuple targets), tuple unpacking, `str()`, `len()`,
+`input()`, and `print()` — all gated by the CPython differential oracle
+(`tools/native_run.sh`), which also requires leak-freedom (`live == 0`).

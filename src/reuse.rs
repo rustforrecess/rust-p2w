@@ -85,6 +85,15 @@ pub fn vars_read(e: &Expr, out: &mut BTreeSet<String>) {
             vars_read(value, out);
             clauses.iter().for_each(|c| comp_clause_reads(c, out));
         }
+        ExprKind::SetComp { element, clauses } => {
+            vars_read(element, out);
+            clauses.iter().for_each(|c| comp_clause_reads(c, out));
+        }
+        ExprKind::IfExp { cond, then, orelse } => {
+            vars_read(cond, out);
+            vars_read(then, out);
+            vars_read(orelse, out);
+        }
     }
 }
 

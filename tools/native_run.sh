@@ -167,6 +167,14 @@ run_case comp_range 'squares: list[int] = [i * i for i in range(5)]\nprint(squar
 # Chained comprehensions — a reuse target (each stage's input dies at last use).
 # Correctness locked here; the alloc win is tracked in tools/reuse_bench.sh.
 run_case comp_chain 'a: list[int] = [1, 2, 3]\nb = [x + 1 for x in a]\nc = [y * 2 for y in b]\nprint(c)\n' '[4, 6, 8]' || fails=$((fails+1))
+# Set comprehensions (native): deduped + canonically (sorted) displayed.
+run_case setcomp   's = {x % 3 for x in range(10)}\nprint(len(s))\nprint(s)\n' '3\n{0, 1, 2}' || fails=$((fails+1))
+run_case setcompf  'evens = {x for x in range(10) if x % 2 == 0}\nprint(evens)\n' '{0, 2, 4, 6, 8}' || fails=$((fails+1))
+# Conditional expression (ternary) — only the taken branch runs (the untaken
+# side here would divide by zero).
+run_case ternary   'x = 5\nprint("big" if x > 3 else "small")\nprint("A" if x >= 9 else "B" if x >= 4 else "C")\n' 'big\nB' || fails=$((fails+1))
+run_case ternlazy  'x = 0\nprint(-1 if x == 0 else 7 // x)\n' '-1' || fails=$((fails+1))
+run_case terncomp  'xs: list[int] = [1, -2, 3]\nsigns = ["+" if v > 0 else "-" for v in xs]\nprint(signs)\n' "['+', '-', '+']" || fails=$((fails+1))
 # --- precise-drop adversaries: early release must not corrupt live data -----
 # inner's SLOT dies after stmt 1 (its last mention) but the OBJECT survives via
 # outer's container refs; junk's allocation must not clobber it (rc must be 2).

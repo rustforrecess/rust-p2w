@@ -294,6 +294,45 @@ fn truthiness_in_conditions() {
     );
 }
 
+// --- conditional expression (ternary) ---
+
+#[test]
+fn ternary_picks_the_right_branch() {
+    assert_output("print(\"big\" if 5 > 3 else \"small\")", "big\n");
+    assert_output("print(\"big\" if 1 > 3 else \"small\")", "small\n");
+    // Right-associative: a b-else-c chain reads as a nested ternary.
+    assert_output(
+        "g = 85\nprint(\"A\" if g >= 90 else \"B\" if g >= 80 else \"C\")",
+        "B\n",
+    );
+    // As a comprehension element.
+    assert_output(
+        "print([\"+\" if v > 0 else \"-\" for v in [1, -2, 3]])",
+        "['+', '-', '+']\n",
+    );
+}
+
+#[test]
+fn ternary_evaluates_only_the_taken_branch() {
+    // The untaken branch would trap (division by zero); it must not run.
+    assert_output("x = 0\nprint(-1 if x == 0 else 7 // x)", "-1\n");
+    assert_output("x = 2\nprint(7 // x if x != 0 else -1)", "3\n");
+}
+
+// --- set comprehensions ---
+
+#[test]
+fn set_comprehension_builds_and_dedups() {
+    // 0,1,4,9 — four distinct squares.
+    assert_output("print(len({x * x for x in range(4)}))", "4\n");
+    // x % 3 over 0..10 collapses to {0, 1, 2}.
+    assert_output("print(len({x % 3 for x in range(10)}))", "3\n");
+    // Display is canonical (sorted), deduped — a set, not a list.
+    assert_output("print({x for x in [3, 1, 2, 1, 3]})", "{1, 2, 3}\n");
+    // With a filter clause.
+    assert_output("print({x for x in range(10) if x % 2 == 0})", "{0, 2, 4, 6, 8}\n");
+}
+
 // --- booleans are a real type ---
 
 #[test]

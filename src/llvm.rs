@@ -3072,6 +3072,51 @@ impl<'a> FuncEmitter<'a> {
                 self.build_dict_comprehension(key, value, clauses)?,
                 Repr::Boxed,
             )),
+            // `{elem for …}` lowers as `set([elem for …])` — the AST stays
+            // first-class (so `{…}` round-trips) but reuses the list-comp +
+            // set-constructor path; dedup is the set constructor's job.
+            ExprKind::SetComp { element, clauses } => {
+                let listcomp = Expr {
+                    kind: ExprKind::ListComp {
+                        element: element.clone(),
+                        clauses: clauses.clone(),
+                    },
+                    line: e.line,
+                    span: e.span,
+                };
+                let set_call = Expr {
+                    kind: ExprKind::Call("set".into(), vec![listcomp]),
+                    line: e.line,
+                    span: e.span,
+                };
+                self.expr_typed(&set_call)
+            }
+            // `then if cond else orelse` — only the taken branch is evaluated
+            // (each in its own basic block), so exactly one owned value reaches
+            // the result slot.
+            ExprKind::IfExp { cond, then, orelse } => {
+                let id = self.next_label;
+                self.next_label += 1;
+                let slot = format!("%ifx{id}");
+                self.allocas.push_str(&format!("  {slot} = alloca i32\n"));
+                let cv = self.cond_i1(cond)?;
+                let then_l = self.fresh_label("cthen");
+                let else_l = self.fresh_label("celse");
+                let end_l = self.fresh_label("cend");
+                self.terminator(&format!("br i1 {cv}, label %{then_l}, label %{else_l}"));
+                self.place_label(&then_l);
+                let tv = self.expr(then)?;
+                self.line(&format!("store i32 {tv}, ptr {slot}"));
+                self.br_to(&end_l);
+                self.place_label(&else_l);
+                let ov = self.expr(orelse)?;
+                self.line(&format!("store i32 {ov}, ptr {slot}"));
+                self.br_to(&end_l);
+                self.place_label(&end_l);
+                let r = self.temp();
+                self.line(&format!("{r} = load i32, ptr {slot}"));
+                Ok((r, Repr::Boxed))
+            }
             _ => nope("this expression"),
         }
     }

@@ -75,7 +75,13 @@ fn lint_ty(e: &Expr) -> Option<LintTy> {
         ExprKind::Str(_) => Some(LintTy::Text),
         ExprKind::List(_) | ExprKind::ListComp { .. } => Some(LintTy::List),
         ExprKind::Dict(_) | ExprKind::DictComp { .. } => Some(LintTy::Dict),
+        ExprKind::SetComp { .. } => Some(LintTy::Set),
         ExprKind::Tuple(_) => Some(LintTy::Tuple),
+        // A conditional expression is known-typed only if both branches agree.
+        ExprKind::IfExp { then, orelse, .. } => match (lint_ty(then), lint_ty(orelse)) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        },
         ExprKind::Unary(UnOp::Neg, inner) => match lint_ty(inner) {
             Some(LintTy::Number) => Some(LintTy::Number),
             _ => None,
@@ -346,6 +352,12 @@ fn expr_may_cycle(e: &Expr) -> bool {
             value,
             clauses,
         } => expr_may_cycle(key) || expr_may_cycle(value) || clauses_may_cycle(clauses),
+        ExprKind::SetComp { element, clauses } => {
+            expr_may_cycle(element) || clauses_may_cycle(clauses)
+        }
+        ExprKind::IfExp { cond, then, orelse } => {
+            expr_may_cycle(cond) || expr_may_cycle(then) || expr_may_cycle(orelse)
+        }
         _ => false,
     }
 }
@@ -552,6 +564,15 @@ fn spans_in_expr(e: &Expr, sets: &HashSet<String>, out: &mut Vec<crate::ast::Spa
             spans_in_expr(value, sets, out);
             spans_in_clauses(clauses, sets, out);
         }
+        ExprKind::SetComp { element, clauses } => {
+            spans_in_expr(element, sets, out);
+            spans_in_clauses(clauses, sets, out);
+        }
+        ExprKind::IfExp { cond, then, orelse } => {
+            spans_in_expr(cond, sets, out);
+            spans_in_expr(then, sets, out);
+            spans_in_expr(orelse, sets, out);
+        }
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Bool(_)
@@ -597,11 +618,12 @@ fn collect_assigns<'a>(
 }
 
 /// Whether `e` evaluates to a set, given the set-typed names known so far. Set
-/// literals and comprehensions desugar to `set(...)` in the parser, so they're
-/// covered by the `Call("set", …)` arm.
+/// literals desugar to `set(...)` in the parser (covered by the `Call("set", …)`
+/// arm); a set comprehension is a first-class `SetComp` node.
 fn is_set_expr(e: &Expr, sets: &HashSet<String>) -> bool {
     match &e.kind {
         ExprKind::Call(name, _) => name == "set" || name == "frozenset",
+        ExprKind::SetComp { .. } => true,
         ExprKind::Name(n) => sets.contains(n),
         ExprKind::Bin(BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor | BinOp::Sub, a, b) => {
             is_set_expr(a, sets) && is_set_expr(b, sets)
@@ -873,6 +895,16 @@ fn read_expr(e: &Expr, allowed: &HashSet<String>, out: &mut Vec<(usize, String)>
             read_expr(key, &inner, out);
             read_expr(value, &inner, out);
             read_comp_clauses(clauses, &inner, out);
+        }
+        ExprKind::SetComp { element, clauses } => {
+            let inner = comp_allowed(allowed, clauses);
+            read_expr(element, &inner, out);
+            read_comp_clauses(clauses, &inner, out);
+        }
+        ExprKind::IfExp { cond, then, orelse } => {
+            read_expr(cond, allowed, out);
+            read_expr(then, allowed, out);
+            read_expr(orelse, allowed, out);
         }
         // Literals (Int/Float/Bool/Str/None) — nothing to read.
         _ => {}
@@ -1197,6 +1229,20 @@ fn reads_of(e: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
+        ExprKind::SetComp { element, clauses } => {
+            reads_of(element, out);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => reads_of(iter, out),
+                    CompClause::If(cond) => reads_of(cond, out),
+                }
+            }
+        }
+        ExprKind::IfExp { cond, then, orelse } => {
+            reads_of(cond, out);
+            reads_of(then, out);
+            reads_of(orelse, out);
+        }
         _ => {}
     }
 }
@@ -1394,6 +1440,20 @@ pub(crate) fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
                     CompClause::If(x) => f(x),
                 }
             }
+        }
+        ExprKind::SetComp { element, clauses } => {
+            f(element);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => f(iter),
+                    CompClause::If(x) => f(x),
+                }
+            }
+        }
+        ExprKind::IfExp { cond, then, orelse } => {
+            f(cond);
+            f(then);
+            f(orelse);
         }
         // Leaves. Explicit (not `_`) so a new expression variant must be
         // classified here — see for_each_child_block.
@@ -1847,6 +1907,13 @@ fn component_expr(
             component_comp_clauses(clauses, &inner, instance, out);
             return;
         }
+        ExprKind::SetComp { element, clauses } => {
+            let inner = comp_allowed(scope, clauses);
+            component_expr(element, &inner, instance, out);
+            component_comp_clauses(clauses, &inner, instance, out);
+            return;
+        }
+        // IfExp and everything else recurse structurally via each_child_expr.
         _ => {}
     }
     each_child_expr(e, &mut |c| component_expr(c, scope, instance, out));
@@ -2116,7 +2183,7 @@ mod tests {
         assert_eq!(sets("a = {1, 2, 3}\n"), vec!["a"]);
         assert_eq!(sets("a = set([1, 2])\n"), vec!["a"]);
         assert_eq!(sets("a = set()\n"), vec!["a"]);
-        // Set comprehension desugars to set(<listcomp>).
+        // Set comprehension is a first-class SetComp node.
         assert_eq!(sets("a = {x for x in range(3)}\n"), vec!["a"]);
     }
 

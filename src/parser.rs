@@ -16,6 +16,7 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>> {
         next_tmp: 0,
         recovering: false,
         errors: Vec::new(),
+        suppress_ternary: false,
     };
     p.program()
 }
@@ -35,6 +36,7 @@ pub fn parse_recovering(tokens: &[Token]) -> (Vec<Stmt>, Vec<CompileError>) {
         next_tmp: 0,
         recovering: true,
         errors: Vec::new(),
+        suppress_ternary: false,
     };
     p.program_recovering()
 }
@@ -48,6 +50,7 @@ pub fn parse_expression(tokens: &[Token]) -> Result<Expr> {
         next_tmp: 0,
         recovering: false,
         errors: Vec::new(),
+        suppress_ternary: false,
     };
     let e = p.expr(0)?;
     // Allow a trailing newline/EOF (the lexer appends one), but nothing else —
@@ -73,6 +76,12 @@ struct Parser<'a> {
     recovering: bool,
     /// Errors gathered while `recovering`.
     errors: Vec<CompileError>,
+    /// Set while parsing a position that is an `or_test`, not a full `test` —
+    /// a comprehension's `for … in <iter>` and `if <filter>` — so a trailing
+    /// `… if … else …` is NOT swallowed as a conditional expression (Python's
+    /// grammar forbids a bare ternary there; it needs parens). The element of
+    /// a comprehension IS a full test, so ternary is allowed there.
+    suppress_ternary: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -927,6 +936,32 @@ impl<'a> Parser<'a> {
                 };
             }
         }
+        // Conditional expression (ternary): `<then> if <cond> else <orelse>`.
+        // Python's lowest precedence, so only at the test level (min_bp == 0),
+        // and not where an `or_test` is required (comprehension for/if — see
+        // `suppress_ternary`). Right-associative: the `else` branch is a full
+        // test, so `a if p else b if q else c` nests to the right.
+        if min_bp == 0 && !self.suppress_ternary && self.is_keyword("if") {
+            let line = self.line();
+            self.advance(); // `if`
+            // The condition is an `or_test` (a nested ternary here needs
+            // parens), so suppress while parsing it.
+            let saved = self.suppress_ternary;
+            self.suppress_ternary = true;
+            let cond = self.expr(0)?;
+            self.suppress_ternary = saved;
+            self.eat_keyword("else")?;
+            let orelse = self.expr(0)?; // full test (right-assoc)
+            lhs = Expr {
+                kind: ExprKind::IfExp {
+                    cond: Box::new(cond),
+                    then: Box::new(lhs),
+                    orelse: Box::new(orelse),
+                },
+                line,
+                span: (0, 0),
+            };
+        }
         Ok(lhs)
     }
 
@@ -1295,25 +1330,23 @@ impl<'a> Parser<'a> {
                     self.expect(&Tok::RBrace, "'}'")?;
                     return Ok(expr(ExprKind::Dict(entries)));
                 }
-                // Set literal / comprehension — desugared to `set([...])` /
-                // `set(<listcomp>)` so codegen reuses the set() builtin.
+                // Set comprehension `{elem for …}` — a first-class node so the
+                // `{…}` spelling survives a blocks round-trip (it lowers the
+                // same way `set(<listcomp>)` would). A set LITERAL `{1, 2}`
+                // still desugars to `set([…])` below (reusing the set() path).
+                if self.is_keyword("for") {
+                    let clauses = self.comp_clauses()?;
+                    self.expect(&Tok::RBrace, "'}'")?;
+                    return Ok(expr(ExprKind::SetComp {
+                        element: Box::new(first),
+                        clauses,
+                    }));
+                }
                 let set_of = |arg: Expr| Expr {
                     kind: ExprKind::Call("set".into(), vec![arg]),
                     line,
                     span: (0, 0),
                 };
-                if self.is_keyword("for") {
-                    let clauses = self.comp_clauses()?;
-                    self.expect(&Tok::RBrace, "'}'")?;
-                    return Ok(set_of(Expr {
-                        kind: ExprKind::ListComp {
-                            element: Box::new(first),
-                            clauses,
-                        },
-                        line,
-                        span: (0, 0),
-                    }));
-                }
                 let mut elements = vec![first];
                 while matches!(self.peek(), Tok::Comma) {
                     self.advance();
@@ -1450,11 +1483,22 @@ impl<'a> Parser<'a> {
                     vars.push(self.for_target_name()?);
                 }
                 self.eat_keyword("in")?;
+                // `for … in <or_test>` / `if <or_test>` — a trailing
+                // `if…else` here is not a ternary (Python's grammar), so
+                // suppress it so the comprehension clause loop can see the
+                // next `for`/`if`.
+                let saved = self.suppress_ternary;
+                self.suppress_ternary = true;
                 let iter = self.expr(0)?;
+                self.suppress_ternary = saved;
                 clauses.push(CompClause::For { vars, iter });
             } else if self.is_keyword("if") {
                 self.advance();
-                clauses.push(CompClause::If(self.expr(0)?));
+                let saved = self.suppress_ternary;
+                self.suppress_ternary = true;
+                let filter = self.expr(0)?;
+                self.suppress_ternary = saved;
+                clauses.push(CompClause::If(filter));
             } else {
                 break;
             }
@@ -1521,6 +1565,7 @@ fn parse_fragment(src: &str, line: usize) -> Result<Expr> {
         next_tmp: 0,
         recovering: false,
         errors: Vec::new(),
+        suppress_ternary: false,
     };
     let mut e = p.expr(0).map_err(|e| CompileError::at(line, e.message))?;
     if !matches!(p.peek(), Tok::Newline | Tok::Eof) {
@@ -1595,7 +1640,10 @@ fn contains_call(e: &Expr) -> bool {
                     .any(|b| contains_call(b))
         }
         // Comprehensions evaluate a loop; treat as potentially side-effecting.
-        ExprKind::ListComp { .. } | ExprKind::DictComp { .. } => true,
+        ExprKind::ListComp { .. } | ExprKind::DictComp { .. } | ExprKind::SetComp { .. } => true,
+        ExprKind::IfExp { cond, then, orelse } => {
+            contains_call(cond) || contains_call(then) || contains_call(orelse)
+        }
         _ => false,
     }
 }
