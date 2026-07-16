@@ -2227,6 +2227,13 @@ impl<'a> FuncEmitter<'a> {
     /// single space, then one newline (CPython's default `sep`/`end`). Zero
     /// args prints a bare newline. Each argument is borrowed.
     fn emit_print(&mut self, args: &[Expr]) -> Result<(), String> {
+        // The common single-argument case stays one combined call (write + \n).
+        if let [arg] = args {
+            let (v, o) = self.expr_borrow(arg)?;
+            self.line(&format!("call void @p2w_print(i32 {v})"));
+            self.release_if_owned(&v, o);
+            return Ok(());
+        }
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
                 self.line("call void @p2w_write_char(i32 32)"); // separator space
