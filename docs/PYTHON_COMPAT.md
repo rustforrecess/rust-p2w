@@ -104,6 +104,10 @@ semantics and leak-freedom are oracle-gated). Differences:
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
+- **`sorted(seq, reverse=True)`** works on the browser backend (stable, both
+  directions). `key=` needs first-class functions and isn't supported yet;
+  `sorted` on native/in the step debugger is still pending (the Pico-parity
+  track). A bad keyword is a clean error.
 - **`list()` / `tuple()` / `dict()`** work: empty (`list()`, `dict()`) or from
   any iterable (`list("abc")`, `list(range(n))`, `tuple(a_set)`). `dict()` is
   empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or

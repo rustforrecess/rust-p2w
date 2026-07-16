@@ -1517,7 +1517,7 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(1, "(br $sl)))");
     b.push("(if (result (ref null eq)) (i32.or (local.get $all_str) (local.get $all_num))");
-    b.push_in(1, "(then (call $py_sorted (local.get $s)))");
+    b.push_in(1, "(then (call $py_sorted (local.get $s) (i32.const 0)))");
     b.push_in(1, "(else (local.get $s)))");
     fs.push(Func {
         signature: "(func $set_display_seq (param $s (ref null $SET)) (result (ref null eq))"
@@ -3744,10 +3744,13 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(1, "(local.set $j (i32.sub (local.get $i) (i32.const 1)))");
     b.push_in(1, "(block $id (loop $il");
     b.push_in(2, "(br_if $id (i32.lt_s (local.get $j) (i32.const 0)))");
+    // Ascending shifts while key < items[j]; reverse swaps the operands so it
+    // shifts while key > items[j] (descending). Stable in both directions.
     b.push_in(
         2,
-        "(br_if $id (i32.eqz (call $sort_lt (local.get $key) (array.get $ITEMS (local.get $items) (local.get $j)))))",
+        "(local.set $cmp (if (result i32) (local.get $rev) (then (call $sort_lt (array.get $ITEMS (local.get $items) (local.get $j)) (local.get $key))) (else (call $sort_lt (local.get $key) (array.get $ITEMS (local.get $items) (local.get $j))))))",
     );
+    b.push_in(2, "(br_if $id (i32.eqz (local.get $cmp)))");
     b.push_in(
         2,
         "(array.set $ITEMS (local.get $items) (i32.add (local.get $j) (i32.const 1)) (array.get $ITEMS (local.get $items) (local.get $j)))",
@@ -3762,13 +3765,16 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(1, "(br $ol)))");
     b.push("(struct.new $LIST (local.get $n) (local.get $items))");
     fs.push(Func {
-        signature: "(func $py_sorted (param $seq (ref null eq)) (result (ref null eq))".into(),
+        signature:
+            "(func $py_sorted (param $seq (ref null eq)) (param $rev i32) (result (ref null eq))"
+                .into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $j i32)".into(),
             "(local $items (ref null $ITEMS))".into(),
             "(local $key (ref null eq))".into(),
+            "(local $cmp i32)".into(),
         ],
         body: b,
     });
@@ -7185,9 +7191,11 @@ impl Gen {
                         "super() is only supported as super().method(...) in this subset",
                     ));
                 }
-                // Keyword arguments are bound only for user functions (below).
+                // Keyword arguments are bound only for user functions and the
+                // few builtins that take one (`sorted(reverse=…)`).
                 if args.iter().any(|a| matches!(a.kind, ExprKind::Kwarg(..)))
                     && !self.funcs.contains_key(n.as_str())
+                    && n != "sorted"
                 {
                     return Err(CompileError::at(
                         e.line,
@@ -7249,9 +7257,29 @@ impl Gen {
                             let seq = self.value_expr(cx, &args[0])?;
                             return Ok(format!("(call $py_sum {seq})"));
                         }
-                        "sorted" if args.len() == 1 => {
+                        // sorted(seq) / sorted(seq, reverse=<bool>). `key=` needs
+                        // first-class functions and isn't supported yet.
+                        "sorted" if (1..=2).contains(&args.len()) => {
                             let seq = self.value_expr(cx, &args[0])?;
-                            return Ok(format!("(call $py_sorted {seq})"));
+                            let rev = if args.len() == 2 {
+                                let ExprKind::Kwarg(k, v) = &args[1].kind else {
+                                    return Err(CompileError::at(
+                                        e.line,
+                                        "sorted()'s second argument must be reverse=... (key= isn't supported yet)",
+                                    ));
+                                };
+                                if k != "reverse" {
+                                    return Err(CompileError::at(
+                                        e.line,
+                                        format!("sorted() doesn't take a '{k}=' argument — only reverse="),
+                                    ));
+                                }
+                                let vv = self.value_expr(cx, v)?;
+                                format!("(call $truthy {vv})")
+                            } else {
+                                "(i32.const 0)".to_string()
+                            };
+                            return Ok(format!("(call $py_sorted {seq} {rev})"));
                         }
                         "any" if args.len() == 1 => {
                             let seq = self.value_expr(cx, &args[0])?;

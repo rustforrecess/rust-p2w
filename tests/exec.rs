@@ -739,8 +739,9 @@ fn type_errors_name_the_offending_type() {
         "x = \"a\"\ny = 1\nprint(x - y)",
         "TypeError: expected a number, got 'str'",
     );
+    // `x * 2` is list repetition now; `-` keeps a list out of arithmetic.
     assert_raises(
-        "x = [1]\nprint(x * 2)",
+        "x = [1]\nprint(x - 2)",
         "TypeError: expected a number, got 'list'",
     );
     assert_raises(
@@ -2346,4 +2347,13 @@ fn list_tuple_dict_constructors() {
     assert_output("d = dict()\nd[\"a\"] = 1\nprint(d)", "{'a': 1}\n");
     assert_output("print(len(dict()))", "0\n");
     assert_output("print(sorted(list(\"cba\")))", "['a', 'b', 'c']\n");
+}
+
+#[test]
+fn sorted_reverse_keyword() {
+    assert_output("print(sorted([3, 1, 2]))", "[1, 2, 3]\n");
+    assert_output("print(sorted([3, 1, 2], reverse=True))", "[3, 2, 1]\n");
+    assert_output("print(sorted([3, 1, 2], reverse=False))", "[1, 2, 3]\n");
+    assert_output("print(sorted(\"cabd\", reverse=True))", "['d', 'c', 'b', 'a']\n");
+    assert_output("flip = True\nprint(sorted([1, 3, 2], reverse=flip))", "[3, 2, 1]\n");
 }
