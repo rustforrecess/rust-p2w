@@ -2316,3 +2316,10 @@ fn differential_stdin_against_cpython() {
         assert_eq!(got, expected, "differs from CPython for:\n{src}");
     }
 }
+
+#[test]
+fn reversed_iterates_and_prints_in_reverse() {
+    assert_output("for x in reversed([1, 2, 3]):\n    print(x)", "3\n2\n1\n");
+    assert_output("for c in reversed(\"abc\"):\n    print(c)", "c\nb\na\n");
+    assert_output("print(reversed([1, 2, 3]))", "[3, 2, 1]\n");
+}

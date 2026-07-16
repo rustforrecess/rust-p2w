@@ -104,6 +104,13 @@ semantics and leak-freedom are oracle-gated). Differences:
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
+- **`reversed(seq)`** desugars to the reverse slice `seq[::-1]`, so it works on
+  both compiled backends (lists, strings, tuples). It yields a reversed *copy*
+  rather than CPython's lazy iterator — identical when you iterate it, and
+  `print(reversed(xs))` shows `[3, 2, 1]` instead of CPython's
+  `<list_reverseiterator …>` (kinder). A `range` isn't sliceable, so
+  `reversed(range(n))` needs a list first (`reversed(list(range(n)))`); like
+  slicing, it isn't in the step debugger yet (use Run).
 - **Starred unpacking** (`a, *rest = xs`) desugars to a temp plus indexed and
   sliced reads, so it runs on both compiled backends (but not the step
   debugger — it needs slicing, which the stepper doesn't have yet; use Run).

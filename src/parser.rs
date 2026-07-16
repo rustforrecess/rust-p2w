@@ -1640,6 +1640,31 @@ impl<'a> Parser<'a> {
                         let name_span = (start, start + name.len());
                         self.advance();
                         let args = self.call_args()?;
+                        // `reversed(seq)` desugars to the reverse slice `seq[::-1]`
+                        // — one lowering already shared by every backend. It
+                        // materializes a reversed copy rather than a lazy
+                        // iterator (kinder to `print`, and identical when
+                        // iterated); ranges aren't sliceable, so wrap a list.
+                        if name == "reversed"
+                            && args.len() == 1
+                            && !matches!(args[0].kind, ExprKind::Kwarg(..))
+                        {
+                            let arg = args.into_iter().next().unwrap();
+                            return Ok(Expr {
+                                kind: ExprKind::Slice {
+                                    obj: Box::new(arg),
+                                    start: None,
+                                    stop: None,
+                                    step: Some(Box::new(Expr {
+                                        kind: ExprKind::Int(-1),
+                                        line,
+                                        span: (0, 0),
+                                    })),
+                                },
+                                line,
+                                span: name_span,
+                            });
+                        }
                         Ok(Expr {
                             kind: ExprKind::Call(name, args),
                             line,
