@@ -294,6 +294,19 @@ fn truthiness_in_conditions() {
     );
 }
 
+// --- del (item deletion) ---
+
+#[test]
+fn del_removes_list_and_dict_items() {
+    assert_output("xs = [1, 2, 3, 4]\ndel xs[1]\nprint(xs)", "[1, 3, 4]\n");
+    assert_output(
+        "d = {\"a\": 1, \"b\": 2, \"c\": 3}\ndel d[\"b\"]\nprint(len(d))\nprint(d[\"a\"])\nprint(d[\"c\"])",
+        "2\n1\n3\n",
+    );
+    // Multiple targets, left to right (indices shift as you go).
+    assert_output("xs = [10, 20, 30, 40]\ndel xs[0], xs[0]\nprint(xs)", "[30, 40]\n");
+}
+
 // --- chained assignment ---
 
 #[test]

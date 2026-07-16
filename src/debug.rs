@@ -1028,6 +1028,14 @@ impl Stepper {
                         return res;
                     }
                 }
+                Some(Value::Dict(pairs)) => {
+                    if let ("pop", [k]) = (method, vals.as_slice()) {
+                        match pairs.iter().position(|(dk, _)| py_eq(dk, k)) {
+                            Some(i) => return Ok(pairs.remove(i).1),
+                            None => return Err("pop(key): key not in dict".to_string()),
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -3314,6 +3322,13 @@ fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<
             let recv = Value::Set(items.clone());
             set_method_val(&recv, method, &args).unwrap_or_else(|| Err(unsupported()))
         }
+        Value::Dict(pairs) => match (method, args.as_slice()) {
+            ("pop", [k]) => match pairs.iter().position(|(dk, _)| py_eq(dk, k)) {
+                Some(i) => Ok(pairs.remove(i).1),
+                None => Err("pop(key): key not in dict".to_string()),
+            },
+            _ => Err(unsupported()),
+        },
         _ => Err(unsupported()),
     }
 }
@@ -3339,6 +3354,15 @@ mod tests {
     #[test]
     fn steps_assignment_and_print() {
         assert_eq!(run_to_end("x = 5\nprint(x)\n"), "5\n");
+    }
+
+    #[test]
+    fn del_removes_list_and_dict_items() {
+        // `del` desugars to a discarded `.pop(...)`; the step debugger must
+        // execute both the list-index and dict-key forms.
+        let src = "xs = [1, 2, 3, 4]\ndel xs[1]\nprint(xs)\n\
+                   d = {\"a\": 1, \"b\": 2}\ndel d[\"a\"]\nprint(len(d))\nprint(d[\"b\"])\n";
+        assert_eq!(run_to_end(src), "[1, 3, 4]\n1\n2\n");
     }
 
     #[test]

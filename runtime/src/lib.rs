@@ -1926,6 +1926,28 @@ pub unsafe extern "C" fn p2w_method1(
             return v;
         }
     }
+    // `d.pop(key)` — remove the pair and hand its value out (owned). Backs
+    // `del d[key]`, which desugars to a discarded pop. Missing key traps, like
+    // CPython's KeyError (the subset has no exceptions to catch it).
+    if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"pop") } {
+        let o = recv as usize;
+        let Some(i) = dict_find(o, a) else {
+            trap("pop(key): key not in dict");
+        };
+        p2w_release(dict_key(o, i)); // drop the stored key
+        let v = dict_val(o, i); // transfer the value out to the caller
+        let len = coll_len(o);
+        // shift the tail pairs (8 bytes each) down by one, then shrink.
+        for j in i..(len - 1) {
+            let src = coll_data(o) + (j + 1) * 8;
+            let dst = coll_data(o) + j * 8;
+            wr(dst, rd(src));
+            wr(dst + 4, rd(src + 4));
+        }
+        set_len(o, len - 1);
+        p2w_release(a); // the search key was transferred to us
+        return v;
+    }
     // Set methods. The argument `a` is transferred to us; `add` stores it (or
     // releases a duplicate), the rest read it and release it before returning.
     if is_heap(recv) && obj_tag(recv) == T_SET {

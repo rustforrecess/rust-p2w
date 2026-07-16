@@ -177,6 +177,8 @@ run_case ternlazy  'x = 0\nprint(-1 if x == 0 else 7 // x)\n' '-1' || fails=$((f
 run_case terncomp  'xs: list[int] = [1, -2, 3]\nsigns = ["+" if v > 0 else "-" for v in xs]\nprint(signs)\n' "['+', '-', '+']" || fails=$((fails+1))
 # Chained assignment — every name owns a reference (live==0 proves no leak/over-free).
 run_case chainassign 'x = y = z = 5\nprint(x + y + z)\na = b = [1, 2]\na.append(3)\nprint(b)\n' '15\n[1, 2, 3]' || fails=$((fails+1))
+# del — item removal (list by index, dict by key); the removed value is freed (live==0).
+run_case delitem   'xs = [1, 2, 3, 4]\ndel xs[1]\nprint(xs)\nd = {"a": 1, "b": 2}\ndel d["a"]\nprint(len(d))\nprint(d["b"])\n' '[1, 3, 4]\n1\n2' || fails=$((fails+1))
 # --- precise-drop adversaries: early release must not corrupt live data -----
 # inner's SLOT dies after stmt 1 (its last mention) but the OBJECT survives via
 # outer's container refs; junk's allocation must not clobber it (rc must be 2).

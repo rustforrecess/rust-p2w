@@ -390,6 +390,40 @@ impl<'a> Parser<'a> {
                 line,
             });
         }
+        if self.is_keyword("del") {
+            self.advance();
+            let mut targets = vec![self.expr(0)?];
+            while matches!(self.peek(), Tok::Comma) {
+                self.advance();
+                targets.push(self.expr(0)?);
+            }
+            self.expect(&Tok::Newline, "a new line")?;
+            // `del container[index]` desugars to `container.pop(index)` with the
+            // result discarded — same effect, and reuses the pop machinery
+            // (list pop-by-index, dict pop-by-key) so no backend change. A bare
+            // `del name` (unbinding a whole variable) isn't supported.
+            let mut stmts = Vec::new();
+            for t in targets {
+                let ExprKind::Index(container, index) = t.kind else {
+                    return Err(CompileError::at(
+                        line,
+                        "`del` removes an item like `del xs[0]` or `del d[key]` — \
+                         deleting a whole variable isn't supported",
+                    ));
+                };
+                stmts.push(Stmt {
+                    kind: StmtKind::Expr(Expr {
+                        kind: ExprKind::MethodCall(container, "pop".into(), vec![*index]),
+                        line,
+                        span: (0, 0),
+                    }),
+                    line,
+                });
+            }
+            let first = stmts.remove(0);
+            self.pending.extend(stmts);
+            return Ok(first);
+        }
         if self.is_keyword("pass") {
             self.advance();
             self.expect(&Tok::Newline, "a new line")?;
@@ -1712,13 +1746,18 @@ fn contains_call(e: &Expr) -> bool {
 /// Statement-starting keywords we offer "did you mean" suggestions for.
 const STMT_KEYWORDS: &[&str] = &[
     "if", "elif", "else", "for", "while", "def", "class", "return", "import", "pass", "break",
-    "continue",
+    "continue", "del",
 ];
 
 /// Closest candidate within an edit-distance threshold that scales with word
 /// length (short words must match almost exactly, to avoid wild guesses).
 /// Exact matches are excluded — those aren't typos.
 pub(crate) fn did_you_mean<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    // An exact match is a real word, not a typo — even if a *different*
+    // candidate is one edit away (`del` is valid though `def` is adjacent).
+    if candidates.contains(&word) {
+        return None;
+    }
     let threshold = if word.chars().count() <= 4 { 1 } else { 2 };
     candidates
         .iter()
@@ -1831,6 +1870,29 @@ mod tests {
         // A non-name chained target is a clean error, not a miscompile.
         let err = parse_src("x = xs[0] = 5\n").unwrap_err();
         assert!(err.to_string().contains("simple names"), "{err}");
+    }
+
+    #[test]
+    fn del_desugars_to_pop_and_rejects_a_bare_name() {
+        // `del xs[1]` -> `xs.pop(1)` (result discarded).
+        let stmts = parse_src("del xs[1]\n").unwrap();
+        assert_eq!(stmts.len(), 1);
+        let StmtKind::Expr(ex) = &stmts[0].kind else {
+            panic!("expected an expr statement");
+        };
+        match &ex.kind {
+            ExprKind::MethodCall(recv, m, args) => {
+                assert_eq!(m, "pop");
+                assert_eq!(recv.kind, ExprKind::Name("xs".into()));
+                assert_eq!(args[0].kind, ExprKind::Int(1));
+            }
+            other => panic!("expected xs.pop(1), got {other:?}"),
+        }
+        // `del d[a], d[b]` -> two pops (second queued).
+        assert_eq!(parse_src("del d[0], d[1]\n").unwrap().len(), 2);
+        // Deleting a whole variable is a clean, specific error.
+        let err = parse_src("x = 1\ndel x\n").unwrap_err();
+        assert!(err.to_string().contains("removes an item"), "{err}");
     }
 
     /// Build an expectation node; line is irrelevant (PartialEq ignores it).

@@ -124,6 +124,8 @@ format specs), lists (incl. `list[int]`/`list[float]`), dicts, sets
 classes (v1 — see above), functions + recursion + default arguments + keyword
 arguments, `for`/`while`, **list, dict, and set comprehensions** (nested,
 filters, `range`, tuple targets), tuple unpacking, **chained assignment**
-(`x = y = value` — value evaluated once, all names bound to it), `str()`, `len()`,
+(`x = y = value` — value evaluated once, all names bound to it), **`del`** of a
+list/dict item (`del xs[i]`, `del d[key]` — deleting a whole variable isn't
+supported), `str()`, `len()`,
 `input()`, and `print()` — all gated by the CPython differential oracle
 (`tools/native_run.sh`), which also requires leak-freedom (`live == 0`).
