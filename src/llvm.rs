@@ -142,6 +142,9 @@ declare i32 @p2w_min(i32)
 declare i32 @p2w_max(i32)
 declare i32 @p2w_sorted(i32, i32)
 declare i32 @p2w_float_of(i32)
+declare i32 @p2w_range_list(i32, i32, i32)
+declare i32 @p2w_enumerate(i32, i32)
+declare i32 @p2w_zip2(i32, i32)
 declare i32 @p2w_band(i32, i32)
 declare i32 @p2w_bor(i32, i32)
 declare i32 @p2w_bxor(i32, i32)
@@ -2786,6 +2789,48 @@ impl<'a> FuncEmitter<'a> {
                     let (v, o) = self.expr_borrow(&args[0])?;
                     let r = self.call_value(&format!("call i32 @p2w_sum(i32 {v})"));
                     self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // range(...) as a VALUE (list(range(n)), sorted(range(n)), …).
+                // `for x in range(...)` is intercepted earlier as a counted loop.
+                if name == "range" && (1..=3).contains(&args.len()) {
+                    let (start, end, step) = match args.len() {
+                        1 => ("0".to_string(), self.expr_int(&args[0])?, "1".to_string()),
+                        2 => (
+                            self.expr_int(&args[0])?,
+                            self.expr_int(&args[1])?,
+                            "1".to_string(),
+                        ),
+                        _ => (
+                            self.expr_int(&args[0])?,
+                            self.expr_int(&args[1])?,
+                            self.expr_int(&args[2])?,
+                        ),
+                    };
+                    let r = self.call_value(&format!(
+                        "call i32 @p2w_range_list(i32 {start}, i32 {end}, i32 {step})"
+                    ));
+                    return Ok((r, Repr::Boxed));
+                }
+                // enumerate(iterable[, start]) — list of (index, element) tuples.
+                if name == "enumerate" && (1..=2).contains(&args.len()) {
+                    let (v, o) = self.expr_borrow(&args[0])?;
+                    let start = if args.len() == 2 {
+                        self.expr_int(&args[1])?
+                    } else {
+                        "0".to_string()
+                    };
+                    let r = self.call_value(&format!("call i32 @p2w_enumerate(i32 {v}, i32 {start})"));
+                    self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // zip(a, b) — list of paired tuples, truncated to the shorter.
+                if name == "zip" && args.len() == 2 {
+                    let (a, ao) = self.expr_borrow(&args[0])?;
+                    let (b, bo) = self.expr_borrow(&args[1])?;
+                    let r = self.call_value(&format!("call i32 @p2w_zip2(i32 {a}, i32 {b})"));
+                    self.release_if_owned(&b, bo);
+                    self.release_if_owned(&a, ao);
                     return Ok((r, Repr::Boxed));
                 }
                 // bool(x) — truthiness boxed to True/False.

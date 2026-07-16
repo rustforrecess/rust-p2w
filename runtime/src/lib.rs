@@ -1932,6 +1932,68 @@ fn parse_float_str(v: Value) -> Option<f64> {
     Some(if neg { -result } else { result })
 }
 
+/// A fresh 2-tuple owning `a` and `b` (both transferred in) — the element shape
+/// `enumerate`/`zip` yield.
+fn pair(a: Value, b: Value) -> Value {
+    let t = coll_new(T_TUPLE);
+    list_push(t as usize, a);
+    list_push(t as usize, b);
+    t
+}
+
+/// `range(start, end, step)` materialized as a list (the value form; the
+/// for-statement uses a raw counted loop). A zero step yields an empty list
+/// rather than looping forever. Mirrors the WAT `$range_list`.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_range_list(start: i32, end: i32, step: i32) -> Value {
+    let out = coll_new(T_LIST);
+    if step != 0 {
+        let (end, step) = (end as i64, step as i64);
+        let mut i = start as i64; // i64 so the increment can't wrap mid-loop
+        loop {
+            let done = if step > 0 { i >= end } else { i <= end };
+            if done {
+                break;
+            }
+            list_push(out as usize, make_int(i));
+            i += step;
+        }
+    }
+    out
+}
+
+/// `enumerate(iterable, start)` — a list of `(index, element)` tuples.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_enumerate(iterable: Value, start: i32) -> Value {
+    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    {
+        trap("enumerate() needs an iterable");
+    }
+    let out = coll_new(T_LIST);
+    for i in 0..container_len(iterable) {
+        let idx = make_int(start as i64 + i as i64);
+        list_push(out as usize, pair(idx, element_at(iterable, i)));
+    }
+    out
+}
+
+/// `zip(a, b)` — a list of `(a_i, b_i)` tuples, truncated to the shorter input.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_zip2(a: Value, b: Value) -> Value {
+    for v in [a, b] {
+        if !(is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE)) {
+            trap("zip() needs iterables");
+        }
+    }
+    let (la, lb) = (container_len(a), container_len(b));
+    let n = if la < lb { la } else { lb };
+    let out = coll_new(T_LIST);
+    for i in 0..n {
+        list_push(out as usize, pair(element_at(a, i), element_at(b, i)));
+    }
+    out
+}
+
 /// `sorted(iterable, reverse)` — a new list, stable insertion sort using
 /// `value_lt` (lexicographic strings, else numeric). Matches the WAT
 /// `$py_sorted`. Elements are owned copies; `reverse` is borrowed.

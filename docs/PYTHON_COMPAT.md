@@ -111,10 +111,9 @@ semantics and leak-freedom are oracle-gated). Differences:
 - **`list()` / `tuple()` / `dict()`** work: empty (`list()`, `dict()`) or from
   any iterable (`list("abc")`, `list(range(n))`, `tuple(a_set)`). `dict()` is
   empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or
-  a dict comprehension). `list(range(n))` works on the browser backend but not
-  yet on native or in the step debugger (both lack `range` as a first-class
-  value — materialize with a comprehension there); every other iterable form
-  works on all three.
+  a dict comprehension). `list(range(n))` works on both compiled backends; the
+  step debugger still needs Run for it (no `range`-as-value there yet). Every
+  other iterable form works on all three.
 - **`reversed(seq)`** desugars to the reverse slice `seq[::-1]`, so it works on
   both compiled backends (lists, strings, tuples). It yields a reversed *copy*
   rather than CPython's lazy iterator — identical when you iterate it, and
@@ -142,8 +141,12 @@ semantics and leak-freedom are oracle-gated). Differences:
   parses via a compact hand-rolled decimal reader (exact for the few-decimal
   literals students write; a long fraction may round differently by an ULP —
   `core`'s dec2flt isn't usable in the no_std/arena runtime and would bloat the
-  device binary). `enumerate`, `zip`, and `range` as a first-class value are
-  still browser-only (tracked).
+  device binary). `enumerate`, `zip`, and `range` **as a first-class value**
+  (`list(range(n))`, `sorted(range(n))`, `for i, x in enumerate(xs)`,
+  `for a, b in zip(a, b)`) now work on native too — each materializes to a list
+  (of `(index, element)` / paired tuples for enumerate/zip), matching the
+  browser. The native and browser backends are now at parity on builtins; the
+  step debugger still needs Run for `range`-as-value and slicing.
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.
