@@ -13,3 +13,6 @@ crate-type = ["lib"]
 # Pure-Rust no_std math (trunc/round/pow) for float formatting and `**`.
 # Works on the host *and* the bare-metal device (no C libm linkage needed).
 libm = "0.2"
+# Shortest round-tripping float digits (round-half-to-even, like CPython's
+# dtoa). no_std; we re-lay-out its digits into CPython's exact repr.
+ryu = { version = "1", default-features = false }

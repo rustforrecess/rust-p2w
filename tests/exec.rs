@@ -79,15 +79,9 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         .unwrap();
     linker
         .func_wrap("env", "write_f64", |mut caller: Caller<'_, Io>, v: f64| {
-            // Python-style: whole floats keep ".0" (repr(2.0) == "2.0");
-            // otherwise Rust's shortest round-trip matches Python's for
-            // everyday values. (Known divergence at extremes: Python
-            // switches to scientific notation around 1e16.)
-            let s = if v.is_finite() && v == v.trunc() {
-                format!("{v:.1}")
-            } else {
-                format!("{v}")
-            };
+            // CPython-exact float repr (same helper the IDE host and the native
+            // runtime use), so the differential oracle agrees on every value.
+            let s = rust_p2w::py_float_repr(v);
             caller.data_mut().out.extend_from_slice(s.as_bytes());
         })
         .unwrap();
@@ -305,6 +299,25 @@ fn del_removes_list_and_dict_items() {
     );
     // Multiple targets, left to right (indices shift as you go).
     assert_output("xs = [10, 20, 30, 40]\ndel xs[0], xs[0]\nprint(xs)", "[30, 40]\n");
+}
+
+// --- float display (CPython-exact repr) ---
+
+#[test]
+fn float_display_matches_cpython() {
+    assert_output("print(1.5)", "1.5\n");
+    assert_output("print(3.0)", "3.0\n"); // whole floats keep .0
+    assert_output("print(0.1)", "0.1\n");
+    assert_output("print(1234567.891)", "1234567.891\n"); // was ...061467
+    assert_output("print(0.0001)", "0.0001\n");
+    assert_output("print(0.00001)", "1e-05\n"); // scientific below 1e-4
+    // (scientific-notation float *literals* like 1e16 aren't lexed yet, so
+    // build the magnitudes from plain decimals.)
+    assert_output("print(10000000000000000.0)", "1e+16\n"); // scientific at/above 1e16
+    assert_output("print(1000000000000000.0)", "1000000000000000.0\n"); // still fixed
+    assert_output("print(-0.0)", "-0.0\n");
+    assert_output("print(10.0 / 4.0)", "2.5\n");
+    assert_output("print([1.5, 2.0, 0.25])", "[1.5, 2.0, 0.25]\n");
 }
 
 // --- nested functions (hoisted to module level) ---

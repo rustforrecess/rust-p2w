@@ -100,9 +100,10 @@ impl Value {
             // this default — a documented debugger-only narrowing).
             Value::Object(o) => format!("<{} object>", o.class),
             Value::Int(n) => n.to_string(),
-            // Rust's float Debug is shortest-round-trip like Python's repr, and
-            // keeps the trailing `.0` Python shows (e.g. 5.0 -> "5.0").
-            Value::Float(f) => format!("{f:?}"),
+            // CPython-exact float repr (shortest round-trip + sci-notation
+            // thresholds); Rust's own `{:?}` disagrees on 16-digit ties and
+            // never uses scientific notation.
+            Value::Float(f) => crate::floatfmt::py_float_repr(*f),
             Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
             Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
             Value::None => "None".to_string(),
@@ -3940,6 +3941,16 @@ mod tests {
             run_to_end("a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)\n"),
             "1\n[2, 3, 4]\n"
         );
+    }
+
+    #[test]
+    fn float_display_matches_cpython_in_the_debugger() {
+        assert_eq!(run_to_end("print(1.5)\n"), "1.5\n");
+        assert_eq!(run_to_end("print(3.0)\n"), "3.0\n");
+        assert_eq!(run_to_end("print(1234567.891)\n"), "1234567.891\n"); // was ...061467
+        assert_eq!(run_to_end("print(0.00001)\n"), "1e-05\n");
+        assert_eq!(run_to_end("print([0.1, 2.0, 0.25])\n"), "[0.1, 2.0, 0.25]\n");
+        assert_eq!(run_to_end("print(10.0 / 4.0)\n"), "2.5\n");
     }
 
     #[test]

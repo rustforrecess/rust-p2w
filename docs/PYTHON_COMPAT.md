@@ -56,13 +56,15 @@ Differences:
 
 - **Parsing is correctly rounded** (`float("...")` and float literals give the
   same `f64` as CPython, bit for bit).
-- **Display prints the full decimal expansion, not CPython's shortest
-  round-tripping `repr`, and doesn't use scientific notation.** So the *value*
-  is right but the *string* can differ: `print(float("1234567.891"))` shows
-  `1234567.891000000061467` (CPython: `1234567.891`), and `print(1e-10)` shows
-  `0.0000000001` (CPython: `1e-10`). Short/exact values (`1.5`, `0.1`, `-2.25`,
-  `3.14`) print identically. Shortest-round-trip formatting (Ryū/Grisu) is
-  planned.
+- **Display matches CPython's `repr` exactly** on all three surfaces (browser,
+  native, step debugger): the shortest string that round-trips (via `ryu`, with
+  round-half-to-even), scientific notation when `decpt <= -4 || decpt > 16`
+  (`print(0.00001)` → `1e-05`, `print(10000000000000000.0)` → `1e+16`), a
+  trailing `.0` on whole floats, and a two-digit padded exponent. Verified
+  bit-for-bit against CPython over 200k values.
+- **Scientific-notation float *literals* (`1e16`, `1.5e-3`) aren't lexed yet** —
+  write the magnitude in plain decimal for now. (The *display* still uses
+  scientific notation; only the source *literal* form is pending.)
 
 ## Reference cycles (native backend only)
 
