@@ -352,13 +352,61 @@ fn nested_functions_run() {
     );
 }
 
+// --- closures (lambda-lifted: captures become leading parameters) ---
+
 #[test]
-fn nested_function_capturing_a_local_is_a_clean_error() {
+fn closures_capture_enclosing_locals() {
+    // Every expectation below matches CPython (verified against python3).
+    assert_output(
+        "def outer():\n    x = 5\n    def inner():\n        return x + 1\n    return inner()\nprint(outer())",
+        "6\n",
+    );
+    // Python captures the variable, not the value: a rebind before the call is
+    // seen (1 then 2 -> 1 + 2*10 = 21).
+    assert_output(
+        "def f():\n    x = 1\n    def show():\n        return x\n    r1 = show()\n    x = 2\n    r2 = show()\n    return r1 + r2 * 10\nprint(f())",
+        "21\n",
+    );
+    // A captured container is shared, so mutation through it shows.
+    assert_output(
+        "def f():\n    xs = []\n    def add(v):\n        xs.append(v)\n    add(1)\n    add(2)\n    return len(xs)\nprint(f())",
+        "2\n",
+    );
+    // An enclosing *parameter* is capturable too.
+    assert_output(
+        "def outer(n):\n    def dbl():\n        return n * 2\n    return dbl() + 1\nprint(outer(20))",
+        "41\n",
+    );
+}
+
+#[test]
+fn closures_thread_captures_through_siblings_and_depth() {
+    // `a` doesn't read x, but calls `b` which does — x must reach b.
+    assert_output(
+        "def f():\n    x = 3\n    def a():\n        return b() * 10\n    def b():\n        return x\n    return a()\nprint(f())",
+        "30\n",
+    );
+    // A doubly-nested capture threads through the middle function.
+    assert_output(
+        "def f():\n    x = 4\n    def mid():\n        def deepest():\n            return x * 100\n        return deepest()\n    return mid()\nprint(f())",
+        "400\n",
+    );
+    // A recursive closure keeps passing its capture along.
+    assert_output(
+        "def f():\n    base = 10\n    def fact(n):\n        if n <= 1:\n            return base\n        return n * fact(n - 1)\n    return fact(4)\nprint(f())",
+        "240\n",
+    );
+}
+
+#[test]
+fn a_shadowed_pass_through_capture_is_a_clean_error() {
+    // `a` must hand outer's y to `b`, but has its own y — refuse rather than
+    // silently pass the wrong one.
     let err = rust_p2w::compile_to_wat(
-        "def outer():\n    x = 5\n    def inner():\n        return x\n    return inner()\n",
+        "def outer():\n    y = 1\n    def b():\n        return y\n    def a():\n        y = 99\n        return b()\n    return a()\n",
     )
     .unwrap_err();
-    assert!(err.contains("closures aren't supported"), "{err}");
+    assert!(err.contains("shadows"), "{err}");
 }
 
 // --- starred unpacking ---

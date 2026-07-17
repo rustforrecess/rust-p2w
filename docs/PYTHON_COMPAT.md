@@ -168,15 +168,23 @@ semantics and leak-freedom are oracle-gated). Differences:
   `sqrt`/`fabs`/`floor`/`ceil`/`trunc`. Works on the browser backend and in the
   debugger (which uses the host's `f64` ops); **native** doesn't have `math`
   yet. A variable named `math` shadows the module, like CPython.
-- **Nested functions** (a `def` inside another) are **lifted to module level**
-  before codegen, so they compile and run on both backends and step in the
-  debugger. Since functions aren't closures here, a nested function may only use
-  its own params/locals, module globals, and other functions — reading a
-  variable *local to the enclosing function* is a clean error (`closures aren't
-  supported yet — pass it in as an argument`). Names must be unique across the
-  program (no shadowing). (Native keeps its existing limit that a function can't
-  read a module global — so a global-reading nested function is browser-only,
-  exactly like a global-reading top-level one.)
+- **Nested functions and closures** work on both backends and in the debugger.
+  A nested `def` is **lifted to module level**, and any variable it captures
+  from the enclosing function becomes a leading parameter passed at each call
+  site (*lambda lifting*). This is exactly equivalent here: functions aren't
+  first-class (one can't escape its enclosing call) and there's no `nonlocal`
+  (an inner function can't rebind an outer local), so capture is always
+  read-only and never outlives the call — no closure objects or GC needed.
+  Capture semantics match CPython, including seeing a rebind made after the
+  `def` (`x = 1; def s(): return x; x = 2; s()` → 2) and sharing a captured
+  container (mutating through it shows). Captures thread through depth and
+  through calls to capturing siblings.
+  Two limits: function names must be unique across the program (no shadowing),
+  and if a nested function must pass a capture along to a sibling but has its
+  own same-named local, that's a clean error rather than a silently wrong value.
+  (Native keeps its existing limit that a function can't read a module global —
+  so a global-reading nested function is browser-only, exactly like a
+  global-reading top-level one.)
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.
