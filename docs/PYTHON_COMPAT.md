@@ -62,9 +62,11 @@ Differences:
   (`print(0.00001)` → `1e-05`, `print(10000000000000000.0)` → `1e+16`), a
   trailing `.0` on whole floats, and a two-digit padded exponent. Verified
   bit-for-bit against CPython over 200k values.
-- **Scientific-notation float *literals* (`1e16`, `1.5e-3`) aren't lexed yet** —
-  write the magnitude in plain decimal for now. (The *display* still uses
-  scientific notation; only the source *literal* form is pending.)
+- **Scientific-notation literals work**: `1e16`, `1.5e-3`, `2E+8`, `6.02e23`,
+  `3.e5`, and underscores in the exponent (`1e1_0`). An exponent makes the
+  literal a **float** even without a point (`1e16` is a float, like CPython).
+  A bare `e` with no exponent digits isn't consumed, so `1else` still reads as
+  `1`, `else`.
 
 ## Reference cycles (native backend only)
 

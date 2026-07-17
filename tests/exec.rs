@@ -311,13 +311,24 @@ fn float_display_matches_cpython() {
     assert_output("print(1234567.891)", "1234567.891\n"); // was ...061467
     assert_output("print(0.0001)", "0.0001\n");
     assert_output("print(0.00001)", "1e-05\n"); // scientific below 1e-4
-    // (scientific-notation float *literals* like 1e16 aren't lexed yet, so
-    // build the magnitudes from plain decimals.)
     assert_output("print(10000000000000000.0)", "1e+16\n"); // scientific at/above 1e16
     assert_output("print(1000000000000000.0)", "1000000000000000.0\n"); // still fixed
     assert_output("print(-0.0)", "-0.0\n");
     assert_output("print(10.0 / 4.0)", "2.5\n");
     assert_output("print([1.5, 2.0, 0.25])", "[1.5, 2.0, 0.25]\n");
+}
+
+#[test]
+fn scientific_notation_literals_run() {
+    // An exponent makes it a float even without a point (Python: 1e16 is float).
+    assert_output("print(1e16)", "1e+16\n");
+    assert_output("print(1e15)", "1000000000000000.0\n");
+    assert_output("print(1.5e-3)", "0.0015\n");
+    assert_output("print(6.02e23)", "6.02e+23\n");
+    assert_output("print(2E+8)", "200000000.0\n");
+    assert_output("x = 1.5e3\nprint(x + 1.0)", "1501.0\n");
+    // Round-trips: a literal, then its repr, agree with CPython.
+    assert_output("print(1e-05)", "1e-05\n");
 }
 
 // --- nested functions (hoisted to module level) ---

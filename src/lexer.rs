@@ -580,6 +580,7 @@ fn aug_or(chars: &[char], i: usize, plain: Tok, op: BinOp) -> (Tok, usize) {
 fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize), CompileError> {
     let mut i = start;
     let mut digits = String::new();
+    let mut is_float = false;
     while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
         if chars[i] != '_' {
             digits.push(chars[i]);
@@ -588,6 +589,7 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize),
     }
     // A '.' makes it a float literal: `3.14`, and Python's `3.` too.
     if i < chars.len() && chars[i] == '.' {
+        is_float = true;
         digits.push('.');
         i += 1;
         while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
@@ -596,6 +598,34 @@ fn lex_number(chars: &[char], start: usize, line: usize) -> Result<(Tok, usize),
             }
             i += 1;
         }
+    }
+    // An exponent also makes it a float, with or without a point (`1e16` is a
+    // float in Python, like `1.5e-3` / `2E+8`). Only consume the `e` when a
+    // real exponent follows — otherwise `1else` must still lex as `1`, `else`
+    // (CPython's tokenizer backs off the same way).
+    if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+        let mut j = i + 1;
+        let mut exp = String::new();
+        if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+            exp.push(chars[j]);
+            j += 1;
+        }
+        let mut any_digit = false;
+        while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '_') {
+            if chars[j] != '_' {
+                exp.push(chars[j]);
+                any_digit = true;
+            }
+            j += 1;
+        }
+        if any_digit {
+            is_float = true;
+            digits.push('e');
+            digits.push_str(&exp);
+            i = j;
+        }
+    }
+    if is_float {
         let f: f64 = digits
             .parse()
             .map_err(|_| CompileError::at(line, format!("invalid number '{digits}'")))?;
@@ -846,6 +876,28 @@ mod tests {
         // Python's trailing-dot form.
         assert_eq!(toks("3.")[0], Tok::Float(3.0));
         assert_eq!(toks("1_000.5")[0], Tok::Float(1000.5));
+    }
+
+    #[test]
+    fn scientific_notation_literals_lex() {
+        // An exponent makes it a float even with no point (Python: 1e16 is a float).
+        assert_eq!(toks("1e16")[0], Tok::Float(1e16));
+        assert_eq!(toks("2E+8")[0], Tok::Float(2e8));
+        assert_eq!(toks("1.5e-3")[0], Tok::Float(0.0015));
+        assert_eq!(toks("6.02e23")[0], Tok::Float(6.02e23));
+        assert_eq!(toks("3.e5")[0], Tok::Float(3e5));
+        // Underscores are allowed in the exponent too.
+        assert_eq!(toks("1e1_0")[0], Tok::Float(1e10));
+        // Correctly rounded, like CPython.
+        assert_eq!(toks("1.7976931348623157e308")[0], Tok::Float(f64::MAX));
+
+        // A bare `e` with no exponent digits is NOT consumed: the number ends
+        // and `e` lexes as its own name (so `1else` stays `1`, `else`).
+        assert_eq!(
+            toks("1e"),
+            vec![Tok::Int(1), Tok::Name("e".into()), Tok::Newline, Tok::Eof]
+        );
+        assert_eq!(toks("1if")[0], Tok::Int(1));
     }
 
     #[test]
