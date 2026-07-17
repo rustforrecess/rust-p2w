@@ -188,7 +188,9 @@ run_case numbuiltins  'print(abs(-5))\nprint(abs(-3.5))\nprint(round(3.7))\nprin
 # range-as-value / enumerate / zip on native — materialize to lists (live==0).
 run_case rangeenumzip  'print(list(range(4)))\nprint(list(range(2, 8, 2)))\nprint(sorted(range(5), reverse=True))\nfor i, x in enumerate(["a", "b"]):\n    print(i, x)\nfor a, b in zip([1, 2, 3], [10, 20]):\n    print(a, b)\nprint(list(zip([1, 2], [3, 4])))\n' '[0, 1, 2, 3]\n[2, 4, 6]\n[4, 3, 2, 1, 0]\n0 a\n1 b\n1 10\n2 20\n[(1, 3), (2, 4)]' || fails=$((fails+1))
 # native sorted (+reverse=), bool(), float() — all borrow; results owned (live==0).
-run_case sortbool  'print(sorted([3, 1, 2]))\nprint(sorted([3, 1, 2], reverse=True))\nprint(sorted("cabd"))\nprint(bool(0))\nprint(bool([1]))\nprint(bool(""))\nprint(float("1.5"))\nprint(float(3))\nprint(float("-2.25"))\n' "[1, 2, 3]\n[3, 2, 1]\n['a', 'b', 'c', 'd']\nFalse\nTrue\nFalse\n1.5\n3.0\n-2.25" || fails=$((fails+1))
+# float("0.123456789012345") needs core's correctly-rounded dec2flt (a hand-rolled
+# mantissa*10^k reader lands an ULP off and would print ...503).
+run_case sortbool  'print(sorted([3, 1, 2]))\nprint(sorted([3, 1, 2], reverse=True))\nprint(sorted("cabd"))\nprint(bool(0))\nprint(bool([1]))\nprint(bool(""))\nprint(float("1.5"))\nprint(float(3))\nprint(float("-2.25"))\nprint(float("0.123456789012345"))\n' "[1, 2, 3]\n[3, 2, 1]\n['a', 'b', 'c', 'd']\nFalse\nTrue\nFalse\n1.5\n3.0\n-2.25\n0.123456789012345" || fails=$((fails+1))
 # multi-arg print — space-separated, one trailing newline; each arg borrowed (live==0).
 run_case printmulti  'print(1, 2, 3)\nprint("x", 5, True)\nprint("a", [1, 2])\nprint()\nprint("done")\n' '1 2 3\nx 5 True\na [1, 2]\n\ndone' || fails=$((fails+1))
 # reversed(seq) — desugars to the reverse slice; the temp copy is freed (live==0).
