@@ -318,6 +318,10 @@ impl Stepper {
     pub fn new(source: &str) -> Result<Stepper, CompileError> {
         let tokens = crate::lexer::lex(source)?;
         let program = crate::parser::parse(&tokens)?;
+        // Same closure conversion the compiler runs, so nested functions (and
+        // their captures) behave identically here and under Run. The pass keeps
+        // statement order, so stepping is unchanged for everything else.
+        let program = crate::hoist::hoist_nested_functions(program)?;
         let mut s = Stepper {
             stack: vec![Cont::Seq {
                 block: Rc::new(program),
@@ -1830,6 +1834,9 @@ impl Vm {
     pub fn new(source: &str) -> Result<Vm, CompileError> {
         let tokens = crate::lexer::lex(source)?;
         let program = crate::parser::parse(&tokens)?;
+        // Closure-convert like the compiler, so a nested function that captures
+        // steps the same way it Runs (and a bad capture errors identically).
+        let program = crate::hoist::hoist_nested_functions(program)?;
         let module = VmFrame {
             func: "<module>".to_string(),
             work: vec![Task::Next(Rc::new(program), 0)],
@@ -3940,6 +3947,25 @@ mod tests {
         assert_eq!(
             run_to_end("a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)\n"),
             "1\n[2, 3, 4]\n"
+        );
+    }
+
+    #[test]
+    fn closures_run_in_the_step_debugger() {
+        // The debugger runs the same closure conversion as the compiler, so
+        // captures behave identically here (values match CPython).
+        assert_eq!(
+            run_to_end("def outer():\n    x = 5\n    def inner():\n        return x + 1\n    return inner()\nprint(outer())\n"),
+            "6\n"
+        );
+        assert_eq!(
+            run_to_end("def f(n):\n    def dbl():\n        return n * 2\n    return dbl()\nprint(f(21))\n"),
+            "42\n"
+        );
+        // A rebind before the call is seen, like Python's cell capture.
+        assert_eq!(
+            run_to_end("def f():\n    x = 1\n    def s():\n        return x\n    x = 2\n    return s()\nprint(f())\n"),
+            "2\n"
         );
     }
 

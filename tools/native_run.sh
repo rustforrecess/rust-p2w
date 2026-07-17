@@ -181,6 +181,9 @@ run_case scilit  'print(1e16)\nprint(1.5e-3)\nprint(6.02e23)\nprint(2E+8)\nx = 1
 run_case floatrepr  'print(1.5)\nprint(3.0)\nprint(1234567.891)\nprint(0.0001)\nprint(0.00001)\nprint(10000000000000000.0)\nprint(1000000000000000.0)\nprint(9999999.9999999)\nprint([0.1, 2.0, 0.25])\n' '1.5\n3.0\n1234567.891\n0.0001\n1e-05\n1e+16\n1000000000000000.0\n9999999.9999999\n[0.1, 2.0, 0.25]' || fails=$((fails+1))
 # Nested functions — lifted to module level (non-capturing); recursion still works (live==0).
 run_case nesteddef  'def outer(x):\n    def dbl(n):\n        return n * 2\n    return dbl(x) + 1\ndef a():\n    def b():\n        return 7\n    return b()\nprint(outer(20))\nprint(a())\n' '41\n7' || fails=$((fails+1))
+# Closures — captures become leading params (lambda lifting); a captured list is
+# shared, so mutation through it shows. All values match CPython (live==0).
+run_case closures  'def c1():\n    x = 5\n    def inner():\n        return x + 1\n    return inner()\ndef c2(n):\n    def dbl():\n        return n * 2\n    return dbl()\ndef c3():\n    xs = []\n    def add(v):\n        xs.append(v)\n    add(1)\n    add(2)\n    return len(xs)\ndef c4():\n    x = 3\n    def a():\n        return b() * 10\n    def b():\n        return x\n    return a()\ndef c5():\n    base = 10\n    def fact(n):\n        if n <= 1:\n            return base\n        return n * fact(n - 1)\n    return fact(4)\nprint(c1())\nprint(c2(21))\nprint(c3())\nprint(c4())\nprint(c5())\n' '6\n42\n2\n30\n240' || fails=$((fails+1))
 # Chained assignment — every name owns a reference (live==0 proves no leak/over-free).
 run_case chainassign 'x = y = z = 5\nprint(x + y + z)\na = b = [1, 2]\na.append(3)\nprint(b)\n' '15\n[1, 2, 3]' || fails=$((fails+1))
 # del — item removal (list by index, dict by key); the removed value is freed (live==0).
