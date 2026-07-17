@@ -52,6 +52,18 @@ Differences:
 - `/` is true division (always a float), `//` floors, `%` follows Python's sign
   rules — all matching CPython.
 
+## Floats
+
+- **Parsing is correctly rounded** (`float("...")` and float literals give the
+  same `f64` as CPython, bit for bit).
+- **Display prints the full decimal expansion, not CPython's shortest
+  round-tripping `repr`, and doesn't use scientific notation.** So the *value*
+  is right but the *string* can differ: `print(float("1234567.891"))` shows
+  `1234567.891000000061467` (CPython: `1234567.891`), and `print(1e-10)` shows
+  `0.0000000001` (CPython: `1e-10`). Short/exact values (`1.5`, `0.1`, `-2.25`,
+  `3.14`) print identically. Shortest-round-trip formatting (Ryū/Grisu) is
+  planned.
+
 ## Reference cycles (native backend only)
 
 Memory is managed by precise reference counting with no garbage collector, so a
@@ -134,10 +146,9 @@ semantics and leak-freedom are oracle-gated). Differences:
   `max`, `sorted` (incl. `reverse=`), `bool()`, and `float()` all work on the
   native backend now (matching the browser), with `min`/`max` over an iterable
   or several positional args and CPython's ties-to-even `round`. `float("1.5")`
-  parses via a compact hand-rolled decimal reader (exact for the few-decimal
-  literals students write; a long fraction may round differently by an ULP —
-  `core`'s dec2flt isn't usable in the no_std/arena runtime and would bloat the
-  device binary). `enumerate`, `zip`, and `range` **as a first-class value**
+  parses through `core`'s correctly-rounded `dec2flt`, so the resulting `f64` is
+  bit-identical to CPython on every input. `enumerate`, `zip`, and `range` **as
+  a first-class value**
   (`list(range(n))`, `sorted(range(n))`, `for i, x in enumerate(xs)`,
   `for a, b in zip(a, b)`) now work on native too — each materializes to a list
   (of `(index, element)` / paired tuples for enumerate/zip), matching the

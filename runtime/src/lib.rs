@@ -1853,83 +1853,15 @@ pub extern "C" fn p2w_float_of(v: Value) -> Value {
     trap("float() needs a number or a numeric string")
 }
 
-/// Parse a decimal float from a string value (arena-aware, via `str_byte`):
-/// optional whitespace, sign, digits, `.`, fraction, and `e`/`E` exponent.
-/// Value is `mantissa * 10^(exp)` — exact for the few-decimal literals students
-/// use (a long fraction may round differently by an ULP; the compiler's own
-/// float literals go through the same shape). `core`'s dec2flt isn't usable in
-/// this no_std/arena runtime (and would bloat the device binary).
+/// Parse a decimal float from a string value using `core`'s correctly-rounded
+/// `dec2flt`, so the result is bit-identical to CPython/`strtod` on every input
+/// (a hand-rolled `mantissa * 10^k` reader drifts by an ULP on values like
+/// `123.456` or `1e-10`). Values are arena OFFSETS, so `heap_base()` maps `v`
+/// to the real address of its (contiguous ASCII) bytes — no copy, no length cap.
 fn parse_float_str(v: Value) -> Option<f64> {
     let len = str_len(v);
-    let (mut i, mut j) = (0usize, len);
-    while i < j && str_byte(v, i).is_ascii_whitespace() {
-        i += 1;
-    }
-    while j > i && str_byte(v, j - 1).is_ascii_whitespace() {
-        j -= 1;
-    }
-    if i == j {
-        return None;
-    }
-    let neg = str_byte(v, i) == b'-';
-    if matches!(str_byte(v, i), b'+' | b'-') {
-        i += 1;
-    }
-    let mut mantissa = 0.0_f64;
-    let mut scale = 0i32; // power of ten owed to fractional digits
-    let mut any = false;
-    while i < j && str_byte(v, i).is_ascii_digit() {
-        mantissa = mantissa * 10.0 + (str_byte(v, i) - b'0') as f64;
-        i += 1;
-        any = true;
-    }
-    if i < j && str_byte(v, i) == b'.' {
-        i += 1;
-        while i < j && str_byte(v, i).is_ascii_digit() {
-            mantissa = mantissa * 10.0 + (str_byte(v, i) - b'0') as f64;
-            scale -= 1;
-            i += 1;
-            any = true;
-        }
-    }
-    if !any {
-        return None;
-    }
-    let mut exp = 0i32;
-    if i < j && matches!(str_byte(v, i), b'e' | b'E') {
-        i += 1;
-        let eneg = i < j && str_byte(v, i) == b'-';
-        if i < j && matches!(str_byte(v, i), b'+' | b'-') {
-            i += 1;
-        }
-        let mut edig = false;
-        while i < j && str_byte(v, i).is_ascii_digit() {
-            exp = exp * 10 + (str_byte(v, i) - b'0') as i32;
-            i += 1;
-            edig = true;
-        }
-        if !edig {
-            return None;
-        }
-        if eneg {
-            exp = -exp;
-        }
-    }
-    if i != j {
-        return None; // trailing junk
-    }
-    let mut result = mantissa;
-    let total = scale + exp;
-    if total > 0 {
-        for _ in 0..total {
-            result *= 10.0;
-        }
-    } else {
-        for _ in 0..(-total) {
-            result /= 10.0;
-        }
-    }
-    Some(if neg { -result } else { result })
+    let bytes = unsafe { core::slice::from_raw_parts(heap_base().add(v as usize + 12), len) };
+    core::str::from_utf8(bytes).ok()?.trim().parse::<f64>().ok()
 }
 
 /// A fresh 2-tuple owning `a` and `b` (both transferred in) — the element shape
