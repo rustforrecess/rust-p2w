@@ -778,9 +778,8 @@ impl Stepper {
             StmtKind::Return(_) => {
                 Err("`return` outside a function — did you mean to indent it?".to_string())
             }
-            StmtKind::ClassDef { .. }
-            | StmtKind::SetAttr { .. }
-            | StmtKind::Import(_) => Err(format!(
+            StmtKind::Import(names) => check_import(names),
+            StmtKind::ClassDef { .. } | StmtKind::SetAttr { .. } => Err(format!(
                 "{} isn't in the step debugger yet — use Run for that",
                 describe_stmt(&s.kind)
             )),
@@ -913,6 +912,18 @@ impl Stepper {
                 let p = bound(step, "step")?;
                 slice_value(&target, s, t, p)
             }
+            ExprKind::Attr(obj, attr) => {
+                // `math.pi` / `math.e` / `math.tau` (the stepper has no user
+                // objects, so a module constant is the only attribute here).
+                if let ExprKind::Name(m) = &obj.kind
+                    && m == "math"
+                    && !scope.contains_key(m)
+                {
+                    return math_const(attr)
+                        .ok_or_else(|| format!("math has no attribute '{attr}'"));
+                }
+                Err("attribute access isn't in the step debugger yet — use Run for that".to_string())
+            }
             ExprKind::Call(name, args) => Self::eval_call(funcs, scope, out, name, args),
             ExprKind::MethodCall(obj, method, args) => {
                 Self::eval_method(funcs, scope, out, obj, method, args)
@@ -982,6 +993,12 @@ impl Stepper {
         name: &str,
         args: &[Expr],
     ) -> Result<Value, String> {
+        // `sorted(seq, reverse=<bool>)` — the one builtin that takes a keyword.
+        if let Some((seq_e, rev_e)) = sorted_reverse_args(name, args) {
+            let seq = Self::eval_in(funcs, scope, out, seq_e)?;
+            let rev = Self::eval_in(funcs, scope, out, rev_e)?.truthy();
+            return sorted_values(&seq, rev);
+        }
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(Self::eval_in(funcs, scope, out, a)?);
@@ -1065,6 +1082,16 @@ impl Stepper {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(Self::eval_in(funcs, scope, out, a)?);
+        }
+        // `math.sqrt(x)` etc. — a module function (unless `math` is a variable).
+        if let ExprKind::Name(m) = &obj.kind
+            && m == "math"
+            && !scope.contains_key(m)
+        {
+            let [arg] = vals.as_slice() else {
+                return Err(format!("math.{method}() takes one argument"));
+            };
+            return math_call(method, arg);
         }
         // Mutating list/set methods need the variable itself, so require a Name.
         if let ExprKind::Name(name) = &obj.kind {
@@ -1333,9 +1360,8 @@ impl Stepper {
             StmtKind::Def { .. } => Err(
                 "a nested function definition isn't in the step debugger yet — use Run".to_string(),
             ),
-            StmtKind::ClassDef { .. }
-            | StmtKind::SetAttr { .. }
-            | StmtKind::Import(_) => Err(format!(
+            StmtKind::Import(names) => check_import(names).map(|_| Flow::Normal),
+            StmtKind::ClassDef { .. } | StmtKind::SetAttr { .. } => Err(format!(
                 "{} isn't in the step debugger yet — use Run for that",
                 describe_stmt(&s.kind)
             )),
@@ -1669,6 +1695,10 @@ enum Task {
     Store(String),
     /// Pop an iterable value and bind its elements to these names (one each).
     Unpack(Vec<String>),
+    /// Pop the reverse flag then the sequence; push `sorted(seq, reverse=…)`.
+    SortedKw,
+    /// Pop one argument; push `math.<func>(arg)`.
+    MathCall(String),
     /// Pop `n` values and print them (space-joined + newline).
     Print(usize),
     /// Discard the top operand (an expression statement's result).
@@ -2263,11 +2293,8 @@ impl Vm {
                 self.push_task(Task::Unpack(names));
                 self.push_task(Task::Eval(Rc::new(value.clone())));
             }
-            StmtKind::Import(_) => {
-                return Err(format!(
-                    "{} isn't in the step debugger yet — use Run for that",
-                    describe_stmt(&s.kind)
-                ));
+            StmtKind::Import(names) => {
+                check_import(names)?;
             }
         }
         Ok(())
@@ -2342,6 +2369,15 @@ impl Vm {
                 for (name, item) in names.into_iter().zip(items) {
                     self.top().scope.insert(name, item);
                 }
+            }
+            Task::SortedKw => {
+                let reverse = self.pop_op()?.truthy();
+                let seq = self.pop_op()?;
+                self.push_op(sorted_values(&seq, reverse)?);
+            }
+            Task::MathCall(func) => {
+                let arg = self.pop_op()?;
+                self.push_op(math_call(&func, &arg)?);
             }
             Task::Print(n) => {
                 let mut vals = Vec::with_capacity(n);
@@ -2755,6 +2791,14 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new((**a).clone())));
             }
             ExprKind::Call(name, args) => {
+                // `sorted(seq, reverse=<expr>)`: evaluate seq (bottom) then the
+                // reverse flag (top); SortedKw pops both.
+                if let Some((seq_e, rev_e)) = sorted_reverse_args(name, args) {
+                    self.push_task(Task::SortedKw);
+                    self.push_task(Task::Eval(Rc::new(rev_e.clone())));
+                    self.push_task(Task::Eval(Rc::new(seq_e.clone())));
+                    return Ok(());
+                }
                 self.push_task(Task::Call(name.clone(), args.len()));
                 for a in args.iter().rev() {
                     self.push_task(Task::Eval(Rc::new(a.clone())));
@@ -2807,6 +2851,17 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new((**obj).clone())));
             }
             ExprKind::Attr(obj, attr) => {
+                // `math.pi` / `math.e` / `math.tau` — module constant, unless a
+                // variable named `math` shadows the module.
+                if let ExprKind::Name(m) = &obj.kind
+                    && m == "math"
+                    && self.lookup(m).is_none()
+                {
+                    let c = math_const(attr)
+                        .ok_or_else(|| format!("math has no attribute '{attr}'"))?;
+                    self.push_op(c);
+                    return Ok(());
+                }
                 // `Counter.limit` — a class-name base resolves against the
                 // registry (a same-named variable shadows, like CPython).
                 if let ExprKind::Name(cn) = &obj.kind
@@ -2863,6 +2918,19 @@ impl Vm {
                     for a in args.iter().rev() {
                         self.push_task(Task::Eval(Rc::new(a.clone())));
                     }
+                    return Ok(());
+                }
+                // `math.sqrt(x)` etc. — a module function (unless `math` is a
+                // variable). Takes exactly one argument.
+                if let ExprKind::Name(m) = &obj.kind
+                    && m == "math"
+                    && self.lookup(m).is_none()
+                {
+                    if args.len() != 1 {
+                        return Err(format!("math.{method}() takes one argument"));
+                    }
+                    self.push_task(Task::MathCall(method.clone()));
+                    self.push_task(Task::Eval(Rc::new(args[0].clone())));
                     return Ok(());
                 }
                 if let ExprKind::Name(recv) = &obj.kind {
@@ -3311,6 +3379,56 @@ fn slice_value(
 /// same ordering as the compiled backends.
 fn py_lt(a: &Value, b: &Value) -> Result<bool, String> {
     Ok(matches!(compare(BinOp::Lt, a, b)?, Value::Bool(true)))
+}
+
+/// `math.<name>` module constant (`pi`/`e`/`tau`), matching the compiled
+/// backends. `None` if `name` isn't a known constant.
+fn math_const(name: &str) -> Option<Value> {
+    match name {
+        "pi" => Some(Value::Float(std::f64::consts::PI)),
+        "e" => Some(Value::Float(std::f64::consts::E)),
+        "tau" => Some(Value::Float(std::f64::consts::TAU)),
+        _ => None,
+    }
+}
+
+/// `math.<func>(x)` — sqrt/fabs return a float, floor/ceil/trunc return an int
+/// (Python's behavior), matching the compiled backends' `gen_math_call`.
+fn math_call(func: &str, arg: &Value) -> Result<Value, String> {
+    let x = as_num(arg).ok_or_else(|| format!("math.{func}() needs a number"))?;
+    Ok(match func {
+        "sqrt" => Value::Float(x.sqrt()),
+        "fabs" => Value::Float(x.abs()),
+        "floor" => Value::Int(x.floor() as i64),
+        "ceil" => Value::Int(x.ceil() as i64),
+        "trunc" => Value::Int(x.trunc() as i64),
+        _ => return Err(format!("math has no function '{func}'")),
+    })
+}
+
+/// `import name1, name2, …` — only `math` exists in the subset. A no-op on
+/// success (the compiled backends treat it the same); a bad module is an error.
+fn check_import(names: &[String]) -> Result<(), String> {
+    for m in names {
+        if m != "math" {
+            return Err(format!("module '{m}' isn't available (only 'math' for now)"));
+        }
+    }
+    Ok(())
+}
+
+/// If this call is `sorted(seq, reverse=<expr>)`, return `(seq, reverse-expr)`
+/// so both evaluators can handle the one keyword builtin. Any other keyword
+/// falls through to the normal (unsupported-kwarg) path.
+fn sorted_reverse_args<'a>(name: &str, args: &'a [Expr]) -> Option<(&'a Expr, &'a Expr)> {
+    if name == "sorted"
+        && args.len() == 2
+        && let ExprKind::Kwarg(k, val) = &args[1].kind
+        && k == "reverse"
+    {
+        return Some((&args[0], val));
+    }
+    None
 }
 
 /// Builtins beyond both debug evaluators' inline core set — numeric reductions,
@@ -3825,6 +3943,29 @@ mod tests {
     }
 
     #[test]
+    fn import_math_in_the_step_debugger() {
+        assert_eq!(run_to_end("import math\nprint(math.sqrt(9.0))\n"), "3.0\n");
+        assert_eq!(run_to_end("import math\nprint(math.floor(3.7))\n"), "3\n");
+        assert_eq!(run_to_end("import math\nprint(math.ceil(3.2))\n"), "4\n");
+        // A constant, and a value named `math` shadows the module (like CPython).
+        assert_eq!(
+            run_to_end("import math\nx = math.pi\nprint(x > 3.14)\nprint(x < 3.15)\n"),
+            "True\nTrue\n"
+        );
+        // math inside a function body (the atomic executor).
+        assert_eq!(
+            run_to_end("import math\ndef h(n):\n    return math.sqrt(n)\nprint(h(16.0))\n"),
+            "4.0\n"
+        );
+        // An unavailable module is a clean error, not a crash.
+        let mut s = Stepper::new("import numpy\n").unwrap();
+        while s.is_paused() {
+            s.step();
+        }
+        assert!(matches!(s.status(), Status::Error { message, .. } if message.contains("numpy")));
+    }
+
+    #[test]
     fn slicing_and_unpack_inside_a_called_function() {
         // Exercises the atomic step-over executor used for function bodies.
         let src = "def head(xs):\n    a, *rest = xs\n    return a\n\
@@ -3841,6 +3982,8 @@ mod tests {
         assert_eq!(run_to_end("print(min([3, 1, 2]))\n"), "1\n");
         assert_eq!(run_to_end("print(max(4, 9, 2))\n"), "9\n");
         assert_eq!(run_to_end("print(sorted([3, 1, 2]))\n"), "[1, 2, 3]\n");
+        assert_eq!(run_to_end("print(sorted([3, 1, 2], reverse=True))\n"), "[3, 2, 1]\n");
+        assert_eq!(run_to_end("print(sorted([3, 1, 2], reverse=False))\n"), "[1, 2, 3]\n");
         assert_eq!(run_to_end("print(round(3.7))\n"), "4\n");
         assert_eq!(run_to_end("print(round(2.5))\n"), "2\n");
         assert_eq!(
@@ -4003,8 +4146,9 @@ mod tests {
 
     #[test]
     fn unsupported_construct_stops_friendly() {
-        // `import` isn't in the stepper yet — friendly stop, not a panic.
-        let mut s = Stepper::new("import math\nprint(1)\n").unwrap();
+        // A class def isn't in the stepper (step-over mode) — friendly stop,
+        // not a panic. (The call-stack Vm does run classes.)
+        let mut s = Stepper::new("class C:\n    def m(self):\n        return 1\nprint(1)\n").unwrap();
         for _ in 0..10 {
             if !s.is_paused() {
                 break;
@@ -4278,6 +4422,14 @@ mod tests {
         assert_eq!(vm_run("print(\"hello\"[1:4])\n"), "ell\n");
         assert_eq!(vm_run("print(list(range(4)))\n"), "[0, 1, 2, 3]\n");
         assert_eq!(vm_run("print(sum([1, 2, 3]))\nprint(max([4, 9, 2]))\n"), "6\n9\n");
+        assert_eq!(vm_run("print(sorted([3, 1, 2], reverse=True))\n"), "[3, 2, 1]\n");
+        // import math, and classes + nested def already run in call-stack mode.
+        assert_eq!(vm_run("import math\nprint(math.sqrt(16.0))\nprint(math.floor(2.9))\n"), "4.0\n2\n");
+        assert_eq!(
+            vm_run("class C:\n    def __init__(self, n):\n        self.n = n\n    def two(self):\n        return self.n * 2\nprint(C(5).two())\n"),
+            "10\n"
+        );
+        assert_eq!(vm_run("def outer():\n    def inner():\n        return 7\n    return inner()\nprint(outer())\n"), "7\n");
         assert_eq!(vm_run("a, *rest = [1, 2, 3]\nprint(rest)\n"), "[2, 3]\n");
         assert_eq!(
             vm_run("for i, x in enumerate([\"a\", \"b\"]):\n    print(i, x)\n"),

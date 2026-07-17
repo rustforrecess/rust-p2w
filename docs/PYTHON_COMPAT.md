@@ -104,10 +104,9 @@ semantics and leak-freedom are oracle-gated). Differences:
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
-- **`sorted(seq, reverse=True)`** works on both compiled backends (stable, both
-  directions). `key=` needs first-class functions and isn't supported yet. The
-  step debugger runs `sorted(seq)` (ascending); the `reverse=` keyword there
-  still needs Run. A bad keyword is a clean error.
+- **`sorted(seq, reverse=True)`** works everywhere — both compiled backends and
+  the step debugger (stable, both directions). `key=` needs first-class
+  functions and isn't supported yet; a bad keyword is a clean error.
 - **`list()` / `tuple()` / `dict()`** work: empty (`list()`, `dict()`) or from
   any iterable (`list("abc")`, `list(range(n))`, `tuple(a_set)`). `dict()` is
   empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or
@@ -143,15 +142,21 @@ semantics and leak-freedom are oracle-gated). Differences:
   `for a, b in zip(a, b)`) now work on native too — each materializes to a list
   (of `(index, element)` / paired tuples for enumerate/zip), matching the
   browser. The native and browser backends are now at parity on builtins.
-- **Step debugger parity:** the step debugger (both step-over and step-into /
-  call-stack modes) now runs slicing, `range`-as-value, `sum`/`min`/`max`/
-  `sorted`/`round`/`enumerate`/`zip`, and tuple unpacking (`a, b = …`,
-  `for k, v in …`), so `reversed`, starred unpack, and `list(range(n))` step
-  cleanly. Still Run-only there: `sorted(reverse=)`, nested `def`, classes,
-  and `import`.
+- **Step debugger parity:** the debugger runs slicing, `range`-as-value,
+  `sum`/`min`/`max`/`sorted` (incl. `reverse=`)/`round`/`enumerate`/`zip`, tuple
+  unpacking (`a, b = …`, `for k, v in …`), and `import math` (`math.pi`/`e`/
+  `tau`, `sqrt`/`fabs`/`floor`/`ceil`/`trunc`) — so `reversed`, starred unpack,
+  and `list(range(n))` step cleanly. **Classes and functions** run in the
+  step-into / call-stack mode (the mode the IDE uses). The simpler step-over
+  interpreter still leaves classes to that mode.
+- **`import`** is `import math` only (the sole module): `math.pi`/`e`/`tau` and
+  `sqrt`/`fabs`/`floor`/`ceil`/`trunc`. Works on the browser backend and in the
+  debugger (which uses the host's `f64` ops); **native** doesn't have `math`
+  yet. A variable named `math` shadows the module, like CPython.
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
-  exceptions. These are rejected with a clear "not in the native backend yet"
-  message rather than miscompiling.
+  exceptions. **Nested `def`** (a function defined inside another) isn't in the
+  compiled subset yet either — it *steps* in the call-stack debugger but won't
+  compile/Run, so avoid it until the backends support it.
 
 ## What's faithful
 
