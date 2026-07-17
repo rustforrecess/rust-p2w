@@ -175,6 +175,8 @@ run_case setcompf  'evens = {x for x in range(10) if x % 2 == 0}\nprint(evens)\n
 run_case ternary   'x = 5\nprint("big" if x > 3 else "small")\nprint("A" if x >= 9 else "B" if x >= 4 else "C")\n' 'big\nB' || fails=$((fails+1))
 run_case ternlazy  'x = 0\nprint(-1 if x == 0 else 7 // x)\n' '-1' || fails=$((fails+1))
 run_case terncomp  'xs: list[int] = [1, -2, 3]\nsigns = ["+" if v > 0 else "-" for v in xs]\nprint(signs)\n' "['+', '-', '+']" || fails=$((fails+1))
+# Scientific-notation float literals — an exponent makes it a float (1e16), incl. E/+/-.
+run_case scilit  'print(1e16)\nprint(1.5e-3)\nprint(6.02e23)\nprint(2E+8)\nx = 1.5e3\nprint(x + 1.0)\n' '1e+16\n0.0015\n6.02e+23\n200000000.0\n1501.0' || fails=$((fails+1))
 # Float display — CPython-exact repr (shortest round-trip + sci notation), via ryu.
 run_case floatrepr  'print(1.5)\nprint(3.0)\nprint(1234567.891)\nprint(0.0001)\nprint(0.00001)\nprint(10000000000000000.0)\nprint(1000000000000000.0)\nprint(9999999.9999999)\nprint([0.1, 2.0, 0.25])\n' '1.5\n3.0\n1234567.891\n0.0001\n1e-05\n1e+16\n1000000000000000.0\n9999999.9999999\n[0.1, 2.0, 0.25]' || fails=$((fails+1))
 # Nested functions — lifted to module level (non-capturing); recursion still works (live==0).
