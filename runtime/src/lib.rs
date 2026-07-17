@@ -2580,49 +2580,90 @@ fn write_u64(mut n: u64, out: &mut impl FnMut(u8)) {
     write_bytes(&buf[i..], out);
 }
 
-/// Format an `f64` Python-style (always a decimal point: `2.0`, `3.5`, `0.1`).
-///
-/// This is a fixed-point formatter good for the teaching range: it rounds to 15
-/// fractional digits and trims trailing zeros. It is **not** CPython's
-/// shortest-round-trip `repr` and does **not** use scientific notation, so very
-/// large/small magnitudes print in long fixed-point — a documented v1 limit.
+/// Format an `f64` exactly as CPython's `repr`/`str`: the shortest string that
+/// round-trips (via `ryu`, round-half-to-even) laid out with CPython's rules —
+/// scientific notation when `decpt <= -4 || decpt > 16`, a trailing `.0` on
+/// whole numbers, a two-digit padded exponent. Mirrors `rust_p2w::py_float_repr`
+/// (the WASM host + debugger use that; a cross-check test keeps them in step).
 fn write_float(x: f64, out: &mut impl FnMut(u8)) {
     if x.is_nan() {
         return write_bytes(b"nan", out);
     }
-    let neg = x.is_sign_negative(); // also catches -0.0, like Python
-    let mut ax = if neg { -x } else { x };
-    if neg {
-        out(b'-');
+    if x.is_sign_negative() {
+        out(b'-'); // also catches -0.0, like CPython
     }
-    if ax.is_infinite() {
+    let mag = x.abs();
+    if mag.is_infinite() {
         return write_bytes(b"inf", out);
     }
-    const SCALE: u64 = 1_000_000_000_000_000; // 10^15
-    let mut ip = libm::trunc(ax);
-    ax -= ip;
-    let mut frac = libm::round(ax * SCALE as f64) as u64;
-    if frac >= SCALE {
-        // rounding carried into the integer part (e.g. 0.9999… -> 1.0)
-        ip += 1.0;
-        frac -= SCALE;
+    let mut buf = ryu::Buffer::new();
+    let s = buf.format_finite(mag); // shortest digits; e.g. "1.5", "0.0001", "1e-10"
+
+    // Split any exponent, then the mantissa's integer/fraction digits.
+    let (mant, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
+        None => (s, 0),
+    };
+    let (int_str, frac_str) = match mant.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mant, ""),
+    };
+    // Concatenate the digits (ryu's shortest form is short — 24 bytes is ample).
+    let mut all = [0u8; 32];
+    let mut len = 0;
+    for b in int_str.bytes().chain(frac_str.bytes()) {
+        all[len] = b;
+        len += 1;
     }
-    write_u64(ip as u64, out);
-    out(b'.');
-    // 15-digit zero-padded fraction, then trim trailing zeros (keep one).
-    let mut buf = [b'0'; 15];
-    let mut f = frac;
-    let mut i = buf.len();
-    while i > 0 {
-        i -= 1;
-        buf[i] = b'0' + (f % 10) as u8;
-        f /= 10;
+    let point = int_str.len() as i32;
+
+    let mut first = 0;
+    while first < len && all[first] == b'0' {
+        first += 1;
     }
-    let mut end = buf.len();
-    while end > 1 && buf[end - 1] == b'0' {
-        end -= 1;
+    if first == len {
+        return write_bytes(b"0.0", out); // zero (sign already emitted for -0.0)
     }
-    write_bytes(&buf[..end], out);
+    let mut last = len - 1;
+    while all[last] == b'0' {
+        last -= 1;
+    }
+    let digits = &all[first..=last];
+    let n = digits.len() as i32;
+    let decpt = point - first as i32 + exp;
+
+    if decpt <= -4 || decpt > 16 {
+        out(digits[0]);
+        if digits.len() > 1 {
+            out(b'.');
+            write_bytes(&digits[1..], out);
+        }
+        out(b'e');
+        let e = decpt - 1;
+        out(if e < 0 { b'-' } else { b'+' });
+        let ea = e.unsigned_abs() as u64;
+        if ea < 10 {
+            out(b'0');
+        }
+        write_u64(ea, out);
+    } else if decpt <= 0 {
+        write_bytes(b"0.", out);
+        for _ in 0..(-decpt) {
+            out(b'0');
+        }
+        write_bytes(digits, out);
+    } else if decpt >= n {
+        write_bytes(digits, out);
+        for _ in 0..(decpt - n) {
+            out(b'0');
+        }
+        write_bytes(b".0", out);
+    } else {
+        let k = decpt as usize;
+        write_bytes(&digits[..k], out);
+        out(b'.');
+        write_bytes(&digits[k..], out);
+    }
 }
 
 unsafe extern "C" {
@@ -2874,6 +2915,37 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 mod tests {
     use super::*;
 
+    fn fmt_float(x: f64) -> String {
+        let mut s = Vec::new();
+        write_float(x, &mut |b| s.push(b));
+        String::from_utf8(s).unwrap()
+    }
+
+    #[test]
+    fn write_float_matches_cpython_repr() {
+        // Same expectations as rust_p2w::floatfmt (kept in step by hand).
+        let cases = [
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (3.0, "3.0"),
+            (1.5, "1.5"),
+            (-2.25, "-2.25"),
+            (0.1, "0.1"),
+            (1234567.891, "1234567.891"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1e16, "1e+16"),
+            (1e15, "1000000000000000.0"),
+            (1.5e20, "1.5e+20"),
+            (1e-10, "1e-10"),
+            (123.456, "123.456"),
+            (f64::from_bits(4828691857781456042), "667082108456853.2"), // tie -> even
+        ];
+        for (v, want) in cases {
+            assert_eq!(fmt_float(v), want, "{v:?}");
+        }
+    }
+
     // Satisfy the linker for the test binary (p2w_print references p2w_putc).
     #[unsafe(no_mangle)]
     extern "C" fn p2w_putc(_c: u8) {}
@@ -2988,7 +3060,9 @@ mod tests {
         assert_eq!(shown(p2w_float(0.1)), "0.1"); // trims float noise
         assert_eq!(shown(p2w_float(-2.75)), "-2.75");
         assert_eq!(shown(p2w_float(123.0)), "123.0");
-        assert_eq!(shown(p2w_float(0.9999999999999999)), "1.0"); // rounds & carries
+        // The largest f64 below 1.0 is its own value, not 1.0 (CPython agrees) —
+        // the old fixed-point formatter wrongly rounded it up.
+        assert_eq!(shown(p2w_float(0.9999999999999999)), "0.9999999999999999");
     }
 
     #[test]

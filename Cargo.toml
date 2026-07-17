@@ -6,6 +6,7 @@ license = "MIT"
 description = "Rust reimplementation of the p2w Python-subset to WebAssembly (WAT) compiler"
 
 [dependencies]
+ryu = "1"
 
 [dev-dependencies]
 wasmtime = { version = "44.0.2", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime"] }

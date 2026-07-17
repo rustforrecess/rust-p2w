@@ -17,6 +17,7 @@ mod debug;
 mod emit;
 mod error;
 mod evidence;
+mod floatfmt;
 mod hoist;
 mod lexer;
 mod lint;
@@ -29,6 +30,7 @@ pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
 pub use builtins::{BUILTINS, Builtin, builtins_json};
 pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{Status, Stepper, Value, Vm};
+pub use floatfmt::py_float_repr;
 pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
 
