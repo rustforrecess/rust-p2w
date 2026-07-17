@@ -307,6 +307,36 @@ fn del_removes_list_and_dict_items() {
     assert_output("xs = [10, 20, 30, 40]\ndel xs[0], xs[0]\nprint(xs)", "[30, 40]\n");
 }
 
+// --- nested functions (hoisted to module level) ---
+
+#[test]
+fn nested_functions_run() {
+    // A helper defined inside another function, called by it.
+    assert_output(
+        "def outer():\n    def inner():\n        return 9\n    return inner() + 1\nprint(outer())",
+        "10\n",
+    );
+    // Passing the outer param in as an argument (no capture needed).
+    assert_output(
+        "def outer(x):\n    def dbl(n):\n        return n * 2\n    return dbl(x)\nprint(outer(21))",
+        "42\n",
+    );
+    // Triple nesting, and a nested helper calling a top-level function.
+    assert_output(
+        "def top():\n    return 100\ndef a():\n    def b():\n        def c():\n            return top() + 7\n        return c()\n    return b()\nprint(a())",
+        "107\n",
+    );
+}
+
+#[test]
+fn nested_function_capturing_a_local_is_a_clean_error() {
+    let err = rust_p2w::compile_to_wat(
+        "def outer():\n    x = 5\n    def inner():\n        return x\n    return inner()\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("closures aren't supported"), "{err}");
+}
+
 // --- starred unpacking ---
 
 #[test]

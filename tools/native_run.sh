@@ -175,6 +175,8 @@ run_case setcompf  'evens = {x for x in range(10) if x % 2 == 0}\nprint(evens)\n
 run_case ternary   'x = 5\nprint("big" if x > 3 else "small")\nprint("A" if x >= 9 else "B" if x >= 4 else "C")\n' 'big\nB' || fails=$((fails+1))
 run_case ternlazy  'x = 0\nprint(-1 if x == 0 else 7 // x)\n' '-1' || fails=$((fails+1))
 run_case terncomp  'xs: list[int] = [1, -2, 3]\nsigns = ["+" if v > 0 else "-" for v in xs]\nprint(signs)\n' "['+', '-', '+']" || fails=$((fails+1))
+# Nested functions — lifted to module level (non-capturing); recursion still works (live==0).
+run_case nesteddef  'def outer(x):\n    def dbl(n):\n        return n * 2\n    return dbl(x) + 1\ndef a():\n    def b():\n        return 7\n    return b()\nprint(outer(20))\nprint(a())\n' '41\n7' || fails=$((fails+1))
 # Chained assignment — every name owns a reference (live==0 proves no leak/over-free).
 run_case chainassign 'x = y = z = 5\nprint(x + y + z)\na = b = [1, 2]\na.append(3)\nprint(b)\n' '15\n[1, 2, 3]' || fails=$((fails+1))
 # del — item removal (list by index, dict by key); the removed value is freed (live==0).

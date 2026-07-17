@@ -153,10 +153,18 @@ semantics and leak-freedom are oracle-gated). Differences:
   `sqrt`/`fabs`/`floor`/`ceil`/`trunc`. Works on the browser backend and in the
   debugger (which uses the host's `f64` ops); **native** doesn't have `math`
   yet. A variable named `math` shadows the module, like CPython.
+- **Nested functions** (a `def` inside another) are **lifted to module level**
+  before codegen, so they compile and run on both backends and step in the
+  debugger. Since functions aren't closures here, a nested function may only use
+  its own params/locals, module globals, and other functions — reading a
+  variable *local to the enclosing function* is a clean error (`closures aren't
+  supported yet — pass it in as an argument`). Names must be unique across the
+  program (no shadowing). (Native keeps its existing limit that a function can't
+  read a module global — so a global-reading nested function is browser-only,
+  exactly like a global-reading top-level one.)
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
-  exceptions. **Nested `def`** (a function defined inside another) isn't in the
-  compiled subset yet either — it *steps* in the call-stack debugger but won't
-  compile/Run, so avoid it until the backends support it.
+  exceptions. These are rejected with a clear "not in the native backend yet"
+  message rather than miscompiling.
 
 ## What's faithful
 

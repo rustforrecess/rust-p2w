@@ -17,6 +17,7 @@ mod debug;
 mod emit;
 mod error;
 mod evidence;
+mod hoist;
 mod lexer;
 mod lint;
 mod llvm;
@@ -44,6 +45,7 @@ pub fn compile_to_wat(source: &str) -> Result<String, String> {
 pub fn try_compile(source: &str) -> Result<String, CompileError> {
     let tokens = lexer::lex(source)?;
     let stmts = parser::parse(&tokens)?;
+    let stmts = hoist::hoist_nested_functions(stmts)?;
     codegen::generate(&stmts)
 }
 
@@ -53,6 +55,7 @@ pub fn try_compile(source: &str) -> Result<String, CompileError> {
 pub fn compile_to_llvm_ir(source: &str) -> Result<String, String> {
     let tokens = lexer::lex(source).map_err(|e| e.to_string())?;
     let stmts = parser::parse(&tokens).map_err(|e| e.to_string())?;
+    let stmts = hoist::hoist_nested_functions(stmts).map_err(|e| e.to_string())?;
     llvm::emit_llvm_ir(&stmts)
 }
 
