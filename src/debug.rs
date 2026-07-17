@@ -639,6 +639,43 @@ impl Stepper {
                 let val = self.eval(value)?;
                 self.assign_index(target, idx, val)
             }
+            // `a, b = value` / `for k, v in …` — bind an iterable's elements to
+            // the targets, one each (length must match, like CPython).
+            StmtKind::UnpackAssign { targets, value } => {
+                let v = self.eval(value)?;
+                let items = to_elements(&v)?;
+                if items.len() < targets.len() {
+                    return Err(format!(
+                        "not enough values to unpack (expected {}, got {})",
+                        targets.len(),
+                        items.len()
+                    ));
+                }
+                if items.len() > targets.len() {
+                    return Err(format!(
+                        "too many values to unpack (expected {})",
+                        targets.len()
+                    ));
+                }
+                for (target, item) in targets.iter().zip(items) {
+                    match &target.kind {
+                        ExprKind::Name(n) => {
+                            self.scope.insert(n.clone(), item);
+                        }
+                        ExprKind::Index(obj, idx) => {
+                            let index = self.eval(idx)?;
+                            self.assign_index(obj, index, item)?;
+                        }
+                        _ => {
+                            return Err(
+                                "an unpacking target must be a variable or an index here"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+                Ok(())
+            }
             StmtKind::If {
                 cond,
                 body,
@@ -743,7 +780,6 @@ impl Stepper {
             }
             StmtKind::ClassDef { .. }
             | StmtKind::SetAttr { .. }
-            | StmtKind::UnpackAssign { .. }
             | StmtKind::Import(_) => Err(format!(
                 "{} isn't in the step debugger yet — use Run for that",
                 describe_stmt(&s.kind)
@@ -855,6 +891,27 @@ impl Stepper {
                 let target = Self::eval_in(funcs, scope, out, obj)?;
                 let index = Self::eval_in(funcs, scope, out, idx)?;
                 index_get(&target, &index)
+            }
+            ExprKind::Slice {
+                obj,
+                start,
+                stop,
+                step,
+            } => {
+                let target = Self::eval_in(funcs, scope, out, obj)?;
+                let mut bound = |b: &Option<Box<Expr>>, what: &str| -> Result<Option<i64>, String> {
+                    match b {
+                        Some(e) => Ok(Some(
+                            as_int(&Self::eval_in(funcs, scope, out, e)?)
+                                .ok_or_else(|| format!("slice {what} must be an integer"))?,
+                        )),
+                        None => Ok(None),
+                    }
+                };
+                let s = bound(start, "start")?;
+                let t = bound(stop, "stop")?;
+                let p = bound(step, "step")?;
+                slice_value(&target, s, t, p)
             }
             ExprKind::Call(name, args) => Self::eval_call(funcs, scope, out, name, args),
             ExprKind::MethodCall(obj, method, args) => {
@@ -988,9 +1045,12 @@ impl Stepper {
             ("add_element", [_parent, _tag, _id]) => Ok(Value::None),
             ("pointer_x", []) | ("pointer_y", []) => Ok(Value::Int(0)),
             ("on_frame", [_h]) => Ok(Value::None),
-            _ => Err(format!(
-                "calling {name}() isn't in the step debugger yet — use Run for that"
-            )),
+            _ => match builtin_extra(name, vals.as_slice())? {
+                Some(v) => Ok(v),
+                None => Err(format!(
+                    "calling {name}() isn't in the step debugger yet — use Run for that"
+                )),
+            },
         }
     }
 
@@ -1235,12 +1295,46 @@ impl Stepper {
                 };
                 Ok(Flow::Return(v))
             }
+            StmtKind::UnpackAssign { targets, value } => {
+                let v = Self::eval_in(funcs, scope, out, value)?;
+                let items = to_elements(&v)?;
+                if items.len() < targets.len() {
+                    return Err(format!(
+                        "not enough values to unpack (expected {}, got {})",
+                        targets.len(),
+                        items.len()
+                    ));
+                }
+                if items.len() > targets.len() {
+                    return Err(format!(
+                        "too many values to unpack (expected {})",
+                        targets.len()
+                    ));
+                }
+                for (target, item) in targets.iter().zip(items) {
+                    match &target.kind {
+                        ExprKind::Name(n) => {
+                            scope.insert(n.clone(), item);
+                        }
+                        ExprKind::Index(obj, idx) => {
+                            let index = Self::eval_in(funcs, scope, out, idx)?;
+                            assign_index_in(scope, obj, index, item)?;
+                        }
+                        _ => {
+                            return Err(
+                                "an unpacking target must be a variable or an index here"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             StmtKind::Def { .. } => Err(
                 "a nested function definition isn't in the step debugger yet — use Run".to_string(),
             ),
             StmtKind::ClassDef { .. }
             | StmtKind::SetAttr { .. }
-            | StmtKind::UnpackAssign { .. }
             | StmtKind::Import(_) => Err(format!(
                 "{} isn't in the step debugger yet — use Run for that",
                 describe_stmt(&s.kind)
@@ -1573,6 +1667,8 @@ enum Task {
     Ternary(Rc<Expr>, Rc<Expr>),
     /// Pop a value and bind it to a name in the current scope.
     Store(String),
+    /// Pop an iterable value and bind its elements to these names (one each).
+    Unpack(Vec<String>),
     /// Pop `n` values and print them (space-joined + newline).
     Print(usize),
     /// Discard the top operand (an expression statement's result).
@@ -1607,6 +1703,9 @@ enum Task {
     BuildDict(usize),
     /// Pop index then target; push `target[index]`.
     IndexGet,
+    /// Pop the present bounds (step, stop, start — only those flagged true) then
+    /// the target; push `target[start:stop:step]`.
+    Slice(bool, bool, bool),
     /// Pop `argc` args and call `name.method(...)` on a list variable.
     MethodOnName(String, String, usize),
     /// Pop the iterable value and start a for-each loop.
@@ -2147,7 +2246,24 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new(value.clone())));
                 self.push_task(Task::Eval(Rc::new(obj.clone())));
             }
-            StmtKind::UnpackAssign { .. } | StmtKind::Import(_) => {
+            StmtKind::UnpackAssign { targets, value } => {
+                // `a, b = value` / `for k, v in …`. Targets are simple names in
+                // the K-12 forms (tuple/dict iteration, enumerate/zip); the
+                // Unpack task binds each after the value is evaluated.
+                let mut names = Vec::with_capacity(targets.len());
+                for t in targets {
+                    let ExprKind::Name(n) = &t.kind else {
+                        return Err(
+                            "tuple unpacking to non-variable targets isn't in call-stack mode yet — use Run"
+                                .to_string(),
+                        );
+                    };
+                    names.push(n.clone());
+                }
+                self.push_task(Task::Unpack(names));
+                self.push_task(Task::Eval(Rc::new(value.clone())));
+            }
+            StmtKind::Import(_) => {
                 return Err(format!(
                     "{} isn't in the step debugger yet — use Run for that",
                     describe_stmt(&s.kind)
@@ -2206,6 +2322,26 @@ impl Vm {
             Task::Store(name) => {
                 let v = self.pop_op()?;
                 self.top().scope.insert(name, v);
+            }
+            Task::Unpack(names) => {
+                let v = self.pop_op()?;
+                let items = to_elements(&v)?;
+                if items.len() < names.len() {
+                    return Err(format!(
+                        "not enough values to unpack (expected {}, got {})",
+                        names.len(),
+                        items.len()
+                    ));
+                }
+                if items.len() > names.len() {
+                    return Err(format!(
+                        "too many values to unpack (expected {})",
+                        names.len()
+                    ));
+                }
+                for (name, item) in names.into_iter().zip(items) {
+                    self.top().scope.insert(name, item);
+                }
             }
             Task::Print(n) => {
                 let mut vals = Vec::with_capacity(n);
@@ -2350,6 +2486,24 @@ impl Vm {
                 } else {
                     self.push_op(index_get(&obj, &idx)?);
                 }
+            }
+            Task::Slice(has_start, has_stop, has_step) => {
+                // Pop top-first: step, stop, start (only the present ones), then
+                // the target underneath.
+                let mut int_bound = |present: bool, what: &str| -> Result<Option<i64>, String> {
+                    if present {
+                        Ok(Some(as_int(&self.pop_op()?).ok_or_else(|| {
+                            format!("slice {what} must be an integer")
+                        })?))
+                    } else {
+                        Ok(None)
+                    }
+                };
+                let step = int_bound(has_step, "step")?;
+                let stop = int_bound(has_stop, "stop")?;
+                let start = int_bound(has_start, "start")?;
+                let target = self.pop_op()?;
+                self.push_op(slice_value(&target, start, stop, step)?);
             }
             Task::MethodOnName(name, method, argc) => {
                 let mut args = Vec::with_capacity(argc);
@@ -2629,6 +2783,27 @@ impl Vm {
             ExprKind::Index(obj, idx) => {
                 self.push_task(Task::IndexGet);
                 self.push_task(Task::Eval(Rc::new((**idx).clone())));
+                self.push_task(Task::Eval(Rc::new((**obj).clone())));
+            }
+            ExprKind::Slice {
+                obj,
+                start,
+                stop,
+                step,
+            } => {
+                // Evaluate target, then present bounds in source order (so the
+                // op stack holds target, start, stop, step bottom-to-top); the
+                // Slice task pops them back off top-first.
+                self.push_task(Task::Slice(start.is_some(), stop.is_some(), step.is_some()));
+                if let Some(e) = step {
+                    self.push_task(Task::Eval(Rc::new((**e).clone())));
+                }
+                if let Some(e) = stop {
+                    self.push_task(Task::Eval(Rc::new((**e).clone())));
+                }
+                if let Some(e) = start {
+                    self.push_task(Task::Eval(Rc::new((**e).clone())));
+                }
                 self.push_task(Task::Eval(Rc::new((**obj).clone())));
             }
             ExprKind::Attr(obj, attr) => {
@@ -3066,6 +3241,216 @@ fn to_elements(v: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
+/// `target[start:stop:step]` with CPython slice semantics — shared by the step
+/// debugger's two evaluators (matching the compiled backends). A list/tuple
+/// slice returns the same kind; a string slice returns a string.
+fn slice_value(
+    target: &Value,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: Option<i64>,
+) -> Result<Value, String> {
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err("slice step cannot be zero".to_string());
+    }
+    // Clamp one bound the way CPython's PySlice_AdjustIndices does.
+    let adjust = |idx: i64, n: i64| -> i64 {
+        let (lower, upper) = if step < 0 { (-1, n - 1) } else { (0, n) };
+        if idx < 0 {
+            (idx + n).max(lower)
+        } else {
+            idx.min(upper)
+        }
+    };
+    let bounds = |n: i64| -> (i64, i64) {
+        let s = match start {
+            Some(v) => adjust(v, n),
+            None if step < 0 => n - 1,
+            None => 0,
+        };
+        let e = match stop {
+            Some(v) => adjust(v, n),
+            None if step < 0 => -1,
+            None => n,
+        };
+        (s, e)
+    };
+    let in_range = |i: i64, e: i64| (step > 0 && i < e) || (step < 0 && i > e);
+    match target {
+        Value::List(xs) | Value::Tuple(xs) => {
+            let (s, e) = bounds(xs.len() as i64);
+            let mut out = Vec::new();
+            let mut i = s;
+            while in_range(i, e) {
+                out.push(xs[i as usize].clone());
+                i += step;
+            }
+            Ok(if matches!(target, Value::Tuple(_)) {
+                Value::Tuple(out)
+            } else {
+                Value::List(out)
+            })
+        }
+        Value::Str(sv) => {
+            let chars: Vec<char> = sv.chars().collect();
+            let (s, e) = bounds(chars.len() as i64);
+            let mut out = String::new();
+            let mut i = s;
+            while in_range(i, e) {
+                out.push(chars[i as usize]);
+                i += step;
+            }
+            Ok(Value::Str(out))
+        }
+        _ => Err(format!("'{}' object is not subscriptable", type_name(target))),
+    }
+}
+
+/// True-if-less-than for sorting/min/max (numeric or lexicographic strings) —
+/// same ordering as the compiled backends.
+fn py_lt(a: &Value, b: &Value) -> Result<bool, String> {
+    Ok(matches!(compare(BinOp::Lt, a, b)?, Value::Bool(true)))
+}
+
+/// Builtins beyond both debug evaluators' inline core set — numeric reductions,
+/// sorting, and the range/enumerate/zip materializers. Returns `Ok(None)` if
+/// `name` isn't one of these, so the caller falls through to its own error.
+fn builtin_extra(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    let int_arg = |v: &Value, what: &str| {
+        as_int(v).ok_or_else(|| format!("{what} must be an integer"))
+    };
+    let v = match (name, args) {
+        ("range", a) if (1..=3).contains(&a.len()) => {
+            let (start, stop, step) = match a {
+                [b] => (0, int_arg(b, "range() stop")?, 1),
+                [a, b] => (int_arg(a, "range() start")?, int_arg(b, "range() stop")?, 1),
+                [a, b, c] => (
+                    int_arg(a, "range() start")?,
+                    int_arg(b, "range() stop")?,
+                    int_arg(c, "range() step")?,
+                ),
+                _ => unreachable!(),
+            };
+            if step == 0 {
+                return Err("range() step must not be zero".to_string());
+            }
+            let mut out = Vec::new();
+            let mut i = start;
+            while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                out.push(Value::Int(i));
+                i += step;
+            }
+            Value::List(out)
+        }
+        ("sum", [v]) => {
+            let mut acc = Value::Int(0);
+            for el in to_elements(v)? {
+                acc = add(&acc, &el)?;
+            }
+            acc
+        }
+        ("min", a) if !a.is_empty() => min_max_values(a, true)?,
+        ("max", a) if !a.is_empty() => min_max_values(a, false)?,
+        ("sorted", [v]) => sorted_values(v, false)?,
+        ("round", [v]) => round_value(v, None)?,
+        ("round", [v, nd]) => round_value(v, Some(int_arg(nd, "round() ndigits")?))?,
+        ("enumerate", [v]) => enumerate_values(v, 0)?,
+        ("enumerate", [v, s]) => enumerate_values(v, int_arg(s, "enumerate() start")?)?,
+        ("zip", [a, b]) => {
+            let (ea, eb) = (to_elements(a)?, to_elements(b)?);
+            let n = ea.len().min(eb.len());
+            Value::List(
+                (0..n)
+                    .map(|i| Value::Tuple(vec![ea[i].clone(), eb[i].clone()]))
+                    .collect(),
+            )
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(v))
+}
+
+fn min_max_values(args: &[Value], want_min: bool) -> Result<Value, String> {
+    // One iterable, or several positional args (like CPython).
+    let items = if args.len() == 1 {
+        to_elements(&args[0])?
+    } else {
+        args.to_vec()
+    };
+    let mut best: Option<Value> = None;
+    for el in items {
+        best = Some(match best {
+            None => el,
+            Some(b) => {
+                let take = if want_min {
+                    py_lt(&el, &b)?
+                } else {
+                    py_lt(&b, &el)?
+                };
+                if take { el } else { b }
+            }
+        });
+    }
+    best.ok_or_else(|| {
+        format!(
+            "{}() arg is an empty sequence",
+            if want_min { "min" } else { "max" }
+        )
+    })
+}
+
+fn sorted_values(seq: &Value, reverse: bool) -> Result<Value, String> {
+    let mut items = to_elements(seq)?;
+    // Stable insertion sort — same shape as the compiled backends.
+    for i in 1..items.len() {
+        let mut j = i;
+        while j > 0 {
+            let shift = if reverse {
+                py_lt(&items[j - 1], &items[j])?
+            } else {
+                py_lt(&items[j], &items[j - 1])?
+            };
+            if !shift {
+                break;
+            }
+            items.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    Ok(Value::List(items))
+}
+
+fn round_value(v: &Value, ndigits: Option<i64>) -> Result<Value, String> {
+    let x = as_num(v).ok_or_else(|| format!("round() needs a number, not {}", type_name(v)))?;
+    match ndigits {
+        None => Ok(Value::Int(x.round_ties_even() as i64)),
+        Some(nd) => {
+            let mut scale = 1.0_f64;
+            if nd >= 0 {
+                for _ in 0..nd {
+                    scale *= 10.0;
+                }
+            } else {
+                for _ in 0..(-nd) {
+                    scale *= 0.1;
+                }
+            }
+            Ok(Value::Float((x * scale).round_ties_even() / scale))
+        }
+    }
+}
+
+fn enumerate_values(seq: &Value, start: i64) -> Result<Value, String> {
+    Ok(Value::List(
+        to_elements(seq)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, el)| Value::Tuple(vec![Value::Int(start + i as i64), el]))
+            .collect(),
+    ))
+}
+
 fn make_set(v: &Value) -> Result<Value, String> {
     let items = to_elements(v)?;
     let mut out: Vec<Value> = Vec::new();
@@ -3308,9 +3693,12 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         ("add_element", [_parent, _tag, _id]) => Ok(Value::None),
         ("pointer_x", []) | ("pointer_y", []) => Ok(Value::Int(0)),
         ("on_frame", [_h]) => Ok(Value::None),
-        _ => Err(format!(
-            "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
-        )),
+        _ => match builtin_extra(name, args)? {
+            Some(v) => Ok(v),
+            None => Err(format!(
+                "calling {name}() isn't in the step debugger's call-stack mode yet — use Run"
+            )),
+        },
     }
 }
 
@@ -3411,20 +3799,58 @@ mod tests {
     }
 
     #[test]
-    fn starred_unpack_degrades_cleanly_in_the_step_debugger() {
-        // The starred form desugars to a slice for the star target, and slicing
-        // isn't in the stepper yet — so it fails with the same clean "use Run"
-        // message as slicing itself, not a panic or a wrong answer.
-        let mut s = Stepper::new("a, *rest = [1, 2, 3, 4]\n").unwrap();
-        while s.is_paused() {
-            s.step();
-        }
-        match s.status() {
-            Status::Error { message, .. } => {
-                assert!(message.contains("step debugger"), "{message}")
-            }
-            other => panic!("expected a clean stepper error, got {other:?}"),
-        }
+    fn slicing_in_the_step_debugger() {
+        // Lists, strings, negative bounds, and steps (incl. the reverse slice
+        // that `reversed()` and starred unpack desugar to).
+        assert_eq!(run_to_end("print([1, 2, 3, 4][1:3])\n"), "[2, 3]\n");
+        assert_eq!(run_to_end("print([1, 2, 3, 4][:2])\n"), "[1, 2]\n");
+        assert_eq!(run_to_end("print([1, 2, 3, 4][2:])\n"), "[3, 4]\n");
+        assert_eq!(run_to_end("print([1, 2, 3, 4][-2:])\n"), "[3, 4]\n");
+        assert_eq!(run_to_end("print([1, 2, 3][::-1])\n"), "[3, 2, 1]\n");
+        assert_eq!(run_to_end("print(\"hello\"[1:4])\n"), "ell\n");
+        assert_eq!(run_to_end("print(\"abc\"[::-1])\n"), "cba\n");
+    }
+
+    #[test]
+    fn reversed_and_starred_unpack_now_run_in_the_stepper() {
+        // Both desugar to slices, so both work now that slicing is in.
+        assert_eq!(
+            run_to_end("for x in reversed([1, 2, 3]):\n    print(x)\n"),
+            "3\n2\n1\n"
+        );
+        assert_eq!(
+            run_to_end("a, *rest = [1, 2, 3, 4]\nprint(a)\nprint(rest)\n"),
+            "1\n[2, 3, 4]\n"
+        );
+    }
+
+    #[test]
+    fn slicing_and_unpack_inside_a_called_function() {
+        // Exercises the atomic step-over executor used for function bodies.
+        let src = "def head(xs):\n    a, *rest = xs\n    return a\n\
+                   def mid(s):\n    return s[1:-1]\n\
+                   print(head([10, 20, 30]))\nprint(mid(\"hello\"))\n";
+        assert_eq!(run_to_end(src), "10\nell\n");
+    }
+
+    #[test]
+    fn range_and_reduction_builtins_in_the_step_debugger() {
+        assert_eq!(run_to_end("print(list(range(4)))\n"), "[0, 1, 2, 3]\n");
+        assert_eq!(run_to_end("print(sorted(list(range(5))))\n"), "[0, 1, 2, 3, 4]\n");
+        assert_eq!(run_to_end("print(sum([1, 2, 3]))\n"), "6\n");
+        assert_eq!(run_to_end("print(min([3, 1, 2]))\n"), "1\n");
+        assert_eq!(run_to_end("print(max(4, 9, 2))\n"), "9\n");
+        assert_eq!(run_to_end("print(sorted([3, 1, 2]))\n"), "[1, 2, 3]\n");
+        assert_eq!(run_to_end("print(round(3.7))\n"), "4\n");
+        assert_eq!(run_to_end("print(round(2.5))\n"), "2\n");
+        assert_eq!(
+            run_to_end("for i, x in enumerate([\"a\", \"b\"]):\n    print(i, x)\n"),
+            "0 a\n1 b\n"
+        );
+        assert_eq!(
+            run_to_end("for a, b in zip([1, 2], [3, 4]):\n    print(a, b)\n"),
+            "1 3\n2 4\n"
+        );
     }
 
     #[test]
@@ -3841,6 +4267,26 @@ mod tests {
             "7\n0\n"
         );
         assert_eq!(vm_run("s = {1, 2}\ns.clear()\nprint(len(s))\n"), "0\n");
+    }
+
+    #[test]
+    fn vm_slicing_range_and_unpack() {
+        // The same step-debugger fixes in call-stack (Vm) mode: slices, range
+        // as a value, reductions, and tuple unpacking (enumerate/zip loops).
+        assert_eq!(vm_run("print([1, 2, 3, 4][1:3])\n"), "[2, 3]\n");
+        assert_eq!(vm_run("print([1, 2, 3][::-1])\n"), "[3, 2, 1]\n");
+        assert_eq!(vm_run("print(\"hello\"[1:4])\n"), "ell\n");
+        assert_eq!(vm_run("print(list(range(4)))\n"), "[0, 1, 2, 3]\n");
+        assert_eq!(vm_run("print(sum([1, 2, 3]))\nprint(max([4, 9, 2]))\n"), "6\n9\n");
+        assert_eq!(vm_run("a, *rest = [1, 2, 3]\nprint(rest)\n"), "[2, 3]\n");
+        assert_eq!(
+            vm_run("for i, x in enumerate([\"a\", \"b\"]):\n    print(i, x)\n"),
+            "0 a\n1 b\n"
+        );
+        assert_eq!(
+            vm_run("for a, b in zip([1, 2], [3, 4]):\n    print(a, b)\n"),
+            "1 3\n2 4\n"
+        );
     }
 
     #[test]

@@ -104,26 +104,23 @@ semantics and leak-freedom are oracle-gated). Differences:
   rounds ties-to-even, like CPython); exotic specs are a clean "unsupported
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
-- **`sorted(seq, reverse=True)`** works on the browser backend (stable, both
-  directions). `key=` needs first-class functions and isn't supported yet;
-  `sorted` on native/in the step debugger is still pending (the Pico-parity
-  track). A bad keyword is a clean error.
+- **`sorted(seq, reverse=True)`** works on both compiled backends (stable, both
+  directions). `key=` needs first-class functions and isn't supported yet. The
+  step debugger runs `sorted(seq)` (ascending); the `reverse=` keyword there
+  still needs Run. A bad keyword is a clean error.
 - **`list()` / `tuple()` / `dict()`** work: empty (`list()`, `dict()`) or from
   any iterable (`list("abc")`, `list(range(n))`, `tuple(a_set)`). `dict()` is
   empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or
-  a dict comprehension). `list(range(n))` works on both compiled backends; the
-  step debugger still needs Run for it (no `range`-as-value there yet). Every
-  other iterable form works on all three.
+  a dict comprehension). All forms work on both compiled backends **and** the
+  step debugger.
 - **`reversed(seq)`** desugars to the reverse slice `seq[::-1]`, so it works on
-  both compiled backends (lists, strings, tuples). It yields a reversed *copy*
-  rather than CPython's lazy iterator — identical when you iterate it, and
-  `print(reversed(xs))` shows `[3, 2, 1]` instead of CPython's
-  `<list_reverseiterator …>` (kinder). A `range` isn't sliceable, so
-  `reversed(range(n))` needs a list first (`reversed(list(range(n)))`); like
-  slicing, it isn't in the step debugger yet (use Run).
+  both compiled backends *and* the step debugger (lists, strings, tuples). It
+  yields a reversed *copy* rather than CPython's lazy iterator — identical when
+  you iterate it, and `print(reversed(xs))` shows `[3, 2, 1]` instead of
+  CPython's `<list_reverseiterator …>` (kinder). A `range` isn't sliceable, so
+  `reversed(range(n))` needs a list first (`reversed(list(range(n)))`).
 - **Starred unpacking** (`a, *rest = xs`) desugars to a temp plus indexed and
-  sliced reads, so it runs on both compiled backends (but not the step
-  debugger — it needs slicing, which the stepper doesn't have yet; use Run).
+  sliced reads, so it runs on both compiled backends and the step debugger.
   With *too few* values and fixed targets on **both** sides (`a, *mid, b = [1]`),
   CPython raises `ValueError`; here the end targets can alias instead of
   erroring (the same length-leniency the plain unpack already has on native).
@@ -145,8 +142,13 @@ semantics and leak-freedom are oracle-gated). Differences:
   (`list(range(n))`, `sorted(range(n))`, `for i, x in enumerate(xs)`,
   `for a, b in zip(a, b)`) now work on native too — each materializes to a list
   (of `(index, element)` / paired tuples for enumerate/zip), matching the
-  browser. The native and browser backends are now at parity on builtins; the
-  step debugger still needs Run for `range`-as-value and slicing.
+  browser. The native and browser backends are now at parity on builtins.
+- **Step debugger parity:** the step debugger (both step-over and step-into /
+  call-stack modes) now runs slicing, `range`-as-value, `sum`/`min`/`max`/
+  `sorted`/`round`/`enumerate`/`zip`, and tuple unpacking (`a, b = …`,
+  `for k, v in …`), so `reversed`, starred unpack, and `list(range(n))` step
+  cleanly. Still Run-only there: `sorted(reverse=)`, nested `def`, classes,
+  and `import`.
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.
