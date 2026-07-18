@@ -276,6 +276,42 @@ fn and_or_short_circuit_skips_the_right_side() {
     assert_output("x = 0\nprint(1 or 7 // x)", "1\n");
 }
 
+// --- bit shifts (`<<`/`>>`) and bitwise invert (`~`) — the viper intersection ---
+
+#[test]
+fn bit_shifts_and_invert() {
+    assert_output("print(1 << 4)", "16\n");
+    assert_output("print(255 >> 2)", "63\n");
+    assert_output("print(~5)", "-6\n");
+    assert_output("print(~0)", "-1\n");
+    // Shifts bind looser than `+`: `(1 + 1) << 2` == 8.
+    assert_output("print(1 + 1 << 2)", "8\n");
+    // `~` binds tight like unary minus: `(~5) + 1` == -5.
+    assert_output("print(~5 + 1)", "-5\n");
+    // `~` round-trips: ~~x == x.
+    assert_output("print(~~42)", "42\n");
+}
+
+#[test]
+fn shift_augmented_assign() {
+    assert_output("x = 1\nx <<= 4\nprint(x)", "16\n");
+    assert_output("x = 12\nx >>= 2\nprint(x)", "3\n");
+}
+
+#[test]
+fn int_bitwise_and_set_dispatch() {
+    // `|`/`&`/`^` are integer bitwise on ints...
+    assert_output("print(5 | 2)", "7\n");
+    assert_output("print(6 & 3)", "2\n");
+    assert_output("print(5 ^ 3)", "6\n");
+    // ...and still set operations when both sides are sets.
+    assert_output("print({1, 2} | {2, 3})", "{1, 2, 3}\n");
+    assert_output("print({1, 2, 3} & {2, 3, 4})", "{2, 3}\n");
+    // augmented forms on ints.
+    assert_output("x = 5\nx |= 2\nprint(x)", "7\n");
+    assert_output("x = 6\nx &= 3\nprint(x)", "2\n");
+}
+
 #[test]
 fn truthiness_in_conditions() {
     assert_output(
@@ -298,7 +334,10 @@ fn del_removes_list_and_dict_items() {
         "2\n1\n3\n",
     );
     // Multiple targets, left to right (indices shift as you go).
-    assert_output("xs = [10, 20, 30, 40]\ndel xs[0], xs[0]\nprint(xs)", "[30, 40]\n");
+    assert_output(
+        "xs = [10, 20, 30, 40]\ndel xs[0], xs[0]\nprint(xs)",
+        "[30, 40]\n",
+    );
 }
 
 // --- float display (CPython-exact repr) ---
@@ -491,7 +530,10 @@ fn set_comprehension_builds_and_dedups() {
     // Display is canonical (sorted), deduped — a set, not a list.
     assert_output("print({x for x in [3, 1, 2, 1, 3]})", "{1, 2, 3}\n");
     // With a filter clause.
-    assert_output("print({x for x in range(10) if x % 2 == 0})", "{0, 2, 4, 6, 8}\n");
+    assert_output(
+        "print({x for x in range(10) if x % 2 == 0})",
+        "{0, 2, 4, 6, 8}\n",
+    );
 }
 
 // --- booleans are a real type ---
@@ -1752,7 +1794,9 @@ fn set_op_augmented_and_precedence() {
 
 #[test]
 fn set_op_on_non_set_is_an_error() {
-    assert_raises("print(1 | 2)", "set operation");
+    // `1 | 2` is now integer bitwise (see int_bitwise_and_set_dispatch); but
+    // mixing a set with a non-set operand is still invalid.
+    run_expect_error("print({1, 2} | 3)");
 }
 
 // --- f-string format specs ---
@@ -2443,7 +2487,10 @@ fn list_tuple_dict_constructors() {
     assert_output("print(list(\"abc\"))", "['a', 'b', 'c']\n");
     assert_output("print(list(range(4)))", "[0, 1, 2, 3]\n");
     assert_output("print(list())", "[]\n");
-    assert_output("xs = [1, 2, 3]\nys = list(xs)\nys.append(4)\nprint(xs)\nprint(ys)", "[1, 2, 3]\n[1, 2, 3, 4]\n");
+    assert_output(
+        "xs = [1, 2, 3]\nys = list(xs)\nys.append(4)\nprint(xs)\nprint(ys)",
+        "[1, 2, 3]\n[1, 2, 3, 4]\n",
+    );
     assert_output("print(tuple([1, 2, 3]))", "(1, 2, 3)\n");
     assert_output("print(tuple())", "()\n");
     assert_output("d = dict()\nd[\"a\"] = 1\nprint(d)", "{'a': 1}\n");
@@ -2456,6 +2503,12 @@ fn sorted_reverse_keyword() {
     assert_output("print(sorted([3, 1, 2]))", "[1, 2, 3]\n");
     assert_output("print(sorted([3, 1, 2], reverse=True))", "[3, 2, 1]\n");
     assert_output("print(sorted([3, 1, 2], reverse=False))", "[1, 2, 3]\n");
-    assert_output("print(sorted(\"cabd\", reverse=True))", "['d', 'c', 'b', 'a']\n");
-    assert_output("flip = True\nprint(sorted([1, 3, 2], reverse=flip))", "[3, 2, 1]\n");
+    assert_output(
+        "print(sorted(\"cabd\", reverse=True))",
+        "['d', 'c', 'b', 'a']\n",
+    );
+    assert_output(
+        "flip = True\nprint(sorted([1, 3, 2], reverse=flip))",
+        "[3, 2, 1]\n",
+    );
 }

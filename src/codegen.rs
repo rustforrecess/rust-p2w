@@ -1295,9 +1295,18 @@ fn runtime_helpers() -> Vec<Func> {
     });
 
     // $py_setop: union (0) / intersection (1) / symmetric difference (2) /
-    // difference (3). Both operands must be sets.
+    // difference (3). Both-sets → the set operation below; otherwise `|`/`&`/`^`
+    // are integer bitwise (dispatched by type, like CPython/viper and the native
+    // runtime's p2w_band/bor/bxor). Non-int, non-set operands trap in $unbox.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (i32.and (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b)))) (then (call $raise_setop) (unreachable)))");
+    b.push("(if (i32.eqz (i32.and (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b)))) (then");
+    b.push_in(1, "(if (i32.eq (local.get $mode) (i32.const 0)) (then (return (call $box (i32.or (call $unbox (local.get $a)) (call $unbox (local.get $b)))))))");
+    b.push_in(1, "(if (i32.eq (local.get $mode) (i32.const 1)) (then (return (call $box (i32.and (call $unbox (local.get $a)) (call $unbox (local.get $b)))))))");
+    b.push_in(
+        1,
+        "(return (call $box (i32.xor (call $unbox (local.get $a)) (call $unbox (local.get $b)))))",
+    );
+    b.push("))");
     b.push("(local.set $sa (ref.cast (ref $SET) (local.get $a)))");
     b.push("(local.set $sb (ref.cast (ref $SET) (local.get $b)))");
     b.push(
@@ -3292,6 +3301,37 @@ fn runtime_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature: "(func $py_neg (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_invert: bitwise NOT (`~x`). Integers only; `~x == x ^ -1 == -x - 1`.
+    let mut b = Body::new();
+    b.push("(call $box (i32.xor (call $unbox (local.get $r)) (i32.const -1)))");
+    fs.push(Func {
+        signature: "(func $py_invert (param $r (ref null eq)) (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_shl / $py_shr: integer bit shifts. WASM masks the shift count mod 32,
+    // which matches viper's machine-word semantics and the native i32 backend;
+    // `>>` is arithmetic (signed) shift.
+    let mut b = Body::new();
+    b.push("(call $box (i32.shl (call $unbox (local.get $a)) (call $unbox (local.get $b))))");
+    fs.push(Func {
+        signature:
+            "(func $py_shl (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
+        locals: vec![],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(call $box (i32.shr_s (call $unbox (local.get $a)) (call $unbox (local.get $b))))");
+    fs.push(Func {
+        signature:
+            "(func $py_shr (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                .into(),
         locals: vec![],
         body: b,
     });
@@ -6574,6 +6614,10 @@ impl Gen {
                 let v = self.value_expr(cx, inner)?;
                 Ok(format!("(call $py_neg {v})"))
             }
+            ExprKind::Unary(UnOp::Invert, inner) => {
+                let v = self.value_expr(cx, inner)?;
+                Ok(format!("(call $py_invert {v})"))
+            }
             ExprKind::Unary(UnOp::Not, inner) => {
                 let c = self.cond_i32(cx, inner)?;
                 Ok(format!("(call $bool (i32.eqz {c}))"))
@@ -6657,6 +6701,16 @@ impl Gen {
                     _ => 2,
                 };
                 Ok(format!("(call $py_setop {lhs} {rhs} (i32.const {mode}))"))
+            }
+            ExprKind::Bin(BinOp::Shl, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_shl {lhs} {rhs})"))
+            }
+            ExprKind::Bin(BinOp::Shr, a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                Ok(format!("(call $py_shr {lhs} {rhs})"))
             }
             ExprKind::Bin(BinOp::FloorDiv, a, b) => {
                 self.uses_floordiv = true;
@@ -7271,7 +7325,9 @@ impl Gen {
                                 if k != "reverse" {
                                     return Err(CompileError::at(
                                         e.line,
-                                        format!("sorted() doesn't take a '{k}=' argument — only reverse="),
+                                        format!(
+                                            "sorted() doesn't take a '{k}=' argument — only reverse="
+                                        ),
                                     ));
                                 }
                                 let vv = self.value_expr(cx, v)?;
@@ -7907,7 +7963,7 @@ impl Gen {
                 let t = self.type_of(cx, inner)?;
                 match op {
                     UnOp::Not => Ok(Ty::Num), // `not "x"` is a bool
-                    UnOp::Neg => match t {
+                    UnOp::Neg | UnOp::Invert => match t {
                         Ty::Str => Err(CompileError::at(
                             e.line,
                             "operator needs a number, not text",

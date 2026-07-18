@@ -109,6 +109,12 @@ impl<'a> Parser<'a> {
         self.toks[self.pos].start
     }
 
+    /// Byte offset one past the last *consumed* token — i.e. the end of a node
+    /// that has just finished parsing at the current position.
+    fn prev_end(&self) -> usize {
+        self.toks[self.pos.saturating_sub(1)].end
+    }
+
     /// A located error at the current token, carrying its byte span so the editor
     /// can underline exactly the offending token (up to the next token's start).
     fn err(&self, message: impl Into<String>) -> CompileError {
@@ -317,7 +323,19 @@ impl<'a> Parser<'a> {
         Ok(stmts)
     }
 
+    /// Parse one statement and stamp its full source span (header through the
+    /// end of any body). Desugared statements pushed to `pending` keep `(0, 0)`
+    /// since they have no single source origin.
     fn statement(&mut self) -> Result<Stmt> {
+        let lo = self.byte();
+        let mut s = self.statement_inner()?;
+        if s.span == (0, 0) {
+            s.span = (lo, self.prev_end());
+        }
+        Ok(s)
+    }
+
+    fn statement_inner(&mut self) -> Result<Stmt> {
         let line = self.line();
         if self.is_keyword("if") {
             return self.if_stmt();
@@ -359,6 +377,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt {
                 kind: StmtKind::Import(names),
                 line,
+                span: (0, 0),
             });
         }
         if self.is_keyword("return") {
@@ -372,6 +391,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt {
                 kind: StmtKind::Return(value),
                 line,
+                span: (0, 0),
             });
         }
         if self.is_keyword("break") {
@@ -380,6 +400,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt {
                 kind: StmtKind::Break,
                 line,
+                span: (0, 0),
             });
         }
         if self.is_keyword("continue") {
@@ -388,6 +409,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt {
                 kind: StmtKind::Continue,
                 line,
+                span: (0, 0),
             });
         }
         if self.is_keyword("del") {
@@ -418,6 +440,7 @@ impl<'a> Parser<'a> {
                         span: (0, 0),
                     }),
                     line,
+                    span: (0, 0),
                 });
             }
             let first = stmts.remove(0);
@@ -430,6 +453,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt {
                 kind: StmtKind::Pass,
                 line,
+                span: (0, 0),
             });
         }
         // Assignment or expression statement: parse the expression first,
@@ -466,6 +490,7 @@ impl<'a> Parser<'a> {
                     Ok(Stmt {
                         kind: StmtKind::Assign(name, combined(read, rhs)),
                         line,
+                        span: (0, 0),
                     })
                 }
                 ExprKind::Index(target, index) => {
@@ -481,6 +506,7 @@ impl<'a> Parser<'a> {
                             value: combined(read, rhs),
                         },
                         line,
+                        span: (0, 0),
                     })
                 }
                 ExprKind::Attr(obj, attr) => {
@@ -496,6 +522,7 @@ impl<'a> Parser<'a> {
                             value: combined(read, rhs),
                         },
                         line,
+                        span: (0, 0),
                     })
                 }
                 _ => Err(CompileError::at(
@@ -517,6 +544,7 @@ impl<'a> Parser<'a> {
                 return Ok(Stmt {
                     kind: StmtKind::AnnAssign { name, ann, value },
                     line,
+                    span: (0, 0),
                 });
             }
             return Err(CompileError::at(
@@ -574,6 +602,7 @@ impl<'a> Parser<'a> {
                 let first = Stmt {
                     kind: StmtKind::Assign(last.clone(), value),
                     line,
+                    span: (0, 0),
                 };
                 let mut prev = last;
                 for name in names.into_iter().rev() {
@@ -587,6 +616,7 @@ impl<'a> Parser<'a> {
                             },
                         ),
                         line,
+                        span: (0, 0),
                     });
                     prev = name;
                 }
@@ -605,6 +635,7 @@ impl<'a> Parser<'a> {
                 ExprKind::Name(name) => Ok(Stmt {
                     kind: StmtKind::Assign(name, value),
                     line,
+                    span: (0, 0),
                 }),
                 ExprKind::Index(target, index) => Ok(Stmt {
                     kind: StmtKind::SetIndex {
@@ -613,6 +644,7 @@ impl<'a> Parser<'a> {
                         value,
                     },
                     line,
+                    span: (0, 0),
                 }),
                 ExprKind::Attr(obj, attr) => Ok(Stmt {
                     kind: StmtKind::SetAttr {
@@ -621,6 +653,7 @@ impl<'a> Parser<'a> {
                         value,
                     },
                     line,
+                    span: (0, 0),
                 }),
                 // `a, b = ...` unpacks; each target must be assignable.
                 ExprKind::Tuple(targets) => {
@@ -639,6 +672,7 @@ impl<'a> Parser<'a> {
                         None => Ok(Stmt {
                             kind: StmtKind::UnpackAssign { targets, value },
                             line,
+                            span: (0, 0),
                         }),
                         Some(k) => self.build_starred_unpack(targets, k, value, line),
                     }
@@ -657,6 +691,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt {
             kind: StmtKind::Expr(e),
             line,
+            span: (0, 0),
         })
     }
 
@@ -696,6 +731,7 @@ impl<'a> Parser<'a> {
                 else_body,
             },
             line,
+            span: (0, 0),
         })
     }
 
@@ -779,6 +815,7 @@ impl<'a> Parser<'a> {
                 body,
             },
             line,
+            span: (0, 0),
         })
     }
 
@@ -870,6 +907,7 @@ impl<'a> Parser<'a> {
                 class_vars,
             },
             line,
+            span: (0, 0),
         })
     }
 
@@ -883,6 +921,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt {
             kind: StmtKind::While { cond, body },
             line,
+            span: (0, 0),
         })
     }
 
@@ -929,6 +968,7 @@ impl<'a> Parser<'a> {
                     body,
                 },
                 line,
+                span: (0, 0),
             });
         }
         let iterable = self.expr(0)?;
@@ -957,6 +997,7 @@ impl<'a> Parser<'a> {
                     },
                 },
                 line,
+                span: (0, 0),
             };
             body.insert(0, unpack);
             return Ok(Stmt {
@@ -966,6 +1007,7 @@ impl<'a> Parser<'a> {
                     body,
                 },
                 line,
+                span: (0, 0),
             });
         }
         Ok(Stmt {
@@ -975,6 +1017,7 @@ impl<'a> Parser<'a> {
                 body,
             },
             line,
+            span: (0, 0),
         })
     }
 
@@ -1104,6 +1147,7 @@ impl<'a> Parser<'a> {
         let mut stmts = vec![Stmt {
             kind: StmtKind::Assign(tmp.clone(), value),
             line,
+            span: (0, 0),
         }];
         for (i, target) in targets.into_iter().enumerate() {
             let elem = if i < star {
@@ -1113,8 +1157,7 @@ impl<'a> Parser<'a> {
                 ))
             } else if i == star {
                 // t[lead:]  (no trailing) or t[lead:-trail]  (some trailing).
-                let stop = (n_trail > 0)
-                    .then(|| Box::new(mk(ExprKind::Int(-(n_trail as i64)))));
+                let stop = (n_trail > 0).then(|| Box::new(mk(ExprKind::Int(-(n_trail as i64)))));
                 mk(ExprKind::Slice {
                     obj: Box::new(tmp_ref(&mk)),
                     start: Some(Box::new(mk(ExprKind::Int(star as i64)))),
@@ -1142,6 +1185,7 @@ impl<'a> Parser<'a> {
             ExprKind::Name(n) => Stmt {
                 kind: StmtKind::Assign(n, value),
                 line,
+                span: (0, 0),
             },
             ExprKind::Index(o, idx) => Stmt {
                 kind: StmtKind::SetIndex {
@@ -1150,6 +1194,7 @@ impl<'a> Parser<'a> {
                     value,
                 },
                 line,
+                span: (0, 0),
             },
             ExprKind::Attr(o, a) => Stmt {
                 kind: StmtKind::SetAttr {
@@ -1158,12 +1203,13 @@ impl<'a> Parser<'a> {
                     value,
                 },
                 line,
+                span: (0, 0),
             },
             _ => {
                 return Err(CompileError::at(
                     line,
                     "unpacking targets must be variables, indices, or attributes",
-                ))
+                ));
             }
         })
     }
@@ -1210,6 +1256,8 @@ impl<'a> Parser<'a> {
             self.suppress_ternary = saved;
             self.eat_keyword("else")?;
             let orelse = self.expr(0)?; // full test (right-assoc)
+            // Full extent: from the `then` operand's start to the `orelse` end.
+            let span = (lhs.span.0, orelse.span.1);
             lhs = Expr {
                 kind: ExprKind::IfExp {
                     cond: Box::new(cond),
@@ -1217,7 +1265,7 @@ impl<'a> Parser<'a> {
                     orelse: Box::new(orelse),
                 },
                 line,
-                span: (0, 0),
+                span,
             };
         }
         Ok(lhs)
@@ -1264,13 +1312,35 @@ impl<'a> Parser<'a> {
         Ok(chain)
     }
 
+    /// Parse a unary/postfix expression, then stamp its full span if the inner
+    /// parse left it unset (covers unary ops and subscript/attr/slice nodes;
+    /// `Call` keeps its callee-name span for diagnostics).
     fn prefix(&mut self) -> Result<Expr> {
+        let lo = self.byte();
+        let mut e = self.prefix_inner()?;
+        if e.span == (0, 0) {
+            e.span = (lo, self.prev_end());
+        }
+        Ok(e)
+    }
+
+    fn prefix_inner(&mut self) -> Result<Expr> {
         let line = self.line();
         if matches!(self.peek(), Tok::Minus) {
             self.advance();
             let operand = self.expr(PREFIX_BP)?;
             return Ok(Expr {
                 kind: ExprKind::Unary(UnOp::Neg, Box::new(operand)),
+                line,
+                span: (0, 0),
+            });
+        }
+        if matches!(self.peek(), Tok::Tilde) {
+            self.advance();
+            // `~` binds like unary minus (tighter than `*`, looser than `**`).
+            let operand = self.expr(PREFIX_BP)?;
+            return Ok(Expr {
+                kind: ExprKind::Unary(UnOp::Invert, Box::new(operand)),
                 line,
                 span: (0, 0),
             });
@@ -1428,13 +1498,27 @@ impl<'a> Parser<'a> {
                 body: vec![Stmt {
                     kind: StmtKind::Return(Some(body_expr)),
                     line,
+                    span: (0, 0),
                 }],
             },
             line,
+            span: (0, 0),
         })
     }
 
+    /// Parse an atom, then stamp its full source span — but only if the inner
+    /// parse didn't already set a *purposeful* span (e.g. a `Call` records its
+    /// callee-name range for the "did you mean" squiggle). `(0, 0)` means unset.
     fn primary(&mut self) -> Result<Expr> {
+        let lo = self.byte();
+        let mut e = self.primary_inner()?;
+        if e.span == (0, 0) {
+            e.span = (lo, self.prev_end());
+        }
+        Ok(e)
+    }
+
+    fn primary_inner(&mut self) -> Result<Expr> {
         let line = self.line();
         let start = self.byte();
         let expr = |kind| Expr {
@@ -1812,6 +1896,11 @@ impl<'a> Parser<'a> {
             Tok::Pipe => (BinOp::BitOr, 8),
             Tok::Caret => (BinOp::BitXor, 9),
             Tok::Amp => (BinOp::BitAnd, 10),
+            // Shifts bind tighter than `&` but looser than `+`/`-` (Python's
+            // order): `1 & 2 << 3` is `1 & (2 << 3)`, `1 + 2 << 3` is
+            // `(1 + 2) << 3`.
+            Tok::LtLt => (BinOp::Shl, 11),
+            Tok::GtGt => (BinOp::Shr, 11),
             Tok::Plus => (BinOp::Add, 12),
             Tok::Minus => (BinOp::Sub, 12),
             Tok::Star => (BinOp::Mul, 20),
@@ -2006,6 +2095,9 @@ fn describe(tok: &Tok) -> String {
         Tok::Pipe => "`|`".to_string(),
         Tok::Amp => "`&`".to_string(),
         Tok::Caret => "`^`".to_string(),
+        Tok::LtLt => "`<<`".to_string(),
+        Tok::GtGt => "`>>`".to_string(),
+        Tok::Tilde => "`~`".to_string(),
         Tok::Lt => "`<`".to_string(),
         Tok::Le => "`<=`".to_string(),
         Tok::Gt => "`>`".to_string(),
@@ -2038,6 +2130,53 @@ mod tests {
 
     fn parse_src(src: &str) -> Result<Vec<Stmt>> {
         parse(&lex(src).unwrap())
+    }
+
+    fn pe(src: &str) -> Expr {
+        parse_expression(&lex(src).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn statements_carry_source_spans() {
+        // Two simple statements: distinct, source-ordered spans.
+        let s = parse_src("a = 1\nb = 22\n").unwrap();
+        assert_eq!(s[0].span.0, 0); // `a`
+        assert!(s[0].span.1 >= 5); // at least through "a = 1"
+        assert_eq!(s[1].span.0, 6); // `b`, just after "a = 1\n"
+        assert!(s[1].span.1 >= 12); // through "b = 22"
+        // Compound statement spans the header through its body.
+        let c = parse_src("if x:\n    y = 1\n").unwrap();
+        assert_eq!(c[0].span.0, 0); // `if`
+        assert!(c[0].span.1 >= 15); // through the indented "y = 1"
+    }
+
+    #[test]
+    fn nodes_carry_source_spans() {
+        // Leaf name: the whole identifier.
+        assert_eq!(pe("hello").span, (0, 5));
+        // Unary: operator + operand.
+        assert_eq!(pe("-x").span, (0, 2));
+        assert_eq!(pe("~n").span, (0, 2));
+        // Subscript spans the whole `xs[10]`, and its child nodes span exactly.
+        let e = pe("xs[10]");
+        assert_eq!(e.span, (0, 6));
+        if let ExprKind::Index(base, idx) = &e.kind {
+            assert_eq!(base.span, (0, 2)); // xs
+            assert_eq!(idx.span, (3, 5)); // 10
+        } else {
+            panic!("expected Index, got {:?}", e.kind);
+        }
+        // Ternary spans then..orelse.
+        assert_eq!(pe("a if c else bb").span, (0, 14));
+        // A list literal and its elements.
+        let l = pe("[1, 22]");
+        assert_eq!(l.span, (0, 7));
+        if let ExprKind::List(items) = &l.kind {
+            assert_eq!(items[0].span, (1, 2)); // 1
+            assert_eq!(items[1].span, (4, 6)); // 22
+        } else {
+            panic!("expected List");
+        }
     }
 
     #[test]

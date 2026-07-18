@@ -241,8 +241,8 @@ impl Counter {
                     }
                     BinOp::And | BinOp::Or => self.bump("boolean_logic"),
                     BinOp::In | BinOp::NotIn => self.bump("membership"),
-                    // Bitwise / set operators — not in the core concept vocab.
-                    BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => {}
+                    // Bitwise / set / shift operators — not in the core concept vocab.
+                    BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {}
                 }
                 self.walk_expr(a);
                 self.walk_expr(b);
