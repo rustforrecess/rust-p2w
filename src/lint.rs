@@ -142,15 +142,15 @@ fn lint_ty(e: &Expr) -> Option<LintTy> {
 /// is not churn. Within a scope, reassignments inside `if`/`for`/`while` bodies
 /// count (they rebind the same name), but `def`/`class` bodies are separate
 /// scopes, recursed on their own.
-pub fn type_churn_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+pub fn type_churn_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let mut out = Vec::new();
     churn_scope(stmts, &mut out);
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out
 }
 
 /// Analyze one scope for churn, then recurse into nested `def`/`class` scopes.
-fn churn_scope(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+fn churn_scope(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
     // name -> (established category, whether we've already warned about it).
     let mut seen: HashMap<String, (LintTy, bool)> = HashMap::new();
     churn_walk(stmts, &mut seen, out);
@@ -171,7 +171,7 @@ fn churn_scope(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
 fn churn_walk(
     stmts: &[Stmt],
     seen: &mut HashMap<String, (LintTy, bool)>,
-    out: &mut Vec<(usize, String)>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
 ) {
     for s in stmts {
         if let StmtKind::Assign(name, value) | StmtKind::AnnAssign { name, value, .. } = &s.kind
@@ -184,6 +184,7 @@ fn churn_walk(
                 Some((first, warned)) if *first != ty && !*warned => {
                     out.push((
                         s.line,
+                        s.span,
                         format!(
                             "'{name}' held {} earlier but is {} here — reusing one \
                                  name for a different kind of value is a common source of \
@@ -654,11 +655,11 @@ fn is_set_expr(e: &Expr, sets: &HashSet<String>) -> bool {
 /// `x = 1`) is not flagged (that harder check invites false positives); this
 /// catches the common "never defined at all" case. Type/annotation positions
 /// (`x: int`, `-> bool`) are skipped — they name types, not variables.
-pub fn undefined_name_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+pub fn undefined_name_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let builtins: HashSet<String> = crate::builtins::names().map(String::from).collect();
     let mut out = Vec::new();
     check_scope_names(stmts, &builtins, &mut out);
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out
 }
 
@@ -713,7 +714,11 @@ fn scope_bindings(stmts: &[Stmt], out: &mut HashSet<String>) {
 /// plus this scope's own bindings, then recurse into nested `def`/`class`
 /// scopes (each seeing the accumulated outer names — over-approximate, so a
 /// closure-style read never false-flags even though we don't model closures).
-fn check_scope_names(stmts: &[Stmt], outer: &HashSet<String>, out: &mut Vec<(usize, String)>) {
+fn check_scope_names(
+    stmts: &[Stmt],
+    outer: &HashSet<String>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
+) {
     let mut allowed = outer.clone();
     scope_bindings(stmts, &mut allowed);
     check_reads(stmts, &allowed, out);
@@ -740,7 +745,11 @@ fn check_scope_names(stmts: &[Stmt], outer: &HashSet<String>, out: &mut Vec<(usi
 /// nested def/class bodies — those recurse as their own scope). Annotation and
 /// default-argument positions belonging to nested scopes are skipped;
 /// class-var and default expressions evaluate in THIS scope and are checked.
-fn check_reads(stmts: &[Stmt], allowed: &HashSet<String>, out: &mut Vec<(usize, String)>) {
+fn check_reads(
+    stmts: &[Stmt],
+    allowed: &HashSet<String>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
+) {
     for s in stmts {
         match &s.kind {
             StmtKind::Assign(_, value) | StmtKind::AnnAssign { value, .. } => {
@@ -822,7 +831,7 @@ fn check_reads(stmts: &[Stmt], allowed: &HashSet<String>, out: &mut Vec<(usize, 
 }
 
 /// Check the bare-name reads inside one expression against `allowed`.
-fn read_expr(e: &Expr, allowed: &HashSet<String>, out: &mut Vec<(usize, String)>) {
+fn read_expr(e: &Expr, allowed: &HashSet<String>, out: &mut Vec<(usize, (usize, usize), String)>) {
     match &e.kind {
         ExprKind::Name(n) => {
             if !allowed.contains(n) {
@@ -833,7 +842,7 @@ fn read_expr(e: &Expr, allowed: &HashSet<String>, out: &mut Vec<(usize, String)>
                         "`{n}` isn't defined yet — set it first (e.g. `{n} = ...`) or check the spelling"
                     ),
                 };
-                out.push((e.line, msg));
+                out.push((e.line, e.span, msg));
             }
         }
         ExprKind::Unary(_, x) => read_expr(x, allowed, out),
@@ -927,7 +936,7 @@ fn comp_allowed(allowed: &HashSet<String>, clauses: &[CompClause]) -> HashSet<St
 fn read_comp_clauses(
     clauses: &[CompClause],
     allowed: &HashSet<String>,
-    out: &mut Vec<(usize, String)>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
 ) {
     for c in clauses {
         match c {
@@ -955,18 +964,18 @@ fn read_comp_clauses(
 /// - a `_`-prefixed name is a deliberate throwaway and is skipped;
 /// - a name that reads itself (`x = x + 1`) counts as read, so accumulators
 ///   never fire.
-pub fn unused_assignment_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+pub fn unused_assignment_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let mut out = Vec::new();
     // Module top level is not a flagging scope; only recurse into functions.
     for s in stmts {
         collect_unused_in_defs(s, &mut out);
     }
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out
 }
 
 /// Find function/method scopes under `s` and analyze each for unused locals.
-fn collect_unused_in_defs(s: &Stmt, out: &mut Vec<(usize, String)>) {
+fn collect_unused_in_defs(s: &Stmt, out: &mut Vec<(usize, (usize, usize), String)>) {
     match &s.kind {
         StmtKind::Def { params, body, .. } => analyze_fn_unused(body, params, out),
         StmtKind::ClassDef { methods, .. } => {
@@ -1009,7 +1018,11 @@ fn collect_unused_in_defs(s: &Stmt, out: &mut Vec<(usize, String)>) {
 /// Analyze one function/method body: flag its own plain assignments to names
 /// never read anywhere in the body (nested scopes included). Then recurse into
 /// nested functions/methods for their own analysis.
-fn analyze_fn_unused(body: &[Stmt], params: &[String], out: &mut Vec<(usize, String)>) {
+fn analyze_fn_unused(
+    body: &[Stmt],
+    params: &[String],
+    out: &mut Vec<(usize, (usize, usize), String)>,
+) {
     let mut reads: HashSet<String> = HashSet::new();
     collect_all_reads(body, &mut reads);
     flag_unused_assigns(body, params, &reads, out);
@@ -1025,7 +1038,7 @@ fn flag_unused_assigns(
     stmts: &[Stmt],
     params: &[String],
     reads: &HashSet<String>,
-    out: &mut Vec<(usize, String)>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
 ) {
     for s in stmts {
         match &s.kind {
@@ -1036,6 +1049,7 @@ fn flag_unused_assigns(
                 {
                     out.push((
                         s.line,
+                        s.span,
                         format!(
                             "`{name}` is set but never used — did you forget to use it (e.g. \
                              `return {name}` / `print({name})`), or is it a leftover line?"
@@ -1473,10 +1487,10 @@ pub(crate) fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
 /// the classic Python surprise. Flags the `def` line and points at the standard
 /// `=None` + make-a-fresh-one-inside fix. Only *mutable* defaults fire; a number,
 /// string, `None`, or tuple default is fine and never flagged.
-pub fn mutable_default_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+pub fn mutable_default_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let mut out = Vec::new();
     walk_mutable_defaults(stmts, &mut out);
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out
 }
 
@@ -1497,7 +1511,7 @@ fn mutable_default_noun(e: &Expr) -> Option<&'static str> {
     }
 }
 
-fn walk_mutable_defaults(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+fn walk_mutable_defaults(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
     for s in stmts {
         if let StmtKind::Def {
             params, defaults, ..
@@ -1510,6 +1524,7 @@ fn walk_mutable_defaults(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
                     let p = params.get(first + i).map(String::as_str).unwrap_or("it");
                     out.push((
                         s.line,
+                        s.span,
                         format!(
                             "`{p}` uses {noun} as its default — that default is created once and \
                              SHARED by every call, so changes to it leak between calls. Use \
@@ -1529,10 +1544,10 @@ fn walk_mutable_defaults(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
 /// SAME block can never run. Only same-level exits count — a `return` inside an
 /// `if` doesn't kill the code after the `if` — so every hit is a true finding.
 /// Reports the first dead line per block (the rest below it is dead too).
-pub fn unreachable_code_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+pub fn unreachable_code_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let mut out = Vec::new();
     walk_unreachable(stmts, &mut out);
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out
 }
 
@@ -1546,7 +1561,7 @@ fn terminator_kw(s: &Stmt) -> Option<&'static str> {
     }
 }
 
-fn walk_unreachable(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+fn walk_unreachable(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
     let mut flagged = false;
     for (i, s) in stmts.iter().enumerate() {
         if !flagged
@@ -1555,6 +1570,7 @@ fn walk_unreachable(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
         {
             out.push((
                 s.line,
+                s.span,
                 format!(
                     "this line can't run — the `{kw}` just above always exits first. Move it above \
                      the `{kw}`, or remove it."
@@ -1595,11 +1611,11 @@ const SHADOW_DANGEROUS: &[&str] = &[
 
 /// Binding a name that shadows a common built-in type/function. Deduped to one
 /// warning per shadowed name across the program, to stay calm.
-pub fn shadowed_builtin_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+pub fn shadowed_builtin_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     walk_shadow(stmts, &mut seen, &mut out);
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out
 }
 
@@ -1607,11 +1623,12 @@ fn shadow_check(
     name: &str,
     line: usize,
     seen: &mut HashSet<String>,
-    out: &mut Vec<(usize, String)>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
 ) {
     if SHADOW_DANGEROUS.contains(&name) && seen.insert(name.to_string()) {
         out.push((
             line,
+            (0, 0),
             format!(
                 "`{name}` is the name of a built-in — using it as a variable means you can't call \
                  `{name}(...)` afterwards. A name like `items` or `values` avoids the clash."
@@ -1620,7 +1637,11 @@ fn shadow_check(
     }
 }
 
-fn walk_shadow(stmts: &[Stmt], seen: &mut HashSet<String>, out: &mut Vec<(usize, String)>) {
+fn walk_shadow(
+    stmts: &[Stmt],
+    seen: &mut HashSet<String>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
+) {
     for s in stmts {
         match &s.kind {
             StmtKind::Assign(name, _) | StmtKind::AnnAssign { name, .. } => {
@@ -1641,10 +1662,10 @@ fn walk_shadow(stmts: &[Stmt], seen: &mut HashSet<String>, out: &mut Vec<(usize,
 /// assigning a variable to itself (`x = x` — does nothing). Only fires on *pure*
 /// operands that contain a variable, so `random() == random()` (two calls, not
 /// self-comparison) and constant folds like `1 == 1` are left alone.
-pub fn self_comparison_warnings(stmts: &[Stmt]) -> Vec<(usize, String)> {
+pub fn self_comparison_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let mut out = Vec::new();
     walk_self_cmp(stmts, &mut out);
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out
 }
 
@@ -1685,7 +1706,7 @@ fn self_cmp_verdict(op: BinOp) -> Option<&'static str> {
     }
 }
 
-fn walk_self_cmp(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
+fn walk_self_cmp(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
     for s in stmts {
         // No-op self-assignment: `x = x`.
         if let StmtKind::Assign(name, value) = &s.kind
@@ -1693,6 +1714,7 @@ fn walk_self_cmp(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
         {
             out.push((
                 s.line,
+                s.span,
                 format!(
                     "`{name} = {name}` doesn't do anything — a variable assigned to itself is \
                      unchanged. Did you mean to change it, or is it a leftover line?"
@@ -1705,7 +1727,7 @@ fn walk_self_cmp(stmts: &[Stmt], out: &mut Vec<(usize, String)>) {
     }
 }
 
-fn find_self_cmp(e: &Expr, out: &mut Vec<(usize, String)>) {
+fn find_self_cmp(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
     if let ExprKind::Bin(op, a, b) = &e.kind
         && let Some(verdict) = self_cmp_verdict(*op)
         && is_pure(a)
@@ -1714,6 +1736,7 @@ fn find_self_cmp(e: &Expr, out: &mut Vec<(usize, String)>) {
     {
         out.push((
             e.line,
+            e.span,
             format!(
                 "this compares something to itself, so it's {verdict} — did you mean to compare \
                  two different things?"
@@ -1801,7 +1824,7 @@ pub fn component_clean_warnings(
     stmts: &[Stmt],
     group: &[String],
     instance: &str,
-) -> Vec<(usize, String)> {
+) -> Vec<(usize, (usize, usize), String)> {
     let mut base: HashSet<String> = crate::builtins::names().map(String::from).collect();
     // `format` is the f-string desugar target — callable, not registry-listed.
     base.insert("format".to_string());
@@ -1821,7 +1844,7 @@ pub fn component_clean_warnings(
             component_body(body, &scope, instance, &mut out);
         }
     }
-    out.sort_by_key(|(line, _)| *line);
+    out.sort_by_key(|(line, _, _)| *line);
     out.dedup();
     out
 }
@@ -1835,7 +1858,7 @@ fn component_body(
     stmts: &[Stmt],
     scope: &HashSet<String>,
     instance: &str,
-    out: &mut Vec<(usize, String)>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
 ) {
     for s in stmts {
         stmt_exprs(s, &mut |e| component_expr(e, scope, instance, out));
@@ -1866,17 +1889,17 @@ fn component_expr(
     e: &Expr,
     scope: &HashSet<String>,
     instance: &str,
-    out: &mut Vec<(usize, String)>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
 ) {
     match &e.kind {
         ExprKind::Name(n) => {
             if !scope.contains(n) {
-                out.push((e.line, outside_msg(n, instance)));
+                out.push((e.line, e.span, outside_msg(n, instance)));
             }
         }
         ExprKind::Call(f, args) => {
             if !scope.contains(f) {
-                out.push((e.line, outside_msg(f, instance)));
+                out.push((e.line, e.span, outside_msg(f, instance)));
             }
             if let Some(arg0) = args.first() {
                 if SELECTOR_ARG0.contains(&f.as_str()) {
@@ -1923,7 +1946,7 @@ fn component_comp_clauses(
     clauses: &[CompClause],
     scope: &HashSet<String>,
     instance: &str,
-    out: &mut Vec<(usize, String)>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
 ) {
     for c in clauses {
         match c {
@@ -1956,7 +1979,12 @@ fn literal_head(e: &Expr) -> Option<&str> {
 /// something outside `instance`'s namespace (`instance` itself, or
 /// `instance_…`). A head that is a prefix of `instance` is an incomplete
 /// literal — unprovable, so it passes.
-fn check_namespaced(arg: &Expr, instance: &str, selector: bool, out: &mut Vec<(usize, String)>) {
+fn check_namespaced(
+    arg: &Expr,
+    instance: &str,
+    selector: bool,
+    out: &mut Vec<(usize, (usize, usize), String)>,
+) {
     let Some(head) = literal_head(arg) else {
         return;
     };
@@ -1986,7 +2014,7 @@ fn check_namespaced(arg: &Expr, instance: &str, selector: bool, out: &mut Vec<(u
                  `{instance}` should only use keys that start with `{instance}_`"
             )
         };
-        out.push((arg.line, msg));
+        out.push((arg.line, arg.span, msg));
     }
 }
 
@@ -2263,6 +2291,9 @@ mod tests {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
         type_churn_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
     }
 
     #[test]
@@ -2296,6 +2327,9 @@ mod tests {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
         undefined_name_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
     }
 
     #[test]
@@ -2344,6 +2378,9 @@ mod tests {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
         unused_assignment_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
     }
 
     #[test]
@@ -2393,6 +2430,9 @@ mod tests {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
         mutable_default_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
     }
 
     #[test]
@@ -2426,6 +2466,9 @@ mod tests {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
         unreachable_code_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
     }
 
     #[test]
@@ -2461,6 +2504,9 @@ mod tests {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
         shadowed_builtin_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
     }
 
     #[test]
@@ -2490,6 +2536,9 @@ mod tests {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
         self_comparison_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
     }
 
     #[test]
@@ -2580,7 +2629,7 @@ mod tests {
         let g: Vec<String> = group.iter().map(|s| s.to_string()).collect();
         component_clean_warnings(&parse(src), &g, instance)
             .into_iter()
-            .map(|(_, m)| m)
+            .map(|(_, _, m)| m)
             .collect()
     }
 
@@ -2675,7 +2724,7 @@ mod tests {
         let g: Vec<String> = group;
         let msgs: Vec<String> = component_clean_warnings(&parse(src), &g, "draw")
             .into_iter()
-            .map(|(_, m)| m)
+            .map(|(_, _, m)| m)
             .collect();
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].contains("`#msg`"), "{msgs:?}");

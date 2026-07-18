@@ -145,6 +145,10 @@ pub fn event_handler_names(source: &str) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lint {
     pub line: usize,
+    /// Byte range `[start, end)` of the offending node, so the editor can
+    /// underline it precisely. `(0, 0)` when the lint isn't localized to a
+    /// single span (the IDE then falls back to a whole-line marker).
+    pub span: (usize, usize),
     pub message: String,
     pub kind: LintKind,
 }
@@ -179,9 +183,10 @@ pub fn component_lints(source: &str, specs: &[(String, Vec<String>)]) -> Vec<Lin
             // The whole namespace, not just the API list: stamped internal
             // helpers (Draw's pen handlers) are checked AND callable siblings.
             let group = lint::component_group(&stmts, &inst);
-            for (line, message) in lint::component_clean_warnings(&stmts, &group, &inst) {
+            for (line, span, message) in lint::component_clean_warnings(&stmts, &group, &inst) {
                 out.push(Lint {
                     line,
+                    span,
                     message,
                     kind: LintKind::ComponentUnclean,
                 });
@@ -218,7 +223,7 @@ pub fn analyze(source: &str) -> (blockly::BlocksOutcome, Vec<Lint>) {
 
 /// The post-parse half of [`lints`] (see [`analyze`]).
 fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
-    let groups: [(LintKind, Vec<(usize, String)>); 7] = [
+    let groups: [(LintKind, Vec<(usize, (usize, usize), String)>); 7] = [
         (
             LintKind::UndefinedName,
             lint::undefined_name_warnings(stmts),
@@ -247,9 +252,10 @@ fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
     ];
     let mut out: Vec<Lint> = Vec::new();
     for (kind, warns) in groups {
-        for (line, message) in warns {
+        for (line, span, message) in warns {
             out.push(Lint {
                 line,
+                span,
                 message,
                 kind,
             });
@@ -268,6 +274,18 @@ mod tests {
         let wat = compile_to_wat("print(\"hello world\")").unwrap();
         assert!(wat.contains("(export \"_start\")"));
         assert!(wat.contains("call $write_char"));
+    }
+
+    #[test]
+    fn lints_carry_precise_spans() {
+        // `foo` is undefined; the lint's span should bracket exactly `foo`
+        // (bytes 6..9), so the editor can squiggle the name, not the whole line.
+        let src = "print(foo)\n";
+        let undef = lints(src)
+            .into_iter()
+            .find(|l| l.kind == LintKind::UndefinedName)
+            .expect("undefined-name lint");
+        assert_eq!(&src[undef.span.0..undef.span.1], "foo");
     }
 
     #[test]
