@@ -681,6 +681,7 @@ impl Builder {
                     "",
                 ))
             }
+            ExprKind::Unary(UnOp::Invert, _) => unsupported("`~` (bitwise not)"),
             ExprKind::Bin(op, a, b) => self.bin_block(*op, a, b),
             // A named call used as a value (`double(x)` in `y = double(x)`)
             // becomes the output-shaped call block.
@@ -792,7 +793,13 @@ impl Builder {
             BinOp::Ge => compare("GTE"),
             BinOp::And => block("logic_operation", &field("OP", &jstr("AND")), &ab, "", ""),
             BinOp::Or => block("logic_operation", &field("OP", &jstr("OR")), &ab, "", ""),
-            BinOp::In | BinOp::NotIn | BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => {
+            BinOp::In
+            | BinOp::NotIn
+            | BinOp::BitOr
+            | BinOp::BitAnd
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr => {
                 return Err(format!(
                     "line {}: this operator has no block yet (edit it in the text pane)",
                     a.line
@@ -1136,6 +1143,7 @@ fn value_to_source(e: &Expr) -> Option<String> {
         ExprKind::Str(s) => jstr(s), // JSON string == Python double-quoted literal here
         ExprKind::Name(n) => n.clone(),
         ExprKind::Unary(UnOp::Neg, inner) => format!("-{}", value_to_source(inner)?),
+        ExprKind::Unary(UnOp::Invert, inner) => format!("~{}", value_to_source(inner)?),
         ExprKind::List(items) => {
             let parts: Option<Vec<String>> = items.iter().map(value_to_source).collect();
             format!("[{}]", parts?.join(", "))

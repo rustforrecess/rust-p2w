@@ -2140,6 +2140,35 @@ pub extern "C" fn p2w_bxor(a: Value, b: Value) -> Value {
     }
 }
 
+/// `a << b` — integer left shift. Machine-word: the count is masked mod 32,
+/// matching the browser's `i32.shl` and viper. Ints only.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_shl(a: Value, b: Value) -> Value {
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => make_int(x.wrapping_shl(y as u32)),
+        _ => trap("<< expects two ints"),
+    }
+}
+
+/// `a >> b` — integer arithmetic (sign-preserving) right shift; count masked
+/// mod 32. Ints only.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_shr(a: Value, b: Value) -> Value {
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => make_int(x.wrapping_shr(y as u32)),
+        _ => trap(">> expects two ints"),
+    }
+}
+
+/// `~a` — bitwise inversion (`~x == -x - 1`). Ints only.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_invert(a: Value) -> Value {
+    match num(a) {
+        Some(x) => make_int(!x),
+        None => trap("bad operand type for unary ~"),
+    }
+}
+
 // --- iteration protocol ----------------------------------------------------
 
 /// Number of elements a for-each yields over `c`.

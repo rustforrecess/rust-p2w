@@ -148,6 +148,9 @@ declare i32 @p2w_zip2(i32, i32)
 declare i32 @p2w_band(i32, i32)
 declare i32 @p2w_bor(i32, i32)
 declare i32 @p2w_bxor(i32, i32)
+declare i32 @p2w_shl(i32, i32)
+declare i32 @p2w_shr(i32, i32)
+declare i32 @p2w_invert(i32)
 declare i32 @p2w_in(i32, i32)
 declare i32 @p2w_notin(i32, i32)
 ; method dispatch by name (runtime resolves on the receiver's type)
@@ -1367,6 +1370,7 @@ impl<'a> FuncEmitter<'a> {
                     mk(ExprKind::Index(Box::new(arr_name()), Box::new(idx()))),
                 ),
                 line,
+                span: (0, 0),
             },
             Stmt {
                 kind: StmtKind::SetIndex {
@@ -1375,6 +1379,7 @@ impl<'a> FuncEmitter<'a> {
                     value: element.clone(),
                 },
                 line,
+                span: (0, 0),
             },
         ];
         let len = mk(ExprKind::Call("len".to_string(), vec![arr_name()]));
@@ -1493,6 +1498,7 @@ impl<'a> FuncEmitter<'a> {
                     mk(ExprKind::Index(Box::new(src_name()), Box::new(idx()))),
                 ),
                 line,
+                span: (0, 0),
             },
             Stmt {
                 kind: StmtKind::SetIndex {
@@ -1501,6 +1507,7 @@ impl<'a> FuncEmitter<'a> {
                     value: element.clone(),
                 },
                 line,
+                span: (0, 0),
             },
         ];
         let len = mk(ExprKind::Call("len".to_string(), vec![src_name()]));
@@ -1617,6 +1624,7 @@ impl<'a> FuncEmitter<'a> {
                     value: item.clone(),
                 },
                 line,
+                span: (0, 0),
             })?;
         }
         self.br_to(&endl);
@@ -1741,6 +1749,7 @@ impl<'a> FuncEmitter<'a> {
                     else_body: None,
                 },
                 line,
+                span: (0, 0),
             }]),
             CompClause::For { vars, iter } => {
                 let mut body = self.comp_body(rest, inner, line)?;
@@ -1766,6 +1775,7 @@ impl<'a> FuncEmitter<'a> {
                             value: mk(ExprKind::Name(ev.clone())),
                         },
                         line,
+                        span: (0, 0),
                     };
                     body.insert(0, unpack);
                     ev
@@ -1795,7 +1805,11 @@ impl<'a> FuncEmitter<'a> {
                         body,
                     },
                 };
-                Ok(vec![Stmt { kind, line }])
+                Ok(vec![Stmt {
+                    kind,
+                    line,
+                    span: (0, 0),
+                }])
             }
         }
     }
@@ -1834,6 +1848,7 @@ impl<'a> FuncEmitter<'a> {
                 vec![element.clone()],
             ))),
             line,
+            span: (0, 0),
         };
         let body = self.comp_body(clauses, append, line)?;
         self.block(&body)?;
@@ -1871,6 +1886,7 @@ impl<'a> FuncEmitter<'a> {
                 value: value.clone(),
             },
             line,
+            span: (0, 0),
         };
         let body = self.comp_body(clauses, set, line)?;
         self.block(&body)?;
@@ -2279,6 +2295,7 @@ impl<'a> FuncEmitter<'a> {
                 ExprKind::Name(n) => Stmt {
                     kind: StmtKind::Assign(n.clone(), elem),
                     line,
+                    span: (0, 0),
                 },
                 ExprKind::Index(o, idx) => Stmt {
                     kind: StmtKind::SetIndex {
@@ -2287,6 +2304,7 @@ impl<'a> FuncEmitter<'a> {
                         value: elem,
                     },
                     line,
+                    span: (0, 0),
                 },
                 _ => {
                     return Err(format!(
@@ -2694,6 +2712,12 @@ impl<'a> FuncEmitter<'a> {
                 self.release_if_owned(&v, o);
                 Ok((r, Repr::Boxed))
             }
+            ExprKind::Unary(UnOp::Invert, inner) => {
+                let (v, o) = self.expr_borrow(inner)?;
+                let r = self.call_value(&format!("call i32 @p2w_invert(i32 {v})"));
+                self.release_if_owned(&v, o);
+                Ok((r, Repr::Boxed))
+            }
             ExprKind::Bin(op, a, b) => self.bin(*op, a, b),
             ExprKind::Call(name, args) => {
                 // len() is the one builtin lowered to the runtime so far.
@@ -2776,7 +2800,8 @@ impl<'a> FuncEmitter<'a> {
                     let (v, o) = self.expr_borrow(&args[0])?;
                     let r = if args.len() == 2 {
                         let (nd, no) = self.expr_borrow(&args[1])?;
-                        let r = self.call_value(&format!("call i32 @p2w_round2(i32 {v}, i32 {nd})"));
+                        let r =
+                            self.call_value(&format!("call i32 @p2w_round2(i32 {v}, i32 {nd})"));
                         self.release_if_owned(&nd, no);
                         r
                     } else {
@@ -2820,7 +2845,8 @@ impl<'a> FuncEmitter<'a> {
                     } else {
                         "0".to_string()
                     };
-                    let r = self.call_value(&format!("call i32 @p2w_enumerate(i32 {v}, i32 {start})"));
+                    let r =
+                        self.call_value(&format!("call i32 @p2w_enumerate(i32 {v}, i32 {start})"));
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }
@@ -2869,7 +2895,8 @@ impl<'a> FuncEmitter<'a> {
                     } else {
                         (self.call_value("call i32 @p2w_none()"), true)
                     };
-                    let r = self.call_value(&format!("call i32 @p2w_sorted(i32 {v}, i32 {})", rev.0));
+                    let r =
+                        self.call_value(&format!("call i32 @p2w_sorted(i32 {v}, i32 {})", rev.0));
                     self.release_if_owned(&rev.0, rev.1);
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
@@ -3573,6 +3600,11 @@ impl<'a> FuncEmitter<'a> {
             BinOp::BitAnd => "p2w_band",
             BinOp::BitOr => "p2w_bor",
             BinOp::BitXor => "p2w_bxor",
+            // Integer bit shifts. Routed through the runtime (which masks the
+            // count mod 32, matching the browser's i32.shl); an unboxed
+            // `shl`/`ashr` fast path is a future optimisation.
+            BinOp::Shl => "p2w_shl",
+            BinOp::Shr => "p2w_shr",
             BinOp::In => "p2w_in",
             BinOp::NotIn => "p2w_notin",
             _ => {

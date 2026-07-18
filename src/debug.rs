@@ -672,10 +672,8 @@ impl Stepper {
                             self.assign_index(obj, index, item)?;
                         }
                         _ => {
-                            return Err(
-                                "an unpacking target must be a variable or an index here"
-                                    .to_string(),
-                            )
+                            return Err("an unpacking target must be a variable or an index here"
+                                .to_string());
                         }
                     }
                 }
@@ -864,6 +862,11 @@ impl Stepper {
                         Value::Bool(b) => Ok(Value::Int(if b { -1 } else { 0 })),
                         _ => Err(format!("can't negate {}", type_name(&v))),
                     },
+                    UnOp::Invert => match v {
+                        Value::Int(n) => Ok(Value::Int(!n)),
+                        Value::Bool(b) => Ok(Value::Int(!(b as i64))),
+                        _ => Err(format!("bad operand type for unary ~: '{}'", type_name(&v))),
+                    },
                 }
             }
             ExprKind::Bin(op, a, b) => Self::eval_bin(funcs, scope, out, *op, a, b),
@@ -903,15 +906,16 @@ impl Stepper {
                 step,
             } => {
                 let target = Self::eval_in(funcs, scope, out, obj)?;
-                let mut bound = |b: &Option<Box<Expr>>, what: &str| -> Result<Option<i64>, String> {
-                    match b {
-                        Some(e) => Ok(Some(
-                            as_int(&Self::eval_in(funcs, scope, out, e)?)
-                                .ok_or_else(|| format!("slice {what} must be an integer"))?,
-                        )),
-                        None => Ok(None),
-                    }
-                };
+                let mut bound =
+                    |b: &Option<Box<Expr>>, what: &str| -> Result<Option<i64>, String> {
+                        match b {
+                            Some(e) => Ok(Some(
+                                as_int(&Self::eval_in(funcs, scope, out, e)?)
+                                    .ok_or_else(|| format!("slice {what} must be an integer"))?,
+                            )),
+                            None => Ok(None),
+                        }
+                    };
                 let s = bound(start, "start")?;
                 let t = bound(stop, "stop")?;
                 let p = bound(step, "step")?;
@@ -927,7 +931,10 @@ impl Stepper {
                     return math_const(attr)
                         .ok_or_else(|| format!("math has no attribute '{attr}'"));
                 }
-                Err("attribute access isn't in the step debugger yet — use Run for that".to_string())
+                Err(
+                    "attribute access isn't in the step debugger yet — use Run for that"
+                        .to_string(),
+                )
             }
             ExprKind::Call(name, args) => Self::eval_call(funcs, scope, out, name, args),
             ExprKind::MethodCall(obj, method, args) => {
@@ -988,6 +995,7 @@ impl Stepper {
             }
             BinOp::And | BinOp::Or => unreachable!("handled above"),
             BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => bitwise_or_set(op, &l, &r),
+            BinOp::Shl | BinOp::Shr => int_shift(op, &l, &r),
         }
     }
 
@@ -1353,10 +1361,8 @@ impl Stepper {
                             assign_index_in(scope, obj, index, item)?;
                         }
                         _ => {
-                            return Err(
-                                "an unpacking target must be a variable or an index here"
-                                    .to_string(),
-                            )
+                            return Err("an unpacking target must be a variable or an index here"
+                                .to_string());
                         }
                     }
                 }
@@ -3379,7 +3385,10 @@ fn slice_value(
             }
             Ok(Value::Str(out))
         }
-        _ => Err(format!("'{}' object is not subscriptable", type_name(target))),
+        _ => Err(format!(
+            "'{}' object is not subscriptable",
+            type_name(target)
+        )),
     }
 }
 
@@ -3419,7 +3428,9 @@ fn math_call(func: &str, arg: &Value) -> Result<Value, String> {
 fn check_import(names: &[String]) -> Result<(), String> {
     for m in names {
         if m != "math" {
-            return Err(format!("module '{m}' isn't available (only 'math' for now)"));
+            return Err(format!(
+                "module '{m}' isn't available (only 'math' for now)"
+            ));
         }
     }
     Ok(())
@@ -3443,9 +3454,8 @@ fn sorted_reverse_args<'a>(name: &str, args: &'a [Expr]) -> Option<(&'a Expr, &'
 /// sorting, and the range/enumerate/zip materializers. Returns `Ok(None)` if
 /// `name` isn't one of these, so the caller falls through to its own error.
 fn builtin_extra(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
-    let int_arg = |v: &Value, what: &str| {
-        as_int(v).ok_or_else(|| format!("{what} must be an integer"))
-    };
+    let int_arg =
+        |v: &Value, what: &str| as_int(v).ok_or_else(|| format!("{what} must be an integer"));
     let v = match (name, args) {
         ("range", a) if (1..=3).contains(&a.len()) => {
             let (start, stop, step) = match a {
@@ -3648,6 +3658,32 @@ fn bitwise_or_set(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     }
 }
 
+/// `<<` / `>>` — integer shifts (both operands integral, like Python and the
+/// native/viper machine-word path). Negative shift counts are an error, as in
+/// CPython; `>>` is arithmetic (sign-preserving).
+fn int_shift(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    match (as_int(l), as_int(r)) {
+        (Some(x), Some(y)) => {
+            if y < 0 {
+                return Err("negative shift count".to_string());
+            }
+            let sh = y as u32;
+            let z = match op {
+                BinOp::Shl => x.wrapping_shl(sh),
+                BinOp::Shr => x.wrapping_shr(sh),
+                _ => unreachable!(),
+            };
+            Ok(Value::Int(z))
+        }
+        _ => Err(format!(
+            "unsupported operand type for {}: {} and {}",
+            op_symbol(op),
+            type_name(l),
+            type_name(r)
+        )),
+    }
+}
+
 /// Whether every element of `a` is in `b` (both must be sets).
 fn set_subset(a: &Value, b: &Value) -> Result<bool, String> {
     match (a, b) {
@@ -3731,6 +3767,7 @@ fn apply_bin(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         }
         BinOp::And | BinOp::Or => unreachable!("short-circuited before apply"),
         BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor => bitwise_or_set(op, l, r),
+        BinOp::Shl | BinOp::Shr => int_shift(op, l, r),
     }
 }
 
@@ -3742,6 +3779,13 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value, String> {
             Value::Float(f) => Ok(Value::Float(-f)),
             Value::Bool(b) => Ok(Value::Int(if b { -1 } else { 0 })),
             _ => Err(format!("can't negate {}", type_name(&v))),
+        },
+        // `~x` == `-x - 1` (Rust's `!` on a signed int is bitwise NOT). Ints
+        // (and bools, which act as 0/1) only — matches CPython and viper.
+        UnOp::Invert => match v {
+            Value::Int(n) => Ok(Value::Int(!n)),
+            Value::Bool(b) => Ok(Value::Int(!(b as i64))),
+            _ => Err(format!("bad operand type for unary ~: '{}'", type_name(&v))),
         },
     }
 }
@@ -3913,7 +3957,10 @@ mod tests {
         assert_eq!(run_to_end("print(list(\"abc\"))\n"), "['a', 'b', 'c']\n");
         assert_eq!(run_to_end("print(tuple([1, 2]))\n"), "(1, 2)\n");
         assert_eq!(run_to_end("print(list())\n"), "[]\n");
-        assert_eq!(run_to_end("d = dict()\nd[\"a\"] = 1\nprint(d)\n"), "{'a': 1}\n");
+        assert_eq!(
+            run_to_end("d = dict()\nd[\"a\"] = 1\nprint(d)\n"),
+            "{'a': 1}\n"
+        );
     }
 
     #[test]
@@ -3955,16 +4002,22 @@ mod tests {
         // The debugger runs the same closure conversion as the compiler, so
         // captures behave identically here (values match CPython).
         assert_eq!(
-            run_to_end("def outer():\n    x = 5\n    def inner():\n        return x + 1\n    return inner()\nprint(outer())\n"),
+            run_to_end(
+                "def outer():\n    x = 5\n    def inner():\n        return x + 1\n    return inner()\nprint(outer())\n"
+            ),
             "6\n"
         );
         assert_eq!(
-            run_to_end("def f(n):\n    def dbl():\n        return n * 2\n    return dbl()\nprint(f(21))\n"),
+            run_to_end(
+                "def f(n):\n    def dbl():\n        return n * 2\n    return dbl()\nprint(f(21))\n"
+            ),
             "42\n"
         );
         // A rebind before the call is seen, like Python's cell capture.
         assert_eq!(
-            run_to_end("def f():\n    x = 1\n    def s():\n        return x\n    x = 2\n    return s()\nprint(f())\n"),
+            run_to_end(
+                "def f():\n    x = 1\n    def s():\n        return x\n    x = 2\n    return s()\nprint(f())\n"
+            ),
             "2\n"
         );
     }
@@ -3975,7 +4028,10 @@ mod tests {
         assert_eq!(run_to_end("print(3.0)\n"), "3.0\n");
         assert_eq!(run_to_end("print(1234567.891)\n"), "1234567.891\n"); // was ...061467
         assert_eq!(run_to_end("print(0.00001)\n"), "1e-05\n");
-        assert_eq!(run_to_end("print([0.1, 2.0, 0.25])\n"), "[0.1, 2.0, 0.25]\n");
+        assert_eq!(
+            run_to_end("print([0.1, 2.0, 0.25])\n"),
+            "[0.1, 2.0, 0.25]\n"
+        );
         assert_eq!(run_to_end("print(10.0 / 4.0)\n"), "2.5\n");
     }
 
@@ -4014,13 +4070,22 @@ mod tests {
     #[test]
     fn range_and_reduction_builtins_in_the_step_debugger() {
         assert_eq!(run_to_end("print(list(range(4)))\n"), "[0, 1, 2, 3]\n");
-        assert_eq!(run_to_end("print(sorted(list(range(5))))\n"), "[0, 1, 2, 3, 4]\n");
+        assert_eq!(
+            run_to_end("print(sorted(list(range(5))))\n"),
+            "[0, 1, 2, 3, 4]\n"
+        );
         assert_eq!(run_to_end("print(sum([1, 2, 3]))\n"), "6\n");
         assert_eq!(run_to_end("print(min([3, 1, 2]))\n"), "1\n");
         assert_eq!(run_to_end("print(max(4, 9, 2))\n"), "9\n");
         assert_eq!(run_to_end("print(sorted([3, 1, 2]))\n"), "[1, 2, 3]\n");
-        assert_eq!(run_to_end("print(sorted([3, 1, 2], reverse=True))\n"), "[3, 2, 1]\n");
-        assert_eq!(run_to_end("print(sorted([3, 1, 2], reverse=False))\n"), "[1, 2, 3]\n");
+        assert_eq!(
+            run_to_end("print(sorted([3, 1, 2], reverse=True))\n"),
+            "[3, 2, 1]\n"
+        );
+        assert_eq!(
+            run_to_end("print(sorted([3, 1, 2], reverse=False))\n"),
+            "[1, 2, 3]\n"
+        );
         assert_eq!(run_to_end("print(round(3.7))\n"), "4\n");
         assert_eq!(run_to_end("print(round(2.5))\n"), "2\n");
         assert_eq!(
@@ -4185,7 +4250,8 @@ mod tests {
     fn unsupported_construct_stops_friendly() {
         // A class def isn't in the stepper (step-over mode) — friendly stop,
         // not a panic. (The call-stack Vm does run classes.)
-        let mut s = Stepper::new("class C:\n    def m(self):\n        return 1\nprint(1)\n").unwrap();
+        let mut s =
+            Stepper::new("class C:\n    def m(self):\n        return 1\nprint(1)\n").unwrap();
         for _ in 0..10 {
             if !s.is_paused() {
                 break;
@@ -4458,15 +4524,31 @@ mod tests {
         assert_eq!(vm_run("print([1, 2, 3][::-1])\n"), "[3, 2, 1]\n");
         assert_eq!(vm_run("print(\"hello\"[1:4])\n"), "ell\n");
         assert_eq!(vm_run("print(list(range(4)))\n"), "[0, 1, 2, 3]\n");
-        assert_eq!(vm_run("print(sum([1, 2, 3]))\nprint(max([4, 9, 2]))\n"), "6\n9\n");
-        assert_eq!(vm_run("print(sorted([3, 1, 2], reverse=True))\n"), "[3, 2, 1]\n");
-        // import math, and classes + nested def already run in call-stack mode.
-        assert_eq!(vm_run("import math\nprint(math.sqrt(16.0))\nprint(math.floor(2.9))\n"), "4.0\n2\n");
         assert_eq!(
-            vm_run("class C:\n    def __init__(self, n):\n        self.n = n\n    def two(self):\n        return self.n * 2\nprint(C(5).two())\n"),
+            vm_run("print(sum([1, 2, 3]))\nprint(max([4, 9, 2]))\n"),
+            "6\n9\n"
+        );
+        assert_eq!(
+            vm_run("print(sorted([3, 1, 2], reverse=True))\n"),
+            "[3, 2, 1]\n"
+        );
+        // import math, and classes + nested def already run in call-stack mode.
+        assert_eq!(
+            vm_run("import math\nprint(math.sqrt(16.0))\nprint(math.floor(2.9))\n"),
+            "4.0\n2\n"
+        );
+        assert_eq!(
+            vm_run(
+                "class C:\n    def __init__(self, n):\n        self.n = n\n    def two(self):\n        return self.n * 2\nprint(C(5).two())\n"
+            ),
             "10\n"
         );
-        assert_eq!(vm_run("def outer():\n    def inner():\n        return 7\n    return inner()\nprint(outer())\n"), "7\n");
+        assert_eq!(
+            vm_run(
+                "def outer():\n    def inner():\n        return 7\n    return inner()\nprint(outer())\n"
+            ),
+            "7\n"
+        );
         assert_eq!(vm_run("a, *rest = [1, 2, 3]\nprint(rest)\n"), "[2, 3]\n");
         assert_eq!(
             vm_run("for i, x in enumerate([\"a\", \"b\"]):\n    print(i, x)\n"),

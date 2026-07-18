@@ -392,6 +392,12 @@ run_case set_sorted_display 'print({3, 1, 2})\nprint({2.5, 1, 3})\n' '{1, 2, 3}\
 # Canonical SORTED display is ours by design (CPython prints hash order) —
 # the expected strings here are the canonical form, not a CPython diff.
 run_case set_sorted_strs 'print({"pear", "apple", "fig"})\n' "{'apple', 'fig', 'pear'}" || fails=$((fails+1))
+# Bit shifts + invert — the viper intersection.
+run_case shifts 'print(1 << 4)\nprint(255 >> 2)\nprint(1 + 1 << 2)\n' '16\n63\n8' || fails=$((fails+1))
+run_case invert 'print(~5)\nprint(~0)\nprint(~~42)\n' '-6\n-1\n42' || fails=$((fails+1))
+run_case shift_typed 'def sh(a: int, b: int) -> int:\n    return a << b\nprint(sh(3, 4))\n' '48' || fails=$((fails+1))
+run_case shift_aug 'x = 3\nx <<= 4\nx >>= 1\nprint(x)\n' '24' || fails=$((fails+1))
+run_case bitwise_ints 'print(5 | 2)\nprint(6 & 3)\nprint(5 ^ 3)\n' '7\n2\n6' || fails=$((fails+1))
 run_case_in input_line 'x = input()\nprint("got " + x)\n' 'got hello' 'hello\n' || fails=$((fails+1))
 run_case_in input_prompt 'name = input("Who? ")\nprint("Hi " + name)\n' 'Who? Hi Ana' 'Ana\n' || fails=$((fails+1))
 run_case_in input_eof 'x = input()\nprint(len(x))\n' '0' '' || fails=$((fails+1))

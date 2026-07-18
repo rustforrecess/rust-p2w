@@ -11,9 +11,14 @@
 pub struct Stmt {
     pub kind: StmtKind,
     pub line: usize,
+    /// Byte range `[start, end)` of the statement in the source — full extent,
+    /// i.e. header through the last line of the body for compound statements.
+    /// `(0, 0)` when unset (e.g. a desugared statement with no single origin).
+    pub span: Span,
 }
 
 impl PartialEq for Stmt {
+    // Structure only — line and span are positional metadata, not meaning.
     fn eq(&self, other: &Self) -> bool {
         self.kind == other.kind
     }
@@ -214,6 +219,9 @@ pub enum CompClause {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~x` — bitwise inversion (`-x - 1`), integers only. Matches CPython and
+    /// MicroPython/viper (machine-word invert on the native path).
+    Invert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -226,10 +234,17 @@ pub enum BinOp {
     FloorDiv,
     Mod,
     Pow,
-    // Set operations (union / intersection / symmetric difference).
+    // Bitwise on ints (or / and / xor) *or* set operations (union /
+    // intersection / symmetric difference) — dispatched by operand type, the
+    // same way `+` chooses int-add vs str/list-concat. This is CPython-exact
+    // and matches viper's integer bit manipulation.
     BitOr,
     BitAnd,
     BitXor,
+    // Bit shifts on integers: `<<`, `>>` (machine-word on the native/viper
+    // path; arithmetic right shift, like CPython on non-negative ints).
+    Shl,
+    Shr,
     // Comparison (yield 0/1)
     Lt,
     Le,

@@ -89,7 +89,9 @@ fn free_vars_of(params: &[String], body: &[Stmt]) -> BTreeSet<String> {
     reads_here(body, &mut free); // includes nested defs' *default* exprs
     for g in nested_defs(body) {
         if let StmtKind::Def {
-            params: gp, body: gb, ..
+            params: gp,
+            body: gb,
+            ..
         } = &g.kind
         {
             free.extend(free_vars_of(gp, gb));
@@ -371,7 +373,9 @@ fn lift_in_function(
             collect_calls(gb, &mut called);
             let mut add: BTreeSet<String> = BTreeSet::new();
             for h in called.intersection(&siblings) {
-                if h != &name && let Some(hc) = caps.get(h) {
+                if h != &name
+                    && let Some(hc) = caps.get(h)
+                {
                     add.extend(hc.iter().cloned());
                 }
             }
@@ -515,8 +519,8 @@ mod tests {
 
     #[test]
     fn lifts_a_non_capturing_nested_def() {
-        let out =
-            hoist("def outer():\n    def inner():\n        return 1\n    return inner()\n").unwrap();
+        let out = hoist("def outer():\n    def inner():\n        return 1\n    return inner()\n")
+            .unwrap();
         assert_eq!(
             defs(&out),
             vec![("inner".into(), vec![]), ("outer".into(), vec![])]
@@ -525,15 +529,13 @@ mod tests {
 
     #[test]
     fn a_capture_becomes_a_leading_parameter() {
-        let out =
-            hoist("def outer():\n    x = 5\n    def inner():\n        return x + 1\n    return inner()\n")
-                .unwrap();
+        let out = hoist(
+            "def outer():\n    x = 5\n    def inner():\n        return x + 1\n    return inner()\n",
+        )
+        .unwrap();
         assert_eq!(
             defs(&out),
-            vec![
-                ("inner".into(), vec!["x".into()]),
-                ("outer".into(), vec![])
-            ]
+            vec![("inner".into(), vec!["x".into()]), ("outer".into(), vec![])]
         );
     }
 
@@ -625,8 +627,9 @@ mod tests {
 
     #[test]
     fn statement_order_is_preserved_with_the_lift_before_its_parent() {
-        let out = hoist("x = 1\ndef o():\n    def i():\n        return 2\n    return i()\nprint(o())\n")
-            .unwrap();
+        let out =
+            hoist("x = 1\ndef o():\n    def i():\n        return 2\n    return i()\nprint(o())\n")
+                .unwrap();
         // x = 1 stays first; `i` is inserted just before `o`; print stays last.
         assert!(matches!(out[0].kind, StmtKind::Assign(..)));
         assert_eq!(defs(&out), vec![("i".into(), vec![]), ("o".into(), vec![])]);

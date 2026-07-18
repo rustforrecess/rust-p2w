@@ -78,6 +78,21 @@ nothing here depends on those licenses since no code is used.
      tools/native_run.sh — running an interpreter to diff outputs uses it as a
      tool and imposes no license obligation on this code.)
 
+6. MicroPython — the viper code emitter (@micropython.viper) —
+   https://github.com/micropython/micropython — MIT
+   - viper's documented "fast typed subset" — machine-word `int`/`uint`,
+     optimized integer arithmetic and **bit manipulation** (`<<` `>>` `~`
+     `&` `|` `^`), and the `ptr8/16/32` buffer types — is the design *target*
+     for the fast, typed intersection of Python we compile ("cover what viper
+     can do fast"). Our shifts/invert/int-bitwise deliberately match viper's
+     machine-word semantics: shift counts masked mod-32; wrapping integer ops.
+   - Consulted the **public documentation only** — docs/reference/speed_python.rst
+     (the viper spec: types, operations, machine-word behavior). The viper
+     *emitter* source (py/emitnative.c, py/asm*.c) was **NOT read**. The
+     implementations here are standard WASM (i32.shl / shr_s / xor) and LLVM
+     bit instructions, patterned on our own existing helpers ($py_neg,
+     p2w_band). Behavior/spec is uncopyrightable; no MicroPython code is used.
+
 ================================================================================
 p2w — MIT License
 ================================================================================

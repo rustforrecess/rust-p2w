@@ -30,9 +30,20 @@ pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
 pub use builtins::{BUILTINS, Builtin, builtins_json};
 pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{Status, Stepper, Value, Vm};
-pub use floatfmt::py_float_repr;
 pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
+pub use floatfmt::py_float_repr;
+pub use lexer::Comment;
+
+/// Recover the `#` comments a student wrote, in source order. Comments never
+/// reach the AST, so this is the way for the IDE / analysis layer to surface
+/// or store what the student wrote alongside their code. Returns an empty list
+/// if the source can't even be tokenized.
+pub fn comments(source: &str) -> Vec<Comment> {
+    lexer::lex_with_comments(source)
+        .map(|(_tokens, comments)| comments)
+        .unwrap_or_default()
+}
 
 /// Compile Python (the supported subset) to WebAssembly text (WAT).
 ///
