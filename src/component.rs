@@ -279,7 +279,7 @@ pub fn to_component(
     let unclean = lint::component_clean_warnings(&stmts, &group, instance);
     if !unclean.is_empty() {
         let mut msg = String::from("not component-clean — fix these first:\n");
-        for (line, m) in &unclean {
+        for (line, _span, m) in &unclean {
             msg.push_str(&format!("  line {line}: {m}\n"));
         }
         return Err(msg);
