@@ -253,6 +253,30 @@ pub fn confirm_container_shrinks(source: &str, name: &str) -> Option<bool> {
     Some(decreased)
 }
 
+/// Does an organizer actually **sort**? A step up from role to algorithm-level:
+/// an organizer preserves the multiset, but only *observation* tells a sort from
+/// a mere rearrangement — a reverse and a bubble sort are both organizers, yet
+/// only one produces ordered output. Runs `source` and checks the final list is
+/// the initial one in ascending (or descending) order.
+///
+/// - `Some(true)`  — sorted output (a genuine sort).
+/// - `Some(false)` — a permutation that is not ordered (reverse, rotate, a
+///   partial/partition rearrangement, or a buggy sort).
+/// - `None` — unobservable (no integer-literal `list`, runtime error).
+///
+/// (The *per-pass* sortedness invariant — the prefix sorted after pass k for
+/// selection, the growing-prefix for insertion, the suffix for bubble — is what
+/// distinguishes *which* sort; that is the follow-on. This confirms *that* it
+/// sorts.)
+pub fn confirm_sorts(source: &str, list: &str) -> Option<bool> {
+    let before = initial_int_list(source, list)?;
+    let after = parse_int_list(&run_and_read(source, list)?)?;
+    let mut asc = before;
+    asc.sort_unstable();
+    let desc: Vec<i64> = asc.iter().rev().copied().collect();
+    Some(after == asc || after == desc)
+}
+
 /// Confirm a **walker** by *differential execution*: a genuinely data-driven
 /// position ends somewhere that *depends on the data*, so running the program on
 /// two different inputs makes it stop in different places. Runs `source` and a
@@ -1701,6 +1725,18 @@ while j < n:
         // execution shows it is NOT data-driven (it is a stepper, not a walker).
         let step = "a = [1, 2, 3, 4]\nn = 4\ni = 0\ns = 0\nwhile i < n:\n    s = s + a[i]\n    i = i + 1\nprint(i)\n";
         assert_eq!(confirm_walker_is_data_driven(step, "i", "a"), Some(false));
+    }
+
+    #[test]
+    fn vm_tells_a_sort_from_a_mere_rearrangement() {
+        // Both are organizers (move elements, preserve the multiset)...
+        let bubble = "a = [4, 2, 6, 1, 5, 3]\nn = 6\nfor i in range(0, n):\n    for j in range(0, n - 1 - i):\n        if a[j] > a[j + 1]:\n            a[j], a[j + 1] = a[j + 1], a[j]\n";
+        let rev = "a = [3, 1, 2]\nn = 3\nfor i in range(0, 1):\n    a[i], a[n - 1 - i] = a[n - 1 - i], a[i]\n";
+        assert_eq!(role_of(bubble, "a"), Some(Role::Organizer));
+        assert_eq!(role_of(rev, "a"), Some(Role::Organizer));
+        // ...but only the bubble sort actually orders the data.
+        assert_eq!(confirm_sorts(bubble, "a"), Some(true));
+        assert_eq!(confirm_sorts(rev, "a"), Some(false));
     }
 
     #[test]
