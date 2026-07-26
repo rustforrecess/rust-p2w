@@ -24,6 +24,7 @@ mod lint;
 mod llvm;
 mod parser;
 mod reuse;
+mod roles;
 
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
@@ -32,6 +33,7 @@ pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{Status, Stepper, Value, Vm};
 pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
+pub use roles::{Role, VarRole, roles_of, variable_roles};
 pub use floatfmt::py_float_repr;
 pub use lexer::Comment;
 
