@@ -253,6 +253,25 @@ pub fn confirm_container_shrinks(source: &str, name: &str) -> Option<bool> {
     Some(decreased)
 }
 
+/// Which sort is it, auto-detecting the outer loop index? Convenience wrapper
+/// over [`classify_sort_by_passes`] that uses the program's outermost `for`
+/// variable as the pass counter.
+pub fn classify_sort(source: &str, list: &str) -> Option<&'static str> {
+    let outer = outer_loop_var(source)?;
+    classify_sort_by_passes(source, list, &outer)
+}
+
+/// The variable of the program's first top-level `for` loop (the outer pass
+/// index of a nested-loop sort), if any.
+fn outer_loop_var(source: &str) -> Option<String> {
+    let tokens = crate::lexer::lex(source).ok()?;
+    let (stmts, _) = crate::parser::parse_recovering(&tokens);
+    stmts.iter().find_map(|s| match &s.kind {
+        StmtKind::For { var, .. } | StmtKind::ForEach { var, .. } => Some(var.clone()),
+        _ => None,
+    })
+}
+
 /// Which sort is it? Distinguish **selection / insertion / bubble** by their
 /// *per-pass* invariant, observed on the `Vm` — the round-13 discriminator done
 /// by observation rather than syntax. Snapshots `list` at each change of the
@@ -1843,6 +1862,10 @@ while j < n:
         assert_eq!(classify_sort_by_passes(sel, "a", "i"), Some("selection"));
         assert_eq!(classify_sort_by_passes(ins, "a", "i"), Some("insertion"));
         assert_eq!(classify_sort_by_passes(bub, "a", "i"), Some("bubble"));
+        // Auto-detecting the outer index gives the same answers.
+        assert_eq!(classify_sort(sel, "a"), Some("selection"));
+        assert_eq!(classify_sort(ins, "a"), Some("insertion"));
+        assert_eq!(classify_sort(bub, "a"), Some("bubble"));
     }
 
     #[test]
