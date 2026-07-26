@@ -35,6 +35,7 @@ pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
 pub use roles::{
     Role, VarRole, confirm_container_shrinks, confirm_organizer_multiset, roles_of, variable_roles,
+    variable_roles_verified,
 };
 pub use floatfmt::py_float_repr;
 pub use lexer::Comment;

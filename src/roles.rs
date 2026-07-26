@@ -134,6 +134,23 @@ pub fn variable_roles(source: &str) -> Vec<VarRole> {
     roles_of(&stmts)
 }
 
+/// Like [`variable_roles`], but with the data-structure tags **confirmed on the
+/// `Vm`**: a syntactic organizer/container whose observed invariant *fails* is
+/// dropped (`confirm_* == Some(false)`), while a confirmed (`Some(true)`) or
+/// merely-unobservable (`None`) tag is kept. This is recognition made *exact*
+/// where the interpreter can see the difference — e.g. a lossy shift that looks
+/// like an organizer, or a dead-branch `pop` that looks like a container, are
+/// removed from the output.
+pub fn variable_roles_verified(source: &str) -> Vec<VarRole> {
+    let mut roles = variable_roles(source);
+    roles.retain(|vr| match vr.role {
+        Role::Organizer => confirm_organizer_multiset(source, &vr.name) != Some(false),
+        Role::Container => confirm_container_shrinks(source, &vr.name) != Some(false),
+        _ => true,
+    });
+    roles
+}
+
 /// Confirm an **organizer** by *observation* on the `Vm`, not syntax: a genuine
 /// in-place rearrangement preserves the multiset of the list (same elements,
 /// reordered). Runs `source` on the step-interpreter and compares the list's
@@ -1526,6 +1543,36 @@ while j < n:
         let dead = "a = [1, 2, 3]\nst = []\nfor x in a:\n    st.append(x)\n    if x > 100:\n        st.pop()\n";
         assert_eq!(role_of(dead, "st"), Some(Role::Container)); // syntax says yes
         assert_eq!(confirm_container_shrinks(dead, "st"), Some(false)); // Vm says no
+    }
+
+    #[test]
+    fn verified_roles_drop_tags_the_vm_disproves() {
+        // A real swap: the organizer tag survives verification.
+        let swap = "a = [3, 1, 2]\nfor i in range(0, 2):\n    if a[i] > a[i + 1]:\n        a[i], a[i + 1] = a[i + 1], a[i]\n";
+        assert_eq!(role_of(swap, "a"), Some(Role::Organizer));
+        assert!(
+            variable_roles_verified(swap)
+                .iter()
+                .any(|v| v.name == "a" && v.role == Role::Organizer),
+            "confirmed organizer is kept"
+        );
+
+        // A lossy shift: syntactic organizer, but the Vm disproves the multiset
+        // invariant, so the verified output DROPS it.
+        let lossy = "a = [3, 1, 2]\nfor i in range(0, 2):\n    a[i] = a[i + 1]\n";
+        assert_eq!(role_of(lossy, "a"), Some(Role::Organizer));
+        assert!(
+            variable_roles_verified(lossy).iter().all(|v| v.name != "a"),
+            "disproved organizer is dropped"
+        );
+
+        // A dead-branch pop: syntactic container, dropped after verification.
+        let dead = "a = [1, 2, 3]\nst = []\nfor x in a:\n    st.append(x)\n    if x > 100:\n        st.pop()\n";
+        assert_eq!(role_of(dead, "st"), Some(Role::Container));
+        assert!(
+            variable_roles_verified(dead).iter().all(|v| v.name != "st"),
+            "disproved container is dropped"
+        );
     }
 
     #[test]
