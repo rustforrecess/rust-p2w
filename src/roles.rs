@@ -31,12 +31,16 @@
 //! swap helper). The order is computed from `reuse.rs`'s tested `vars_read` /
 //! `vars_assigned` primitives — the first hookup to the liveness substrate.
 //!
-//! Deferred: **transformation**, **fixed-value**, **organizer**, **walker**,
-//! **container** are later predicates. The two static approximations that
-//! remain (data-flow taint; treating a `while` condition's names as loop
-//! drivers) are where fuller `reuse.rs` liveness and the `debug.rs` `Vm` make
-//! recognition exact — the point of the owned substrate. See
-//! `docs/CAUSALCODE_INTEGRATION.md`.
+//! And the remaining scalar roles: **transformation** (a computed derived value
+//! `y = 2*x`, no self-reference or carry-across) and **fixed-value** (a scalar
+//! literal set before the loop, read inside it, never reassigned).
+//!
+//! Deferred: the data-structure roles **organizer**, **walker**, **container**
+//! (which lean on the `Vm`'s observable invariants). The two static
+//! approximations that remain (data-flow taint; treating a `while` condition's
+//! names as loop drivers) are where fuller `reuse.rs` liveness and the
+//! `debug.rs` `Vm` make recognition exact — the point of the owned substrate.
+//! See `docs/CAUSALCODE_INTEGRATION.md`.
 
 use crate::ast::{CompClause, Expr, ExprKind, Stmt, StmtKind};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -63,6 +67,12 @@ pub enum Role {
     /// A short-lived scratch value — an unconditional copy `t = a[i]` that is
     /// *written before it is read* each iteration (the classic swap helper).
     Temporary,
+    /// A fresh value computed from the data each iteration, with no
+    /// self-reference and no carry-across (`y = 2*x + 7`, `c = (f-32)*5//9`).
+    Transformation,
+    /// A constant parameter: set to a literal before the loop and only read
+    /// inside it, never reassigned (`limit = 100` used in `if x < limit`).
+    FixedValue,
 }
 
 impl Role {
@@ -77,6 +87,8 @@ impl Role {
             Role::OneWayFlag => "one_way_flag",
             Role::Follower => "follower",
             Role::Temporary => "temporary",
+            Role::Transformation => "transformation",
+            Role::FixedValue => "fixed_value",
         }
     }
 }
@@ -108,6 +120,7 @@ pub fn roles_of(stmts: &[Stmt]) -> Vec<VarRole> {
     a.taint(stmts);
     a.walk(stmts, false, false);
     a.classify_followers(stmts);
+    a.classify_fixed_values(stmts);
     a.finish()
 }
 
@@ -139,6 +152,10 @@ struct Info {
     /// order): an unconditional element copy read-before-write vs write-before-read.
     follower: bool,
     temporary: bool,
+    /// A computed derived value (`y = 2*x`), set in the main walk.
+    transform: bool,
+    /// A constant parameter, set by the whole-program fixed-value pass.
+    fixed: bool,
     line: usize,
 }
 
@@ -235,6 +252,12 @@ impl Analysis {
                     && !is_maxmin
                     && !is_lit
                     && is_copy_of_data(value, &self.drivers, &self.data_vars);
+                // A computed derived value of the data (not self-ref, not a bare
+                // copy, not a literal) — a transformation.
+                let is_transform = selfref_data.is_none()
+                    && !is_maxmin
+                    && !is_lit
+                    && is_computed_from_data(value, &self.drivers, &self.data_vars);
                 let line = s.line;
 
                 let e = self.updates.entry(name.clone()).or_default();
@@ -255,6 +278,8 @@ impl Analysis {
                     }
                 } else if is_cond_copy {
                     e.copy_cond = true;
+                } else if is_transform {
+                    e.transform = true;
                 }
                 // An unconditional bare copy (`prev = x`) is a follower OR a
                 // temporary — the two differ only by read/write order within the
@@ -359,6 +384,33 @@ impl Analysis {
         }
     }
 
+    // ---- fixed value: a literal set before the loop, read inside it, never
+    // reassigned in any loop (a constant parameter used in the body's logic). ----
+    fn classify_fixed_values(&mut self, stmts: &[Stmt]) {
+        let mut lit_outside: HashMap<String, usize> = HashMap::new();
+        let mut assigned_in_loop: HashSet<String> = HashSet::new();
+        let mut read_in_loop: HashSet<String> = HashSet::new();
+        scan_fixed(
+            stmts,
+            false,
+            &mut lit_outside,
+            &mut assigned_in_loop,
+            &mut read_in_loop,
+        );
+        for (name, line) in lit_outside {
+            if !assigned_in_loop.contains(&name)
+                && read_in_loop.contains(&name)
+                && !self.drivers.contains(&name)
+            {
+                let e = self.updates.entry(name).or_default();
+                e.fixed = true;
+                if e.line == 0 {
+                    e.line = line;
+                }
+            }
+        }
+    }
+
     fn finish(self) -> Vec<VarRole> {
         let Analysis {
             drivers, updates, ..
@@ -392,6 +444,10 @@ impl Analysis {
                     Role::Follower
                 } else if info.temporary {
                     Role::Temporary
+                } else if info.transform {
+                    Role::Transformation
+                } else if info.fixed {
+                    Role::FixedValue
                 } else {
                     return None;
                 };
@@ -570,6 +626,129 @@ fn collect_writes(s: &Stmt, out: &mut BTreeSet<String>) {
                 collect_writes(st, out);
             }
         }
+        _ => {}
+    }
+}
+
+/// Is `value` a computed expression (`Bin` or a `Call`) that references the
+/// data — a transformation, as opposed to a self-ref update, a bare copy, or a
+/// literal (which the caller has already ruled out)?
+fn is_computed_from_data(value: &Expr, drivers: &HashSet<String>, data: &HashSet<String>) -> bool {
+    matches!(value.kind, ExprKind::Bin(..) | ExprKind::Call(..)) && refs_data(value, drivers, data)
+}
+
+/// A scalar literal (int / float / bool / string) — the initializer shape of a
+/// fixed-value parameter. Lists/dicts/tuples are excluded (the data, not a
+/// constant parameter).
+fn is_scalar_literal(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_)
+    )
+}
+
+/// Walk for the fixed-value pass: scalar-literal assignments made *outside* any
+/// loop, plus everything assigned or read *inside* a loop body.
+fn scan_fixed(
+    stmts: &[Stmt],
+    in_loop: bool,
+    lit_outside: &mut HashMap<String, usize>,
+    assigned_in_loop: &mut HashSet<String>,
+    read_in_loop: &mut HashSet<String>,
+) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, value) | StmtKind::AnnAssign { name, value, .. } => {
+                if in_loop {
+                    assigned_in_loop.insert(name.clone());
+                } else if is_scalar_literal(value) {
+                    lit_outside.insert(name.clone(), s.line);
+                }
+            }
+            _ => {}
+        }
+        if in_loop {
+            // This statement's own reads (its header/rhs, not nested bodies —
+            // those recurse). A loop header read at `in_loop == false` is not
+            // counted, so a bound like `range(n)` doesn't mark `n` as body-read.
+            let mut r = BTreeSet::new();
+            stmt_own_reads(s, &mut r);
+            read_in_loop.extend(r);
+        }
+        match &s.kind {
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                scan_fixed(body, in_loop, lit_outside, assigned_in_loop, read_in_loop);
+                for (_, b) in elifs {
+                    scan_fixed(b, in_loop, lit_outside, assigned_in_loop, read_in_loop);
+                }
+                if let Some(b) = else_body {
+                    scan_fixed(b, in_loop, lit_outside, assigned_in_loop, read_in_loop);
+                }
+            }
+            StmtKind::For { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::While { body, .. } => {
+                scan_fixed(body, true, lit_outside, assigned_in_loop, read_in_loop);
+            }
+            StmtKind::Def { body, .. } => {
+                scan_fixed(body, false, lit_outside, assigned_in_loop, read_in_loop);
+            }
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    scan_fixed(&m.body, false, lit_outside, assigned_in_loop, read_in_loop);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names read by a statement's *own* expressions (condition / rhs / index),
+/// not descending into nested control-flow bodies.
+fn stmt_own_reads(s: &Stmt, out: &mut BTreeSet<String>) {
+    use crate::reuse::vars_read;
+    match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Assign(_, e) => vars_read(e, out),
+        StmtKind::AnnAssign { ann, value, .. } => {
+            vars_read(ann, out);
+            vars_read(value, out);
+        }
+        StmtKind::If { cond, .. } | StmtKind::While { cond, .. } => vars_read(cond, out),
+        StmtKind::For {
+            start, end, step, ..
+        } => {
+            vars_read(start, out);
+            vars_read(end, out);
+            vars_read(step, out);
+        }
+        StmtKind::ForEach { iterable, .. } => vars_read(iterable, out),
+        StmtKind::SetIndex {
+            target,
+            index,
+            value,
+        } => {
+            vars_read(target, out);
+            vars_read(index, out);
+            vars_read(value, out);
+        }
+        StmtKind::SetAttr { obj, value, .. } => {
+            vars_read(obj, out);
+            vars_read(value, out);
+        }
+        StmtKind::UnpackAssign { targets, value } => {
+            for t in targets {
+                if !matches!(t.kind, ExprKind::Name(_)) {
+                    vars_read(t, out);
+                }
+            }
+            vars_read(value, out);
+        }
+        StmtKind::Return(Some(e)) => vars_read(e, out),
         _ => {}
     }
 }
@@ -858,6 +1037,27 @@ while j < n:
 ";
         assert_eq!(role_of(src, "s"), Some(Role::Gatherer));
         assert_eq!(role_of(src, "j"), None); // driver (in the while condition)
+    }
+
+    #[test]
+    fn transformation_is_a_computed_derived_value() {
+        // `y = 2*x + 7` — computed from the element, no self-reference. A bare
+        // copy (`prev = x`) is not a transformation; a running sum is not either.
+        let src = "a = [1, 2, 3]\nfor x in a:\n    y = 2 * x + 7\n    print(y)\n";
+        assert_eq!(role_of(src, "y"), Some(Role::Transformation));
+        // temp-unit conversion, driver `f`.
+        let conv = "a = [32, 212]\nfor f in a:\n    c = (f - 32) * 5 // 9\n    print(c)\n";
+        assert_eq!(role_of(conv, "c"), Some(Role::Transformation));
+    }
+
+    #[test]
+    fn fixed_value_is_a_constant_parameter() {
+        // `limit` is set to a literal before the loop and only read inside it.
+        let src = "a = [1, 200, 3]\nlimit = 100\nc = 0\nfor x in a:\n    if x < limit:\n        c = c + 1\nprint(c)\n";
+        assert_eq!(role_of(src, "limit"), Some(Role::FixedValue));
+        // `c` is a counter, not fixed; the data list `a` is not a fixed value.
+        assert_eq!(role_of(src, "c"), Some(Role::Counter));
+        assert_eq!(role_of(src, "a"), None);
     }
 
     #[test]
