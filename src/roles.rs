@@ -19,25 +19,39 @@
 //!          else (unconditional constant step)          Stepper
 //! ```
 //!
-//! Holder / follower / one-way-flag / temporary / organizer / walker /
-//! container / fixed-value / transformation get their own predicates later; and
-//! the two static approximations here (data-flow taint; treating a `while`
-//! condition's names as loop drivers) are where `reuse.rs` liveness and the
-//! `debug.rs` `Vm` will make recognition exact rather than approximate — the
-//! point of running on the owned substrate. See
-//! `docs/CAUSALCODE_INTEGRATION.md`.
+//! Also covered: the assignment-based scalar roles that don't need liveness —
+//! **most-wanted-holder** (`if x > best: best = x`, or `best = max(best, x)`)
+//! and **one-way-flag** (`if cond: found = True`, a single latched constant; a
+//! two-way toggle is *not* a flag).
+//!
+//! Deferred: **follower** and **temporary** are the same syntax (`prev = x`, an
+//! unconditional element copy) distinguished only by read/write order within
+//! the iteration — that needs `reuse.rs` liveness. **transformation**,
+//! **fixed-value**, **organizer**, **walker**, **container** are later
+//! predicates. The two static approximations here (data-flow taint; treating a
+//! `while` condition's names as loop drivers) are where `reuse.rs` liveness and
+//! the `debug.rs` `Vm` make recognition exact rather than approximate — the
+//! point of running on the owned substrate. See `docs/CAUSALCODE_INTEGRATION.md`.
 
 use crate::ast::{CompClause, Expr, ExprKind, Stmt, StmtKind};
 use std::collections::{HashMap, HashSet};
 
-/// A role in the scalar accumulator family (v1).
+/// A recognized scalar variable role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    // Accumulator family (self-referential arithmetic update `v = v <op> e`).
     Stepper,
     Counter,
     Gatherer,
     ResetCounter,
     ResetGatherer,
+    // Assignment-based roles.
+    /// Best-so-far value, conditionally replaced (`if x > best: best = x`, or
+    /// `best = max(best, x)`).
+    MostWantedHolder,
+    /// A two-state variable latched to the other state and never reset
+    /// (`if cond: found = True`).
+    OneWayFlag,
 }
 
 impl Role {
@@ -48,12 +62,14 @@ impl Role {
             Role::Gatherer => "gatherer",
             Role::ResetCounter => "reset_counter",
             Role::ResetGatherer => "reset_gatherer",
+            Role::MostWantedHolder => "most_wanted_holder",
+            Role::OneWayFlag => "one_way_flag",
         }
     }
 }
 
-/// A variable found to play an accumulator-family role, with the source line of
-/// its first in-loop update.
+/// A variable found to play a recognized role, with the source line of its
+/// first in-loop update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarRole {
     pub name: String,
@@ -61,8 +77,9 @@ pub struct VarRole {
     pub line: usize,
 }
 
-/// The accumulator-family roles in `source`, ordered by source line then name.
-/// Unparseable source yields an empty list (best-effort, error-recovering parse).
+/// The recognized scalar variable roles in `source`, ordered by source line
+/// then name. Unparseable source yields an empty list (best-effort,
+/// error-recovering parse).
 pub fn variable_roles(source: &str) -> Vec<VarRole> {
     let Ok(tokens) = crate::lexer::lex(source) else {
         return Vec::new();
@@ -71,7 +88,7 @@ pub fn variable_roles(source: &str) -> Vec<VarRole> {
     roles_of(&stmts)
 }
 
-/// The accumulator-family roles in an already-parsed program.
+/// The recognized scalar variable roles in an already-parsed program.
 pub fn roles_of(stmts: &[Stmt]) -> Vec<VarRole> {
     let mut a = Analysis::default();
     a.collect_drivers(stmts);
@@ -80,12 +97,30 @@ pub fn roles_of(stmts: &[Stmt]) -> Vec<VarRole> {
     a.finish()
 }
 
+/// A boolean or small-integer literal (the values a one-way flag latches to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LitVal {
+    B(bool),
+    I(i64),
+}
+
 #[derive(Default)]
 struct Info {
+    // accumulator family
     seen_update: bool,
     data: bool,
     gated: bool,
     reset: bool,
+    // assignment-based
+    /// `v = max(v, ..)` / `v = min(v, ..)` — a most-wanted holder.
+    maxmin: bool,
+    /// `v = <copy of the current element>` under an `if` — a holder.
+    copy_cond: bool,
+    /// Literal constants assigned to `v` inside the loop, and whether any such
+    /// assignment was conditional (a one-way flag latches a single value under
+    /// a condition; a two-way toggle assigns two distinct values).
+    lits: std::collections::HashSet<LitVal>,
+    lit_gated: bool,
     line: usize,
 }
 
@@ -171,22 +206,42 @@ impl Analysis {
     fn walk_stmt(&mut self, s: &Stmt, in_loop: bool, in_if: bool) {
         match &s.kind {
             StmtKind::Assign(name, value) if in_loop => {
-                if let Some(operand) = selfref_operand(name, value) {
-                    let data = refs_data(operand, &self.drivers, &self.data_vars);
-                    let e = self.updates.entry(name.clone()).or_default();
+                // Compute the facts with immutable borrows first, then record.
+                let selfref_data = selfref_operand(name, value)
+                    .map(|op| refs_data(op, &self.drivers, &self.data_vars));
+                let is_maxmin = selfref_data.is_none() && maxmin_selfref(name, value);
+                let lit = literal_value(value);
+                let is_lit = is_literal(value);
+                let is_cond_copy = in_if
+                    && selfref_data.is_none()
+                    && !is_maxmin
+                    && !is_lit
+                    && is_copy_of_data(value, &self.drivers, &self.data_vars);
+                let line = s.line;
+
+                let e = self.updates.entry(name.clone()).or_default();
+                if e.line == 0 {
+                    e.line = line;
+                }
+                if let Some(data) = selfref_data {
                     e.seen_update = true;
                     e.data |= data;
                     e.gated |= in_if;
-                    if e.line == 0 {
-                        e.line = s.line;
+                } else if is_maxmin {
+                    e.maxmin = true;
+                } else if is_lit {
+                    e.reset = true; // an in-loop literal is the accumulator reset
+                    if let Some(lv) = lit {
+                        e.lits.insert(lv);
+                        e.lit_gated |= in_if;
                     }
-                } else if is_literal(value) {
-                    let e = self.updates.entry(name.clone()).or_default();
-                    e.reset = true;
-                    if e.line == 0 {
-                        e.line = s.line;
-                    }
+                } else if is_cond_copy {
+                    e.copy_cond = true;
                 }
+                // An unconditional bare copy (`prev = x`) is a follower OR a
+                // temporary — the two differ only by read/write order within the
+                // iteration, which needs `reuse.rs` liveness; deferred to that
+                // step. A computed `v = f(x)` transformation is deferred too.
             }
             StmtKind::If {
                 body,
@@ -223,26 +278,37 @@ impl Analysis {
         } = self;
         let mut out: Vec<VarRole> = updates
             .into_iter()
-            .filter(|(name, info)| info.seen_update && !drivers.contains(name))
-            .map(|(name, info)| {
-                let role = if info.data {
-                    if info.reset {
-                        Role::ResetGatherer
+            .filter(|(name, _)| !drivers.contains(name))
+            .filter_map(|(name, info)| {
+                let role = if info.seen_update {
+                    // accumulator family
+                    if info.data {
+                        if info.reset {
+                            Role::ResetGatherer
+                        } else {
+                            Role::Gatherer
+                        }
+                    } else if info.reset {
+                        Role::ResetCounter
+                    } else if info.gated {
+                        Role::Counter
                     } else {
-                        Role::Gatherer
+                        Role::Stepper
                     }
-                } else if info.reset {
-                    Role::ResetCounter
-                } else if info.gated {
-                    Role::Counter
+                } else if info.maxmin || info.copy_cond {
+                    Role::MostWantedHolder
+                } else if info.lits.len() == 1 && info.lit_gated {
+                    // Latched a single constant under a condition, never the
+                    // other value (two distinct literals = a two-way toggle).
+                    Role::OneWayFlag
                 } else {
-                    Role::Stepper
+                    return None;
                 };
-                VarRole {
+                Some(VarRole {
                     name,
                     role,
                     line: info.line,
-                }
+                })
             })
             .collect();
         out.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
@@ -261,6 +327,36 @@ fn is_literal(e: &Expr) -> bool {
         e.kind,
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_)
     )
+}
+
+/// A boolean / small-int literal value (for one-way-flag latch detection).
+fn literal_value(e: &Expr) -> Option<LitVal> {
+    match &e.kind {
+        ExprKind::Bool(b) => Some(LitVal::B(*b)),
+        ExprKind::Int(i) => Some(LitVal::I(*i)),
+        _ => None,
+    }
+}
+
+/// Is `value` a bare copy of the current element — a name that is a loop driver
+/// or data-derived, or a subscript read? (Not a computed expression.)
+fn is_copy_of_data(value: &Expr, drivers: &HashSet<String>, data: &HashSet<String>) -> bool {
+    match &value.kind {
+        ExprKind::Name(n) => drivers.contains(n) || data.contains(n),
+        ExprKind::Index(..) => true,
+        _ => false,
+    }
+}
+
+/// Is `value` a `max(name, ..)` / `min(name, ..)` call — a most-wanted holder
+/// written with the built-in rather than an explicit `if`?
+fn maxmin_selfref(name: &str, value: &Expr) -> bool {
+    if let ExprKind::Call(f, args) = &value.kind {
+        if f == "max" || f == "min" {
+            return args.iter().any(|a| is_name(a, name));
+        }
+    }
+    false
 }
 
 /// If `value` is `name <op> e` or `e <op> name`, return the other operand `e`.
@@ -461,11 +557,28 @@ mod tests {
     }
 
     #[test]
-    fn a_holder_is_not_an_accumulator_role() {
-        // `best = x` is a bare copy, not a self-referential update -> unclassified
-        // here (it's a most-wanted-holder, a later predicate).
-        let src = "a = [3, 1, 2]\nbest = a[0]\nfor x in a:\n    if x > best:\n        best = x\n";
-        assert_eq!(role_of(src, "best"), None);
+    fn most_wanted_holder_conditional_copy_and_maxmin() {
+        // `if x > best: best = x` — conditional element copy is a holder.
+        let cond = "a = [3, 1, 2]\nbest = a[0]\nfor x in a:\n    if x > best:\n        best = x\n";
+        assert_eq!(role_of(cond, "best"), Some(Role::MostWantedHolder));
+        // `best = max(best, x)` — the built-in form is the same role.
+        let mx = "a = [3, 1, 4]\nbest = a[0]\nfor x in a:\n    best = max(best, x)\n";
+        assert_eq!(role_of(mx, "best"), Some(Role::MostWantedHolder));
+    }
+
+    #[test]
+    fn one_way_flag_latches_a_single_constant() {
+        // Set True under a condition, never reset -> one-way flag.
+        let src = "a = [1, 0, 2]\nfound = False\nfor x in a:\n    if x == 0:\n        found = True\n";
+        assert_eq!(role_of(src, "found"), Some(Role::OneWayFlag));
+    }
+
+    #[test]
+    fn a_two_way_toggle_is_not_a_flag() {
+        // Assigns BOTH True and False in the loop -> a toggle, not a one-way
+        // flag (its final value tracks only the last element). Unclassified.
+        let src = "a = [1, -2, 3]\nf = False\nfor x in a:\n    if x > 0:\n        f = True\n    else:\n        f = False\n";
+        assert_eq!(role_of(src, "f"), None);
     }
 
     #[test]
