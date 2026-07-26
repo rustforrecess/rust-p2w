@@ -31,18 +31,25 @@
 //! swap helper). The order is computed from `reuse.rs`'s tested `vars_read` /
 //! `vars_assigned` primitives — the first hookup to the liveness substrate.
 //!
-//! And the remaining scalar roles: **transformation** (a computed derived value
+//! The remaining scalar roles: **transformation** (a computed derived value
 //! `y = 2*x`, no self-reference or carry-across) and **fixed-value** (a scalar
 //! literal set before the loop, read inside it, never reassigned).
 //!
-//! Deferred: the data-structure roles **organizer**, **walker**, **container**
-//! (which lean on the `Vm`'s observable invariants). The two static
-//! approximations that remain (data-flow taint; treating a `while` condition's
-//! names as loop drivers) are where fuller `reuse.rs` liveness and the
-//! `debug.rs` `Vm` make recognition exact — the point of the owned substrate.
-//! See `docs/CAUSALCODE_INTEGRATION.md`.
+//! And the data-structure roles: **organizer** (a list whose existing elements
+//! are moved in place — `a[i] = a[j]`, a swap — a map like `a[i] = a[i]*2` is
+//! *not* one), **container** (a collection with both add and remove — a stack /
+//! queue / worklist), and **walker** (a position advanced inside a *data-driven*
+//! loop or branch, e.g. `while j < n and a[j] < x: j += 1`, vs a plain
+//! fixed-range index which is a stepper).
+//!
+//! All 14 roles are now recognized. Remaining refinement: the structural
+//! detection here (and the two static approximations — data-flow taint, and
+//! treating a `while` condition's names as drivers) is where the `debug.rs`
+//! `Vm`'s observable invariants (multiset-preserved for an organizer; sortedness
+//! per pass; data-driven traversal) make recognition *exact* rather than
+//! syntactic. See `docs/CAUSALCODE_INTEGRATION.md`.
 
-use crate::ast::{CompClause, Expr, ExprKind, Stmt, StmtKind};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// A recognized scalar variable role.
@@ -73,6 +80,17 @@ pub enum Role {
     /// A constant parameter: set to a literal before the loop and only read
     /// inside it, never reassigned (`limit = 100` used in `if x < limit`).
     FixedValue,
+    // Data-structure roles.
+    /// A list rearranged *in place* — its existing elements moved between
+    /// positions (swaps, shifts), preserving the multiset (`a[i], a[j] = ...`).
+    Organizer,
+    /// A position index whose path/stop is *data-driven* — advanced inside a
+    /// loop or branch whose condition inspects the data (search, binary search,
+    /// two-pointer), not a fixed range.
+    Walker,
+    /// A collection whose membership changes both ways — elements added *and*
+    /// removed during the loop (a stack / queue / worklist).
+    Container,
 }
 
 impl Role {
@@ -89,6 +107,9 @@ impl Role {
             Role::Temporary => "temporary",
             Role::Transformation => "transformation",
             Role::FixedValue => "fixed_value",
+            Role::Organizer => "organizer",
+            Role::Walker => "walker",
+            Role::Container => "container",
         }
     }
 }
@@ -121,6 +142,7 @@ pub fn roles_of(stmts: &[Stmt]) -> Vec<VarRole> {
     a.walk(stmts, false, false);
     a.classify_followers(stmts);
     a.classify_fixed_values(stmts);
+    a.classify_structures(stmts);
     a.finish()
 }
 
@@ -156,6 +178,10 @@ struct Info {
     transform: bool,
     /// A constant parameter, set by the whole-program fixed-value pass.
     fixed: bool,
+    /// Data-structure roles, set by the structure pass.
+    organizer: bool,
+    walker: bool,
+    container: bool,
     line: usize,
 }
 
@@ -411,15 +437,52 @@ impl Analysis {
         }
     }
 
+    // ---- data-structure roles: organizer, container, walker ----
+    fn classify_structures(&mut self, stmts: &[Stmt]) {
+        let orgs = organized_lists(stmts);
+        let conts = container_lists(stmts);
+        let mut walkers = HashMap::new();
+        find_walkers(stmts, false, &mut walkers);
+        for (name, line) in &conts {
+            let e = self.updates.entry(name.clone()).or_default();
+            e.container = true;
+            if e.line == 0 {
+                e.line = *line;
+            }
+        }
+        for (name, line) in orgs {
+            if !conts.contains_key(&name) {
+                let e = self.updates.entry(name).or_default();
+                e.organizer = true;
+                if e.line == 0 {
+                    e.line = line;
+                }
+            }
+        }
+        for (name, line) in walkers {
+            let e = self.updates.entry(name).or_default();
+            e.walker = true;
+            if e.line == 0 {
+                e.line = line;
+            }
+        }
+    }
+
     fn finish(self) -> Vec<VarRole> {
         let Analysis {
             drivers, updates, ..
         } = self;
         let mut out: Vec<VarRole> = updates
             .into_iter()
-            .filter(|(name, _)| !drivers.contains(name))
             .filter_map(|(name, info)| {
-                let role = if info.seen_update {
+                // A walker overrides the driver exclusion: a data-driven `while`
+                // index (e.g. `while j < n and a[j] < x: j += 1`) is a driver
+                // syntactically but plays the walker role.
+                let role = if info.walker {
+                    Role::Walker
+                } else if drivers.contains(&name) {
+                    return None;
+                } else if info.seen_update {
                     // accumulator family
                     if info.data {
                         if info.reset {
@@ -448,6 +511,10 @@ impl Analysis {
                     Role::Transformation
                 } else if info.fixed {
                     Role::FixedValue
+                } else if info.organizer {
+                    Role::Organizer
+                } else if info.container {
+                    Role::Container
                 } else {
                     return None;
                 };
@@ -627,6 +694,225 @@ fn collect_writes(s: &Stmt, out: &mut BTreeSet<String>) {
             }
         }
         _ => {}
+    }
+}
+
+// ---- data-structure role detection ----
+
+/// Visit every statement (recursing into control-flow bodies).
+fn for_each_stmt(stmts: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
+    for s in stmts {
+        f(s);
+        match &s.kind {
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                for_each_stmt(body, f);
+                for (_, b) in elifs {
+                    for_each_stmt(b, f);
+                }
+                if let Some(b) = else_body {
+                    for_each_stmt(b, f);
+                }
+            }
+            StmtKind::For { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::While { body, .. }
+            | StmtKind::Def { body, .. } => for_each_stmt(body, f),
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    for_each_stmt(&m.body, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Visit every expression in the program (through statements and sub-exprs).
+fn for_each_expr(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
+    for_each_stmt(stmts, &mut |s| match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Assign(_, e) | StmtKind::Return(Some(e)) => {
+            for_each_subexpr(e, f)
+        }
+        StmtKind::AnnAssign { ann, value, .. } => {
+            for_each_subexpr(ann, f);
+            for_each_subexpr(value, f);
+        }
+        StmtKind::If { cond, .. } | StmtKind::While { cond, .. } => for_each_subexpr(cond, f),
+        StmtKind::For {
+            start, end, step, ..
+        } => {
+            for_each_subexpr(start, f);
+            for_each_subexpr(end, f);
+            for_each_subexpr(step, f);
+        }
+        StmtKind::ForEach { iterable, .. } => for_each_subexpr(iterable, f),
+        StmtKind::SetIndex {
+            target,
+            index,
+            value,
+        } => {
+            for_each_subexpr(target, f);
+            for_each_subexpr(index, f);
+            for_each_subexpr(value, f);
+        }
+        StmtKind::SetAttr { obj, value, .. } => {
+            for_each_subexpr(obj, f);
+            for_each_subexpr(value, f);
+        }
+        StmtKind::UnpackAssign { targets, value } => {
+            for t in targets {
+                for_each_subexpr(t, f);
+            }
+            for_each_subexpr(value, f);
+        }
+        _ => {}
+    });
+}
+
+/// Is `e` exactly `list[..]` — a bare subscript read of `list` (a moved
+/// element), not a computed expression that merely mentions it?
+fn is_bare_index_into(e: &Expr, list: &str) -> bool {
+    if let ExprKind::Index(base, _) = &e.kind {
+        matches!(&base.kind, ExprKind::Name(n) if n == list)
+    } else {
+        false
+    }
+}
+
+/// Lists rearranged in place: a position is written a *bare* element of the
+/// same list (a move), via `a[i] = a[j]` or a tuple-swap `a[i], a[j] = a[j], a[i]`.
+/// A computed write like `a[i] = a[i] * 2` is a map, not a move — excluded.
+fn organized_lists(stmts: &[Stmt]) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    for_each_stmt(stmts, &mut |s| match &s.kind {
+        StmtKind::SetIndex { target, value, .. } => {
+            if let ExprKind::Name(a) = &target.kind {
+                if is_bare_index_into(value, a) {
+                    out.entry(a.clone()).or_insert(s.line);
+                }
+            }
+        }
+        StmtKind::UnpackAssign { targets, value } => {
+            let lists: Vec<String> = targets
+                .iter()
+                .filter_map(|t| match &t.kind {
+                    ExprKind::Index(base, _) => match &base.kind {
+                        ExprKind::Name(a) => Some(a.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            let elems: Vec<&Expr> = match &value.kind {
+                ExprKind::Tuple(xs) => xs.iter().collect(),
+                _ => vec![value],
+            };
+            for a in lists {
+                if elems.iter().any(|e| is_bare_index_into(e, &a)) {
+                    out.entry(a).or_insert(s.line);
+                }
+            }
+        }
+        _ => {}
+    });
+    out
+}
+
+/// Collections whose membership changes both ways — a receiver with *both* an
+/// add (`append`/`insert`/`push`) and a remove (`pop`/`remove`) method call.
+fn container_lists(stmts: &[Stmt]) -> HashMap<String, usize> {
+    let mut added: HashMap<String, usize> = HashMap::new();
+    let mut removed: HashSet<String> = HashSet::new();
+    for_each_expr(stmts, &mut |e| {
+        if let ExprKind::MethodCall(recv, method, _) = &e.kind {
+            if let ExprKind::Name(v) = &recv.kind {
+                match method.as_str() {
+                    "append" | "insert" | "push" | "add" => {
+                        added.entry(v.clone()).or_insert(e.line);
+                    }
+                    "pop" | "popleft" | "remove" => {
+                        removed.insert(v.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    added
+        .into_iter()
+        .filter(|(v, _)| removed.contains(v))
+        .collect()
+}
+
+/// Does `e` reference a subscript / slice anywhere (a data-navigation signal)?
+fn expr_has_index(e: &Expr) -> bool {
+    let mut found = false;
+    for_each_subexpr(e, &mut |x| {
+        if matches!(x.kind, ExprKind::Index(..) | ExprKind::Slice { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Is `value` a constant advance of a position — `x <+|-> <int>` (`j + 1`,
+/// `mid - 1`)?
+fn is_index_advance(value: &Expr) -> bool {
+    if let ExprKind::Bin(op, a, b) = &value.kind {
+        if matches!(op, BinOp::Add | BinOp::Sub) {
+            return matches!(a.kind, ExprKind::Int(_)) || matches!(b.kind, ExprKind::Int(_));
+        }
+    }
+    false
+}
+
+/// Walkers: a position advanced by a constant *inside a data-driven context* — a
+/// `while`/`if` whose condition inspects the data (a subscript). A plain
+/// `while i < n: i += 1` (no data in the condition) is a stepper, not a walker.
+fn find_walkers(stmts: &[Stmt], data_ctx: bool, out: &mut HashMap<String, usize>) {
+    for s in stmts {
+        if data_ctx {
+            if let StmtKind::Assign(name, value) = &s.kind {
+                if is_index_advance(value) {
+                    out.entry(name.clone()).or_insert(s.line);
+                }
+            }
+        }
+        match &s.kind {
+            StmtKind::While { cond, body } => {
+                find_walkers(body, data_ctx || expr_has_index(cond), out);
+            }
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                let dc = data_ctx || expr_has_index(cond);
+                find_walkers(body, dc, out);
+                for (c, b) in elifs {
+                    find_walkers(b, data_ctx || expr_has_index(c), out);
+                }
+                if let Some(b) = else_body {
+                    find_walkers(b, dc, out);
+                }
+            }
+            StmtKind::For { body, .. } | StmtKind::ForEach { body, .. } => {
+                find_walkers(body, data_ctx, out);
+            }
+            StmtKind::Def { body, .. } => find_walkers(body, false, out),
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    find_walkers(&m.body, false, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1058,6 +1344,41 @@ while j < n:
         // `c` is a counter, not fixed; the data list `a` is not a fixed value.
         assert_eq!(role_of(src, "c"), Some(Role::Counter));
         assert_eq!(role_of(src, "a"), None);
+    }
+
+    #[test]
+    fn organizer_moves_elements_but_a_map_does_not() {
+        // Bubble-style swap moves existing elements in place -> organizer.
+        let swap = "a = [3, 1, 2]\nfor i in range(0, 2):\n    if a[i] > a[i + 1]:\n        a[i], a[i + 1] = a[i + 1], a[i]\n";
+        assert_eq!(role_of(swap, "a"), Some(Role::Organizer));
+        // A shift (`a[i] = a[i+1]`) also moves an element.
+        let shift = "a = [1, 2, 3]\nfor i in range(0, 2):\n    a[i] = a[i + 1]\n";
+        assert_eq!(role_of(shift, "a"), Some(Role::Organizer));
+        // Writing a COMPUTED value is a map, not a move -> NOT an organizer.
+        let map = "a = [1, 2, 3]\nfor i in range(0, 3):\n    a[i] = a[i] * 2\n";
+        assert_eq!(role_of(map, "a"), None);
+    }
+
+    #[test]
+    fn container_needs_both_add_and_remove() {
+        // Push on positive, pop otherwise -> membership changes both ways.
+        let stack = "a = [1, -2, 3]\nst = []\nfor x in a:\n    if x > 0:\n        st.append(x)\n    else:\n        st.pop()\n";
+        assert_eq!(role_of(stack, "st"), Some(Role::Container));
+        // Append-only is an accumulate collection, NOT a container.
+        let collect = "a = [1, 2, 3]\nout = []\nfor x in a:\n    out.append(x)\n";
+        assert_eq!(role_of(collect, "out"), None);
+    }
+
+    #[test]
+    fn walker_is_a_data_driven_index() {
+        // Scan-until: the while condition inspects the data (`a[j] < x`), so `j`
+        // is a walker, not a plain stepper.
+        let scan = "a = [1, 3, 5, 8]\nn = 4\nx = 6\nj = 0\nwhile j < n and a[j] < x:\n    j = j + 1\nprint(j)\n";
+        assert_eq!(role_of(scan, "j"), Some(Role::Walker));
+        // A plain fixed-range while index is NOT a walker (no data in the test).
+        let plain = "a = [1, 2, 3]\nn = 3\ni = 0\ns = 0\nwhile i < n:\n    s = s + a[i]\n    i = i + 1\n";
+        assert_ne!(role_of(plain, "i"), Some(Role::Walker));
+        assert_eq!(role_of(plain, "s"), Some(Role::Gatherer));
     }
 
     #[test]
