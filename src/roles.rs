@@ -163,6 +163,52 @@ pub fn confirm_organizer_multiset(source: &str, list: &str) -> Option<bool> {
     Some(before == after)
 }
 
+/// Confirm a **container** by *tracing* it on the `Vm`: a genuine
+/// stack/queue/worklist actually shrinks at some point (a `pop` fires), not just
+/// grows. Steps through `source` and watches `name`'s length.
+///
+/// - `Some(true)`  — the collection's length decreased at least once: a real
+///   add-and-remove container.
+/// - `Some(false)` — it never shrank: the `pop` the syntactic check
+///   ([`variable_roles`]) saw is textual but never fires (a dead branch), so at
+///   runtime this is an append-only collection.
+/// - `None` — can't be observed (runtime error, a non-integer collection, or the
+///   step budget was exhausted).
+///
+/// Complements [`confirm_organizer_multiset`]: that observes a before/after
+/// invariant; this observes the *trace*. Same recognition-proposes /
+/// `Vm`-confirms pattern.
+pub fn confirm_container_shrinks(source: &str, name: &str) -> Option<bool> {
+    let mut st = crate::debug::Stepper::new(source).ok()?;
+    let mut prev: Option<usize> = None;
+    let mut observed = false;
+    let mut decreased = false;
+    let mut budget = 100_000;
+    loop {
+        if let Some(len) = st
+            .eval_watch(name)
+            .ok()
+            .and_then(|r| parse_int_list(&r))
+            .map(|v| v.len())
+        {
+            observed = true;
+            if prev.is_some_and(|p| len < p) {
+                decreased = true;
+            }
+            prev = Some(len);
+        }
+        if !st.is_paused() || budget == 0 {
+            break;
+        }
+        st.step();
+        budget -= 1;
+    }
+    if budget == 0 || matches!(st.status(), crate::debug::Status::Error { .. }) || !observed {
+        return None;
+    }
+    Some(decreased)
+}
+
 /// The integer elements of `list`'s initializer literal (`list = [1, 2, 3]`) at
 /// the top level, or None if it isn't a literal list of integers.
 fn initial_int_list(source: &str, list: &str) -> Option<Vec<i64>> {
@@ -1464,6 +1510,22 @@ while j < n:
         let lossy = "a = [3, 1, 2]\nfor i in range(0, 2):\n    a[i] = a[i + 1]\n";
         assert_eq!(role_of(lossy, "a"), Some(Role::Organizer)); // syntax says yes
         assert_eq!(confirm_organizer_multiset(lossy, "a"), Some(false)); // Vm says no
+    }
+
+    #[test]
+    fn vm_confirms_the_container_actually_shrinks() {
+        // A genuine stack: push positives, pop otherwise -> length goes up AND
+        // down at runtime.
+        let stack = "a = [5, 3, -1]\nst = []\nfor x in a:\n    if x > 0:\n        st.append(x)\n    else:\n        st.pop()\n";
+        assert_eq!(role_of(stack, "st"), Some(Role::Container)); // syntactic
+        assert_eq!(confirm_container_shrinks(stack, "st"), Some(true)); // observed
+
+        // THE POINT: a `pop` in a branch the data never triggers is textually
+        // present (so syntax says container) but never fires -- the collection
+        // only grows. The Vm's trace catches it. Observation > syntax.
+        let dead = "a = [1, 2, 3]\nst = []\nfor x in a:\n    st.append(x)\n    if x > 100:\n        st.pop()\n";
+        assert_eq!(role_of(dead, "st"), Some(Role::Container)); // syntax says yes
+        assert_eq!(confirm_container_shrinks(dead, "st"), Some(false)); // Vm says no
     }
 
     #[test]

@@ -33,7 +33,9 @@ pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{Status, Stepper, Value, Vm};
 pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
-pub use roles::{Role, VarRole, confirm_organizer_multiset, roles_of, variable_roles};
+pub use roles::{
+    Role, VarRole, confirm_container_shrinks, confirm_organizer_multiset, roles_of, variable_roles,
+};
 pub use floatfmt::py_float_repr;
 pub use lexer::Comment;
 
