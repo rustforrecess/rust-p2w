@@ -49,7 +49,7 @@
 //! per pass; data-driven traversal) make recognition *exact* rather than
 //! syntactic. See `docs/CAUSALCODE_INTEGRATION.md`.
 
-use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// A recognized scalar variable role.
@@ -132,6 +132,72 @@ pub fn variable_roles(source: &str) -> Vec<VarRole> {
     };
     let (stmts, _) = crate::parser::parse_recovering(&tokens);
     roles_of(&stmts)
+}
+
+/// Confirm an **organizer** by *observation* on the `Vm`, not syntax: a genuine
+/// in-place rearrangement preserves the multiset of the list (same elements,
+/// reordered). Runs `source` on the step-interpreter and compares the list's
+/// initial literal to its final value.
+///
+/// - `Some(true)`  — multiset preserved: a real organizer.
+/// - `Some(false)` — a value was lost / duplicated / changed: a *lossy* "move"
+///   or a map that the syntactic check ([`variable_roles`]) can't tell from a
+///   real rearrangement (e.g. a shift `a[i]=a[i+1]` with no wrap-around).
+/// - `None` — can't be observed here (no integer-literal initializer for `list`,
+///   a runtime error, or a non-integer element).
+///
+/// This is the `debug.rs` `Vm`-hookup: recognition proposes structurally, the
+/// interpreter's observed invariant confirms. The same pattern extends to the
+/// other data-structure roles (a sort's per-pass sortedness; a walker's
+/// data-driven path). See `docs/CAUSALCODE_INTEGRATION.md`.
+pub fn confirm_organizer_multiset(source: &str, list: &str) -> Option<bool> {
+    let mut before = initial_int_list(source, list)?;
+    let mut st = crate::debug::Stepper::new(source).ok()?;
+    st.run(&[]);
+    if !matches!(st.status(), crate::debug::Status::Finished) {
+        return None; // runtime error or unsupported construct — can't observe
+    }
+    let mut after = parse_int_list(&st.eval_watch(list).ok()?)?;
+    before.sort_unstable();
+    after.sort_unstable();
+    Some(before == after)
+}
+
+/// The integer elements of `list`'s initializer literal (`list = [1, 2, 3]`) at
+/// the top level, or None if it isn't a literal list of integers.
+fn initial_int_list(source: &str, list: &str) -> Option<Vec<i64>> {
+    let tokens = crate::lexer::lex(source).ok()?;
+    let (stmts, _) = crate::parser::parse_recovering(&tokens);
+    for s in &stmts {
+        if let StmtKind::Assign(name, value) = &s.kind {
+            if name == list {
+                if let ExprKind::List(items) = &value.kind {
+                    return items.iter().map(int_of).collect();
+                }
+            }
+        }
+    }
+    None
+}
+
+fn int_of(e: &Expr) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Int(n) => Some(*n),
+        ExprKind::Unary(UnOp::Neg, inner) => match &inner.kind {
+            ExprKind::Int(n) => Some(-*n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Parse a `Vm` list repr like `"[1, 2, -3]"` into its integer elements.
+fn parse_int_list(repr: &str) -> Option<Vec<i64>> {
+    let inner = repr.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    inner.split(',').map(|p| p.trim().parse::<i64>().ok()).collect()
 }
 
 /// The recognized scalar variable roles in an already-parsed program.
@@ -1379,6 +1445,25 @@ while j < n:
         let plain = "a = [1, 2, 3]\nn = 3\ni = 0\ns = 0\nwhile i < n:\n    s = s + a[i]\n    i = i + 1\n";
         assert_ne!(role_of(plain, "i"), Some(Role::Walker));
         assert_eq!(role_of(plain, "s"), Some(Role::Gatherer));
+    }
+
+    #[test]
+    fn vm_confirms_the_organizer_multiset_invariant() {
+        // A real swap preserves the multiset -> confirmed by observation.
+        let swap = "a = [3, 1, 2]\nfor i in range(0, 2):\n    if a[i] > a[i + 1]:\n        a[i], a[i + 1] = a[i + 1], a[i]\n";
+        assert_eq!(role_of(swap, "a"), Some(Role::Organizer)); // syntactic
+        assert_eq!(confirm_organizer_multiset(swap, "a"), Some(true)); // observed
+
+        // A rotate with wrap-around also preserves the multiset.
+        let rot = "a = [1, 2, 3]\nfirst = a[0]\nfor i in range(0, 2):\n    a[i] = a[i + 1]\na[2] = first\n";
+        assert_eq!(confirm_organizer_multiset(rot, "a"), Some(true));
+
+        // THE POINT: a bare shift `a[i]=a[i+1]` with NO wrap-around LOOKS like an
+        // organizer syntactically, but it clobbers a value -> the Vm's observed
+        // multiset invariant catches it. Observation > syntax.
+        let lossy = "a = [3, 1, 2]\nfor i in range(0, 2):\n    a[i] = a[i + 1]\n";
+        assert_eq!(role_of(lossy, "a"), Some(Role::Organizer)); // syntax says yes
+        assert_eq!(confirm_organizer_multiset(lossy, "a"), Some(false)); // Vm says no
     }
 
     #[test]
