@@ -226,6 +226,76 @@ pub fn confirm_container_shrinks(source: &str, name: &str) -> Option<bool> {
     Some(decreased)
 }
 
+/// Confirm a **walker** by *differential execution*: a genuinely data-driven
+/// position ends somewhere that *depends on the data*, so running the program on
+/// two different inputs makes it stop in different places. Runs `source` and a
+/// variant with `list` reversed, comparing `walker`'s final value.
+///
+/// - `Some(true)`  — the walker landed in different places on different data: its
+///   path is data-driven (a real walker).
+/// - `Some(false)` — it landed in the same place regardless of the data: a fixed
+///   traversal, i.e. a stepper, not a walker.
+/// - `None` — can't be observed (no integer-literal `list`, too short or a
+///   palindrome, a runtime error, or the literal couldn't be substituted).
+///
+/// The third `Vm` observation mode after [`confirm_organizer_multiset`]
+/// (before/after invariant) and [`confirm_container_shrinks`] (single-run trace).
+pub fn confirm_walker_is_data_driven(source: &str, walker: &str, list: &str) -> Option<bool> {
+    let base = initial_int_list(source, list)?;
+    if base.len() < 2 {
+        return None;
+    }
+    let alt: Vec<i64> = base.iter().rev().copied().collect();
+    if alt == base {
+        return None; // palindrome — can't distinguish
+    }
+    let src2 = replace_list_literal(source, list, &alt)?;
+    let end1 = run_and_read(source, walker)?;
+    let end2 = run_and_read(&src2, walker)?;
+    Some(end1 != end2)
+}
+
+/// Run `source` to completion and read `var`'s final repr (or None on error).
+fn run_and_read(source: &str, var: &str) -> Option<String> {
+    let mut st = crate::debug::Stepper::new(source).ok()?;
+    st.run(&[]);
+    if !matches!(st.status(), crate::debug::Status::Finished) {
+        return None;
+    }
+    st.eval_watch(var).ok()
+}
+
+/// Replace the literal list on `list`'s assignment line with `values`. Returns
+/// None if the `list = [...]` assignment isn't found on a single line.
+fn replace_list_literal(source: &str, list: &str, values: &[i64]) -> Option<String> {
+    let newlit = format!(
+        "[{}]",
+        values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut out = Vec::new();
+    let mut done = false;
+    for line in source.lines() {
+        let t = line.trim_start();
+        let is_target = !done
+            && (t.starts_with(&format!("{list} =")) || t.starts_with(&format!("{list}=")))
+            && line.contains('[')
+            && line.contains(']');
+        if is_target {
+            let start = line.find('[')?;
+            let end = line.rfind(']')?;
+            out.push(format!("{}{}{}", &line[..start], newlit, &line[end + 1..]));
+            done = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    done.then(|| out.join("\n") + "\n")
+}
+
 /// The integer elements of `list`'s initializer literal (`list = [1, 2, 3]`) at
 /// the top level, or None if it isn't a literal list of integers.
 fn initial_int_list(source: &str, list: &str) -> Option<Vec<i64>> {
@@ -1573,6 +1643,20 @@ while j < n:
             variable_roles_verified(dead).iter().all(|v| v.name != "st"),
             "disproved container is dropped"
         );
+    }
+
+    #[test]
+    fn vm_confirms_the_walker_path_is_data_driven() {
+        // Scan-until: where `j` stops depends on the contents, so on reversed
+        // data it stops in a different place -> confirmed data-driven.
+        let scan = "a = [1, 3, 5, 8]\nn = 4\nx = 6\nj = 0\nwhile j < n and a[j] < x:\n    j = j + 1\nprint(j)\n";
+        assert_eq!(role_of(scan, "j"), Some(Role::Walker)); // syntactic
+        assert_eq!(confirm_walker_is_data_driven(scan, "j", "a"), Some(true)); // observed
+
+        // A plain fixed-range index ends at `n` no matter the data -> differential
+        // execution shows it is NOT data-driven (it is a stepper, not a walker).
+        let step = "a = [1, 2, 3, 4]\nn = 4\ni = 0\ns = 0\nwhile i < n:\n    s = s + a[i]\n    i = i + 1\nprint(i)\n";
+        assert_eq!(confirm_walker_is_data_driven(step, "i", "a"), Some(false));
     }
 
     #[test]
