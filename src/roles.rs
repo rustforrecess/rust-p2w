@@ -146,9 +146,36 @@ pub fn variable_roles_verified(source: &str) -> Vec<VarRole> {
     roles.retain(|vr| match vr.role {
         Role::Organizer => confirm_organizer_multiset(source, &vr.name) != Some(false),
         Role::Container => confirm_container_shrinks(source, &vr.name) != Some(false),
+        Role::Walker => match list_indexed_by(source, &vr.name) {
+            Some(list) => confirm_walker_is_data_driven(source, &vr.name, &list) != Some(false),
+            None => true, // can't pair a list to observe -> keep
+        },
         _ => true,
     });
     roles
+}
+
+/// The name of a list `walker` is used to index (`a[walker]`), or None — so a
+/// walker can be Vm-confirmed against the data it navigates.
+fn list_indexed_by(source: &str, walker: &str) -> Option<String> {
+    let tokens = crate::lexer::lex(source).ok()?;
+    let (stmts, _) = crate::parser::parse_recovering(&tokens);
+    let mut found = None;
+    for_each_expr(&stmts, &mut |e| {
+        if found.is_some() {
+            return;
+        }
+        if let ExprKind::Index(base, idx) = &e.kind {
+            if let ExprKind::Name(a) = &base.kind {
+                let mut refs = BTreeSet::new();
+                crate::reuse::vars_read(idx, &mut refs);
+                if refs.contains(walker) {
+                    found = Some(a.clone());
+                }
+            }
+        }
+    });
+    found
 }
 
 /// Confirm an **organizer** by *observation* on the `Vm`, not syntax: a genuine
@@ -1642,6 +1669,23 @@ while j < n:
         assert!(
             variable_roles_verified(dead).iter().all(|v| v.name != "st"),
             "disproved container is dropped"
+        );
+
+        // A genuine data-driven walker survives verification...
+        let walk = "a = [1, 3, 5, 8]\nn = 4\nx = 6\nj = 0\nwhile j < n and a[j] < x:\n    j = j + 1\nprint(j)\n";
+        assert!(
+            variable_roles_verified(walk)
+                .iter()
+                .any(|v| v.name == "j" && v.role == Role::Walker),
+            "confirmed walker is kept"
+        );
+        // ...but a data-predicate that never actually stops it early makes `j`
+        // run to `n` regardless of the data -> a fixed traversal the Vm exposes.
+        let fake = "a = [1, 3, 5, 8]\nn = 4\nj = 0\nwhile j < n and a[j] < 1000000:\n    j = j + 1\nprint(j)\n";
+        assert_eq!(role_of(fake, "j"), Some(Role::Walker)); // syntax says walker
+        assert!(
+            variable_roles_verified(fake).iter().all(|v| v.name != "j"),
+            "data-independent 'walker' is dropped"
         );
     }
 
