@@ -24,17 +24,22 @@
 //! and **one-way-flag** (`if cond: found = True`, a single latched constant; a
 //! two-way toggle is *not* a flag).
 //!
-//! Deferred: **follower** and **temporary** are the same syntax (`prev = x`, an
-//! unconditional element copy) distinguished only by read/write order within
-//! the iteration — that needs `reuse.rs` liveness. **transformation**,
-//! **fixed-value**, **organizer**, **walker**, **container** are later
-//! predicates. The two static approximations here (data-flow taint; treating a
-//! `while` condition's names as loop drivers) are where `reuse.rs` liveness and
-//! the `debug.rs` `Vm` make recognition exact rather than approximate — the
-//! point of running on the owned substrate. See `docs/CAUSALCODE_INTEGRATION.md`.
+//! Also: **follower** vs **temporary** — the same syntax (`prev = x`, an
+//! unconditional element copy) distinguished by *read/write order within the
+//! iteration*. A follower is **read before it is written** (it carries the
+//! previous value forward); a temporary is **written before it is read** (a
+//! swap helper). The order is computed from `reuse.rs`'s tested `vars_read` /
+//! `vars_assigned` primitives — the first hookup to the liveness substrate.
+//!
+//! Deferred: **transformation**, **fixed-value**, **organizer**, **walker**,
+//! **container** are later predicates. The two static approximations that
+//! remain (data-flow taint; treating a `while` condition's names as loop
+//! drivers) are where fuller `reuse.rs` liveness and the `debug.rs` `Vm` make
+//! recognition exact — the point of the owned substrate. See
+//! `docs/CAUSALCODE_INTEGRATION.md`.
 
 use crate::ast::{CompClause, Expr, ExprKind, Stmt, StmtKind};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// A recognized scalar variable role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +57,12 @@ pub enum Role {
     /// A two-state variable latched to the other state and never reset
     /// (`if cond: found = True`).
     OneWayFlag,
+    /// Remembers the current element across iterations — an unconditional copy
+    /// `prev = x` that is *read before it is written* each iteration.
+    Follower,
+    /// A short-lived scratch value — an unconditional copy `t = a[i]` that is
+    /// *written before it is read* each iteration (the classic swap helper).
+    Temporary,
 }
 
 impl Role {
@@ -64,6 +75,8 @@ impl Role {
             Role::ResetGatherer => "reset_gatherer",
             Role::MostWantedHolder => "most_wanted_holder",
             Role::OneWayFlag => "one_way_flag",
+            Role::Follower => "follower",
+            Role::Temporary => "temporary",
         }
     }
 }
@@ -94,6 +107,7 @@ pub fn roles_of(stmts: &[Stmt]) -> Vec<VarRole> {
     a.collect_drivers(stmts);
     a.taint(stmts);
     a.walk(stmts, false, false);
+    a.classify_followers(stmts);
     a.finish()
 }
 
@@ -119,8 +133,12 @@ struct Info {
     /// Literal constants assigned to `v` inside the loop, and whether any such
     /// assignment was conditional (a one-way flag latches a single value under
     /// a condition; a two-way toggle assigns two distinct values).
-    lits: std::collections::HashSet<LitVal>,
+    lits: HashSet<LitVal>,
     lit_gated: bool,
+    /// Set by the loop-level follower/temporary pass (`reuse.rs` read/write
+    /// order): an unconditional element copy read-before-write vs write-before-read.
+    follower: bool,
+    temporary: bool,
     line: usize,
 }
 
@@ -272,6 +290,75 @@ impl Analysis {
         }
     }
 
+    // ---- follower vs temporary: read/write order over each loop body ----
+    // Both are an unconditional element copy `v = <elem>`; they differ only by
+    // whether `v` is read *before* it is written within the iteration (follower,
+    // carries the previous value) or written first (temporary, scratch). Order
+    // is computed from `reuse.rs`'s tested `vars_read` / `vars_assigned`.
+    fn classify_followers(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::For { body, .. }
+                | StmtKind::ForEach { body, .. }
+                | StmtKind::While { body, .. } => {
+                    self.followers_in_loop(body);
+                    self.classify_followers(body);
+                }
+                StmtKind::If {
+                    body,
+                    elifs,
+                    else_body,
+                    ..
+                } => {
+                    self.classify_followers(body);
+                    for (_, b) in elifs {
+                        self.classify_followers(b);
+                    }
+                    if let Some(b) = else_body {
+                        self.classify_followers(b);
+                    }
+                }
+                StmtKind::Def { body, .. } => self.classify_followers(body),
+                StmtKind::ClassDef { methods, .. } => {
+                    for m in methods {
+                        self.classify_followers(&m.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn followers_in_loop(&mut self, body: &[Stmt]) {
+        // Top-level (unconditional) bare copies of the current element.
+        let mut candidates: Vec<(String, usize)> = Vec::new();
+        for s in body {
+            if let StmtKind::Assign(name, value) = &s.kind {
+                if !self.drivers.contains(name)
+                    && selfref_operand(name, value).is_none()
+                    && !maxmin_selfref(name, value)
+                    && !is_literal(value)
+                    && is_copy_of_data(value, &self.drivers, &self.data_vars)
+                {
+                    candidates.push((name.clone(), s.line));
+                }
+            }
+        }
+        for (v, line) in candidates {
+            if let Some(read_first) = first_mention_is_read(body, &v) {
+                let e = self.updates.entry(v).or_default();
+                if read_first {
+                    e.follower = true;
+                } else {
+                    e.temporary = true;
+                }
+                if e.line == 0 {
+                    e.line = line;
+                }
+            }
+        }
+    }
+
     fn finish(self) -> Vec<VarRole> {
         let Analysis {
             drivers, updates, ..
@@ -301,6 +388,10 @@ impl Analysis {
                     // Latched a single constant under a condition, never the
                     // other value (two distinct literals = a two-way toggle).
                     Role::OneWayFlag
+                } else if info.follower {
+                    Role::Follower
+                } else if info.temporary {
+                    Role::Temporary
                 } else {
                     return None;
                 };
@@ -327,6 +418,160 @@ fn is_literal(e: &Expr) -> bool {
         e.kind,
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_)
     )
+}
+
+/// Within one iteration of `body`, is `v`'s first mention a *read* (→ follower,
+/// it uses the value carried from the previous iteration) or a *write* (→
+/// temporary, it is created fresh)? `None` if `v` is never mentioned. Reads and
+/// writes come from `reuse.rs`'s tested primitives.
+fn first_mention_is_read(body: &[Stmt], v: &str) -> Option<bool> {
+    for s in body {
+        let reads = reads_name(s, v);
+        let writes = writes_name(s, v);
+        if reads && !writes {
+            return Some(true);
+        }
+        if writes {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// Does statement `s` (recursively) read `v`?
+fn reads_name(s: &Stmt, v: &str) -> bool {
+    let mut out = BTreeSet::new();
+    collect_reads(s, &mut out);
+    out.contains(v)
+}
+
+/// Does statement `s` (recursively) assign `v`?
+fn writes_name(s: &Stmt, v: &str) -> bool {
+    let mut out = BTreeSet::new();
+    collect_writes(s, &mut out);
+    out.contains(v)
+}
+
+fn collect_reads(s: &Stmt, out: &mut BTreeSet<String>) {
+    use crate::reuse::vars_read;
+    match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Assign(_, e) => vars_read(e, out),
+        StmtKind::AnnAssign { ann, value, .. } => {
+            vars_read(ann, out);
+            vars_read(value, out);
+        }
+        StmtKind::SetIndex {
+            target,
+            index,
+            value,
+        } => {
+            vars_read(target, out);
+            vars_read(index, out);
+            vars_read(value, out);
+        }
+        StmtKind::SetAttr { obj, value, .. } => {
+            vars_read(obj, out);
+            vars_read(value, out);
+        }
+        StmtKind::UnpackAssign { targets, value } => {
+            for t in targets {
+                if !matches!(t.kind, ExprKind::Name(_)) {
+                    vars_read(t, out);
+                }
+            }
+            vars_read(value, out);
+        }
+        StmtKind::Return(Some(e)) => vars_read(e, out),
+        StmtKind::If {
+            cond,
+            body,
+            elifs,
+            else_body,
+        } => {
+            vars_read(cond, out);
+            for st in body {
+                collect_reads(st, out);
+            }
+            for (c, b) in elifs {
+                vars_read(c, out);
+                for st in b {
+                    collect_reads(st, out);
+                }
+            }
+            if let Some(b) = else_body {
+                for st in b {
+                    collect_reads(st, out);
+                }
+            }
+        }
+        StmtKind::For {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            vars_read(start, out);
+            vars_read(end, out);
+            vars_read(step, out);
+            for st in body {
+                collect_reads(st, out);
+            }
+        }
+        StmtKind::ForEach { iterable, body, .. } => {
+            vars_read(iterable, out);
+            for st in body {
+                collect_reads(st, out);
+            }
+        }
+        StmtKind::While { cond, body } => {
+            vars_read(cond, out);
+            for st in body {
+                collect_reads(st, out);
+            }
+        }
+        StmtKind::Def { body, .. } => {
+            for st in body {
+                collect_reads(st, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_writes(s: &Stmt, out: &mut BTreeSet<String>) {
+    crate::reuse::vars_assigned(s, out);
+    match &s.kind {
+        StmtKind::If {
+            body,
+            elifs,
+            else_body,
+            ..
+        } => {
+            for st in body {
+                collect_writes(st, out);
+            }
+            for (_, b) in elifs {
+                for st in b {
+                    collect_writes(st, out);
+                }
+            }
+            if let Some(b) = else_body {
+                for st in b {
+                    collect_writes(st, out);
+                }
+            }
+        }
+        StmtKind::For { body, .. }
+        | StmtKind::ForEach { body, .. }
+        | StmtKind::While { body, .. }
+        | StmtKind::Def { body, .. } => {
+            for st in body {
+                collect_writes(st, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A boolean / small-int literal value (for one-way-flag latch detection).
@@ -579,6 +824,21 @@ mod tests {
         // flag (its final value tracks only the last element). Unclassified.
         let src = "a = [1, -2, 3]\nf = False\nfor x in a:\n    if x > 0:\n        f = True\n    else:\n        f = False\n";
         assert_eq!(role_of(src, "f"), None);
+    }
+
+    #[test]
+    fn follower_is_read_before_written() {
+        // `prev` is read (in the print) before it is reassigned each iteration —
+        // it carries the previous element forward.
+        let src = "a = [3, 1, 4]\nprev = a[0]\nfor x in a:\n    print(x - prev)\n    prev = x\n";
+        assert_eq!(role_of(src, "prev"), Some(Role::Follower));
+    }
+
+    #[test]
+    fn temporary_is_written_before_read() {
+        // The swap helper `t` is written first, then read — scratch, not carried.
+        let src = "a = [3, 1, 2]\nfor i in range(0, 2):\n    t = a[i]\n    a[i] = a[i + 1]\n    a[i + 1] = t\n";
+        assert_eq!(role_of(src, "t"), Some(Role::Temporary));
     }
 
     #[test]
