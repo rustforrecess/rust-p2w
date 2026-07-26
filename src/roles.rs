@@ -253,6 +253,98 @@ pub fn confirm_container_shrinks(source: &str, name: &str) -> Option<bool> {
     Some(decreased)
 }
 
+/// Which sort is it? Distinguish **selection / insertion / bubble** by their
+/// *per-pass* invariant, observed on the `Vm` — the round-13 discriminator done
+/// by observation rather than syntax. Snapshots `list` at each change of the
+/// outer index `outer`, then inspects the last not-yet-sorted pass:
+///
+/// - **selection** — the sorted **prefix** is *final* (matches the fully-sorted
+///   result): elements reach their final position front-to-back.
+/// - **bubble** — the sorted **suffix** is final: back-to-front.
+/// - **insertion** — the prefix is *internally* sorted but **not** final yet
+///   (values in order, but not the final ones).
+///
+/// Returns the sort name, or `None` if it can't be observed / doesn't match a
+/// known shape. (A heuristic over one representative pass — enough to tell the
+/// three canonical shapes apart; not a proof.)
+pub fn classify_sort_by_passes(source: &str, list: &str, outer: &str) -> Option<&'static str> {
+    let mut full = initial_int_list(source, list)?;
+    let n = full.len();
+    if n < 4 {
+        return None;
+    }
+    full.sort_unstable();
+
+    let mut st = crate::debug::Stepper::new(source).ok()?;
+    st.set_watchpoints(&[outer.to_string()]);
+    let mut snaps: Vec<Vec<i64>> = Vec::new();
+    let mut budget = 1000;
+    loop {
+        st.run(&[]);
+        if let Some(v) = st.eval_watch(list).ok().and_then(|r| parse_int_list(&r)) {
+            if v.len() == n {
+                snaps.push(v);
+            }
+        }
+        match st.status() {
+            crate::debug::Status::Finished => break,
+            crate::debug::Status::Error { .. } => return None,
+            _ => {}
+        }
+        budget -= 1;
+        if budget == 0 {
+            return None;
+        }
+    }
+
+    // Vote across every not-yet-sorted pass. Per pass:
+    //  - insertion: the prefix is sorted but NOT final (internally-sorted length
+    //    exceeds the final-prefix length) and nothing is placed at the back.
+    //  - selection: finals accumulate at the FRONT (final-prefix > final-suffix).
+    //  - bubble: finals accumulate at the BACK (final-suffix > final-prefix).
+    let (mut sel, mut ins, mut bub) = (0, 0, 0);
+    for s in &snaps {
+        if s.len() != n || *s == full {
+            continue;
+        }
+        let fp = final_prefix_len(s, &full);
+        let fs = final_suffix_len(s, &full);
+        let ip = sorted_prefix_len(s);
+        if ip > fp + 1 && fs <= fp + 1 {
+            ins += 1;
+        } else if fp > fs {
+            sel += 1;
+        } else if fs > fp {
+            bub += 1;
+        }
+    }
+    if ins >= sel && ins >= bub && ins > 0 {
+        Some("insertion")
+    } else if sel >= bub && sel > 0 {
+        Some("selection")
+    } else if bub > 0 {
+        Some("bubble")
+    } else {
+        None
+    }
+}
+
+fn final_prefix_len(s: &[i64], full: &[i64]) -> usize {
+    s.iter().zip(full).take_while(|(a, b)| a == b).count()
+}
+
+fn final_suffix_len(s: &[i64], full: &[i64]) -> usize {
+    s.iter().rev().zip(full.iter().rev()).take_while(|(a, b)| a == b).count()
+}
+
+fn sorted_prefix_len(s: &[i64]) -> usize {
+    let mut k = 1;
+    while k < s.len() && s[k - 1] <= s[k] {
+        k += 1;
+    }
+    k.min(s.len())
+}
+
 /// Does an organizer actually **sort**? A step up from role to algorithm-level:
 /// an organizer preserves the multiset, but only *observation* tells a sort from
 /// a mere rearrangement — a reverse and a bubble sort are both organizers, yet
@@ -1737,6 +1829,20 @@ while j < n:
         // ...but only the bubble sort actually orders the data.
         assert_eq!(confirm_sorts(bubble, "a"), Some(true));
         assert_eq!(confirm_sorts(rev, "a"), Some(false));
+    }
+
+    #[test]
+    fn vm_tells_which_sort_by_the_per_pass_invariant() {
+        let data = "a = [5, 3, 8, 1, 9, 2, 7, 4]\nn = 8\n";
+        let sel = format!("{data}for i in range(0, n):\n    m = i\n    for j in range(i + 1, n):\n        if a[j] < a[m]:\n            m = j\n    a[i], a[m] = a[m], a[i]\n");
+        let ins = format!("{data}for i in range(1, n):\n    key = a[i]\n    j = i - 1\n    while j >= 0 and a[j] > key:\n        a[j + 1] = a[j]\n        j = j - 1\n    a[j + 1] = key\n");
+        let bub = format!("{data}for i in range(0, n):\n    for j in range(0, n - 1 - i):\n        if a[j] > a[j + 1]:\n            a[j], a[j + 1] = a[j + 1], a[j]\n");
+        let sel = sel.as_str();
+        let ins = ins.as_str();
+        let bub = bub.as_str();
+        assert_eq!(classify_sort_by_passes(sel, "a", "i"), Some("selection"));
+        assert_eq!(classify_sort_by_passes(ins, "a", "i"), Some("insertion"));
+        assert_eq!(classify_sort_by_passes(bub, "a", "i"), Some("bubble"));
     }
 
     #[test]
