@@ -1560,9 +1560,14 @@ fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     };
     let ints = both_int(l, r);
     match op {
-        BinOp::Add => Ok(num_result(x + y, ints)),
-        BinOp::Sub => Ok(num_result(x - y, ints)),
-        BinOp::Mul => Ok(num_result(x * y, ints)),
+        // The int cases go through `int_result`, which enforces the same 32-bit
+        // range the compiled backends do. The interpreter computes in f64 and
+        // would otherwise happily return 1000000000000 for a program that traps
+        // when compiled — the Stepper must not show an answer the run cannot
+        // produce.
+        BinOp::Add => int_result(x + y, ints),
+        BinOp::Sub => int_result(x - y, ints),
+        BinOp::Mul => int_result(x * y, ints),
         BinOp::Div => {
             if y == 0.0 {
                 return Err("division by zero".to_string());
@@ -1602,6 +1607,20 @@ fn num_result(v: f64, ints: bool) -> Value {
     } else {
         Value::Float(v)
     }
+}
+
+/// Whole numbers are 32-bit on the compiled backends, so the interpreter has to
+/// refuse the same values they refuse. Message matches `$raise_overflow` in
+/// codegen — one behaviour, three surfaces.
+fn int_result(v: f64, ints: bool) -> Result<Value, String> {
+    if ints && (v > i32::MAX as f64 || v < i32::MIN as f64) {
+        return Err(
+            "this calculation went outside the range of whole numbers we can store \
+             (-2147483648 to 2147483647)"
+                .to_string(),
+        );
+    }
+    Ok(num_result(v, ints))
 }
 
 fn type_name(v: &Value) -> &'static str {

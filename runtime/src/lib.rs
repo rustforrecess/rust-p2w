@@ -699,7 +699,21 @@ pub extern "C" fn p2w_none() -> Value {
 /// the next slice).
 fn numeric<F: Fn(i64, i64) -> i64>(a: Value, b: Value, f: F) -> Value {
     match (num(a), num(b)) {
-        (Some(x), Some(y)) => make_int(f(x, y)),
+        (Some(x), Some(y)) => {
+            // Whole numbers are 32-bit. `make_int` wraps deliberately for
+            // internal uses (hashes, indices), but PROGRAM-VISIBLE arithmetic
+            // must not: a silently wrong answer is the worst failure a teaching
+            // language can produce, and the WASM backend traps here. One
+            // behaviour on every target.
+            let r = f(x, y);
+            if r > i32::MAX as i64 || r < i32::MIN as i64 {
+                trap(
+                    "this calculation went outside the range of whole numbers we can store \
+                     (-2147483648 to 2147483647)",
+                );
+            }
+            make_int(r)
+        }
         _ => trap("unsupported operand type for a numeric op (heap types are TODO)"),
     }
 }
@@ -1752,7 +1766,8 @@ pub extern "C" fn p2w_round2(v: Value, ndigits: Value) -> Value {
 /// (leak-free; oracle-gated).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_sum(iterable: Value) -> Value {
-    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    if !(is_heap(iterable)
+        && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
         trap("sum() needs an iterable");
     }
@@ -1801,7 +1816,8 @@ pub extern "C" fn p2w_max(iterable: Value) -> Value {
 }
 
 fn min_max(iterable: Value, want_min: bool) -> Value {
-    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    if !(is_heap(iterable)
+        && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
         trap("min()/max() need an iterable");
     }
@@ -1897,7 +1913,8 @@ pub extern "C" fn p2w_range_list(start: i32, end: i32, step: i32) -> Value {
 /// `enumerate(iterable, start)` — a list of `(index, element)` tuples.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_enumerate(iterable: Value, start: i32) -> Value {
-    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    if !(is_heap(iterable)
+        && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
         trap("enumerate() needs an iterable");
     }
@@ -1931,7 +1948,8 @@ pub extern "C" fn p2w_zip2(a: Value, b: Value) -> Value {
 /// `$py_sorted`. Elements are owned copies; `reverse` is borrowed.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_sorted(iterable: Value, reverse: Value) -> Value {
-    if !(is_heap(iterable) && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
+    if !(is_heap(iterable)
+        && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
         trap("sorted() needs an iterable");
     }
@@ -2922,8 +2940,26 @@ fn trap(_msg: &str) -> ! {
     #[cfg(test)]
     panic!("p2w runtime trap: {_msg}");
     #[cfg(not(test))]
-    loop {
-        core::hint::spin_loop();
+    {
+        // SAY WHAT HAPPENED. This used to discard the message and spin, which
+        // meant every runtime error on the device — all ~100 trap sites — was
+        // an unexplained freeze. The WASM backend prints a message and stops;
+        // a student switching to a board deserves the same sentence.
+        //
+        // Newline first, matching the WASM raisers, so the message never lands
+        // mid-line after a partial `print`.
+        unsafe {
+            p2w_putc(b'\n');
+            for &c in _msg.as_bytes() {
+                p2w_putc(c);
+            }
+            p2w_putc(b'\n');
+        }
+        // Nothing sensible follows a trap: on bare metal there is no process to
+        // exit, so halt. The message has already been flushed to the sink.
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -3032,6 +3068,38 @@ mod tests {
         let mut s = Vec::new();
         write_value(v, &mut |c| s.push(c));
         String::from_utf8(s).unwrap()
+    }
+
+    /// Whole-number arithmetic is 32-bit and must FAIL LOUDLY outside it. It
+    /// used to wrap via `make_int`, so `1000000 * 1000000` quietly produced
+    /// -727379968 — the same wrong answer the WASM backend used to give.
+    // These call `numeric` rather than p2w_mul/p2w_add because a panic cannot
+    // unwind out of an `extern "C"` function — it aborts, which `should_panic`
+    // cannot catch. `numeric` is the choke point every whole-number `+`, `-`
+    // and `*` passes through, so it is the right thing to pin anyway.
+    #[test]
+    #[should_panic(expected = "outside the range of whole numbers")]
+    fn multiplication_past_the_int_range_traps() {
+        numeric(p2w_int(1_000_000), p2w_int(1_000_000), |x, y| x * y);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the range of whole numbers")]
+    fn addition_past_the_int_range_traps() {
+        numeric(p2w_int(2_147_483_647), p2w_int(1), |x, y| x + y);
+    }
+
+    /// ...but the boundary values themselves are fine.
+    #[test]
+    fn the_edges_of_the_int_range_still_work() {
+        assert_eq!(
+            shown(p2w_add(p2w_int(2_147_483_646), p2w_int(1))),
+            "2147483647"
+        );
+        assert_eq!(
+            shown(p2w_sub(p2w_int(-2_147_483_647), p2w_int(1))),
+            "-2147483648"
+        );
     }
 
     #[test]

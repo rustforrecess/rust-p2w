@@ -33,13 +33,13 @@ pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{Status, Stepper, Value, Vm};
 pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
+pub use floatfmt::py_float_repr;
+pub use lexer::Comment;
 pub use roles::{
     Role, VarRole, classify_sort, classify_sort_by_passes, confirm_container_shrinks,
     confirm_organizer_multiset, confirm_sorts, confirm_walker_is_data_driven, roles_of,
     variable_roles, variable_roles_verified,
 };
-pub use floatfmt::py_float_repr;
-pub use lexer::Comment;
 
 /// Recover the `#` comments a student wrote, in source order. Comments never
 /// reach the AST, so this is the way for the IDE / analysis layer to surface

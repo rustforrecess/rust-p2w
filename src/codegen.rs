@@ -633,6 +633,59 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $raise_overflow: whole-number arithmetic left the 32-bit range.
+    //
+    // CPython's ints are arbitrary precision, so this is a real divergence —
+    // but the alternative was WRAPPING SILENTLY, which gave a wrong answer with
+    // no indication. Failing loudly is strictly better; widening to 64 bits (or
+    // further) is a separate piece of work tied to the value model.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        0,
+        "OverflowError: this calculation went outside the range of whole \
+         numbers we can store (-2147483648 to 2147483647)",
+    );
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_overflow".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_pow_float: `**` with a fractional exponent.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        0,
+        "TypeError: ** raises to a whole-number power — for a square root use \
+         math.sqrt(x)",
+    );
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_pow_float".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $ck32: narrow a 64-bit intermediate back to i32, trapping if it does not
+    // fit. Every whole-number `+`, `-`, `*` and `**` routes through here, so
+    // overflow is caught in one place rather than at each operator.
+    let mut b = Body::new();
+    b.push("(if (i64.ne (i64.extend_i32_s (i32.wrap_i64 (local.get $r))) (local.get $r))");
+    b.push_in(1, "(then (call $raise_overflow))");
+    b.push(")");
+    b.push("(i32.wrap_i64 (local.get $r))");
+    fs.push(Func {
+        signature: "(func $ck32 (param $r i64) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // Type-name-bearing raisers that differ only in their message shape.
     for (fname, before, after) in [
         (
@@ -2887,6 +2940,10 @@ fn runtime_helpers() -> Vec<Func> {
     // stays int (wrapping i32); a float base or negative exponent goes through
     // f64. `0 ** negative` is a ZeroDivisionError.
     let mut b = Body::new();
+    // A float exponent can't be handled (no exp/ln in WASM). Say so plainly —
+    // reaching $unbox here would report "expected a number, got 'float'",
+    // which is self-contradicting, since a float IS a number.
+    b.push("(if (ref.test (ref $FLOAT) (local.get $b)) (then (call $raise_pow_float)))");
     b.push("(local.set $e (call $unbox (local.get $b)))");
     b.push("(if (i32.lt_s (local.get $e) (i32.const 0))");
     b.push_in(1, "(then");
@@ -2934,7 +2991,7 @@ fn runtime_helpers() -> Vec<Func> {
     b.push_in(1, "(br_if $d3 (i32.ge_s (local.get $i) (local.get $e)))");
     b.push_in(
         1,
-        "(local.set $acc (i32.mul (local.get $acc) (call $unbox (local.get $a))))",
+        "(local.set $acc (call $ck32 (i64.mul (i64.extend_i32_s (local.get $acc)) (i64.extend_i32_s (call $unbox (local.get $a))))))",
     );
     b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(1, "(br $l3)))");
@@ -3192,7 +3249,7 @@ fn runtime_helpers() -> Vec<Func> {
     );
     b.push_in(
         3,
-        "(else (call $box (i32.add (call $unbox (local.get $a)) (call $unbox (local.get $b))))))))",
+        "(else (call $box (call $ck32 (i64.add (i64.extend_i32_s (call $unbox (local.get $a))) (i64.extend_i32_s (call $unbox (local.get $b))))))))))",
     );
     fs.push(Func {
         signature:
@@ -3209,8 +3266,8 @@ fn runtime_helpers() -> Vec<Func> {
     // $py_sub / $py_mul: a left operand's dunder first, then float promotion,
     // else i32.
     for (name, f_instr, i_instr, dunder) in [
-        ("$py_sub", "f64.sub", "i32.sub", "__sub__"),
-        ("$py_mul", "f64.mul", "i32.mul", "__mul__"),
+        ("$py_sub", "f64.sub", "i64.sub", "__sub__"),
+        ("$py_mul", "f64.mul", "i64.mul", "__mul__"),
     ] {
         let mut b = Body::new();
         // `set - set` is set difference (mode 3); other `-` is numeric.
@@ -3235,7 +3292,7 @@ fn runtime_helpers() -> Vec<Func> {
         );
         b.push_in(
             1,
-            format!("(else (call $box ({i_instr} (call $unbox (local.get $a)) (call $unbox (local.get $b))))))"),
+            format!("(else (call $box (call $ck32 ({i_instr} (i64.extend_i32_s (call $unbox (local.get $a))) (i64.extend_i32_s (call $unbox (local.get $b))))))))"),
         );
         fs.push(Func {
             signature: format!(
@@ -6686,6 +6743,9 @@ impl Gen {
                 Ok(format!("(call $py_mul {lhs} {rhs})"))
             }
             ExprKind::Bin(BinOp::Pow, a, b) => {
+                // A float-LITERAL exponent is rejected in the parser, so every
+                // backend agrees; a computed float exponent still reaches
+                // $py_pow, which says so plainly.
                 let lhs = self.value_expr(cx, a)?;
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call $py_pow {lhs} {rhs})"))

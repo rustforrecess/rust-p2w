@@ -353,7 +353,11 @@ fn final_prefix_len(s: &[i64], full: &[i64]) -> usize {
 }
 
 fn final_suffix_len(s: &[i64], full: &[i64]) -> usize {
-    s.iter().rev().zip(full.iter().rev()).take_while(|(a, b)| a == b).count()
+    s.iter()
+        .rev()
+        .zip(full.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 fn sorted_prefix_len(s: &[i64]) -> usize {
@@ -492,7 +496,10 @@ fn parse_int_list(repr: &str) -> Option<Vec<i64>> {
     if inner.is_empty() {
         return Some(Vec::new());
     }
-    inner.split(',').map(|p| p.trim().parse::<i64>().ok()).collect()
+    inner
+        .split(',')
+        .map(|p| p.trim().parse::<i64>().ok())
+        .collect()
 }
 
 /// The recognized scalar variable roles in an already-parsed program.
@@ -1640,7 +1647,8 @@ mod tests {
     #[test]
     fn one_way_flag_latches_a_single_constant() {
         // Set True under a condition, never reset -> one-way flag.
-        let src = "a = [1, 0, 2]\nfound = False\nfor x in a:\n    if x == 0:\n        found = True\n";
+        let src =
+            "a = [1, 0, 2]\nfound = False\nfor x in a:\n    if x == 0:\n        found = True\n";
         assert_eq!(role_of(src, "found"), Some(Role::OneWayFlag));
     }
 
@@ -1737,7 +1745,8 @@ while j < n:
         let scan = "a = [1, 3, 5, 8]\nn = 4\nx = 6\nj = 0\nwhile j < n and a[j] < x:\n    j = j + 1\nprint(j)\n";
         assert_eq!(role_of(scan, "j"), Some(Role::Walker));
         // A plain fixed-range while index is NOT a walker (no data in the test).
-        let plain = "a = [1, 2, 3]\nn = 3\ni = 0\ns = 0\nwhile i < n:\n    s = s + a[i]\n    i = i + 1\n";
+        let plain =
+            "a = [1, 2, 3]\nn = 3\ni = 0\ns = 0\nwhile i < n:\n    s = s + a[i]\n    i = i + 1\n";
         assert_ne!(role_of(plain, "i"), Some(Role::Walker));
         assert_eq!(role_of(plain, "s"), Some(Role::Gatherer));
     }
@@ -1853,9 +1862,15 @@ while j < n:
     #[test]
     fn vm_tells_which_sort_by_the_per_pass_invariant() {
         let data = "a = [5, 3, 8, 1, 9, 2, 7, 4]\nn = 8\n";
-        let sel = format!("{data}for i in range(0, n):\n    m = i\n    for j in range(i + 1, n):\n        if a[j] < a[m]:\n            m = j\n    a[i], a[m] = a[m], a[i]\n");
-        let ins = format!("{data}for i in range(1, n):\n    key = a[i]\n    j = i - 1\n    while j >= 0 and a[j] > key:\n        a[j + 1] = a[j]\n        j = j - 1\n    a[j + 1] = key\n");
-        let bub = format!("{data}for i in range(0, n):\n    for j in range(0, n - 1 - i):\n        if a[j] > a[j + 1]:\n            a[j], a[j + 1] = a[j + 1], a[j]\n");
+        let sel = format!(
+            "{data}for i in range(0, n):\n    m = i\n    for j in range(i + 1, n):\n        if a[j] < a[m]:\n            m = j\n    a[i], a[m] = a[m], a[i]\n"
+        );
+        let ins = format!(
+            "{data}for i in range(1, n):\n    key = a[i]\n    j = i - 1\n    while j >= 0 and a[j] > key:\n        a[j + 1] = a[j]\n        j = j - 1\n    a[j + 1] = key\n"
+        );
+        let bub = format!(
+            "{data}for i in range(0, n):\n    for j in range(0, n - 1 - i):\n        if a[j] > a[j + 1]:\n            a[j], a[j + 1] = a[j + 1], a[j]\n"
+        );
         let sel = sel.as_str();
         let ins = ins.as_str();
         let bub = bub.as_str();

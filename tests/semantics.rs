@@ -119,11 +119,15 @@ fn groups() -> Vec<Group> {
     vec![
         Group {
             title: "Arithmetic on numbers",
-            note: "⚠ `int` is **32-bit** on this backend, not 64 — the literal \
-                   range is checked at compile time but arithmetic that \
-                   overflows it is not. Mixed int/float promotes and `/` is \
-                   always float division; both are CPython's rules and both \
-                   must survive typing.",
+            note: "`int` is **32-bit**, not 64. Arithmetic that leaves that \
+                   range now TRAPS on every surface — WASM, the native \
+                   runtime, and the Stepper's interpreter — rather than \
+                   wrapping silently and printing a wrong answer. CPython has \
+                   arbitrary-precision ints, so this is still a divergence, \
+                   but a loud one; widening the value model is separate work \
+                   tied to the memory model. Otherwise: mixed int/float \
+                   promotes and `/` is always float division, both CPython's \
+                   rules, both must survive typing.",
             probes: vec![
                 e!("1 + 2"),
                 e!("2 - 5"),
@@ -144,10 +148,15 @@ fn groups() -> Vec<Group> {
         },
         Group {
             title: "Floats",
-            note: "⚠ `**` REJECTS FLOATS AT RUNTIME, and says so with a message \
-                   that contradicts itself — a float is a number. Everything \
-                   else here is fine, so this is an isolated gap in `$py_pow`, \
-                   not a float problem.",
+            note: "⚠ **A FRACTIONAL EXPONENT IS A TARGET DIVERGENCE, NOT A \
+                   FEATURE TO DECLINE.** The native runtime already computes \
+                   `2 ** 0.5` correctly via `libm::pow`; WASM has no exp/ln \
+                   instruction and cannot, so it traps — with a message that \
+                   now at least names `math.sqrt`, which does exist. Closing \
+                   this properly means a host `pow` import so the browser \
+                   matches the Pico (SUBSET_POLICY.md gate 1: both targets or \
+                   neither). Until then the base may be a float and the \
+                   exponent may not.",
             probes: vec![
                 e!("2.5 + 1.5"),
                 e!("2.5 * 2.0"),
