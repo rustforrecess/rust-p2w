@@ -144,6 +144,162 @@ contradicting it. It is a teaching argument, and none of them were making one.
    opening, and it is the same opening as `PRIOR-ART-AGENTIC.md` found: the
    machinery is well explored, the *pedagogical output* is not.
 
+---
+
+## Recent research (2017–2026)
+
+The compilers above answer *what the type system permits*. A separate body of
+work answers *what the compiler should say when you get it wrong* — and it has
+moved a lot recently. The short version: **the field has split into two camps
+that do not read each other**, and the gap between them is where this project
+sits.
+
+### ⭐ The result that matters most: handwritten beats generated
+
+**"Not the Silver Bullet: LLM-enhanced Programming Error Messages are
+Ineffective in Practice"** — Santos & Becker, UKICER 2024.
+
+106 participants, six buggy C programs, within-subjects, measuring time-to-fix
+rather than expert opinion. GPT-4-generated error messages beat conventional
+compiler messages in **1 of 6 tasks**. And:
+
+> Handwritten explanations still outperform LLM and conventional error
+> messages, both on objective and subjective measures.
+
+Students *preferred* the GPT-4 explanations while not being any faster with
+them. **Preference and effectiveness came apart**, which is the single most
+useful thing to know before wiring an AI tutor to a compiler.
+
+A 2025 follow-up sharpens it rather than overturning it: *fine-tuned* GPT-4o
+messages did produce significantly faster fixes where baseline GPT-4o did not.
+The active ingredient is authored pedagogical content, not model scale.
+
+**What this means here:** `lint::Scaffold` — authored question/hint/fix ladders,
+written by a teacher — is the intervention with the best evidence behind it, and
+we already have the machinery. The copilot's job is to *route to* a ladder, not
+to improvise one. An improvised explanation will feel better and not be better,
+and the feeling is what gets it shipped.
+
+### ⭐ Helium — the direct ancestor, and nobody continued it
+
+**Heeren, Hage & Swierstra** — *Helium, for Learning Haskell* (Haskell Workshop
+2003), *Scripting the Type Inference Process* (ICFP 2003), *Type Class
+Directives*.
+
+A Haskell compiler built specifically to give beginners good type errors. Two
+ideas worth taking whole:
+
+1. **Split inference into constraint GENERATION and constraint SOLVING.** Once
+   those are separate, message quality becomes a property of the *solver* — you
+   can reorder, reweight and explain without touching the language definition.
+   This is the architectural decision that makes everything else possible.
+2. **Type inference directives** — externally supplied instructions that script
+   the inference process. Including **sibling functions**: declare which
+   functions beginners commonly confuse, and when inference hits an
+   inconsistency, the solver tries the sibling as a candidate fix.
+
+**Directives are DATA, not compiler code.** A teacher who notices that their
+class keeps confusing two things can say so, without touching Rust. That is the
+same seam as `Scaffold`, one level deeper — and it maps cleanly onto a
+constraint store: generation produces facts, directives are rules.
+
+Helium is from 2003, targets Haskell, and never became the way people learn.
+**The mechanism was proven and then left on the shelf.**
+
+### Type error localization: it is a solved-ish research problem
+
+- **SHErrLoc** (Zhang & Myers, TOPLAS 2017) — counter-factual unification plus
+  **error-tolerant typing**: keep type-checking after an error instead of
+  stopping. We already do the parser equivalent (recovery, partial blocks), so
+  this is consistent with what exists.
+- **Counter-factual typing** (Chen & Erwig) — the earlier formulation.
+- **⭐ "Learning to blame: localizing novice type errors with data-driven
+  diagnosis"** (Seidel et al., OOPSLA 2017). Trains on **pairs of ill-typed
+  student programs and their fixed versions**, then predicts which
+  sub-expression to blame. Top-1 accuracy **72%**, versus 44% for the OCaml
+  compiler and 56% for SHErrLoc.
+
+**The asset nobody else has:** that training corpus is *exactly* what the IDE
+observes — a student's program before the fix and after it. We would be
+collecting the highest-value dataset in this subfield as a side effect of
+running lessons. The oracle corpus is a hand-built, 21-program version of the
+same thing. (Consent and FERPA get decided before any of that, obviously.)
+
+### Inference: static is beating ML again, and interpretably
+
+- **⭐ Typify** (Aman, Asaduzzaman & Wang, **ICPC 2026**) — Python type
+  inference by symbolic execution, iterative fixpoint analysis and dependency-
+  graph traversal, **no machine learning**. Matches or surpasses Type4Py,
+  HiTyper and Pyre on ManyTypes4Py/Typilus. Pitched explicitly as *"practical,
+  interpretable, and computationally efficient."*
+- **TypyBench** (ICML 2025) — LLMs score decently per annotation but **struggle
+  with global consistency**, which is the one property a compiler cannot do
+  without.
+
+Both point the same way and both point at us. A glass-box compiler cannot use a
+neural type inferencer — not because it would not work, but because "why does it
+think that?" has to have an answer. Fixpoint analysis has one; a model does not.
+And *interpretable* being the selling point of an ICPC 2026 paper says the wind
+is behind this.
+
+### The frame that goes furthest: errors against a *process*
+
+**"A Design Recipe and Recipe-Based Errors for Regular Expressions"** —
+Morazán et al., TFPiE 2025 (EPTCS 424).
+
+Students follow an explicit design recipe; when something fails, the error names
+**the step of the recipe not successfully completed**, not the implementation
+failure. Messages are held to being *"concise, succinct, jargon-free, and
+nonprescriptive."*
+
+This is a different axis from better wording. It says an error should be
+reported **against the process the student is being taught**, not against the
+compiler's internal state. It generalises the fix ladder: a ladder helps you
+repair a line; a recipe-based error tells you which part of *how to build this
+kind of thing* you skipped. Worth holding against the lesson-player design as
+much as the compiler.
+
+### Also on the map
+
+- **Gradual Soundness: Lessons from Static Python** (Lu, Greenman, Meyer,
+  Viehland, Panse & Krishnamurthi, *Programming* 7:1, 2023). The soundness
+  spectrum: **concrete** types (fully sound, but impose nonlocal constraints)
+  versus **transient** types (shallow soundness, easier to adopt). Meta's Static
+  Python blends them; the Instagram migration gained 3.7% throughput. Relevant
+  because our annotations currently parse and mean nothing — "what does an
+  annotation *do*" is a question with a real design space behind it.
+- **Compiler Error Messages Considered Unhelpful: The Landscape** (Becker et
+  al., ITiCSE 2019 working group) — the survey everything above cites.
+- On novices and errors generally: roughly **20% report panicking** at the sight
+  of an error message, and about half of novices say they do not always
+  understand what error messages mean — falling under 30% for advanced students.
+  **Type mismatches appear in nearly every study** of what beginners get wrong.
+
+### ⭐ What the research changes about the plan
+
+**The two camps do not talk.** PL research treats type errors as a *localization*
+problem (SHErrLoc, counter-factual typing, Nate): find the right expression to
+blame. CS-education research treats them as a *communication* problem (Becker,
+Santos, Denny): find the right words, and no, LLMs are not the answer.
+
+**Helium is the only project that did both, and it stopped in 2003.**
+
+So the opening is not "nobody has written good type errors." It is that **nobody
+has built a compiler where pedagogy is a first-class input to the inference
+engine, for a language children actually use.** Every piece has been
+independently validated:
+
+- the mechanism — Helium's directives and its generation/solving split;
+- the content strategy — authored explanations beat generated ones, measured;
+- the implementation route — static, interpretable inference now matches ML;
+- the data — localization is learnable from before/after pairs, and we are the
+  ones positioned to collect them;
+- the framing — errors reported against a taught process, not a failed
+  assertion.
+
+Nobody has assembled them. That is the same shape of gap `PRIOR-ART-AGENTIC.md`
+found, arrived at from the opposite direction.
+
 ## Sources
 
 - Mojo — <https://mojolang.org/docs/manual/variables>
@@ -156,5 +312,32 @@ contradicting it. It is a teaching argument, and none of them were making one.
 - Agesen, *The Cartesian Product Algorithm* (ECOOP 1995) —
   <https://link.springer.com/chapter/10.1007/3-540-49538-X_2>
 - mypy — <https://mypy.readthedocs.io/en/stable/type_inference_and_annotations.html>
+
+Recent research:
+
+- Santos & Becker, *Not the Silver Bullet: LLM-enhanced Programming Error
+  Messages are Ineffective in Practice*, UKICER 2024 —
+  <https://arxiv.org/abs/2409.18661>
+- Heeren, Leijen & van IJzendoorn, *Helium, for Learning Haskell*, Haskell
+  Workshop 2003 —
+  <https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/helium.pdf>
+- Heeren, Hage & Swierstra, *Scripting the Type Inference Process*, ICFP 2003 —
+  <https://dl.acm.org/doi/10.1145/944705.944707>
+- Seidel et al., *Learning to Blame: Localizing Novice Type Errors with
+  Data-Driven Diagnosis*, OOPSLA 2017 — <https://arxiv.org/abs/1708.07583>
+- Zhang & Myers, *SHErrLoc: A Static Holistic Error Locator*, TOPLAS 39(4) 2017
+  — <https://dl.acm.org/doi/10.1145/3121137>
+- Aman, Asaduzzaman & Wang, *Typify: A Lightweight Usage-driven Static Analyzer
+  for Precise Python Type Inference*, ICPC 2026 —
+  <https://arxiv.org/abs/2604.05067>
+- *TypyBench: Evaluating LLM Type Inference for Untyped Python Repositories*,
+  ICML 2025 — <https://arxiv.org/abs/2507.22086>
+- Morazan et al., *A Design Recipe and Recipe-Based Errors for Regular
+  Expressions*, TFPiE 2025 (EPTCS 424) — <https://arxiv.org/abs/2508.03639>
+- Lu, Greenman, Meyer, Viehland, Panse & Krishnamurthi, *Gradual Soundness:
+  Lessons from Static Python*, Programming 7:1, 2023 —
+  <https://arxiv.org/abs/2206.13831>
+- Becker et al., *Compiler Error Messages Considered Unhelpful: The Landscape*,
+  ITiCSE-WGR 2019 — <https://amirkamil.com/papers/iticse19.pdf>
 
 No source code from any of these projects was read. See `NOTICE`.
