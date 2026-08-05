@@ -8,6 +8,12 @@
 #
 # Whatever is decided here must match the reassignment answer. Two different
 # answers for the same underlying question is how a language becomes folklore.
+#
+# PRIOR ART (see PRIOR-ART-TYPES.md): RPython states the rule per control flow
+# point rather than per assignment, which covers this case and the plain
+# reassignment case at once — "variables should contain values of at most one
+# type at each control flow point". Adopting that phrasing makes the two
+# answers identical by construction rather than by discipline.
 
 n = 7
 if n > 5:

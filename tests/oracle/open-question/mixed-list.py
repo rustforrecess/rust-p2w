@@ -10,6 +10,15 @@
 #
 # The third is the dangerous one: silent performance cliffs are exactly what a
 # glass-box system should not have.
+#
+# PRIOR ART (see PRIOR-ART-TYPES.md): unanimous HOMOGENEOUS among everything
+# that compiles. Only mypy allows it, by joining to list[object] — and mypy has
+# no memory layout to satisfy.
+#
+# Codon supplies the answer worth giving a student: TUPLES stay heterogeneous,
+# because their length and element layout are statically known. "A list holds
+# many of one thing; a tuple holds a few different things" is true about the
+# machine and teachable at the same time, which is rare.
 
 things = [1, "two", 3.0]
 print(things[0])

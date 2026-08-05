@@ -93,6 +93,42 @@ nothing here depends on those licenses since no code is used.
      bit instructions, patterned on our own existing helpers ($py_neg,
      p2w_band). Behavior/spec is uncopyrightable; no MicroPython code is used.
 
+7. Statically-compiled Python subsets, as a group — consulted for TYPE SYSTEM
+   DESIGN DECISIONS ONLY, from public documentation. Written up in
+   PRIOR-ART-TYPES.md; each decision is cited at the point it informed, in
+   tests/oracle/open-question/.
+   - RPython (PyPy) — https://rpython.readthedocs.io — MIT
+     The rule "variables should contain values of at most one type at each
+     control flow point", and the representation-derived rule that None may mix
+     with pointer-shaped types but not with int, float or tuple. Both informed
+     how we frame the same questions. Documentation only; the annotator and
+     rtyper sources were NOT read.
+   - Shed Skin — https://github.com/shedskin/shedskin — GPL/BSD
+     That it uses Agesen's Cartesian Product Algorithm for parametric
+     polymorphism — a published algorithm (ECOOP 1995), consulted as literature.
+     Shed Skin's own source was NOT read, and note its GPL status: nothing from
+     it may be used beyond the fact of the citation.
+   - Codon — https://docs.exaloop.io — Business Source License
+     The framing that tuples remain heterogeneous while lists must be
+     homogeneous, as the answer to give a student. Public docs only; Codon's
+     license makes reading its source inappropriate for this project, and it
+     was not read.
+   - Mojo — https://mojolang.org — proprietary
+     The phrasing "the variable receives a type when it's created, and the type
+     never changes". Public documentation only.
+   - SPy (Antonio Cuni) — https://github.com/spylang/spy
+     The blue/red "redshift" framing — expressions computable at compile time
+     versus those that must run — as one of the strategies for resolving
+     generic code. Public write-ups and talks only; source NOT read. (See also
+     the separate SPy evaluation: build-on/port was considered and declined.)
+   - Cython — https://cython.org — Apache-2.0
+     That the typed/untyped choice can be made per variable by the programmer,
+     as the one gradual answer in the field.
+   - mypy — https://mypy.readthedocs.io — MIT
+     Consulted as the definition of what Python programmers now EXPECT from
+     typing, which is a pedagogical constraint on us regardless of what we
+     implement.
+
 ================================================================================
 p2w — MIT License
 ================================================================================
