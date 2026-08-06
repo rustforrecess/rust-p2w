@@ -127,9 +127,63 @@ which is what `component.rs` generates. This is a statement about world size,
 not about WASI being unsafe. It is worth re-testing if the chain moves to
 `wit-bindgen`.
 
-## The next decision
+## `wit-bindgen` in the component chain — costed
 
-**Cost `wit-bindgen` in the component chain.** It gates `wasi:cli/stdout`, it
-would remove the hand-written-shim maintenance, and it is the difference
-between "we prefer our own" and "we could not afford theirs" — which are very
-different positions to be defending in a year.
+**Finding: it replaces about a third of the shim, cannot touch the rest, and is
+worth adopting *with* the first resource-bearing interface rather than before
+it.**
+
+`shim_c` in `component.rs` is 226 lines of a 1402-line file. What it does, and
+who could generate it:
+
+| part | `wit-bindgen`? |
+|---|---|
+| `cabi_realloc` bump allocator | **yes** |
+| `import_module`/`import_name` declarations and wrappers | **yes** |
+| `mk_list_of_*`: canonical `(ptr,len)` → **p2w list** | **no** |
+| p2w list → canonical `(ptr,len)` result | **no** |
+| export wrappers honouring the **borrow mask** (release discipline) | **no** |
+
+The three it cannot do are not an oversight — **`wit-bindgen` knows the
+canonical ABI and knows nothing about p2w's value model**: tagged `Value`s that
+are i32 offsets into an arena, reference counted, with borrowed parameters the
+caller still owns. Marshalling between that and canonical types is ours by
+construction, and it is the part that is actually hard. So adopting
+`wit-bindgen` removes the boilerplate and leaves the interesting half.
+
+**The real finding is about sequencing, not savings.** The current world is flat
+functions over scalars, strings and lists, with **no resources** — which is
+exactly why hand-writing the shim is tractable at all. `wasi:cli/stdout`
+introduces a `resource` (`output-stream`), and resource glue is the genuinely
+hard part of the canonical ABI: handle tables, ownership, `[method]` lowering.
+That is where hand-writing stops being reasonable.
+
+⇒ **`wit-bindgen` is not a debt to pay down now. It is the enabler for the first
+standard interface that carries a resource, and should be adopted together with
+it.** Adopting it speculatively buys deleted boilerplate and adds a build-tool
+dependency to a chain that today needs only clang, wasm-ld and wasm-tools.
+
+Tooling notes: `bytecodealliance/wit-bindgen` is **Apache-2.0**, actively
+developed (pushed the same day this was written), and ships a maintained **`c`**
+generator alongside rust/cpp/csharp/go/moonbit. It is **not currently
+installed** here — `wasm-tools` is.
+
+## Where that leaves each capability
+
+- **Domain caps** (`seed`, `get_field`, `report`, `on_frame`, DOM/stage) —
+  bespoke, because no standard exists. Keep them WIT-shaped. Unaffected by any
+  of the above.
+- **`wasi:clocks`** — flat functions, **no resources**, so it needs no
+  `wit-bindgen` and no new machinery. **If time is ever wanted, this is the
+  cheap standard to adopt, and it should be the first one.**
+- **`wasi:cli/stdout`** — costs `wit-bindgen` plus the remaining bespoke
+  marshalling. Real, bounded, and with no forcing reason today. The trigger
+  stays: components needing to run in a host we do not write.
+
+## The honest summary
+
+We are not defending "we prefer our own" — we are defending "no standard exists
+for most of what we grant, and the one that does costs a binding generator we
+have no other reason to add yet." That is a position with an expiry date on it,
+and the expiry is the first time a component has to run somewhere we do not
+control.
