@@ -300,6 +300,82 @@ independently validated:
 Nobody has assembled them. That is the same shape of gap `PRIOR-ART-AGENTIC.md`
 found, arrived at from the opposite direction.
 
+---
+
+## ⭐ WIT — the one "prior art" that is also a constraint
+
+Every system above is a comparison. WIT is different: if the future is
+WASI/component-shaped (`HOST_INTERFACE.md`), then **a p2w type that cannot be
+expressed in WIT cannot cross a component boundary.** That makes it an
+external, mechanically checkable gate on the type system rather than a matter
+of taste — the kind `SUBSET_POLICY.md` prefers.
+
+**Take the type system. Do NOT take the canonical ABI.** They are different
+things and conflating them would be expensive:
+
+- **WIT** is a *vocabulary of types*: `bool`, `s8`–`s64`, `u8`–`u64`, `f32`,
+  `f64`, `char`, `string`, `list<T>`, `tuple<…>`, `option<T>`, `result<T,E>`,
+  `record`, `variant`, `enum`, `flags`, `resource`.
+- **The canonical ABI** is how those are *lowered* to core wasm: flattened
+  params, `(ptr, len)` into linear memory, handle tables, `cabi_realloc`.
+
+Imitating the ABI internally would be a serious mistake. It is a **boundary
+lingua franca**, designed for crossing between components that disagree about
+representation, and it is **copying and flat by construction** — the exact
+opposite of in-place reuse. Adopting it internally would negate the FBIP work
+that is the whole "no GC, $7 board" claim, and the **WASM-GC backend could not
+do it at all**, since GC arrays are not addressable and there is no `(ptr,
+len)` to hand out. That would quietly decide the GC-versus-linear-memory
+question as a side effect of an ABI convenience.
+
+### What WIT's vocabulary answers
+
+Three of the five files in `tests/oracle/open-question/` have a standard,
+implemented answer sitting in WIT already:
+
+- **`list<T>` is homogeneous.** Same answer as everyone in the table above, now
+  with an interop reason behind it, not just a layout one.
+- **`tuple<…>` is heterogeneous and fixed-length** — the escape hatch for mixed
+  data, matching Codon's, and now the *portable* one.
+- **`option<T>`** is `function-with-no-return.py`, decided.
+
+### ⭐ And `result<T,E>` re-opens exceptions
+
+`SUBSET_POLICY.md` blocks exceptions at gate 1: cheap under WASM-GC, expensive
+on the Pico, because unwinding needs cleanup paths and unwind tables on the
+target with least room.
+
+**`result<T,E>` is an error-handling answer that needs no unwinding at all.** It
+is a return value. No unwind tables, no cleanup paths, identical on both
+targets, and compatible with reuse analysis. It also gets the pedagogy right in
+a way `try/except` does not: a `result` cannot be ignored silently, whereas a
+beginner's `except: pass` exists to make the error go away.
+
+That does not decide it — a `result` type needs somewhere to *put* the error,
+and Python has no `Result`. But it is the first option that clears gate 1, and
+gate 1 is what has been blocking.
+
+### How it stays Python
+
+WIT types are not Python types, so by `SUBSET_POLICY.md` Tier 3 anything
+borrowed has to be **spelled in syntax CPython already parses and ignores** —
+which for types means **annotations**:
+
+```python
+def find(xs: list[int], target: int) -> Optional[int]: ...
+```
+
+is ordinary Python (`typing.Optional`), runs in CPython unchanged, and maps
+exactly to `option<s32>`. The invariant survives *because* the borrowing
+happens in the annotation layer.
+
+Note this is already happening implicitly: `component.rs` maps `int -> s32`,
+`float -> f64`, `str -> string`, `list[T] -> list<T>` today, **and its comment
+already records the mismatch it forced someone to notice** — `s32` is "the
+linear-memory runtime's int width today; the spec's `s64` arrives when the
+value model widens." WIT made the 32-versus-64 decision visible before anyone
+went looking for it. That is the constraint earning its keep.
+
 ## Sources
 
 - Mojo — <https://mojolang.org/docs/manual/variables>

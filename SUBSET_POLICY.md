@@ -129,6 +129,18 @@ traceback. And the classic motivating cases (validating input, missing file,
 failed network call) mostly do not exist in this subset. Types delete more of
 the remaining category than exceptions would (see `tests/oracle/`).
 
+**⭐ But `result<T,E>` clears gate 1, and gate 1 was the blocker.** WIT's
+`result` is error handling as a **return value** — no unwinding, so no cleanup
+paths and no unwind tables, identical on both targets, and compatible with
+reuse analysis. It also gets the pedagogy right where `try/except` does not: a
+`result` cannot be ignored silently, whereas a beginner's `except: pass` exists
+precisely to make the error go away.
+
+Not decided — a `result` needs somewhere to put the error, and Python has no
+`Result`, so it would arrive as a Tier 3 feature spelled in annotations with a
+CPython shim. But it is the first proposal that gets past the gate that has
+been stopping this. See `PRIOR-ART-TYPES.md`.
+
 ### First-class functions — passes, and is aligned
 
 Passes all four gates. More usefully, it **pulls in the same direction as the
