@@ -79,7 +79,7 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 
 ## Strings
 
-`+` joins and `*` repeats — which is exactly why `-` on strings surprises students: two of the three arithmetic operators they know do work. Note also that ORDERING COMPARISONS ON STRINGS ARE NOT SUPPORTED (`'a' < 'b'`) though CPython allows them — a real subset gap, and the message now says so rather than blaming the operator.
+`+` joins and `*` repeats — which is exactly why `-` on strings surprises students: two of the three arithmetic operators they know do work. Ordering comparisons ARE supported and lexicographic, matching CPython — including the two results that surprise people: uppercase sorts before lowercase, and a prefix is smaller than the word it begins.
 
 | program | where | result |
 |---|---|---|
@@ -88,7 +88,13 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `3 * 'ab'` | value | `ababab` |
 | `'abc'[1]` | value | `b` |
 | `len('abc')` | value | `3` |
-| `'a' < 'b'` | compile error | `line 1: comparing text with < > <= >= isn't supported yet — that one is our gap, not your mistake. To compare lengths use len(a) < len(b); to check they're th…` |
+| `'a' < 'b'` | value | `True` |
+| `'pear' < 'apple'` | value | `False` |
+| `'a' <= 'a'` | value | `True` |
+| `'b' > 'a'` | value | `True` |
+| `'b' >= 'c'` | value | `False` |
+| `'Zoe' < 'amy'` | value | `True` |
+| `'app' < 'apple'` | value | `True` |
 | `'ab' - 'b'` | compile error | `line 1: this operator needs numbers on both sides` |
 | `'ab' + 1` | compile error | `line 1: can't add text and a number together` |
 | `1 + 'ab'` | compile error | `line 1: can't add text and a number together` |

@@ -3350,19 +3350,57 @@ fn runtime_helpers() -> Vec<Func> {
     }
 
     // $py_lt / $py_le / $py_gt / $py_ge: ordered comparison (raw i32 0/1). A
-    // left operand's dunder first (Vector/Fraction etc.); otherwise compare as
-    // f64 (exact for every i32). String comparison is rejected at compile time.
-    for (name, f_instr, dunder) in [
-        ("$py_lt", "f64.lt", "__lt__"),
-        ("$py_le", "f64.le", "__le__"),
-        ("$py_gt", "f64.gt", "__gt__"),
-        ("$py_ge", "f64.ge", "__ge__"),
+    // left operand's dunder first (Vector/Fraction etc.); then TEXT, compared
+    // lexicographically like CPython; otherwise as f64 (exact for every i32).
+    //
+    // The string branch derives all four from `$str_lt`, which sorted()/min()/
+    // max() have always used via `$sort_lt`. Without it a student could write
+    // max("apple", "pear") but not "apple" < "pear" — the same idea working in
+    // one spelling and not the other, which is how a language turns into
+    // folklore.
+    for (name, f_instr, dunder, str_expr) in [
+        (
+            "$py_lt",
+            "f64.lt",
+            "__lt__",
+            "(call $str_lt (local.get $sa) (local.get $sb))",
+        ),
+        // a <= b  is  !(b < a)
+        (
+            "$py_le",
+            "f64.le",
+            "__le__",
+            "(i32.eqz (call $str_lt (local.get $sb) (local.get $sa)))",
+        ),
+        // a > b  is  b < a
+        (
+            "$py_gt",
+            "f64.gt",
+            "__gt__",
+            "(call $str_lt (local.get $sb) (local.get $sa))",
+        ),
+        // a >= b  is  !(a < b)
+        (
+            "$py_ge",
+            "f64.ge",
+            "__ge__",
+            "(i32.eqz (call $str_lt (local.get $sa) (local.get $sb)))",
+        ),
     ] {
         let mut b = Body::new();
         b.push(format!(
             "(if (call $obj_has (local.get $a) {n}) (then (return (call $truthy (call $obj_call1 (local.get $a) (local.get $b) {n})))))",
             n = str_lit(dunder)
         ));
+        b.push(
+            "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
+        );
+        b.push_in(1, "(then");
+        b.push_in(2, "(local.set $sa (ref.cast (ref $STR) (local.get $a)))");
+        b.push_in(2, "(local.set $sb (ref.cast (ref $STR) (local.get $b)))");
+        b.push_in(2, format!("(return {str_expr})"));
+        b.push_in(1, ")");
+        b.push(")");
         b.push(format!(
             "({f_instr} (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))"
         ));
@@ -3370,7 +3408,10 @@ fn runtime_helpers() -> Vec<Func> {
             signature: format!(
                 "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
             ),
-            locals: vec![],
+            locals: vec![
+                "(local $sa (ref null $STR))".into(),
+                "(local $sb (ref null $STR))".into(),
+            ],
             body: b,
         });
     }
@@ -8119,21 +8160,11 @@ impl Gen {
                         (Ty::Num, Ty::Num) => Ok(Ty::Num),
                         _ => Ok(Ty::Value),
                     },
-                    // Ordering comparisons on two strings are a SUBSET GAP, not
-                    // a student mistake: CPython compares text alphabetically
-                    // and we do not yet. Saying "needs numbers on both sides"
-                    // is simply false, and sends them looking for an error they
-                    // did not make. Own it.
+                    // Two strings compare lexicographically, like CPython.
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                         if ta == Ty::Str && tb == Ty::Str =>
                     {
-                        Err(CompileError::at(
-                            e.line,
-                            "comparing text with < > <= >= isn't supported yet — that one is \
-                             our gap, not your mistake. To compare lengths use len(a) < len(b); \
-                             to check they're the same use ==",
-                        )
-                        .with_kind(crate::ErrorKind::Type))
+                        Ok(Ty::Value)
                     }
                     // Text against a number, on the other hand, is a real
                     // mistake and there is no answer we could give.
@@ -8321,7 +8352,15 @@ mod tests {
                 .message
                 .contains("numbers on both sides")
         );
-        assert!(compile("print(\"a\" < \"b\")").is_err()); // lexicographic: later
+        // "lexicographic: later" arrived — two strings compare like CPython.
+        assert!(compile("print(\"a\" < \"b\")").is_ok());
+        // Text against a number stays an error: there is no answer to give.
+        assert!(
+            compile("print(\"a\" < 1)")
+                .unwrap_err()
+                .message
+                .contains("can't compare text with a number")
+        );
         assert!(compile("for i in range(\"x\"):\n    print(i)\n").is_err());
     }
 

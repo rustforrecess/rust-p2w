@@ -181,10 +181,11 @@ pub fn groups() -> Vec<Group> {
             title: "Strings",
             note: "`+` joins and `*` repeats — which is exactly why `-` on \
                    strings surprises students: two of the three arithmetic \
-                   operators they know do work. Note also that ORDERING \
-                   COMPARISONS ON STRINGS ARE NOT SUPPORTED (`'a' < 'b'`) \
-                   though CPython allows them — a real subset gap, and the \
-                   message now says so rather than blaming the operator.",
+                   operators they know do work. Ordering comparisons ARE \
+                   supported and lexicographic, matching CPython — including \
+                   the two results that surprise people: uppercase sorts \
+                   before lowercase, and a prefix is smaller than the word it \
+                   begins.",
             probes: vec![
                 e!("'ab' + 'cd'"),
                 e!("'ab' * 3"),
@@ -192,6 +193,15 @@ pub fn groups() -> Vec<Group> {
                 e!("'abc'[1]"),
                 e!("len('abc')"),
                 e!("'a' < 'b'"),
+                e!("'pear' < 'apple'"),
+                e!("'a' <= 'a'"),
+                e!("'b' > 'a'"),
+                e!("'b' >= 'c'"),
+                // Uppercase sorts before lowercase (code-point order), and a
+                // prefix is smaller than the word it starts — the two results
+                // that surprise people, so they are pinned.
+                e!("'Zoe' < 'amy'"),
+                e!("'app' < 'apple'"),
                 e!("'ab' - 'b'"),
                 e!("'ab' + 1"),
                 e!("1 + 'ab'"),
