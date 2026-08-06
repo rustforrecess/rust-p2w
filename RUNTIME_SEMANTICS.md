@@ -79,7 +79,7 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 
 ## Strings
 
-`+` joins and `*` repeats — which is exactly why `-` on strings surprises students: two of the three arithmetic operators they know do work. ⚠ Note also that ORDERING COMPARISONS ON STRINGS ARE NOT SUPPORTED (`'a' < 'b'`), though CPython allows them — a real subset gap, and the message blames the operator rather than naming the gap.
+`+` joins and `*` repeats — which is exactly why `-` on strings surprises students: two of the three arithmetic operators they know do work. Note also that ORDERING COMPARISONS ON STRINGS ARE NOT SUPPORTED (`'a' < 'b'`) though CPython allows them — a real subset gap, and the message now says so rather than blaming the operator.
 
 | program | where | result |
 |---|---|---|
@@ -88,7 +88,7 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `3 * 'ab'` | value | `ababab` |
 | `'abc'[1]` | value | `b` |
 | `len('abc')` | value | `3` |
-| `'a' < 'b'` | compile error | `line 1: this operator needs numbers on both sides` |
+| `'a' < 'b'` | compile error | `line 1: comparing text with < > <= >= isn't supported yet — that one is our gap, not your mistake. To compare lengths use len(a) < len(b); to check they're th…` |
 | `'ab' - 'b'` | compile error | `line 1: this operator needs numbers on both sides` |
 | `'ab' + 1` | compile error | `line 1: can't add text and a number together` |
 | `1 + 'ab'` | compile error | `line 1: can't add text and a number together` |
@@ -104,7 +104,7 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `n = 5; n[0]` | trap | `TypeError: 'int' object is not subscriptable` |
 | `n = 5; len(n)` | trap | `TypeError: object of type 'int' has no len()` |
 | `n = 5; n.append(1)` | trap | `AttributeError: 'int' object has no attribute 'append'` |
-| `n = 5; for x in n` | trap | `TypeError: object of type 'int' has no len()` |
+| `n = 5; for x in n` | trap | `TypeError: a 'int' is one single value, so a for loop has nothing to go through. A loop needs a list, some text, a dict or a set — or use range(n) to count.` |
 | `x: int = 'no'` | value | `no` |
 | `def f() -> int: return 'x'` | value | `x` |
 | `def f(n: int) called with str` | value | `x` |
@@ -170,7 +170,7 @@ Comparing unlike things is where Python's own rules are least obvious, so it is 
 | `bool('')` | value | `False` |
 | `bool([])` | value | `False` |
 | `1 == 'one'` | value | `False` |
-| `1 < 'one'` | compile error | `line 1: this operator needs numbers on both sides` |
+| `1 < 'one'` | compile error | `line 1: can't compare text with a number — there's no way to say whether a word is bigger than 5` |
 
 ## Unpacking
 

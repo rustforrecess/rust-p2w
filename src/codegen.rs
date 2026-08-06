@@ -743,6 +743,27 @@ fn raise_helpers() -> Vec<Func> {
         });
     }
 
+    // $raise_not_iterable: `for x in <something you cannot go through>`.
+    //
+    // Says what a for loop CAN go through, and offers range() — which is what
+    // the student almost always wanted when the value is a number.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_text(&mut b, 0, "TypeError: a '");
+    b.push("(call $type_name (local.get $r))");
+    push_text(
+        &mut b,
+        0,
+        "' is one single value, so a for loop has nothing to go through. A loop needs a list, some text, a dict or a set — or use range(n) to count.",
+    );
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_not_iterable (param $r (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
     // $raise_no_attr: attribute miss (read or method) — names the attribute.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
@@ -1078,6 +1099,31 @@ fn runtime_helpers() -> Vec<Func> {
     b.push("unreachable");
     fs.push(Func {
         signature: "(func $py_len (param $r (ref null eq)) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $py_iter_len: the loop bound for `for x in ...`.
+    //
+    // Identical to $py_len for everything iterable — it exists only so the
+    // FAILURE reads correctly. Going through $py_len directly meant a student
+    // who wrote `for x in 5` was told "object of type 'int' has no len()",
+    // which mentions a function they never used and describes our
+    // implementation rather than their mistake.
+    let mut b = Body::new();
+    b.push(format!(
+        "(if (call $obj_has (local.get $r) {n}) (then (return (call $py_len (local.get $r)))))",
+        n = str_lit("__len__")
+    ));
+    for ty in ["$LIST", "$STR", "$DICT", "$TUPLE", "$SET"] {
+        b.push(format!(
+            "(if (ref.test (ref {ty}) (local.get $r)) (then (return (call $py_len (local.get $r)))))"
+        ));
+    }
+    b.push("(call $raise_not_iterable (local.get $r))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $py_iter_len (param $r (ref null eq)) (result i32)".into(),
         locals: vec![],
         body: b,
     });
@@ -6354,7 +6400,9 @@ impl Gen {
         out.push_in(1, format!("(loop $l{n}"));
         out.push_in(
             2,
-            format!("(br_if $b{n} (i32.ge_s (local.get ${idx}) (call $py_len (local.get ${it}))))"),
+            format!(
+                "(br_if $b{n} (i32.ge_s (local.get ${idx}) (call $py_iter_len (local.get ${it}))))"
+            ),
         );
         out.push_in(2, set_var);
         out.push_in(2, format!("(block $c{n}"));
@@ -6536,7 +6584,9 @@ impl Gen {
         b.push_in(1, format!("(loop $l{n}"));
         b.push_in(
             2,
-            format!("(br_if $b{n} (i32.ge_s (local.get ${idx}) (call $py_len (local.get ${it}))))"),
+            format!(
+                "(br_if $b{n} (i32.ge_s (local.get ${idx}) (call $py_iter_len (local.get ${it}))))"
+            ),
         );
         b.push_in(
             2,
@@ -8069,6 +8119,34 @@ impl Gen {
                         (Ty::Num, Ty::Num) => Ok(Ty::Num),
                         _ => Ok(Ty::Value),
                     },
+                    // Ordering comparisons on two strings are a SUBSET GAP, not
+                    // a student mistake: CPython compares text alphabetically
+                    // and we do not yet. Saying "needs numbers on both sides"
+                    // is simply false, and sends them looking for an error they
+                    // did not make. Own it.
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                        if ta == Ty::Str && tb == Ty::Str =>
+                    {
+                        Err(CompileError::at(
+                            e.line,
+                            "comparing text with < > <= >= isn't supported yet — that one is \
+                             our gap, not your mistake. To compare lengths use len(a) < len(b); \
+                             to check they're the same use ==",
+                        )
+                        .with_kind(crate::ErrorKind::Type))
+                    }
+                    // Text against a number, on the other hand, is a real
+                    // mistake and there is no answer we could give.
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                        if ta == Ty::Str || tb == Ty::Str =>
+                    {
+                        Err(CompileError::at(
+                            e.line,
+                            "can't compare text with a number — there's no way to say whether \
+                             a word is bigger than 5",
+                        )
+                        .with_kind(crate::ErrorKind::Type))
+                    }
                     _ => {
                         if ta == Ty::Str || tb == Ty::Str {
                             Err(CompileError::at(

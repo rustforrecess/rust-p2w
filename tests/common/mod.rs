@@ -181,10 +181,10 @@ pub fn groups() -> Vec<Group> {
             title: "Strings",
             note: "`+` joins and `*` repeats — which is exactly why `-` on \
                    strings surprises students: two of the three arithmetic \
-                   operators they know do work. ⚠ Note also that ORDERING \
-                   COMPARISONS ON STRINGS ARE NOT SUPPORTED (`'a' < 'b'`), \
+                   operators they know do work. Note also that ORDERING \
+                   COMPARISONS ON STRINGS ARE NOT SUPPORTED (`'a' < 'b'`) \
                    though CPython allows them — a real subset gap, and the \
-                   message blames the operator rather than naming the gap.",
+                   message now says so rather than blaming the operator.",
             probes: vec![
                 e!("'ab' + 'cd'"),
                 e!("'ab' * 3"),
