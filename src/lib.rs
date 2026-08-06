@@ -68,6 +68,41 @@ pub fn try_compile(source: &str) -> Result<String, CompileError> {
     codegen::generate(&stmts)
 }
 
+/// The host functions a compiled module imports — its **capability manifest**.
+///
+/// Read out of the EMITTED MODULE, deliberately, rather than from codegen's
+/// internal `uses_*` flags. The imports are the ground truth about what a
+/// program can reach; a flag is only a claim about it, and the two could drift.
+/// Reading the artifact means this cannot report a capability the module does
+/// not have, or miss one it does.
+///
+/// This is the whole security story in one list. The subset has **no ambient
+/// authority** — no filesystem, no clock, no network, no randomness — so
+/// everything a program can touch has to arrive through a host import and
+/// therefore appears here. That is what makes "this program reaches nothing
+/// outside the whitelist" a question a verifier can answer mechanically
+/// instead of a claim someone has to trust.
+///
+/// It stays true only while names cannot be resolved dynamically (no `eval`,
+/// no computed `getattr`) — see `SUBSET_POLICY.md`. With those, the call graph
+/// stops being decidable and the import list stops being the whole statement.
+///
+/// Sorted and deduplicated, so callers can diff two programs' reach.
+pub fn capabilities(wat: &str) -> Vec<String> {
+    let mut out: Vec<String> = wat
+        .lines()
+        .filter_map(|l| {
+            // (import "env" "NAME" (func ...))  — take NAME, the second string.
+            let rest = l.trim().strip_prefix("(import \"env\" \"")?;
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Compile Python to textual LLVM IR — Phase 0 of the native Pico 2 W backend
 /// (the integer subset; see `PICO_BACKEND.md`). Text only: turning this into an
 /// RP2350 binary is a later, toolchain-gated phase.
@@ -280,6 +315,38 @@ mod tests {
         let wat = compile_to_wat("print(\"hello world\")").unwrap();
         assert!(wat.contains("(export \"_start\")"));
         assert!(wat.contains("call $write_char"));
+    }
+
+    #[test]
+    fn a_printing_program_reaches_only_the_output_sink() {
+        let wat = compile_to_wat("print(1)\n").unwrap();
+        let caps = capabilities(&wat);
+        assert!(caps.contains(&"write_char".to_string()), "{caps:?}");
+        // The point of the whole exercise: nothing else is reachable.
+        for forbidden in ["read_char", "seed", "set_field", "play_sound"] {
+            assert!(
+                !caps.contains(&forbidden.to_string()),
+                "a program that only prints must not reach {forbidden}: {caps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_for_input_shows_up_as_a_capability() {
+        // Reading input is a distinct power from writing output, and the
+        // manifest has to say so — otherwise it is not measuring anything.
+        let caps = capabilities(&compile_to_wat("x = input()\nprint(x)\n").unwrap());
+        assert!(caps.contains(&"read_char".to_string()), "{caps:?}");
+    }
+
+    #[test]
+    fn the_manifest_is_sorted_and_free_of_duplicates() {
+        // Callers diff these lists; unstable order would make every diff noise.
+        let caps = capabilities(&compile_to_wat("x = input()\nprint(x)\nprint(x)\n").unwrap());
+        let mut sorted = caps.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(caps, sorted, "manifest must be sorted and deduplicated");
     }
 
     #[test]

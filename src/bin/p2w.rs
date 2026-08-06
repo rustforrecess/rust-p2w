@@ -173,6 +173,24 @@ fn check(source: &str) -> Report {
     out.push_str(",\n  \"lints\": ");
     out.push_str(&join_array(&items));
 
+    // ---- capabilities ---------------------------------------------------
+    // What the program can actually TOUCH, read out of the module's import
+    // list. The subset grants no ambient authority — no filesystem, clock,
+    // network or randomness — so this list is the complete statement of a
+    // program's reach, and CI or a teacher can check it without reading WAT.
+    //
+    // Empty when compilation failed: a program that does not build has no
+    // manifest, and guessing one would be worse than saying nothing.
+    let caps: Vec<String> = match &compile {
+        Ok(wat) => rust_p2w::capabilities(wat)
+            .iter()
+            .map(|c| json_str(c))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    out.push_str(",\n  \"capabilities\": ");
+    out.push_str(&join_array(&caps));
+
     // ---- concepts -------------------------------------------------------
     // The field with no precedent elsewhere: what this program is *reaching
     // for*, not just whether it is well-formed.
@@ -327,6 +345,23 @@ mod tests {
         );
         assert_eq!(lint_code(rust_p2w::LintKind::Typo), "typo");
         assert_eq!(lint_code(rust_p2w::LintKind::UnusedLocal), "unused_local");
+    }
+
+    #[test]
+    fn the_report_states_what_the_program_can_reach() {
+        let r = check("print(1)\n");
+        assert!(r.json.contains("\"capabilities\""), "{}", r.json);
+        assert!(r.json.contains("\"write_char\""), "{}", r.json);
+        // A program that only prints must not claim the input capability.
+        assert!(!r.json.contains("\"read_char\""), "{}", r.json);
+    }
+
+    #[test]
+    fn a_broken_program_claims_no_capabilities() {
+        // No module, no manifest. Guessing would be worse than silence.
+        let r = check("for i in range(3)\n    print(i)\n");
+        assert!(!r.ok);
+        assert!(r.json.contains("\"capabilities\": []"), "{}", r.json);
     }
 
     #[test]
