@@ -852,6 +852,21 @@ fn seq_repeat(seq: Value, n: i64) -> Value {
 }
 
 /// True division (`/`) is *always* float in Python: `4 / 2 == 2.0`.
+/// Reporters the LLVM backend calls directly from its INLINE fast paths.
+///
+/// Those paths never reach `numeric`/`p2w_div`, so the checks there could not
+/// see them — the emitter now tests and calls these. Both diverge from CPython
+/// only in that our whole numbers are 32-bit; the failure is loud either way.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_overflow() -> ! {
+    trap("this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)")
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_zero_div() -> ! {
+    trap("division by zero")
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_div(a: Value, b: Value) -> Value {
     match (fnum(a), fnum(b)) {

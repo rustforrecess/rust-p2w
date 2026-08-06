@@ -88,6 +88,12 @@ declare i1 @p2w_truthy(i32)
 declare void @p2w_print(i32)
 declare void @p2w_write(i32)
 declare void @p2w_write_char(i32)
+; whole-number overflow: checked arithmetic + the runtime's reporter
+declare void @p2w_overflow()
+declare void @p2w_zero_div()
+declare {i32, i1} @llvm.sadd.with.overflow.i32(i32, i32)
+declare {i32, i1} @llvm.ssub.with.overflow.i32(i32, i32)
+declare {i32, i1} @llvm.smul.with.overflow.i32(i32, i32)
 ; reference counting (no-ops for inline int/bool/None at runtime)
 declare void @p2w_retain(i32)
 declare void @p2w_release(i32)
@@ -3546,9 +3552,27 @@ impl<'a> FuncEmitter<'a> {
         // no refcount traffic. The result stays an unboxed Int and only boxes if
         // it later reaches a dynamic sink (via as_boxed).
         if let (Some(instr), Repr::Int, Repr::Int) = (int_native_op(op), ar, br) {
-            let r = self.temp();
-            self.line(&format!("{r} = {instr} i32 {va}, {vb}"));
-            return Ok((r, Repr::Int));
+            // CHECKED, not wrapping. This is the fast path for typed and
+            // inferred int slots, so it never reaches the runtime's `numeric`
+            // — which is why range-checking there alone left `2147483647 + 1`
+            // silently wrapping here. A wrong answer with no indication is the
+            // worst failure a teaching language can produce.
+            let pair = self.temp();
+            let val = self.temp();
+            let bit = self.temp();
+            let bad = self.fresh_label("ovf");
+            let ok = self.fresh_label("ovfok");
+            self.line(&format!(
+                "{pair} = call {{i32, i1}} @llvm.s{instr}.with.overflow.i32(i32 {va}, i32 {vb})"
+            ));
+            self.line(&format!("{val} = extractvalue {{i32, i1}} {pair}, 0"));
+            self.line(&format!("{bit} = extractvalue {{i32, i1}} {pair}, 1"));
+            self.line(&format!("br i1 {bit}, label %{bad}, label %{ok}"));
+            self.line(&format!("{bad}:"));
+            self.line("call void @p2w_overflow()");
+            self.line("unreachable");
+            self.line(&format!("{ok}:"));
+            return Ok((val, Repr::Int));
         }
         // Native integer comparison: a raw `icmp` yielding an unboxed Bool (i1).
         if let (Some(pred), Repr::Int, Repr::Int) = (int_cmp_pred(op), ar, br) {
@@ -3571,6 +3595,20 @@ impl<'a> FuncEmitter<'a> {
             let b_f = self.promote_double(vb, br);
             let r = self.temp();
             if let Some(instr) = float_native_op(op) {
+                // `/` by zero must raise, not produce inf. p2w_div checks, but
+                // this inline path never reaches it — which is why the board
+                // printed `inf` where CPython and the WASM backend both raise.
+                if matches!(op, BinOp::Div) {
+                    let z = self.temp();
+                    let bad = self.fresh_label("divz");
+                    let ok = self.fresh_label("divok");
+                    self.line(&format!("{z} = fcmp oeq double {b_f}, 0.0"));
+                    self.line(&format!("br i1 {z}, label %{bad}, label %{ok}"));
+                    self.line(&format!("{bad}:"));
+                    self.line("call void @p2w_zero_div()");
+                    self.line("unreachable");
+                    self.line(&format!("{ok}:"));
+                }
                 self.line(&format!("{r} = {instr} double {a_f}, {b_f}"));
                 return Ok((r, Repr::Float));
             }
@@ -3821,8 +3859,8 @@ fn zero_init(repr: Repr) -> &'static str {
 /// The LLVM instruction for a native (unboxed) integer binop, or `None` for ops
 /// that fall back to the boxed runtime. `//`, `%`, `**` differ from LLVM's
 /// truncating `sdiv`/`srem` (Python floors) or aren't a single instruction;
-/// comparisons return a bool (a later repr). Native ops use i32 wraparound,
-/// matching the value model's overflow decision.
+/// comparisons return a bool (a later repr). Native ops are CHECKED — the
+/// emitter wraps each in an `llvm.*.with.overflow` intrinsic and traps.
 fn int_native_op(op: BinOp) -> Option<&'static str> {
     match op {
         BinOp::Add => Some("add"),
@@ -4199,7 +4237,10 @@ mod tests {
         assert!(out.contains("declare void @p2w_print(i32)"), "{out}");
         // 6 * 7 is unboxed native integer multiply — no boxed operands, no
         // runtime mul call.
-        assert!(out.contains("mul i32 6, 7"), "native mul: {out}");
+        assert!(
+            out.contains("@llvm.smul.with.overflow.i32(i32 6, i32 7)"),
+            "native mul is the checked intrinsic now: {out}"
+        );
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         // the native result is boxed exactly once, at the dynamic sink (print).
         assert!(
@@ -4269,7 +4310,10 @@ mod tests {
         // with no boxing and no refcount traffic.
         let out = ir("def sq(n: int) -> int:\n    return n * n\nprint(sq(7))\n");
         assert!(out.contains("define i32 @sq(i32 %a0)"), "{out}");
-        assert!(out.contains("mul i32"), "native mul: {out}");
+        assert!(
+            out.contains("@llvm.smul.with.overflow.i32"),
+            "native mul: {out}"
+        );
         assert!(!out.contains("call i32 @p2w_mul"), "no boxed mul: {out}");
         assert!(
             !out.contains("call void @p2w_retain"),
@@ -4297,7 +4341,10 @@ mod tests {
             out.contains("call i32 @p2w_iarray_new"),
             "packed result: {out}"
         );
-        assert!(out.contains("mul i32"), "native element compute: {out}");
+        assert!(
+            out.contains("@llvm.smul.with.overflow.i32"),
+            "native element compute: {out}"
+        );
         assert!(
             out.contains("call void @p2w_iarray_push"),
             "raw append: {out}"
@@ -4402,7 +4449,10 @@ mod tests {
             "def s(n: int) -> int:\n    total: int = 0\n    i: int = 0\n    while i < n:\n        total = total + i\n        i = i + 1\n    return total\n",
         );
         assert!(out.contains("icmp slt i32"), "native compare: {out}");
-        assert!(out.contains("add i32"), "native add: {out}");
+        assert!(
+            out.contains("@llvm.sadd.with.overflow.i32"),
+            "native add: {out}"
+        );
         assert!(!out.contains("call i32 @p2w_add"), "no boxed add: {out}");
         assert!(!out.contains("call i32 @p2w_int"), "no boxing: {out}");
     }

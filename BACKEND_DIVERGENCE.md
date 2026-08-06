@@ -13,7 +13,7 @@ Error WORDING is not compared — the two have always phrased things differently
 
 ## Result
 
-**18 of 87 probes disagree.**
+**14 of 87 probes disagree.**
 
 A short list means converging the backends is cheap. A long one means we have been maintaining two languages, and which one is the real student-facing runtime is a decision rather than an accident.
 
@@ -22,8 +22,6 @@ A short list means converging the backends is cheap. A long one means we have be
 | program | WASM-GC | linear memory |
 |---|---|---|
 | `2147483648` | compile error — `line 1: the number 2147483648 is too big — whole numbers from -2147483648 to 2147483647 ar…` | value — `-2147483648` |
-| `2147483647 + 1` | trap — `OverflowError: this calculation went outside the range of whole numbers we can store (-214…` | value — `-2147483648` |
-| `1000000 * 1000000` | trap — `OverflowError: this calculation went outside the range of whole numbers we can store (-214…` | value — `-727379968` |
 
 ### Floats
 
@@ -31,13 +29,6 @@ A short list means converging the backends is cheap. A long one means we have be
 |---|---|---|
 | `2.0 ** 2.0` | trap — `TypeError: ** raises to a whole-number power — for a square root use math.sqrt(x)` | value — `4.0` |
 | `2 ** 0.5` | trap — `TypeError: ** raises to a whole-number power — for a square root use math.sqrt(x)` | value — `1.4142135623730951` |
-
-### Division by zero
-
-| program | WASM-GC | linear memory |
-|---|---|---|
-| `1 / 0` | trap — `ZeroDivisionError: division by zero` | value — `inf` |
-| `1.0 / 0.0` | trap — `ZeroDivisionError: division by zero` | value — `inf` |
 
 ### Strings
 
