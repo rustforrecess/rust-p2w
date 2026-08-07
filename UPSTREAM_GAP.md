@@ -103,7 +103,7 @@ table indices cannot be computed from data — but no longer free.
 **Large integers — `$INT64`.** Upstream keeps small integers as `i31ref` and
 boxes anything outside that range into an `$INT64` struct. We stop at 32 bits:
 the literal range is a compile error and overflowing arithmetic now traps
-(`f021a84`, `edf734c`). Trapping was the right interim — a loud failure beats a
+(`980c9a0`, `655c73c`). Trapping was the right interim — a loud failure beats a
 silent wrong answer — but the widening path `RUNTIME_SEMANTICS.md` calls
 "separate work tied to the value model" **already has a reference
 implementation.**
