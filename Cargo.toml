@@ -33,9 +33,3 @@ wat = "1"
 # rebuild) while keeping this crate's own incremental builds fast.
 [profile.dev.package."*"]
 opt-level = 2
-
-# `p2w run` needs wasmtime, so it only exists with --features run.
-[[bin]]
-name = "p2w-run"
-path = "src/bin/run.rs"
-required-features = ["run"]

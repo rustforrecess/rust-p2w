@@ -66,6 +66,54 @@ fn main() {
             };
             println!("{}", concepts_json(&source));
         }
+        // `run` is one CLI with a conditional subcommand rather than a second
+        // binary: executing needs wasmtime, and a default build should not.
+        // When it is absent the command still EXISTS and says how to get it —
+        // an unknown-command error would look like a typo.
+        #[cfg(feature = "run")]
+        "run" => {
+            let mut fuel = rust_p2w::harness::DEFAULT_FUEL;
+            let mut stdin_text = String::new();
+            let mut path: Option<String> = None;
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--fuel" => match it.next().and_then(|v| v.parse().ok()) {
+                        Some(v) => fuel = v,
+                        None => {
+                            eprintln!("p2w: --fuel needs a whole number");
+                            std::process::exit(2);
+                        }
+                    },
+                    "--stdin" => match it.next() {
+                        Some(v) => stdin_text = v.clone(),
+                        None => {
+                            eprintln!("p2w: --stdin needs a value");
+                            std::process::exit(2);
+                        }
+                    },
+                    other => path = Some(other.to_string()),
+                }
+            }
+            let source = match rust_p2w::harness::read_source(path.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("p2w: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let r = rust_p2w::harness::run(&source, fuel, &stdin_text);
+            println!("{}", r.json);
+            std::process::exit(r.exit);
+        }
+        #[cfg(not(feature = "run"))]
+        "run" => {
+            eprintln!(
+                "p2w: `run` executes a program, which needs wasmtime, so it is not in this \
+                 build.\n     Rebuild with:  cargo build --features run"
+            );
+            std::process::exit(2);
+        }
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("p2w: unknown command `{other}`");
@@ -84,6 +132,8 @@ USAGE:
     p2w check [FILE]        compile-check; JSON to stdout
                             exit 0 = compiles, 1 = errors, 2 = bad invocation
     p2w concepts [FILE]     concept evidence only, as JSON
+    p2w run [FILE]          execute it under a fuel budget; JSON to stdout
+                            --fuel N, --stdin TEXT  (needs --features run)
 
 With no FILE, reads stdin. Lints never affect the exit code."
     );

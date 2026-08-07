@@ -68,6 +68,35 @@ pub fn try_compile(source: &str) -> Result<String, CompileError> {
     codegen::generate(&stmts)
 }
 
+/// Executing a program under a fuel budget — `p2w run`. Behind the `run`
+/// feature so a default build keeps one runtime dependency.
+#[cfg(feature = "run")]
+pub mod harness;
+
+/// Minimal RFC 8259 string escaping, for the harness's hand-written JSON.
+///
+/// Public because both the `check` and `run` paths emit JSON and one escaping
+/// routine is better than two that can disagree. Hand-written rather than
+/// pulling in serde: this crate has one runtime dependency and adding a second
+/// for a binary's output would make it permanent.
+pub fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The host functions a compiled module imports — its **capability manifest**.
 ///
 /// Read out of the EMITTED MODULE, deliberately, rather than from codegen's

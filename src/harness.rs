@@ -1,104 +1,48 @@
-//! `p2w run` — execute a program under a **deterministic** budget and report
-//! what happened as JSON.
+//! Executing a program under a **deterministic** budget — the other half of the
+//! harness. `p2w check` says whether a program compiles; this says whether it
+//! does the right thing, and what it cost.
 //!
-//! Compiled only with `--features run`, because executing a program needs
-//! wasmtime and compiling one does not. The library and the compiler keep
-//! exactly one runtime dependency.
+//! Behind the `run` feature, because executing needs wasmtime and compiling
+//! does not: a default build of the library and the compiler keeps exactly one
+//! runtime dependency.
 //!
 //! ## Why fuel and not a timeout
 //!
-//! Fuel is wasmtime's instruction budget: each wasm instruction costs one unit
-//! and the program traps when the allowance runs out. **Same program, same
-//! input, same number, on every machine.** A wall-clock timeout would give a
-//! different answer on a fast laptop than on a school Chromebook, and would
-//! quietly reintroduce exactly the nondeterminism the subset removes by having
-//! no ambient clock and no ambient randomness.
+//! Fuel is wasmtime's instruction budget: each instruction costs a unit and the
+//! program traps when the allowance runs out. **Same program, same input, same
+//! number, on every machine.** A wall-clock timeout would answer differently on
+//! a fast laptop than on a school Chromebook, reintroducing exactly the
+//! nondeterminism the subset removes by having no ambient clock and no ambient
+//! randomness. A number that changes per machine cannot go in a rubric.
 //!
-//! That buys two different things:
+//! Two distinct uses:
 //!
-//! * **A bound.** A runaway loop traps instead of hanging, which is what makes
-//!   it safe to run a student's — or a generated — program in CI at all.
-//! * **A measure.** The reference solution costs 1,200 units and yours costs
-//!   18,000, both correct. "Efficiency" stops being a word a teacher asserts
-//!   and becomes a number a student can watch move when they change the code.
+//! * **A bound** — a runaway loop traps instead of hanging, which is what makes
+//!   it safe to execute a student's, or a generated, program in CI at all.
+//! * **A measure** — two correct solutions with different costs, so efficiency
+//!   becomes a number a student watches move rather than a word a teacher uses.
 //!
 //! ## What fuel is NOT
 //!
-//! **It counts instructions, not time.** It is a fair comparison between two
-//! programs on the same runtime, and a good regression signal, but it does not
-//! predict wall-clock on the board, where memory traffic dominates. A teaching
-//! and regression metric — not a benchmark. The temptation to read it as
-//! "speed" is strong and should be resisted.
+//! **It counts instructions, not time.** Fair between two programs on the same
+//! runtime and a good regression signal, but no predictor of wall-clock on the
+//! board, where memory traffic dominates. A teaching metric, not a benchmark.
+//!
+//! ## This is also the REFERENCE HOST
+//!
+//! The `env.*` imports wired below are the contract `codegen` emits against.
+//! Keeping one implementation next to the compiler is deliberate: host copies
+//! that drift are how a flush bug faked an entire harness run.
 
 use std::io::Read;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 
 /// Enough for any classroom program; small enough that a runaway loop stops
 /// while a person is still looking at the screen.
-const DEFAULT_FUEL: u64 = 100_000_000;
+pub const DEFAULT_FUEL: u64 = 100_000_000;
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut fuel = DEFAULT_FUEL;
-    let mut path: Option<String> = None;
-    let mut stdin_text = String::new();
-
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--fuel" => match it.next().and_then(|v| v.parse().ok()) {
-                Some(v) => fuel = v,
-                None => die("--fuel needs a whole number"),
-            },
-            "--stdin" => match it.next() {
-                Some(v) => stdin_text = v.clone(),
-                None => die("--stdin needs a value"),
-            },
-            "-h" | "--help" => {
-                usage();
-                return;
-            }
-            other if other.starts_with('-') && other != "-" => {
-                die(&format!("unknown option `{other}`"))
-            }
-            other => path = Some(other.to_string()),
-        }
-    }
-
-    let source = match read_source(path.as_deref()) {
-        Ok(s) => s,
-        Err(e) => die(&e),
-    };
-
-    let report = run(&source, fuel, &stdin_text);
-    println!("{}", report.json);
-    std::process::exit(report.exit);
-}
-
-fn usage() {
-    eprintln!(
-        "\
-p2w run — execute a program under a deterministic fuel budget
-
-USAGE:
-    p2w-run [OPTIONS] [FILE]
-
-OPTIONS:
-    --fuel N        instruction budget (default {DEFAULT_FUEL})
-    --stdin TEXT    text to feed input()
-
-With no FILE, reads the program from stdin.
-Exit: 0 ran to completion, 1 did not (compile error, trap, or out of fuel),
-2 bad invocation."
-    );
-}
-
-fn die(msg: &str) -> ! {
-    eprintln!("p2w run: {msg}");
-    std::process::exit(2);
-}
-
-fn read_source(path: Option<&str>) -> Result<String, String> {
+/// Read a program from a path, or from stdin when absent or `-`.
+pub fn read_source(path: Option<&str>) -> Result<String, String> {
     match path {
         Some(p) if p != "-" => std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}")),
         _ => {
@@ -111,9 +55,15 @@ fn read_source(path: Option<&str>) -> Result<String, String> {
     }
 }
 
-struct Report {
-    json: String,
-    exit: i32,
+/// An unrecoverable harness problem (not a problem with the student's program).
+fn fatal(msg: &str) -> ! {
+    eprintln!("p2w run: {msg}");
+    std::process::exit(2);
+}
+
+pub struct Report {
+    pub json: String,
+    pub exit: i32,
 }
 
 /// Host state: what the program printed, plus the stdin it may read.
@@ -123,8 +73,8 @@ struct Io {
     pos: usize,
 }
 
-fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
-    let wat = match rust_p2w::try_compile(source) {
+pub fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
+    let wat = match crate::try_compile(source) {
         Ok(w) => w,
         Err(e) => {
             return Report {
@@ -132,7 +82,7 @@ fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
                     "{{\n  \"ok\": false,\n  \"reason\": \"compile-error\",\n  \
                      \"message\": {},\n  \"line\": {},\n  \"output\": \"\",\n  \
                      \"fuel_used\": null\n}}",
-                    json_str(&e.message),
+                    crate::json_escape(&e.message),
                     e.line.map_or("null".into(), |l| l.to_string()),
                 ),
                 exit: 1,
@@ -147,16 +97,16 @@ fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
     config.consume_fuel(true);
     let engine = match Engine::new(&config) {
         Ok(e) => e,
-        Err(e) => die(&format!("engine: {e}")),
+        Err(e) => fatal(&format!("engine: {e}")),
     };
 
     let wasm = match wat::parse_str(&wat) {
         Ok(w) => w,
-        Err(e) => die(&format!("internal: emitted invalid WAT: {e}")),
+        Err(e) => fatal(&format!("internal: emitted invalid WAT: {e}")),
     };
     let module = match Module::new(&engine, &wasm[..]) {
         Ok(m) => m,
-        Err(e) => die(&format!("internal: module rejected: {e}")),
+        Err(e) => fatal(&format!("internal: module rejected: {e}")),
     };
 
     let mut store = Store::new(
@@ -168,7 +118,7 @@ fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
         },
     );
     if let Err(e) = store.set_fuel(fuel) {
-        die(&format!("fuel: {e}"));
+        fatal(&format!("fuel: {e}"));
     }
 
     let mut linker: Linker<Io> = Linker::new(&engine);
@@ -184,7 +134,7 @@ fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
         .unwrap();
     linker
         .func_wrap("env", "write_f64", |mut c: Caller<'_, Io>, v: f64| {
-            let s = rust_p2w::py_float_repr(v);
+            let s = crate::py_float_repr(v);
             c.data_mut().out.extend_from_slice(s.as_bytes());
         })
         .unwrap();
@@ -215,7 +165,7 @@ fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
                 json: format!(
                     "{{\n  \"ok\": false,\n  \"reason\": \"missing-capability\",\n  \
                      \"message\": {},\n  \"output\": \"\",\n  \"fuel_used\": null\n}}",
-                    json_str(&e.to_string())
+                    crate::json_escape(&e.to_string())
                 ),
                 exit: 1,
             };
@@ -223,7 +173,7 @@ fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
     };
     let start = match instance.get_typed_func::<(), i32>(&mut store, "_start") {
         Ok(f) => f,
-        Err(e) => die(&format!("internal: no _start: {e}")),
+        Err(e) => fatal(&format!("internal: no _start: {e}")),
     };
 
     let result = start.call(&mut store, ());
@@ -253,31 +203,12 @@ fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
         json: format!(
             "{{\n  \"ok\": {ok},\n  \"reason\": {},\n  \"message\": {},\n  \
              \"output\": {},\n  \"fuel_used\": {used},\n  \"fuel_limit\": {fuel}\n}}",
-            json_str(reason),
-            json_str(&message),
-            json_str(&out),
+            crate::json_escape(reason),
+            crate::json_escape(&message),
+            crate::json_escape(&out),
         ),
         exit: i32::from(!ok),
     }
-}
-
-/// Minimal RFC 8259 string escaping — see `src/bin/p2w.rs`, same reasoning.
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]
