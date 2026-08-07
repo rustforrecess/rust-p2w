@@ -1,8 +1,25 @@
-//! rust-p2w — a Rust reimplementation of the p2w Python-subset -> WebAssembly
-//! (WAT) compiler, for the AcornSTEM K-12 IDE.
+//! rust-p2w — the language substrate for the AcornSTEM K-12 IDE: a Python-subset
+//! compiler, **plus the analyses built on the same AST**.
 //!
-//! Pipeline: source -> [lexer] -> tokens -> [parser] -> spanned AST ->
-//! [codegen] -> WAT (via the emit module's module/function builders).
+//! Pipeline: source -> `lexer` -> tokens -> `parser` -> spanned AST ->
+//! `codegen` -> WAT (via the emit module's module/function builders). A second
+//! backend (`llvm`) takes the same AST to native code for the microcontroller
+//! target, and `component` takes it to a Component-Model component.
+//!
+//! ## The name understates what is here, deliberately
+//!
+//! About a third of this crate compiles nothing. `debug` is an interpreter and
+//! stepper — a second implementation of the language, for the debugger. `lint`
+//! carries the teaching lints and their fix ladders, `roles` classifies
+//! variable roles for assessment, `blockly` round-trips blocks and code, and
+//! `evidence` extracts concepts.
+//!
+//! **The organising principle is not "Python to WASM" — it is "shares the
+//! AST".** Every one of those breaks when the AST changes, so keeping them
+//! together beats five crates version-locked to one definition that moves
+//! weekly. The parts with the weakest claim to being here are the ones that
+//! need no AST at all: `harness` (feature-gated, so not always present) and
+//! [`capabilities`], which read the emitted artifact rather than the source.
 //!
 //! Derived from MIT-licensed p2w (semantics / WAT conventions) and informed by
 //! the design of ruff_python_parser (front-end architecture). See the NOTICE

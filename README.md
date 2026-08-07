@@ -92,8 +92,20 @@ bash tools/pico_build.sh            # cross-compile+link to a Cortex-M33 ELF (cl
 
 ## Layout
 
-- `src/` — lexer, parser, AST, the two emitters (`codegen.rs` = WASM, `llvm.rs` =
-  native), debugger, lints.
+**A third of this crate is not a compiler**, and the name does not say so.
+Roughly **20k lines compile Python** and roughly **12k are analysis built on
+the same AST**. The organising principle is not "Python to WASM" — it is
+**"shares the AST"**: every analysis below breaks if the AST changes, which is
+why they live together rather than in five crates version-locked to one moving
+definition.
+
+| | what it is |
+|---|---|
+| **compiles** | `lexer` `parser` `ast` `hoist` `codegen` (WASM) `llvm` (native) `component` `emit` `reuse` `floatfmt` |
+| **analyses the AST** | `debug` (interpreter + stepper), `lint` (+ fix ladders), `roles` (variable roles for assessment), `blockly` (blocks ⇄ code), `evidence` (concepts), `builtins` |
+| **analyses the OUTPUT** | `harness` (runs a program under a fuel budget), `capabilities()` — these need no AST, and are the parts with the weakest claim to being here |
+
+- `src/` — as above.
 - `runtime/` — `p2w-rt`, the `no_std` native runtime (value rep, arena, RC,
   strings/lists/dicts/packed-arrays).
 - `tools/native_run.sh` — the host correctness + alloc-count oracle.

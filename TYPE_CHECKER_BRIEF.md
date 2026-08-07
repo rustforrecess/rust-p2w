@@ -61,7 +61,16 @@ have to argue with it before replacing it.
 | [`SUBSET_POLICY.md`](SUBSET_POLICY.md) | What may enter the language, and the one permanent rule. |
 | `p2w check --json` | A headless harness: errors, lints, concepts, capabilities. **The checker has somewhere to report on day one.** |
 
-The compiler is ~33k lines of Rust with **one runtime dependency**, 548 tests,
+**What the crate actually contains**, since "33k lines of compiler" would
+overstate it: roughly **20k lines compile Python** (lexer, parser, hoist,
+codegen, the LLVM backend, the component converter, reuse analysis) and
+roughly **12k are analysis built on the same AST** — an interpreter and stepper
+for the debugger, lints and their fix ladders, variable-role classification,
+Blockly round-tripping, concept evidence. **You would be working in the first
+20k.** The rest shares the AST, which is why it lives here, and is worth
+knowing about mainly because a change to the AST touches it.
+
+That is ~33k lines of Rust with **one runtime dependency**, 548 tests,
 plus a native run-oracle of ~200 cases. MIT.
 
 ## What you would own
