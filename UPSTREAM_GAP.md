@@ -17,7 +17,10 @@ has a node of its own), and it reported **inheritance as missing** because the
 probe was `class B(A): pass` — which fails on `pass` in a class body, not on
 inheritance.
 
-Probes live in the scratchpad, not the repo; rerun them if this drifts.
+The probes now live in `tests/upstream_gap.rs` and regenerate
+`FEATURE_PROBES.md`, with a test that fails when the table drifts —
+**a row moving is a feature landing or a regression.** They started in a
+scratch directory, which would have guaranteed this document went stale.
 
 ## Implemented
 
