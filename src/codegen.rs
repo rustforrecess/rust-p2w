@@ -8075,7 +8075,13 @@ fn const_float(e: &Expr) -> Option<f64> {
 fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
     for s in stmts {
         match &s.kind {
-            StmtKind::Assign(name, _) => {
+            // AnnAssign binds a name exactly as Assign does. Omitting it here
+            // meant an annotated local was registered only if some LATER plain
+            // assignment happened to mention it — so `t: int = 0` followed by a
+            // reassignment worked, while `t: int = 0` followed only by a read
+            // failed with "unknown name". Found by compiling third-party code:
+            // it blocked every program in the Alioth benchmark suite.
+            StmtKind::Assign(name, _) | StmtKind::AnnAssign { name, .. } => {
                 out.insert(name.clone());
             }
             StmtKind::For { var, body, .. } | StmtKind::ForEach { var, body, .. } => {

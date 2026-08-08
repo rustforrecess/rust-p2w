@@ -102,6 +102,10 @@ fn probes() -> Vec<(&'static str, &'static str)> {
         ("map / filter", "print(list(map(abs, [-1])))\n"),
         ("sorted(key=...)", "print(sorted([[2], [1]], key=len))\n"),
         // --- values and builtins ---
+        (
+            "implicit string concatenation",
+            "s = (\n    'aa'\n    'bb'\n)\nprint(s)\n",
+        ),
         ("bytes literal", "b = b'hi'\nprint(len(b))\n"),
         ("integer past 2^31", "print(4000000000)\n"),
         ("percent formatting", "print('%d x' % 5)\n"),
@@ -123,6 +127,10 @@ fn probes() -> Vec<(&'static str, &'static str)> {
         (
             "closure capture",
             "def o():\n    x = 5\n    def i():\n        return x\n    return i()\nprint(o())\n",
+        ),
+        (
+            "annotated local, only read",
+            "def f(n: int) -> int:\n    t: int = n + 1\n    return t\nprint(f(1))\n",
         ),
         ("del item", "xs = [1, 2]\ndel xs[0]\nprint(xs)\n"),
         ("chained comparison", "x = 5\nprint(1 < x < 10)\n"),
