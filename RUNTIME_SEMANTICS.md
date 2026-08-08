@@ -42,7 +42,7 @@ Traps print their message and then execute `unreachable`. That is CPython's unca
 
 ## Floats
 
-⚠ **A FRACTIONAL EXPONENT IS A TARGET DIVERGENCE, NOT A FEATURE TO DECLINE.** The native runtime already computes `2 ** 0.5` correctly via `libm::pow`; WASM has no exp/ln instruction and cannot, so it traps — with a message that now at least names `math.sqrt`, which does exist. Closing this properly means a host `pow` import so the browser matches the Pico (SUBSET_POLICY.md gate 1: both targets or neither). Until then the base may be a float and the exponent may not.
+`x ** 0.5` is a SQUARE ROOT and `f64.sqrt` is a WASM instruction, so it costs one op and matches CPython exactly — including a computed 0.5. Any OTHER fractional power needs exp/ln, which WASM has no instruction for and this module has no library for; the native runtime does them all via `libm::pow`, so that remainder is still a target divergence.
 
 | program | where | result |
 |---|---|---|
@@ -50,9 +50,13 @@ Traps print their message and then execute `unreachable`. That is CPython's unca
 | `2.5 * 2.0` | value | `5.0` |
 | `2.5 - 1.0` | value | `1.5` |
 | `5.0 / 2.0` | value | `2.5` |
-| `2.0 ** 2.0` | trap | `TypeError: ** raises to a whole-number power — for a square root use math.sqrt(x)` |
 | `2.0 ** 2` | value | `4.0` |
-| `2 ** 0.5` | trap | `TypeError: ** raises to a whole-number power — for a square root use math.sqrt(x)` |
+| `2 ** 0.5` | value | `1.4142135623730951` |
+| `9 ** 0.5` | value | `3.0` |
+| `2.25 ** 0.5` | value | `1.5` |
+| `h = 0.5; 16 ** h` | value | `4.0` |
+| `8 ** 0.3333` | trap | `TypeError: ** can raise to a whole number, or to 0.5 — a square root, which the machine does in one step. Other fractional powers need a maths library this pr…` |
+| `2.0 ** 2.0` | trap | `TypeError: ** can raise to a whole number, or to 0.5 — a square root, which the machine does in one step. Other fractional powers need a maths library this pr…` |
 | `abs(-2.5)` | value | `2.5` |
 
 ## Division by zero

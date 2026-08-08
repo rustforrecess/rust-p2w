@@ -139,23 +139,27 @@ pub fn groups() -> Vec<Group> {
         },
         Group {
             title: "Floats",
-            note: "⚠ **A FRACTIONAL EXPONENT IS A TARGET DIVERGENCE, NOT A \
-                   FEATURE TO DECLINE.** The native runtime already computes \
-                   `2 ** 0.5` correctly via `libm::pow`; WASM has no exp/ln \
-                   instruction and cannot, so it traps — with a message that \
-                   now at least names `math.sqrt`, which does exist. Closing \
-                   this properly means a host `pow` import so the browser \
-                   matches the Pico (SUBSET_POLICY.md gate 1: both targets or \
-                   neither). Until then the base may be a float and the \
-                   exponent may not.",
+            note: "`x ** 0.5` is a SQUARE ROOT and `f64.sqrt` is a WASM \
+                   instruction, so it costs one op and matches CPython \
+                   exactly — including a computed 0.5. Any OTHER fractional \
+                   power needs exp/ln, which WASM has no instruction for and \
+                   this module has no library for; the native runtime does \
+                   them all via `libm::pow`, so that remainder is still a \
+                   target divergence.",
             probes: vec![
                 e!("2.5 + 1.5"),
                 e!("2.5 * 2.0"),
                 e!("2.5 - 1.0"),
                 e!("5.0 / 2.0"),
-                e!("2.0 ** 2.0"),
                 e!("2.0 ** 2"),
                 e!("2 ** 0.5"),
+                e!("9 ** 0.5"),
+                e!("2.25 ** 0.5"),
+                // A computed exponent, not a literal — the check is at runtime.
+                p("h = 0.5; 16 ** h", "h = 0.5\nprint(16 ** h)\n"),
+                // The remaining honest gap: everything that is not a half.
+                e!("8 ** 0.3333"),
+                e!("2.0 ** 2.0"),
                 e!("abs(-2.5)"),
             ],
         },

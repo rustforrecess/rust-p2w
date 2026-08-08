@@ -661,8 +661,10 @@ fn raise_helpers() -> Vec<Func> {
     push_text(
         &mut b,
         0,
-        "TypeError: ** raises to a whole-number power — for a square root use \
-         math.sqrt(x)",
+        "TypeError: ** can raise to a whole number, or to 0.5 — a square root, \
+         which the machine does in one step. Other fractional powers need a \
+         maths library this program does not have; try math.sqrt() or a \
+         whole-number power.",
     );
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
@@ -2986,10 +2988,28 @@ fn runtime_helpers() -> Vec<Func> {
     // stays int (wrapping i32); a float base or negative exponent goes through
     // f64. `0 ** negative` is a ZeroDivisionError.
     let mut b = Body::new();
-    // A float exponent can't be handled (no exp/ln in WASM). Say so plainly —
-    // reaching $unbox here would report "expected a number, got 'float'",
-    // which is self-contradicting, since a float IS a number.
-    b.push("(if (ref.test (ref $FLOAT) (local.get $b)) (then (call $raise_pow_float)))");
+    // A FLOAT EXPONENT OF EXACTLY 0.5 IS A SQUARE ROOT, and `f64.sqrt` is a
+    // WASM instruction — so `x ** 0.5` is not merely possible, it is one op.
+    // It is also the only fractional power a student reaches for: RMS error,
+    // distance, standard deviation. Leaving it broken while `math.sqrt(x)`
+    // worked meant one value had two spellings and one of them trapped.
+    //
+    // Checked at runtime rather than on a literal, so a COMPUTED 0.5 works too.
+    b.push("(if (ref.test (ref $FLOAT) (local.get $b))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(if (f64.eq (call $unbox_f64 (local.get $b)) (f64.const 0.5))",
+    );
+    b.push_in(
+        3,
+        "(then (return (struct.new $FLOAT (f64.sqrt (call $unbox_f64 (local.get $a)))))))",
+    );
+    // Any other fractional power needs exp/ln, which WASM has no instruction
+    // for and this module has no library for.
+    b.push_in(2, "(call $raise_pow_float)");
+    b.push_in(1, ")");
+    b.push(")");
     b.push("(local.set $e (call $unbox (local.get $b)))");
     b.push("(if (i32.lt_s (local.get $e) (i32.const 0))");
     b.push_in(1, "(then");
