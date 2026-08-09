@@ -49,6 +49,26 @@ Reproduce with `tools/native_run.sh` (correctness oracle) and
   is what makes compiled Python viable as a sandboxed-activity guest (see
   the PXC standard work).
 
+**Measured against C** (`tools/safety_cost.sh`, host x86-64, medians, ±0.15):
+no-heap scalar loop **1.15x** clang -O2; heap-resident reads **1.17x**; 600k
+allocate-and-die churn **1.40x** — with loop reuse still off (task 2's
+headroom). For scale, Fil-C reports ~4x for memory-safe C in bad cases.
+
+**Third-party programs as the honesty check:** upstream p2w ships the Alioth
+suite; `spectralnorm`, `fannkuchredux` and `mandelbrot` now compile, run
+natively, and match CPython byte-for-byte (`nbody` waits on task 8). Feeding
+the suite foreign code found three real bugs the 550-test suite could not —
+annotated locals only read were never bound, packed-array loops walked nothing
+on re-entry, and `def main` collided with the entry point at link.
+
+**And the honest timing split** (same host, medians): `mandelbrot` n=1000
+**1.63x** gcc, `fannkuchredux` n=10 **3.17x** — real programs sit well above
+the 1.15–1.40x microbenchmarks, and that gap is the open work, not a footnote.
+One anomaly is deliberately left unprofiled for whoever takes this on:
+`spectralnorm` n=150 is correct with LIVE=0 and only 330 allocations, but at
+n=1000 it slows past 90 s and then exhausts the arena with a near-empty live
+set — an allocator/arena-scaling question, not an RC leak.
+
 What's landed of the Perceus staging (`REUSE_PLAN.md` has the detail):
 last-mention liveness (`src/reuse.rs`) → precise drops at last use →
 dying-source map reuse (`try_reuse_map`) → assign-site literal reuse
@@ -113,6 +133,20 @@ never double-release. **Interface:** replace `Liveness::analyze`'s body; the
 `dead_after` contract and emitter stay put (extend the token protocol if you
 need per-branch granularity). **Acceptance:** oracle green; peak numbers drop
 on new bench cases that today's analysis can't catch.
+
+**Status update (measured):** loop bodies are conservative BY CONSTRUCTION —
+they get plain `block()` walks, no early releases, no tokens — so this is
+purely an optimisation task, not a correctness one. The cost is now
+quantified: the `churn` case in `tools/safety_cost.sh` (600k allocate-and-die
+pairs) runs **1.40x hand-written C** with **1.2M allocations** that loop-aware
+liveness would collapse to ~2; the no-heap control case runs 1.15x, so the
+recoverable gap is real. Loop re-entry adversaries (`loop_comp_reentry`,
+`loop_foreach_packed`, `nested_for_packed`, …) are already in the oracle as
+your regression net. References: the Perceus paper / Koka's Parc pass
+(Apache-2.0) for the dup/drop/reuse discipline; note Koka has no back-edges
+(loops are tail calls there), so the imperative fixpoint itself is textbook
+dataflow — rustc's MIR liveness (MIT/Apache) is the production-shaped
+reference.
 
 ### 3. ~~Type inference to widen the reuse whitelist~~ — LANDED (both halves)
 
@@ -235,6 +269,26 @@ at an `if` is re-placed inside each mutually-exclusive arm; `wl_branch`
 a same-shape guard) and **`append`-then-die builders** (`ys = []; for x in
 xs: ys.append(f(x))` stealing xs's buffer — wants task 2's cross-loop
 liveness, since the source dies after the loop, not at a statement).
+
+### 8. Module-level globals readable from functions (native backend)
+
+The WASM backend has real globals (`(global $g_x …)`); the native backend
+emits top-level bindings as allocas inside `main`, so a function body reading
+a module constant fails with "name is not defined". This is the last blocker
+for the fourth Alioth program: `nbody` opens with
+
+    SOLAR_MASS: float = 4.0 * PI * PI
+
+and reads it from every function. Students write module constants constantly,
+so this is a language gap wearing a benchmark costume.
+
+**Interface:** promote module-level slots that any `def` reads to LLVM
+`@globals` (zero-init like slots today; `main` still runs the initialising
+statements in order, so a def called before the binding reads the zero value —
+the same program is broken under CPython too). `p2w_dispose` — already emitted,
+currently empty — releases heap-valued globals so `live == 0` stays exact.
+**Acceptance:** `nbody` compiles, runs, matches CPython; oracle green with new
+global-read/write/shadow adversaries; dispose keeps the leak gate at zero.
 
 ### 7. Stretch: a verified RC pass (the research angle)
 
