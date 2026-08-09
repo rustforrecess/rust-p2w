@@ -46,7 +46,10 @@ cat > "$OUT/putc.c" <<'CEOF'
 #include <stdlib.h>
 extern int p2w_allocs(void);
 static void report(void) { fprintf(stderr, "ALLOCS=%d\n", p2w_allocs()); }
-void p2w_putc(unsigned char c) { putchar(c); }
+// Flush per byte: a native trap halts in a spin loop, so a buffered message
+// dies with the killed process and the run looks silent. Same bug that faked
+// a whole run in tests/backend_diff.rs.
+void p2w_putc(unsigned char c) { putchar(c); fflush(stdout); }
 int p2w_getc(void) { return getchar(); }
 __attribute__((constructor)) static void init(void) { atexit(report); }
 CEOF
@@ -54,11 +57,15 @@ CEOF
 # Median of N runs in milliseconds — one outlier on a laptop is otherwise the
 # whole measurement.
 time_exe() {
-  local exe="$1" n=5 t times=()
+  local exe="$1" n=5 times=()
   for _ in $(seq $n); do
     local s e
     s=$(python -c 'import time;print(int(time.perf_counter()*1000))')
-    "$exe" >/dev/null 2>&1
+    # CAP EVERY RUN. A native trap halts in a spin loop (there is no process to
+    # exit on bare metal), so an untimed run of a trapping program never
+    # returns. The first version of this script hung on exactly that.
+    timeout 30 "$exe" >/dev/null 2>&1
+    if [ $? -eq 124 ]; then echo "TIMEOUT"; return; fi
     e=$(python -c 'import time;print(int(time.perf_counter()*1000))')
     times+=($((e - s)))
   done
@@ -101,13 +108,13 @@ echo "-----------------------------------------------------------"
 
 # No heap at all: isolates codegen + value representation from refcounting.
 run_case scalar \
-'total = 0\ni = 0\nwhile i < 20000000:\n    total = total + i\n    i = i + 1\nprint(total)\n' \
-'#include <stdio.h>\nint main(void){long long t=0;for(long long i=0;i<20000000;i++)t+=i;printf("%lld\\n",t%2147483648LL);return 0;}\n'
+'total = 0\ni = 0\nwhile i < 20000000:\n    total = total + 1\n    if total > 1000000:\n        total = 0\n    i = i + 1\nprint(total)\n' \
+'#include <stdio.h>\nint main(void){int t=0;for(int i=0;i<20000000;i++){t=t+1;if(t>1000000)t=0;}printf("%d\\n",t);return 0;}\n'
 
 # Heap-resident but not churning: allocation once, reads many.
 run_case listsum \
 'xs: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]\ntotal = 0\nr = 0\nwhile r < 2000000:\n    for x in xs:\n        total = total + x\n    r = r + 1\nprint(total)\n' \
-'#include <stdio.h>\nint main(void){int xs[8]={1,2,3,4,5,6,7,8};long long t=0;for(int r=0;r<2000000;r++)for(int i=0;i<8;i++)t+=xs[i];printf("%lld\\n",t%2147483648LL);return 0;}\n'
+'#include <stdio.h>\nint main(void){int xs[8]={1,2,3,4,5,6,7,8};int t=0;for(int r=0;r<2000000;r++)for(int i=0;i<8;i++)t+=xs[i];printf("%d\\n",t);return 0;}\n'
 
 # Heap CHURN — allocate and die every iteration. Where refcounting is paid, and
 # where the reuse tier is supposed to earn its keep.

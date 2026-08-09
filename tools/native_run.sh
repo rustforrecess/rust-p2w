@@ -155,6 +155,18 @@ run_case borrowtwice 'def total(xs):\n    s = 0\n    for x in xs:\n        s = s
 run_case escarg    'def echo(xs):\n    return xs\nzs = echo([5, 6])\nprint(zs)\n' '[5, 6]' || fails=$((fails+1))
 run_case borrowstr 'def shout(s):\n    print(s)\nname = "hi"\nshout(name)\nprint(name)\n' 'hi\nhi' || fails=$((fails+1))
 
+# --- loop re-entry: packed-array walks must reset their hidden index -------
+# The index counter was zero-initialized in the function PROLOGUE, so any
+# packed foreach/comprehension re-entered from an enclosing loop resumed at its
+# previous end value and walked nothing: b = [x+1 for x in a] inside `while`
+# built [] on iteration 2 and b[3] raised IndexError on correct code. Every
+# prior reuse/fbip case was straight-line, so the suite could not see it.
+run_case loop_comp_reentry 'a: list[int] = [1, 2, 3, 4]\nr = 0\nwhile r < 3:\n    b = [x + 1 for x in a]\n    print(b[3])\n    r = r + 1\n' '5\n5\n5' || fails=$((fails+1))
+run_case loop_comp_src_inside 'r = 0\nlast = 0\nwhile r < 3:\n    a: list[int] = [1, 2, 3, 4]\n    b = [x + 1 for x in a]\n    last = b[3]\n    r = r + 1\nprint(last)\n' '5' || fails=$((fails+1))
+run_case loop_foreach_packed 'a: list[int] = [7, 8]\nr = 0\nwhile r < 2:\n    for x in a:\n        print(x)\n    r = r + 1\n' '7\n8\n7\n8' || fails=$((fails+1))
+run_case nested_for_packed 'a: list[int] = [1, 2]\nfor i in range(2):\n    for x in a:\n        print(x)\n' '1\n2\n1\n2' || fails=$((fails+1))
+run_case loop_comp_float 'd: list[float] = [1.5, 2.5]\nr = 0\nwhile r < 2:\n    e = [v * 2.0 for v in d]\n    print(e[1])\n    r = r + 1\n' '5.0\n5.0' || fails=$((fails+1))
+
 # --- FBIP drop-reuse: in-place map over a unique array; copy when aliased ---
 run_case fbip_unique 'data: list[int] = [1, 2, 3]\ndata = [x * x for x in data]\nprint(data)\n' '[1, 4, 9]' || fails=$((fails+1))
 run_case fbip_alias 'data: list[int] = [1, 2, 3]\nalias = data\ndata = [x * x for x in data]\nprint(data)\nprint(alias)\n' '[1, 4, 9]\n[1, 2, 3]' || fails=$((fails+1))

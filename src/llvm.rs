@@ -2565,8 +2565,13 @@ impl<'a> FuncEmitter<'a> {
         let id = self.next_label;
         self.next_label += 1;
         let ix = format!("%ix{id}");
-        self.allocas
-            .push_str(&format!("  {ix} = alloca i32\n  store i32 0, ptr {ix}\n"));
+        // The alloca belongs in the entry prologue; the ZERO does not. With the
+        // store in the prologue the index was reset once per FUNCTION, so this
+        // loop re-entered from an enclosing loop (or a comprehension executed a
+        // second time) began at its previous end value and walked nothing —
+        // `b = [x + 1 for x in a]` inside `while` built [] on iteration 2.
+        self.allocas.push_str(&format!("  {ix} = alloca i32\n"));
+        self.line(&format!("store i32 0, ptr {ix}"));
         let existed = self.vars.iter().any(|v| v == var);
         let slot = self.ensure_slot(var, elem); // typed loop-var slot (i32 / double)
         if existed && llvm_ty(self.slot_repr(var)) != llvm_ty(elem) {
