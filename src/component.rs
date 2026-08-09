@@ -811,7 +811,7 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
             "int"
         };
         c.push_str(&format!(
-            "extern {ret_c} {}({});\n",
+            "extern {ret_c} u_{}({});\n",
             x.def_name,
             ext_params.join(", ")
         ));
@@ -856,7 +856,7 @@ fn shim_c(exports: &[WitExport], imports: &[&'static str]) -> String {
             }
         }
         let kebab_name = kebab(&x.api_name);
-        let call = format!("{}({})", x.def_name, args.join(", "));
+        let call = format!("u_{}({})", x.def_name, args.join(", "));
         match &x.result {
             // A string result spills to a canonical return area: the export
             // returns a pointer to [ptr, len] over the p2w string's bytes, and
@@ -979,7 +979,7 @@ mod tests {
             x.shim_c
         );
         assert!(
-            x.shim_c.contains("p2w_release(grid_set(p0, p1, s2));"),
+            x.shim_c.contains("p2w_release(u_grid_set(p0, p1, s2));"),
             "{}",
             x.shim_c
         );
@@ -1156,7 +1156,7 @@ mod tests {
             x.shim_c
         );
         assert!(
-            x.shim_c.contains("p2w_release(poll_vote_a());"),
+            x.shim_c.contains("p2w_release(u_poll_vote_a());"),
             "{}",
             x.shim_c
         );
@@ -1265,7 +1265,7 @@ mod tests {
         );
         // A scalar-returning export returns the unboxed result — no release.
         assert!(
-            x.shim_c.contains("int r = calc_area(p0, p1);"),
+            x.shim_c.contains("int r = u_calc_area(p0, p1);"),
             "{}",
             x.shim_c
         );

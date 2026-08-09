@@ -319,6 +319,9 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         {
             let (def, g) = emit_function(
                 name,
+                // Prefixed so `def main` cannot collide with the program entry,
+                // nor `def printf` with libc at link time.
+                &format!("u_{name}"),
                 params,
                 body,
                 None,
@@ -334,6 +337,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
             for m in methods {
                 let mangled = format!("m_{name}_{}", m.name);
                 let (def, g) = emit_function(
+                    &mangled,
                     &mangled,
                     &m.params,
                     &m.body,
@@ -774,6 +778,7 @@ pub(crate) fn param_borrow_mask(stmts: &[Stmt], def_name: &str) -> Vec<bool> {
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     name: &str,
+    symbol: &str,
     params: &[String],
     body: &[Stmt],
     current_class: Option<&str>,
@@ -832,7 +837,7 @@ fn emit_function(
         })
         .collect();
     let def = format!(
-        "define {} @{name}({}) {{\nentry:\n{}{}}}\n",
+        "define {} @{symbol}({}) {{\nentry:\n{}{}}}\n",
         llvm_ty(f.ret_repr),
         sig.join(", "),
         f.allocas,
@@ -3153,7 +3158,7 @@ impl<'a> FuncEmitter<'a> {
                     }
                 }
                 let r = self.call_value(&format!(
-                    "call {} @{name}({})",
+                    "call {} @u_{name}({})",
                     llvm_ty(ret_repr),
                     ops.join(", ")
                 ));
@@ -4314,7 +4319,7 @@ mod tests {
         // A `: int` param is an unboxed raw i32: the body is native integer math
         // with no boxing and no refcount traffic.
         let out = ir("def sq(n: int) -> int:\n    return n * n\nprint(sq(7))\n");
-        assert!(out.contains("define i32 @sq(i32 %a0)"), "{out}");
+        assert!(out.contains("define i32 @u_sq(i32 %a0)"), "{out}");
         assert!(
             out.contains("@llvm.smul.with.overflow.i32"),
             "native mul: {out}"
@@ -4367,7 +4372,7 @@ mod tests {
         );
         // A comprehension returned from a `-> list[int]` function builds packed.
         let r = ir("def f(n: int) -> list[int]:\n    return [i for i in range(n)]\n");
-        let fbody = r.split("define i32 @f").nth(1).unwrap_or("");
+        let fbody = r.split("define i32 @u_f").nth(1).unwrap_or("");
         assert!(
             fbody.contains("call i32 @p2w_iarray_new"),
             "typed-return comprehension is packed: {fbody}"
@@ -4438,7 +4443,7 @@ mod tests {
     fn typed_float_param_is_a_native_double_function() {
         let out = ir("def dbl(x: float) -> float:\n    return x * 2.0\nprint(dbl(2.5))\n");
         assert!(
-            out.contains("define double @dbl(double %a0)"),
+            out.contains("define double @u_dbl(double %a0)"),
             "double sig: {out}"
         );
         assert!(out.contains("alloca double"), "double slot: {out}");
@@ -4585,10 +4590,10 @@ mod tests {
     #[test]
     fn functions_take_and_return_values() {
         let out = ir("def double(n):\n    return n * 2\nprint(double(21))\n");
-        assert!(out.contains("define i32 @double(i32 %a0)"), "{out}");
+        assert!(out.contains("define i32 @u_double(i32 %a0)"), "{out}");
         assert!(out.contains("store i32 %a0, ptr %v_n"), "param slot: {out}");
         assert!(out.contains("ret i32"), "{out}");
-        assert!(out.contains("call i32 @double(i32"), "{out}");
+        assert!(out.contains("call i32 @u_double(i32"), "{out}");
     }
 
     #[test]
@@ -4596,8 +4601,8 @@ mod tests {
         let out = ir(
             "def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n - 1)\nprint(fact(5))\n",
         );
-        assert!(out.contains("define i32 @fact(i32 %a0)"), "{out}");
-        assert!(out.contains("call i32 @fact(i32"), "self-call: {out}");
+        assert!(out.contains("define i32 @u_fact(i32 %a0)"), "{out}");
+        assert!(out.contains("call i32 @u_fact(i32"), "self-call: {out}");
         // A void function falls off the end returning None.
         let out = ir("def greet(name):\n    print(name)\ngreet(\"x\")\n");
         assert!(out.contains("call i32 @p2w_none()"), "implicit None: {out}");

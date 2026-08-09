@@ -759,10 +759,10 @@ print(\"sum of evens:\", total)
         let wat = compile_to_wat("f = lambda x: x + 1\nprint(f(2))\n").unwrap();
         assert!(wat.contains("(func $f_f"), "browser def: {wat}");
         let ir = compile_to_llvm_ir("f = lambda x: x + 1\nprint(f(2))\n").unwrap();
-        assert!(ir.contains("define i32 @f("), "native def: {ir}");
+        assert!(ir.contains("define i32 @u_f("), "native def: {ir}");
         // Defaults ride along on the def machinery.
         let ir2 = compile_to_llvm_ir("g = lambda n, k=10: n + k\nprint(g(5))\n").unwrap();
-        assert!(ir2.contains("define i32 @g("), "{ir2}");
+        assert!(ir2.contains("define i32 @u_g("), "{ir2}");
         // Any other position is a friendly, specific error.
         let e = compile_to_llvm_ir("print(lambda x: x)\n").unwrap_err();
         assert!(e.contains("name = lambda"), "{e}");
