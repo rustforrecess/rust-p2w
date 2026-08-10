@@ -976,12 +976,18 @@ pub extern "C" fn p2w_lt(a: Value, b: Value) -> Value {
     if is_obj(a) || is_obj(b) {
         return unsafe { p2w_obj_op(OP_LT, a, b) };
     }
+    if both_strs(a, b) {
+        return make_bool(str_lt(a, b));
+    }
     compare(a, b, |x, y| x < y, |x, y| x < y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_le(a: Value, b: Value) -> Value {
     if is_obj(a) || is_obj(b) {
         return unsafe { p2w_obj_op(OP_LE, a, b) };
+    }
+    if both_strs(a, b) {
+        return make_bool(!str_lt(b, a));
     }
     compare(a, b, |x, y| x <= y, |x, y| x <= y)
 }
@@ -990,12 +996,18 @@ pub extern "C" fn p2w_gt(a: Value, b: Value) -> Value {
     if is_obj(a) || is_obj(b) {
         return unsafe { p2w_obj_op(OP_GT, a, b) };
     }
+    if both_strs(a, b) {
+        return make_bool(str_lt(b, a));
+    }
     compare(a, b, |x, y| x > y, |x, y| x > y)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_ge(a: Value, b: Value) -> Value {
     if is_obj(a) || is_obj(b) {
         return unsafe { p2w_obj_op(OP_GE, a, b) };
+    }
+    if both_strs(a, b) {
+        return make_bool(!str_lt(a, b));
     }
     compare(a, b, |x, y| x >= y, |x, y| x >= y)
 }
@@ -1797,19 +1809,15 @@ pub extern "C" fn p2w_sum(iterable: Value) -> Value {
     acc
 }
 
-/// `a < b` for `min`/`max` (and, later, native `sorted`): lexicographic for two
+fn both_strs(a: Value, b: Value) -> bool {
+    is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR
+}
+
+/// `a < b` for `min`/`max` and native `sorted`: lexicographic for two
 /// strings, else numeric — the same ordering as the WAT `$sort_lt`.
 fn value_lt(a: Value, b: Value) -> bool {
-    if is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR {
-        let (la, lb) = (str_len(a), str_len(b));
-        let n = if la < lb { la } else { lb };
-        for i in 0..n {
-            let (x, y) = (str_byte(a, i), str_byte(b, i));
-            if x != y {
-                return x < y;
-            }
-        }
-        return la < lb;
+    if both_strs(a, b) {
+        return str_lt(a, b);
     }
     match (fnum(a), fnum(b)) {
         (Some(x), Some(y)) => x < y,

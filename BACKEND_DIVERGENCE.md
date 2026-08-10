@@ -13,7 +13,7 @@ Error WORDING is not compared — the two have always phrased things differently
 
 ## Result
 
-**23 of 104 probes disagree.**
+**16 of 104 probes disagree.**
 
 A short list means converging the backends is cheap. A long one means we have been maintaining two languages, and which one is the real student-facing runtime is a decision rather than an accident.
 
@@ -37,13 +37,6 @@ A short list means converging the backends is cheap. A long one means we have be
 
 | program | WASM-GC | linear memory |
 |---|---|---|
-| `'a' < 'b'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
-| `'pear' < 'apple'` | value — `False` | trap — `unsupported operand type for a comparison [hung]` |
-| `'a' <= 'a'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
-| `'b' > 'a'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
-| `'b' >= 'c'` | value — `False` | trap — `unsupported operand type for a comparison [hung]` |
-| `'Zoe' < 'amy'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
-| `'app' < 'apple'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
 | `'ab' - 'b'` | compile error — `line 1: this operator needs numbers on both sides` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
 | `'ab' + 1` | compile error — `line 1: can't add text and a number together` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
 | `1 + 'ab'` | compile error — `line 1: can't add text and a number together` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |

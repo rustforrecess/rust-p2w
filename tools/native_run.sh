@@ -293,6 +293,20 @@ run_case set_symdiff 'print({1, 2, 3} ^ {2, 3, 4})\n'                           
 run_case set_member 's = {1, 2, 3}\nprint(2 in s)\nprint(9 not in s)\n'         'True\nTrue'  || fails=$((fails+1))
 run_case set_dedup 'print(len({1, 1, 2, 3, 3, 3}))\n'                           '3'           || fails=$((fails+1))
 run_case set_iter 'total = 0\nfor x in {10, 20, 30}:\n    total = total + x\nprint(total)\n' '60' || fails=$((fails+1))
+run_case str_ordering 'print("apple" < "pear")
+print("pear" < "apple")
+print("a" <= "a")
+print("b" > "a")
+print("b" >= "c")
+print("Zoe" < "amy")
+print("app" < "apple")
+' 'True
+False
+True
+True
+False
+True
+True' || fails=$((fails+1))
 run_case substr_in 'print("ll" in "hello")\nprint("z" in "hello")\n'           'True\nFalse' || fails=$((fails+1))
 run_case int_bitwise 'print(6 & 3)\nprint(5 | 2)\n'                             '2\n7'        || fails=$((fails+1))
 run_case set_add   's = {1, 2}\ns.add(3)\ns.add(2)\nprint(len(s))\nprint(3 in s)\n' '3\nTrue' || fails=$((fails+1))
