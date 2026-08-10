@@ -52,7 +52,12 @@ let-chains) that a plain build never shows:
 
 ```bash
 cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo fmt --manifest-path runtime/Cargo.toml --check
 ```
+
+Root `cargo fmt` does NOT reach `runtime/` or `tools/mathwat/` — they
+have their own manifests, and CI checks the runtime separately.
 
 ## Where the decisions are written down
 

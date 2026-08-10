@@ -621,7 +621,33 @@ impl Builder {
             }
             StmtKind::SetAttr { .. } => unsupported("attribute assignment"),
             StmtKind::UnpackAssign { .. } => unsupported("tuple unpacking"),
-            StmtKind::Import(_) => unsupported("`import`"),
+            // `import math` -> python_import; `from math import sqrt, pi`
+            // (colon-encoded by the parser as "math:sqrt", "math:pi") ->
+            // python_from_import. Both are field-only blocks: the statement
+            // must round-trip through the blocks pane, or switching views
+            // would silently drop the import and break the program.
+            StmtKind::Import(names) => {
+                if let Some((module, _)) = names.first().and_then(|n| n.split_once(':')) {
+                    let bare: Vec<&str> = names
+                        .iter()
+                        .map(|n| n.split_once(':').map_or(n.as_str(), |(_, f)| f))
+                        .collect();
+                    let fields = format!(
+                        "{},{}",
+                        field("MODULE", &jstr(module)),
+                        field("NAMES", &jstr(&bare.join(", ")))
+                    );
+                    Ok(block("python_from_import", &fields, "", "", next))
+                } else {
+                    Ok(block(
+                        "python_import",
+                        &field("MODULE", &jstr(&names.join(", "))),
+                        "",
+                        "",
+                        next,
+                    ))
+                }
+            }
         }
     }
 
@@ -1646,6 +1672,23 @@ mod tests {
             "valid-but-unrepresentable code must not be flagged: {:?}",
             out.error_lines
         );
+    }
+
+    #[test]
+    fn imports_render_as_blocks() {
+        // Plain import: one field-only statement block.
+        let json = to_blockly_json("import math\nprint(math.sqrt(9.0))\n").unwrap();
+        assert!(json.contains("\"type\":\"python_import\""), "{json}");
+        assert!(json.contains("\"MODULE\":\"math\""), "{json}");
+
+        // from-import: module and the bare names, comma-joined, exactly as
+        // the statement reads — the JS generator re-emits it verbatim.
+        let json = to_blockly_json("from math import sqrt, pi\nprint(sqrt(pi))\n").unwrap();
+        assert!(json.contains("\"type\":\"python_from_import\""), "{json}");
+        assert!(json.contains("\"MODULE\":\"math\""), "{json}");
+        assert!(json.contains("\"NAMES\":\"sqrt, pi\""), "{json}");
+        // The bare call rides the existing pipeline, not a new block.
+        assert!(json.contains("\"type\":\"python_call_value\""), "{json}");
     }
 }
 
