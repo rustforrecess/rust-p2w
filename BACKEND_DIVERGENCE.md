@@ -13,7 +13,7 @@ Error WORDING is not compared — the two have always phrased things differently
 
 ## Result
 
-**14 of 87 probes disagree.**
+**23 of 104 probes disagree.**
 
 A short list means converging the backends is cheap. A long one means we have been maintaining two languages, and which one is the real student-facing runtime is a decision rather than an accident.
 
@@ -27,14 +27,23 @@ A short list means converging the backends is cheap. A long one means we have be
 
 | program | WASM-GC | linear memory |
 |---|---|---|
-| `2.0 ** 2.0` | trap — `TypeError: ** raises to a whole-number power — for a square root use math.sqrt(x)` | value — `4.0` |
-| `2 ** 0.5` | trap — `TypeError: ** raises to a whole-number power — for a square root use math.sqrt(x)` | value — `1.4142135623730951` |
+| `math.exp(1.0)` | value — `2.7182818284590455` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
+| `math.log(10.0)` | value — `2.302585092994046` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
+| `math.log2(8.0)` | value — `3.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
+| `math.log10(1000.0)` | value — `3.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
+| `math.pow(2, 10)` | value — `1024.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
 
 ### Strings
 
 | program | WASM-GC | linear memory |
 |---|---|---|
-| `'a' < 'b'` | compile error — `line 1: this operator needs numbers on both sides` | trap — `unsupported operand type for a comparison [hung]` |
+| `'a' < 'b'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
+| `'pear' < 'apple'` | value — `False` | trap — `unsupported operand type for a comparison [hung]` |
+| `'a' <= 'a'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
+| `'b' > 'a'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
+| `'b' >= 'c'` | value — `False` | trap — `unsupported operand type for a comparison [hung]` |
+| `'Zoe' < 'amy'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
+| `'app' < 'apple'` | value — `True` | trap — `unsupported operand type for a comparison [hung]` |
 | `'ab' - 'b'` | compile error — `line 1: this operator needs numbers on both sides` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
 | `'ab' + 1` | compile error — `line 1: can't add text and a number together` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
 | `1 + 'ab'` | compile error — `line 1: can't add text and a number together` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
@@ -58,7 +67,7 @@ A short list means converging the backends is cheap. A long one means we have be
 
 | program | WASM-GC | linear memory |
 |---|---|---|
-| `1 < 'one'` | compile error — `line 1: this operator needs numbers on both sides` | trap — `unsupported operand type for a comparison [hung]` |
+| `1 < 'one'` | compile error — `line 1: can't compare text with a number — there's no way to say whether a word is bigger …` | trap — `unsupported operand type for a comparison [hung]` |
 
 ### Unpacking
 
