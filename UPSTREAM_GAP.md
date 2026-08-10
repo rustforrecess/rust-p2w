@@ -53,7 +53,7 @@ and gets its front end from the `ast` module for free.
 | `is` / `is not` | |
 | decorators (`@`) | |
 | `*args` / `**kwargs` | at the definition site; keyword args at *call* sites work |
-| `from X import Y` | plain `import math` works |
+| ~~`from X import Y`~~ | LANDED: `from math import sqrt, exp` binds bare names; `as` and `*` still rejected with clear messages |
 | bytes literals | |
 | `del name` | `del d[k]` works, and the error explains the difference |
 | multiple inheritance | rejected deliberately, with a message saying so |

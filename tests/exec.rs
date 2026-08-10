@@ -193,6 +193,33 @@ fn assert_output(src: &str, expected: &str) {
     assert_eq!(run(src), expected, "program:\n{src}");
 }
 
+/// `from math import ...`: bare names route to the same lowering as
+/// `math.name(...)`, and a later `def` of the same name shadows the import,
+/// matching CPython's later-binding-wins.
+#[test]
+fn from_import_binds_bare_math_names() {
+    assert_output(
+        "from math import sqrt, exp
+print(sqrt(2.0))
+print(sqrt(16))
+print(exp(1.0))
+",
+        "1.4142135623730951
+4.0
+2.7182818284590455
+",
+    );
+    assert_output(
+        "from math import sqrt
+def sqrt(x):
+    return 99
+print(sqrt(4.0))
+",
+        "99
+",
+    );
+}
+
 /// libm-backed math. Expected strings are what the VENDORED LIBM computes —
 /// the same libm the native runtime links, so both backends print these
 /// exact digits. A few differ from a given host CPython in the last ULP

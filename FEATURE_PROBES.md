@@ -6,7 +6,7 @@ Regenerate with `P2W_BLESS=1 cargo test --test upstream_gap`. **A row moving is 
 
 See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's designs are worth taking.
 
-## Rejected (32)
+## Rejected (31)
 
 | feature | message |
 |---|---|
@@ -29,7 +29,6 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `*args` | expected a parameter name, found Star |
 | `**kwargs` | expected a parameter name, found DoubleStar |
 | `multiple inheritance` | multiple inheritance isn't supported — one base class only |
-| `from X import Y` | expected a new line, but found `math` |
 | `bind a function to a name` | 'f' is a function — call it with f(...) |
 | `pass a function as an argument` | 'd' is a function — call it with d(...) |
 | `return a closure` | expected ',' or ')' in call, found LParen |
@@ -43,8 +42,9 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `type()` | unknown function 'type' |
 | `isinstance()` | unknown name 'int' (define it with `int = ...` first) |
 
-## Compiles (10)
+## Compiles (11)
 
+- `from X import Y`
 - `inheritance`
 - `super()`
 - `lambda`

@@ -3496,6 +3496,15 @@ fn sorted_reverse_args<'a>(name: &str, args: &'a [Expr]) -> Option<(&'a Expr, &'
 /// sorting, and the range/enumerate/zip materializers. Returns `Ok(None)` if
 /// `name` isn't one of these, so the caller falls through to its own error.
 fn builtin_extra(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+    // Bare math names bound by `from math import ...`. The COMPILER enforces
+    // that the import is present (unknown function otherwise); the
+    // interpreters trust programs that compile, so the name alone suffices.
+    if matches!(
+        name,
+        "sqrt" | "fabs" | "floor" | "ceil" | "trunc" | "exp" | "log" | "log2" | "log10" | "pow"
+    ) {
+        return math_call(name, args).map(Some);
+    }
     let int_arg =
         |v: &Value, what: &str| as_int(v).ok_or_else(|| format!("{what} must be an integer"));
     let v = match (name, args) {

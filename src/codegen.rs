@@ -111,13 +111,31 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     for s in stmts {
         if let StmtKind::Import(names) = &s.kind {
             for m in names {
-                if m != "math" {
-                    return Err(CompileError::at(
-                        s.line,
-                        format!("module '{m}' isn't available (only 'math' for now)"),
-                    ));
+                // "module:name" is the parser's encoding of `from module
+                // import name`; a bare entry is a plain `import module`.
+                if let Some((module, func)) = m.split_once(':') {
+                    if module != "math" {
+                        return Err(CompileError::at(
+                            s.line,
+                            format!("module '{module}' isn't available (only 'math' for now)"),
+                        ));
+                    }
+                    if !MATH_FNS.contains(&func) {
+                        return Err(CompileError::at(
+                            s.line,
+                            format!("math has no function '{func}'"),
+                        ));
+                    }
+                    g.from_math.insert(func.to_string());
+                } else {
+                    if m != "math" {
+                        return Err(CompileError::at(
+                            s.line,
+                            format!("module '{m}' isn't available (only 'math' for now)"),
+                        ));
+                    }
+                    g.imported.insert(m.clone());
                 }
-                g.imported.insert(m.clone());
             }
         }
     }
@@ -930,6 +948,12 @@ fn raise_helpers() -> Vec<Func> {
 }
 
 /// The always-present boxed-value runtime: box/unbox/bool/truthy/print.
+/// Every name `from math import ...` may bind — exactly the set
+/// `gen_math_call` lowers, so importing and calling cannot disagree.
+const MATH_FNS: &[&str] = &[
+    "sqrt", "fabs", "floor", "ceil", "trunc", "exp", "log", "log2", "log10", "pow",
+];
+
 fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     let mut fs = Vec::new();
 
@@ -5590,6 +5614,10 @@ fn floormod_helper() -> Func {
 #[derive(Default)]
 struct Gen {
     uses_floordiv: bool,
+    /// Names bound by `from math import ...` — resolved statically, so a
+    /// bare `sqrt(x)` routes to gen_math_call. A user `def` of the same
+    /// name shadows the import (checked first at the call site).
+    from_math: std::collections::HashSet<String>,
     /// Fractional-capable `**` or math.exp/log/log2/log10/pow anywhere:
     /// splice the vendored libm WAT (src/math_wat.rs) into the module.
     uses_math: bool,
@@ -7882,6 +7910,12 @@ impl Gen {
                     }
                 }
                 let Some(&total) = self.funcs.get(n) else {
+                    // `from math import sqrt` makes the bare name callable.
+                    // Checked AFTER user functions, so a `def sqrt` shadows
+                    // the import, matching CPython's later-binding-wins.
+                    if self.from_math.contains(n.as_str()) {
+                        return self.gen_math_call(cx, n, args, e.line);
+                    }
                     return Err(CompileError::at(e.line, format!("unknown function '{n}'")));
                 };
                 // Clone params/defaults so we can evaluate at the call site

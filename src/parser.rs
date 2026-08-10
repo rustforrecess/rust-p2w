@@ -352,6 +352,69 @@ impl<'a> Parser<'a> {
         if self.is_keyword("class") {
             return self.class_stmt();
         }
+        if self.is_keyword("from") {
+            self.advance();
+            let module = match self.peek().clone() {
+                Tok::Name(m) => {
+                    self.advance();
+                    m
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "expected a module name after 'from', found {other:?}"
+                    )));
+                }
+            };
+            if !self.is_keyword("import") {
+                return Err(self.err(format!("expected 'import' after 'from {module}'")));
+            }
+            self.advance();
+            if matches!(self.peek(), Tok::Star) {
+                return Err(self.err(
+                    "`from module import *` isn't supported — name what you need, \
+                     e.g. `from math import sqrt`"
+                        .to_string(),
+                ));
+            }
+            let mut names = Vec::new();
+            loop {
+                match self.peek().clone() {
+                    Tok::Name(n) if n == "as" => {
+                        return Err(self.err(
+                            "`import ... as ...` isn't supported yet — use the \
+                             imported name directly"
+                                .to_string(),
+                        ));
+                    }
+                    Tok::Name(n) => {
+                        self.advance();
+                        names.push(format!("{module}:{n}"));
+                    }
+                    other => {
+                        return Err(self.err(format!("expected a name to import, found {other:?}")));
+                    }
+                }
+                match self.peek().clone() {
+                    Tok::Comma => {
+                        self.advance();
+                    }
+                    Tok::Name(n) if n == "as" => {
+                        return Err(self.err(
+                            "`import ... as ...` isn't supported yet — use the \
+                             imported name directly"
+                                .to_string(),
+                        ));
+                    }
+                    _ => break,
+                }
+            }
+            self.expect(&Tok::Newline, "a new line")?;
+            return Ok(Stmt {
+                kind: StmtKind::Import(names),
+                line,
+                span: (0, 0),
+            });
+        }
         if self.is_keyword("import") {
             self.advance();
             let mut names = Vec::new();
@@ -2023,8 +2086,8 @@ fn contains_call(e: &Expr) -> bool {
 
 /// Statement-starting keywords we offer "did you mean" suggestions for.
 const STMT_KEYWORDS: &[&str] = &[
-    "if", "elif", "else", "for", "while", "def", "class", "return", "import", "pass", "break",
-    "continue", "del",
+    "if", "elif", "else", "for", "while", "def", "class", "return", "import", "from", "pass",
+    "break", "continue", "del",
 ];
 
 /// Closest candidate within an edit-distance threshold that scales with word
