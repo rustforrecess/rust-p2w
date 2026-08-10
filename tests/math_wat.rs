@@ -36,6 +36,7 @@ fn instantiate() -> (Store<()>, Instance) {
 /// Inputs that walk the interesting regions: exact cases, subnormal-adjacent,
 /// huge, tiny, negative, the curriculum's own idioms (cube root, sigmoid
 /// arguments, entropy probabilities).
+#[allow(clippy::approx_constant)] // ln(2), e, pi as inputs: hard mantissas, not constants
 const XS: &[f64] = &[
     1e-300,
     1e-10,
@@ -58,6 +59,7 @@ const XS: &[f64] = &[
 #[test]
 fn exp_log_log2_log10_are_bit_identical_to_libm() {
     let (mut store, instance) = instantiate();
+    #[allow(clippy::type_complexity)] // (name, oracle) pairs — the shape is the point
     let cases: &[(&str, fn(f64) -> f64)] = &[
         ("exp", libm::exp),
         ("log", libm::log),
@@ -125,9 +127,8 @@ fn pow_is_bit_identical_to_libm() {
     ] {
         let got = f.call(&mut store, (a, b)).unwrap();
         let want = libm::pow(a, b);
-        assert_eq!(
+        assert!(
             got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
-            true,
             "pow({a}, {b}): wasm {got:e} != libm {want:e}"
         );
     }

@@ -387,10 +387,10 @@ fn scan_wiring(stmts: &[Stmt], group: &[String]) -> Vec<(String, String, String)
             continue;
         }
         // Only no-arg handlers can be driven by a plain DOM event.
-        if let Some((params, _, _)) = find_def(stmts, handler) {
-            if params.is_empty() {
-                out.push((sel.clone(), event.clone(), handler.clone()));
-            }
+        if let Some((params, _, _)) = find_def(stmts, handler)
+            && params.is_empty()
+        {
+            out.push((sel.clone(), event.clone(), handler.clone()));
         }
     }
     out
@@ -402,10 +402,10 @@ fn scan_caps(stmts: &[Stmt], group: &[String]) -> (Vec<&'static str>, Option<(us
     let mut used: Vec<&'static str> = Vec::new();
     let mut blocked: Option<(usize, String)> = None;
     for s in stmts {
-        if let StmtKind::Def { name, body, .. } = &s.kind {
-            if group.contains(name) {
-                scan_body(body, &mut used, &mut blocked);
-            }
+        if let StmtKind::Def { name, body, .. } = &s.kind
+            && group.contains(name)
+        {
+            scan_body(body, &mut used, &mut blocked);
         }
     }
     (used, blocked)
@@ -455,10 +455,11 @@ fn extract_group_source(source: &str, stmts: &[Stmt], group: &[String]) -> Strin
     out.trim_end().to_string() + "\n"
 }
 
-fn find_def<'a>(
-    stmts: &'a [Stmt],
-    def_name: &str,
-) -> Option<(&'a [String], &'a [Option<Expr>], &'a Option<Expr>)> {
+/// A def's callable surface: (params, per-param annotations, return
+/// annotation), borrowed from the AST.
+type DefSig<'a> = (&'a [String], &'a [Option<Expr>], &'a Option<Expr>);
+
+fn find_def<'a>(stmts: &'a [Stmt], def_name: &str) -> Option<DefSig<'a>> {
     stmts.iter().find_map(|s| match &s.kind {
         StmtKind::Def {
             name,

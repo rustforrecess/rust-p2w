@@ -158,10 +158,8 @@ fn rewrite_call_expr(e: &mut Expr, caps: &BTreeMap<String, Vec<String>>) {
             step,
         } => {
             rewrite_call_expr(obj, caps);
-            for o in [start, stop, step] {
-                if let Some(x) = o {
-                    rewrite_call_expr(x, caps);
-                }
+            for x in [start, stop, step].into_iter().flatten() {
+                rewrite_call_expr(x, caps);
             }
         }
         ExprKind::MethodCall(recv, _, args) => {

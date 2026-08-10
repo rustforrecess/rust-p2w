@@ -766,10 +766,9 @@ pub(crate) fn param_borrow_mask(stmts: &[Stmt], def_name: &str) -> Vec<bool> {
         if let StmtKind::Def {
             name, params, body, ..
         } = &s.kind
+            && name == def_name
         {
-            if name == def_name {
-                return params.iter().map(|p| !param_escapes(body, p)).collect();
-            }
+            return params.iter().map(|p| !param_escapes(body, p)).collect();
         }
     }
     Vec::new()

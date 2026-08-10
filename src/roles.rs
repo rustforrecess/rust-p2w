@@ -165,13 +165,13 @@ fn list_indexed_by(source: &str, walker: &str) -> Option<String> {
         if found.is_some() {
             return;
         }
-        if let ExprKind::Index(base, idx) = &e.kind {
-            if let ExprKind::Name(a) = &base.kind {
-                let mut refs = BTreeSet::new();
-                crate::reuse::vars_read(idx, &mut refs);
-                if refs.contains(walker) {
-                    found = Some(a.clone());
-                }
+        if let ExprKind::Index(base, idx) = &e.kind
+            && let ExprKind::Name(a) = &base.kind
+        {
+            let mut refs = BTreeSet::new();
+            crate::reuse::vars_read(idx, &mut refs);
+            if refs.contains(walker) {
+                found = Some(a.clone());
             }
         }
     });
@@ -300,10 +300,10 @@ pub fn classify_sort_by_passes(source: &str, list: &str, outer: &str) -> Option<
     let mut budget = 1000;
     loop {
         st.run(&[]);
-        if let Some(v) = st.eval_watch(list).ok().and_then(|r| parse_int_list(&r)) {
-            if v.len() == n {
-                snaps.push(v);
-            }
+        if let Some(v) = st.eval_watch(list).ok().and_then(|r| parse_int_list(&r))
+            && v.len() == n
+        {
+            snaps.push(v);
         }
         match st.status() {
             crate::debug::Status::Finished => break,
@@ -468,12 +468,11 @@ fn initial_int_list(source: &str, list: &str) -> Option<Vec<i64>> {
     let tokens = crate::lexer::lex(source).ok()?;
     let (stmts, _) = crate::parser::parse_recovering(&tokens);
     for s in &stmts {
-        if let StmtKind::Assign(name, value) = &s.kind {
-            if name == list {
-                if let ExprKind::List(items) = &value.kind {
-                    return items.iter().map(int_of).collect();
-                }
-            }
+        if let StmtKind::Assign(name, value) = &s.kind
+            && name == list
+            && let ExprKind::List(items) = &value.kind
+        {
+            return items.iter().map(int_of).collect();
         }
     }
     None
@@ -752,15 +751,14 @@ impl Analysis {
         // Top-level (unconditional) bare copies of the current element.
         let mut candidates: Vec<(String, usize)> = Vec::new();
         for s in body {
-            if let StmtKind::Assign(name, value) = &s.kind {
-                if !self.drivers.contains(name)
-                    && selfref_operand(name, value).is_none()
-                    && !maxmin_selfref(name, value)
-                    && !is_literal(value)
-                    && is_copy_of_data(value, &self.drivers, &self.data_vars)
-                {
-                    candidates.push((name.clone(), s.line));
-                }
+            if let StmtKind::Assign(name, value) = &s.kind
+                && !self.drivers.contains(name)
+                && selfref_operand(name, value).is_none()
+                && !maxmin_selfref(name, value)
+                && !is_literal(value)
+                && is_copy_of_data(value, &self.drivers, &self.data_vars)
+            {
+                candidates.push((name.clone(), s.line));
             }
         }
         for (v, line) in candidates {
@@ -1159,10 +1157,10 @@ fn organized_lists(stmts: &[Stmt]) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for_each_stmt(stmts, &mut |s| match &s.kind {
         StmtKind::SetIndex { target, value, .. } => {
-            if let ExprKind::Name(a) = &target.kind {
-                if is_bare_index_into(value, a) {
-                    out.entry(a.clone()).or_insert(s.line);
-                }
+            if let ExprKind::Name(a) = &target.kind
+                && is_bare_index_into(value, a)
+            {
+                out.entry(a.clone()).or_insert(s.line);
             }
         }
         StmtKind::UnpackAssign { targets, value } => {
@@ -1197,17 +1195,17 @@ fn container_lists(stmts: &[Stmt]) -> HashMap<String, usize> {
     let mut added: HashMap<String, usize> = HashMap::new();
     let mut removed: HashSet<String> = HashSet::new();
     for_each_expr(stmts, &mut |e| {
-        if let ExprKind::MethodCall(recv, method, _) = &e.kind {
-            if let ExprKind::Name(v) = &recv.kind {
-                match method.as_str() {
-                    "append" | "insert" | "push" | "add" => {
-                        added.entry(v.clone()).or_insert(e.line);
-                    }
-                    "pop" | "popleft" | "remove" => {
-                        removed.insert(v.clone());
-                    }
-                    _ => {}
+        if let ExprKind::MethodCall(recv, method, _) = &e.kind
+            && let ExprKind::Name(v) = &recv.kind
+        {
+            match method.as_str() {
+                "append" | "insert" | "push" | "add" => {
+                    added.entry(v.clone()).or_insert(e.line);
                 }
+                "pop" | "popleft" | "remove" => {
+                    removed.insert(v.clone());
+                }
+                _ => {}
             }
         }
     });
@@ -1231,10 +1229,10 @@ fn expr_has_index(e: &Expr) -> bool {
 /// Is `value` a constant advance of a position — `x <+|-> <int>` (`j + 1`,
 /// `mid - 1`)?
 fn is_index_advance(value: &Expr) -> bool {
-    if let ExprKind::Bin(op, a, b) = &value.kind {
-        if matches!(op, BinOp::Add | BinOp::Sub) {
-            return matches!(a.kind, ExprKind::Int(_)) || matches!(b.kind, ExprKind::Int(_));
-        }
+    if let ExprKind::Bin(op, a, b) = &value.kind
+        && matches!(op, BinOp::Add | BinOp::Sub)
+    {
+        return matches!(a.kind, ExprKind::Int(_)) || matches!(b.kind, ExprKind::Int(_));
     }
     false
 }
@@ -1244,12 +1242,11 @@ fn is_index_advance(value: &Expr) -> bool {
 /// `while i < n: i += 1` (no data in the condition) is a stepper, not a walker.
 fn find_walkers(stmts: &[Stmt], data_ctx: bool, out: &mut HashMap<String, usize>) {
     for s in stmts {
-        if data_ctx {
-            if let StmtKind::Assign(name, value) = &s.kind {
-                if is_index_advance(value) {
-                    out.entry(name.clone()).or_insert(s.line);
-                }
-            }
+        if data_ctx
+            && let StmtKind::Assign(name, value) = &s.kind
+            && is_index_advance(value)
+        {
+            out.entry(name.clone()).or_insert(s.line);
         }
         match &s.kind {
             StmtKind::While { cond, body } => {
@@ -1429,10 +1426,10 @@ fn is_copy_of_data(value: &Expr, drivers: &HashSet<String>, data: &HashSet<Strin
 /// Is `value` a `max(name, ..)` / `min(name, ..)` call — a most-wanted holder
 /// written with the built-in rather than an explicit `if`?
 fn maxmin_selfref(name: &str, value: &Expr) -> bool {
-    if let ExprKind::Call(f, args) = &value.kind {
-        if f == "max" || f == "min" {
-            return args.iter().any(|a| is_name(a, name));
-        }
+    if let ExprKind::Call(f, args) = &value.kind
+        && (f == "max" || f == "min")
+    {
+        return args.iter().any(|a| is_name(a, name));
     }
     false
 }

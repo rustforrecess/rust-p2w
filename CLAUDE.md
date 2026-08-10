@@ -44,6 +44,16 @@ P2W_DIFF=1 P2W_BLESS=1 cargo test --test backend_diff   # BACKEND_DIVERGENCE.md 
 
 A diff in any of them is a change to the language. Read it before blessing.
 
+## Before pushing
+
+CI denies every clippy warning across all targets. Run what CI runs, not a
+subset — a newer clippy than the local habit fires lints (collapsible_if in
+let-chains) that a plain build never shows:
+
+```bash
+cargo clippy --all-targets -- -D warnings
+```
+
 ## Where the decisions are written down
 
 | file | |
