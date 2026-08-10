@@ -139,13 +139,14 @@ pub fn groups() -> Vec<Group> {
         },
         Group {
             title: "Floats",
-            note: "`x ** 0.5` is a SQUARE ROOT and `f64.sqrt` is a WASM \
-                   instruction, so it costs one op and matches CPython \
-                   exactly — including a computed 0.5. Any OTHER fractional \
-                   power needs exp/ln, which WASM has no instruction for and \
-                   this module has no library for; the native runtime does \
-                   them all via `libm::pow`, so that remainder is still a \
-                   target divergence.",
+            note: "Full fractional `**` and math.exp/log/log2/log10/pow, \
+                   via libm compiled to WAT (src/math_wat.rs) — the same \
+                   pinned libm the native runtime links, so both backends \
+                   agree to the LAST BIT. `x ** 0.5` stays one f64.sqrt \
+                   instruction. Known bounded caveat: CPython defers to \
+                   the PLATFORM libm, so a last-ULP digit can differ from \
+                   a given host's CPython (exp(1.0) on Windows ucrt) — \
+                   exactly as two CPythons differ from each other.",
             probes: vec![
                 e!("2.5 + 1.5"),
                 e!("2.5 * 2.0"),
@@ -159,6 +160,16 @@ pub fn groups() -> Vec<Group> {
                 p("h = 0.5; 16 ** h", "h = 0.5\nprint(16 ** h)\n"),
                 // The remaining honest gap: everything that is not a half.
                 e!("8 ** 0.3333"),
+                e!("2 ** 2.5"),
+                e!("2 ** -1.5"),
+                p("math.exp(1.0)", "import math\nprint(math.exp(1.0))\n"),
+                p("math.log(10.0)", "import math\nprint(math.log(10.0))\n"),
+                p("math.log2(8.0)", "import math\nprint(math.log2(8.0))\n"),
+                p(
+                    "math.log10(1000.0)",
+                    "import math\nprint(math.log10(1000.0))\n",
+                ),
+                p("math.pow(2, 10)", "import math\nprint(math.pow(2, 10))\n"),
                 e!("2.0 ** 2.0"),
                 e!("abs(-2.5)"),
             ],

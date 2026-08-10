@@ -130,6 +130,19 @@ nothing here depends on those licenses since no code is used.
      implement.
 
 ================================================================================
+libm (rust-lang) — MIT License
+================================================================================
+
+src/math_wat.rs contains the compiled WebAssembly text of the libm crate,
+version 0.2.16 — the functions pow, exp, log, log2 and log10 and their
+compiler-builtins helpers — extracted by tools/gen_math_wat.py from a
+wasm32-unknown-unknown build of tools/mathwat. libm is a port of MUSL's
+libm to Rust (https://github.com/rust-lang/libm; development continues in
+rust-lang/compiler-builtins). Its LICENSE.txt states: "rust-lang/libm as a
+whole is available for use under the MIT license"; the standard MIT terms
+reproduced in the p2w section below apply equally here.
+
+================================================================================
 p2w — MIT License
 ================================================================================
 

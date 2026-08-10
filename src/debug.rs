@@ -1101,10 +1101,7 @@ impl Stepper {
             && m == "math"
             && !scope.contains_key(m)
         {
-            let [arg] = vals.as_slice() else {
-                return Err(format!("math.{method}() takes one argument"));
-            };
-            return math_call(method, arg);
+            return math_call(method, vals.as_slice());
         }
         // Mutating list/set methods need the variable itself, so require a Name.
         if let ExprKind::Name(name) = &obj.kind {
@@ -1728,7 +1725,7 @@ enum Task {
     /// Pop the reverse flag then the sequence; push `sorted(seq, reverse=…)`.
     SortedKw,
     /// Pop one argument; push `math.<func>(arg)`.
-    MathCall(String),
+    MathCall(String, usize),
     /// Pop `n` values and print them (space-joined + newline).
     Print(usize),
     /// Discard the top operand (an expression statement's result).
@@ -2408,9 +2405,13 @@ impl Vm {
                 let seq = self.pop_op()?;
                 self.push_op(sorted_values(&seq, reverse)?);
             }
-            Task::MathCall(func) => {
-                let arg = self.pop_op()?;
-                self.push_op(math_call(&func, &arg)?);
+            Task::MathCall(func, n) => {
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    args.push(self.pop_op()?);
+                }
+                args.reverse();
+                self.push_op(math_call(&func, &args)?);
             }
             Task::Print(n) => {
                 let mut vals = Vec::with_capacity(n);
@@ -2954,16 +2955,15 @@ impl Vm {
                     return Ok(());
                 }
                 // `math.sqrt(x)` etc. — a module function (unless `math` is a
-                // variable). Takes exactly one argument.
+                // variable). Arity is checked in math_call.
                 if let ExprKind::Name(m) = &obj.kind
                     && m == "math"
                     && self.lookup(m).is_none()
                 {
-                    if args.len() != 1 {
-                        return Err(format!("math.{method}() takes one argument"));
+                    self.push_task(Task::MathCall(method.clone(), args.len()));
+                    for a in args.iter().rev() {
+                        self.push_task(Task::Eval(Rc::new(a.clone())));
                     }
-                    self.push_task(Task::MathCall(method.clone()));
-                    self.push_task(Task::Eval(Rc::new(args[0].clone())));
                     return Ok(());
                 }
                 if let ExprKind::Name(recv) = &obj.kind {
@@ -3428,12 +3428,35 @@ fn math_const(name: &str) -> Option<Value> {
     }
 }
 
-/// `math.<func>(x)` — sqrt/fabs return a float, floor/ceil/trunc return an int
-/// (Python's behavior), matching the compiled backends' `gen_math_call`.
-fn math_call(func: &str, arg: &Value) -> Result<Value, String> {
+/// `math.<func>(args)` — matching the compiled backends' `gen_math_call`:
+/// sqrt/fabs/exp/log/log2/log10/pow return floats, floor/ceil/trunc ints.
+///
+/// Transcendentals use std's f64 methods. In the browser — where the
+/// Stepper actually runs — wasm32 std routes them to the libm crate, the
+/// same source the compiled module vendors, so stepping shows exactly the
+/// bits the program computes. On a native HOST, std uses the platform
+/// libm, which may differ from musl-libm in the last ULP on some inputs —
+/// the same caveat CPython itself has across platforms.
+fn math_call(func: &str, args: &[Value]) -> Result<Value, String> {
+    // math.pow is the one two-argument function; always float (CPython).
+    if func == "pow" {
+        let [a, b] = args else {
+            return Err("math.pow() takes two arguments".to_string());
+        };
+        let x = as_num(a).ok_or_else(|| "math.pow() needs numbers".to_string())?;
+        let y = as_num(b).ok_or_else(|| "math.pow() needs numbers".to_string())?;
+        return Ok(Value::Float(x.powf(y)));
+    }
+    let [arg] = args else {
+        return Err(format!("math.{func}() takes one argument"));
+    };
     let x = as_num(arg).ok_or_else(|| format!("math.{func}() needs a number"))?;
     Ok(match func {
         "sqrt" => Value::Float(x.sqrt()),
+        "exp" => Value::Float(x.exp()),
+        "log" => Value::Float(x.ln()),
+        "log2" => Value::Float(x.log2()),
+        "log10" => Value::Float(x.log10()),
         "fabs" => Value::Float(x.abs()),
         "floor" => Value::Int(x.floor() as i64),
         "ceil" => Value::Int(x.ceil() as i64),

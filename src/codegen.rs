@@ -267,7 +267,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     for f in user_funcs {
         module.funcs.push(f);
     }
-    for f in runtime_helpers() {
+    for f in runtime_helpers(g.uses_math) {
         module.funcs.push(f);
     }
     for f in class_helpers() {
@@ -275,6 +275,12 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     }
     for f in raise_helpers() {
         module.funcs.push(f);
+    }
+    if g.uses_math {
+        module.raw.push(crate::math_wat::MATH_MEMORY.to_string());
+        module.raw.push(crate::math_wat::MATH_GLOBALS.to_string());
+        module.raw.push(crate::math_wat::MATH_FUNCS.to_string());
+        module.raw.push(crate::math_wat::MATH_DATA.to_string());
     }
     if g.uses_floordiv {
         module.funcs.push(py_floordiv_helper());
@@ -924,7 +930,7 @@ fn raise_helpers() -> Vec<Func> {
 }
 
 /// The always-present boxed-value runtime: box/unbox/bool/truthy/print.
-fn runtime_helpers() -> Vec<Func> {
+fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     let mut fs = Vec::new();
 
     // $box: i32 -> value (i31 when it fits, $INT struct otherwise).
@@ -3005,9 +3011,18 @@ fn runtime_helpers() -> Vec<Func> {
         3,
         "(then (return (struct.new $FLOAT (f64.sqrt (call $unbox_f64 (local.get $a)))))))",
     );
-    // Any other fractional power needs exp/ln, which WASM has no instruction
-    // for and this module has no library for.
-    b.push_in(2, "(call $raise_pow_float)");
+    // Any other fractional power: libm's pow when the module carries the
+    // vendored math. A module whose every `**` exponent is a literal int
+    // never splices it, and this branch is unreachable there — the trap
+    // stays for that case so the symbol always resolves.
+    if uses_math {
+        b.push_in(
+            2,
+            "(return (struct.new $FLOAT (call $mw_m_pow (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))))",
+        );
+    } else {
+        b.push_in(2, "(call $raise_pow_float)");
+    }
     b.push_in(1, ")");
     b.push(")");
     b.push("(local.set $e (call $unbox (local.get $b)))");
@@ -5575,6 +5590,9 @@ fn floormod_helper() -> Func {
 #[derive(Default)]
 struct Gen {
     uses_floordiv: bool,
+    /// Fractional-capable `**` or math.exp/log/log2/log10/pow anywhere:
+    /// splice the vendored libm WAT (src/math_wat.rs) into the module.
+    uses_math: bool,
     uses_floormod: bool,
     /// Set when `input()` is used, so the `env.read_char` import and the
     /// `$read_line` helper are only emitted (and only required of the host)
@@ -6156,7 +6174,9 @@ impl Gen {
     }
 
     /// `math.<fn>(args)`. sqrt/fabs return a float; floor/ceil/trunc return an
-    /// int (Python's behavior). WASM has native f64 ops for all of these.
+    /// int (Python's behavior). sqrt/fabs/floor/ceil/trunc are single WASM
+    /// instructions; exp/log/log2/log10/pow call the vendored libm WAT
+    /// (src/math_wat.rs), spliced in only when one of them is used.
     fn gen_math_call(
         &mut self,
         cx: &mut FuncCx,
@@ -6164,6 +6184,20 @@ impl Gen {
         args: &[Expr],
         line: usize,
     ) -> Result<String> {
+        // math.pow(x, y): always float, CPython's contract — unlike `**`,
+        // which keeps int for int operands. Two args, so it precedes the
+        // one-argument gate.
+        if method == "pow" {
+            if args.len() != 2 {
+                return Err(CompileError::at(line, "math.pow() takes two arguments"));
+            }
+            self.uses_math = true;
+            let a0 = self.value_expr(cx, &args[0])?;
+            let a1 = self.value_expr(cx, &args[1])?;
+            return Ok(format!(
+                "(struct.new $FLOAT (call $mw_m_pow (call $unbox_f64 {a0}) (call $unbox_f64 {a1})))"
+            ));
+        }
         if args.len() != 1 {
             return Err(CompileError::at(
                 line,
@@ -6176,6 +6210,10 @@ impl Gen {
             |op: &str| format!("(call $box (i32.trunc_sat_f64_s ({op} (call $unbox_f64 {x}))))");
         match method {
             "sqrt" => Ok(float("f64.sqrt")),
+            "exp" | "log" | "log2" | "log10" => {
+                self.uses_math = true;
+                Ok(float(&format!("call $mw_m_{method}")))
+            }
             "fabs" => Ok(float("f64.abs")),
             "floor" => Ok(to_int("f64.floor")),
             "ceil" => Ok(to_int("f64.ceil")),
@@ -6854,9 +6892,16 @@ impl Gen {
                 Ok(format!("(call $py_mul {lhs} {rhs})"))
             }
             ExprKind::Bin(BinOp::Pow, a, b) => {
-                // A float-LITERAL exponent is rejected in the parser, so every
-                // backend agrees; a computed float exponent still reaches
-                // $py_pow, which says so plainly.
+                // An exponent that could be fractional at runtime needs
+                // libm's pow; only a literal int exponent (optionally
+                // negated) provably cannot be. `x ** 0.5` still takes
+                // $py_pow's one-instruction f64.sqrt path first.
+                match &b.kind {
+                    ExprKind::Int(_) => {}
+                    ExprKind::Unary(UnOp::Neg, inner) if matches!(inner.kind, ExprKind::Int(_)) => {
+                    }
+                    _ => self.uses_math = true,
+                }
                 let lhs = self.value_expr(cx, a)?;
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call $py_pow {lhs} {rhs})"))
@@ -8562,6 +8607,25 @@ mod tests {
         assert!(wat.contains("(func $py_floordiv"));
         assert!(wat.contains("(func $i32_floordiv"));
         assert!(wat.contains("(func $i32_floormod"));
+    }
+
+    #[test]
+    fn math_spliced_only_when_used() {
+        // Integer `**` provably never needs libm — no math, no memory.
+        let wat = compile("print(2 ** 10)").unwrap();
+        assert!(!wat.contains("$mw_"), "int pow must not splice math");
+        assert!(!wat.contains("(memory"), "int pow must not add a memory");
+        // A fractional exponent splices functions, memory, and tables.
+        let wat = compile("print(2 ** 2.5)").unwrap();
+        assert!(wat.contains("(func $mw_m_pow"));
+        assert!(wat.contains("(memory $mw_mem 1)"));
+        assert!(wat.contains("(data (i32.const 16384)"));
+        // And adds NO capabilities: the math is pure computation.
+        assert!(
+            crate::capabilities(&wat)
+                .iter()
+                .all(|c| c.starts_with("write_"))
+        );
     }
 
     #[test]

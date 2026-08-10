@@ -39,6 +39,7 @@ mod hoist;
 mod lexer;
 mod lint;
 mod llvm;
+mod math_wat;
 mod parser;
 mod reuse;
 mod roles;
@@ -52,6 +53,7 @@ pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
 pub use floatfmt::py_float_repr;
 pub use lexer::Comment;
+pub use math_wat::{MATH_DATA, MATH_FUNCS, MATH_GLOBALS, MATH_MEMORY};
 pub use roles::{
     Role, VarRole, classify_sort, classify_sort_by_passes, confirm_container_shrinks,
     confirm_organizer_multiset, confirm_sorts, confirm_walker_is_data_driven, roles_of,

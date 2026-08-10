@@ -42,7 +42,7 @@ Traps print their message and then execute `unreachable`. That is CPython's unca
 
 ## Floats
 
-`x ** 0.5` is a SQUARE ROOT and `f64.sqrt` is a WASM instruction, so it costs one op and matches CPython exactly — including a computed 0.5. Any OTHER fractional power needs exp/ln, which WASM has no instruction for and this module has no library for; the native runtime does them all via `libm::pow`, so that remainder is still a target divergence.
+Full fractional `**` and math.exp/log/log2/log10/pow, via libm compiled to WAT (src/math_wat.rs) — the same pinned libm the native runtime links, so both backends agree to the LAST BIT. `x ** 0.5` stays one f64.sqrt instruction. Known bounded caveat: CPython defers to the PLATFORM libm, so a last-ULP digit can differ from a given host's CPython (exp(1.0) on Windows ucrt) — exactly as two CPythons differ from each other.
 
 | program | where | result |
 |---|---|---|
@@ -55,8 +55,15 @@ Traps print their message and then execute `unreachable`. That is CPython's unca
 | `9 ** 0.5` | value | `3.0` |
 | `2.25 ** 0.5` | value | `1.5` |
 | `h = 0.5; 16 ** h` | value | `4.0` |
-| `8 ** 0.3333` | trap | `TypeError: ** can raise to a whole number, or to 0.5 — a square root, which the machine does in one step. Other fractional powers need a maths library this pr…` |
-| `2.0 ** 2.0` | trap | `TypeError: ** can raise to a whole number, or to 0.5 — a square root, which the machine does in one step. Other fractional powers need a maths library this pr…` |
+| `8 ** 0.3333` | value | `1.999861375368307` |
+| `2 ** 2.5` | value | `5.65685424949238` |
+| `2 ** -1.5` | value | `0.35355339059327373` |
+| `math.exp(1.0)` | value | `2.7182818284590455` |
+| `math.log(10.0)` | value | `2.302585092994046` |
+| `math.log2(8.0)` | value | `3.0` |
+| `math.log10(1000.0)` | value | `3.0` |
+| `math.pow(2, 10)` | value | `1024.0` |
+| `2.0 ** 2.0` | value | `4.0` |
 | `abs(-2.5)` | value | `2.5` |
 
 ## Division by zero

@@ -86,6 +86,10 @@ pub struct Module {
     /// is valid (method dispatch references methods as function references).
     pub elem_declares: Vec<String>,
     pub funcs: Vec<Func>,
+    /// Pre-rendered WAT spliced in verbatim before the closing paren —
+    /// the vendored libm math (memory + global + functions + data) when
+    /// a program uses it. Text-format fields may appear in any order.
+    pub raw: Vec<String>,
 }
 
 impl Module {
@@ -106,6 +110,10 @@ impl Module {
         }
         for f in &self.funcs {
             f.render(&mut out);
+        }
+        for entry in &self.raw {
+            out.push_str(entry);
+            out.push('\n');
         }
         out.push_str(")\n");
         out
@@ -138,6 +146,7 @@ mod tests {
             imports: vec!["(import \"env\" \"f\" (func $f))".into()],
             globals: vec![],
             elem_declares: vec![],
+            raw: vec![],
             funcs: vec![Func {
                 signature: "(func $_start (export \"_start\") (result i32)".into(),
                 locals: vec!["(local $x i32)".into()],

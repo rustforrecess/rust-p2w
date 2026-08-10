@@ -1,0 +1,28 @@
+# The libm->WAT source crate. `tools/gen_math_wat.py` builds this for
+# wasm32-unknown-unknown, extracts the functions and lookup tables from the
+# artifact, and vendors them as WAT text in src/math_wat.rs.
+#
+# libm is pinned to the same version runtime/Cargo.toml links, because the
+# whole point is BIT-IDENTICAL transcendentals on both backends — the browser
+# module and the board must disagree with CPython (if ever) in exactly the
+# same last bit, or the differential harness reports phantom divergences.
+[workspace]
+
+[package]
+name = "mathwat"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libm = "=0.2.16"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

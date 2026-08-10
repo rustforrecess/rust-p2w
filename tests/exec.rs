@@ -193,6 +193,51 @@ fn assert_output(src: &str, expected: &str) {
     assert_eq!(run(src), expected, "program:\n{src}");
 }
 
+/// libm-backed math. Expected strings are what the VENDORED LIBM computes —
+/// the same libm the native runtime links, so both backends print these
+/// exact digits. A few differ from a given host CPython in the last ULP
+/// (CPython defers to the platform libm; platforms disagree with each other
+/// the same way). math.log2(8.0)-style rows agree everywhere.
+#[test]
+fn libm_math_matches_the_vendored_libm() {
+    assert_output(
+        "import math
+print(math.exp(1.0))
+print(math.log(10.0))
+print(math.log2(8.0))
+print(math.log10(1000.0))
+print(math.pow(2, 10))
+print(math.pow(9, 0.5))
+",
+        "2.7182818284590455
+2.302585092994046
+3.0
+3.0
+1024.0
+3.0
+",
+    );
+    assert_output(
+        "print(2 ** 2.5)
+print(2 ** -1.5)
+print(8 ** 0.3333)
+print(2.0 ** 2.0)
+",
+        "5.65685424949238
+0.35355339059327373
+1.999861375368307
+4.0
+",
+    );
+    // The one-instruction sqrt fast path is not disturbed by the library.
+    assert_output(
+        "print(2 ** 0.5)
+",
+        "1.4142135623730951
+",
+    );
+}
+
 #[track_caller]
 fn assert_io(src: &str, stdin: &str, expected: &str) {
     let (out, result) = execute_io(src, stdin);

@@ -27,6 +27,10 @@ run = ["dep:wasmtime", "dep:wat"]
 [dev-dependencies]
 wasmtime = { version = "44.0.2", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime"] }
 wat = "1"
+# The oracle for the vendored WAT math (src/math_wat.rs): tests assert the
+# extracted functions return BIT-IDENTICAL results to this crate, which is
+# also what runtime/ links — the pin must match both.
+libm = "=0.2.16"
 
 # Tests JIT-compile every program through Cranelift; an unoptimized Cranelift
 # is 10-50x slower, dominating the suite. Optimize dependencies (one-time
