@@ -859,7 +859,9 @@ fn seq_repeat(seq: Value, n: i64) -> Value {
 /// only in that our whole numbers are 32-bit; the failure is loud either way.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_overflow() -> ! {
-    trap("this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)")
+    trap(
+        "this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)",
+    )
 }
 
 #[unsafe(no_mangle)]
