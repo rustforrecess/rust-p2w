@@ -59,9 +59,6 @@ fn as_int(v: Value) -> i64 {
 /// Allocate a boxed full-width `i32` (for values outside the inline range).
 fn int_alloc(n: i32) -> Value {
     let p = alloc(8 + 4); // [tag][rc][i32]
-    if p == 0 {
-        trap("out of memory");
-    }
     wr(p, T_INT);
     wr(p + 4, 1);
     live_inc();
@@ -111,8 +108,19 @@ fn num(v: Value) -> Option<i64> {
 
 const HEAP_SIZE: usize = 64 * 1024; // device build tunes this to available SRAM
 
+#[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+
+// wasm32 (browser / component builds): the arena claims pages at the current
+// end of linear memory on first allocation and grows on demand — the static
+// array would cap browser programs at the device budget, and writing past a
+// static array is UB, not growth. Pages never shrink (wasm has none), so
+// BASE/CAP deliberately survive `heap_reset`.
+#[cfg(target_arch = "wasm32")]
+static mut ARENA_BASE: usize = 0;
+#[cfg(target_arch = "wasm32")]
+static mut ARENA_CAP: usize = 0;
 static mut CURSOR: usize = 4; // offset 0 is reserved (never a valid object)
 static mut FREELIST: usize = 0; // head block offset, 0 = empty
 // Live heap-object count (births − frees). The RC acceptance gate: a finished
@@ -138,7 +146,44 @@ const T_FLOAT: u32 = 5;
 const T_INT: u32 = 6;
 
 fn heap_base() -> *mut u8 {
-    &raw mut HEAP as *mut u8
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        &raw mut HEAP as *mut u8
+    }
+    // Set by the first alloc's ensure_capacity; no heap value can exist (and
+    // so no rd/wr can run) before that.
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        ARENA_BASE as *mut u8
+    }
+}
+
+/// Make offsets up to `need_end` addressable. Off wasm32 the arena is the
+/// fixed array; on wasm32 grow linear memory, with slack so a growing list
+/// doesn't pay a memory.grow per append. False = genuinely out of memory.
+fn ensure_capacity(need_end: usize) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        need_end <= HEAP_SIZE
+    }
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        if ARENA_BASE == 0 {
+            ARENA_BASE = core::arch::wasm32::memory_size(0) * 65536;
+        }
+        if need_end <= ARENA_CAP {
+            return true;
+        }
+        let want = (need_end - ARENA_CAP).div_ceil(65536);
+        let slack = (ARENA_CAP / 65536).clamp(4, 64);
+        for pages in [want.max(slack), want] {
+            if core::arch::wasm32::memory_grow(0, pages) != usize::MAX {
+                ARENA_CAP += pages * 65536;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn rd(off: usize) -> u32 {
@@ -283,9 +328,6 @@ pub extern "C" fn p2w_add_assign(a: Value, b: Value) -> Value {
         }
         // Grow with slack so the next appends land in place.
         let p = alloc(need * 2);
-        if p == 0 {
-            trap("out of memory");
-        }
         wr(p, T_STR);
         wr(p + 4, 1);
         live_inc();
@@ -327,9 +369,6 @@ pub extern "C" fn p2w_str_of(v: Value) -> Value {
     let mut n = 0usize;
     write_value(v, &mut |_| n += 1);
     let p = alloc(12 + n);
-    if p == 0 {
-        trap("out of memory");
-    }
     wr(p, T_STR);
     wr(p + 4, 1);
     live_inc();
@@ -397,9 +436,6 @@ pub extern "C" fn p2w_slice(obj: Value, start_v: Value, stop_v: Value, step_v: V
             i += step;
         }
         let p = alloc(12 + n);
-        if p == 0 {
-            trap("out of memory");
-        }
         wr(p, T_STR);
         wr(p + 4, 1);
         live_inc();
@@ -495,8 +531,10 @@ pub extern "C" fn p2w_unbox_float(v: Value) -> f64 {
     }
 }
 
-/// Allocate `payload` bytes; returns the payload offset, or 0 on OOM. The block
-/// carries a u32 size header just before the payload (for `free`).
+/// Allocate `payload` bytes; returns the payload offset. NEVER returns 0:
+/// exhaustion traps with a message (silent-0 corrupted the heap head or hung
+/// list growth — the spectralnorm anomaly). The block carries a u32 size
+/// header just before the payload (for `free`).
 fn alloc(payload: usize) -> usize {
     let need = align4(4 + payload);
     unsafe {
@@ -520,8 +558,8 @@ fn alloc(payload: usize) -> usize {
         }
         // Bump.
         let blk = CURSOR;
-        if blk + need > HEAP_SIZE {
-            return 0;
+        if !ensure_capacity(blk + need) {
+            trap("out of memory");
         }
         wr(blk, need as u32);
         CURSOR = blk + need;
@@ -556,9 +594,6 @@ fn str_byte(v: Value, i: usize) -> u8 {
 /// Allocate a string object from raw bytes (refcount starts at 1).
 fn str_alloc(bytes: &[u8]) -> Value {
     let p = alloc(12 + bytes.len());
-    if p == 0 {
-        trap("out of memory");
-    }
     wr(p, T_STR);
     wr(p + 4, 1);
     live_inc();
@@ -650,9 +685,6 @@ fn as_f64(v: Value) -> f64 {
 /// Box an `f64` on the heap (refcount starts at 1).
 fn float_alloc(x: f64) -> Value {
     let p = alloc(8 + 8); // [tag][rc][f64]
-    if p == 0 {
-        trap("out of memory");
-    }
     wr(p, T_FLOAT);
     wr(p + 4, 1);
     live_inc();
@@ -746,9 +778,6 @@ pub extern "C" fn p2w_add(a: Value, b: Value) -> Value {
     if is_heap(a) && obj_tag(a) == T_STR && is_heap(b) && obj_tag(b) == T_STR {
         let (la, lb) = (str_len(a), str_len(b));
         let p = alloc(12 + la + lb);
-        if p == 0 {
-            trap("out of memory");
-        }
         wr(p, T_STR);
         wr(p + 4, 1);
         live_inc();
@@ -1505,9 +1534,6 @@ const OP_GETITEM: i32 = 9;
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_obj_new(class_id: i32) -> Value {
     let p = alloc(16);
-    if p == 0 {
-        trap("out of memory");
-    }
     wr(p, T_OBJECT);
     wr(p + 4, 1);
     live_inc();
@@ -2796,9 +2822,6 @@ pub extern "C" fn p2w_input(prompt: Value) -> Value {
     // shape as p2w_add_assign's grow path.
     let mut cap = 32usize;
     let mut p = alloc(12 + cap);
-    if p == 0 {
-        trap("out of memory");
-    }
     wr(p, T_STR);
     wr(p + 4, 1);
     live_inc();
@@ -2875,9 +2898,6 @@ pub extern "C" fn p2w_format(
         _ => 0,
     };
     let p = alloc(12 + w);
-    if p == 0 {
-        trap("out of memory");
-    }
     wr(p, T_STR);
     wr(p + 4, 1);
     live_inc();
@@ -3102,6 +3122,20 @@ mod tests {
     // unwind out of an `extern "C"` function — it aborts, which `should_panic`
     // cannot catch. `numeric` is the choke point every whole-number `+`, `-`
     // and `*` passes through, so it is the right thing to pin anyway.
+    /// Exhaustion must FAIL LOUDLY. `alloc` used to return 0, which most
+    /// callers never checked — the zero offset then aliased the heap head,
+    /// so big programs hung or corrupted instead of reporting (observed
+    /// live as the wasm32 bench hang; the leading suspect for the
+    /// spectralnorm anomaly). The next heap_guard() resets the arena.
+    #[test]
+    #[should_panic(expected = "out of memory")]
+    fn arena_exhaustion_traps_instead_of_returning_zero() {
+        let _g = heap_guard();
+        loop {
+            alloc(4096);
+        }
+    }
+
     #[test]
     #[should_panic(expected = "outside the range of whole numbers")]
     fn multiplication_past_the_int_range_traps() {
