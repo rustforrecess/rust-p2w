@@ -110,9 +110,20 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         })
         .unwrap();
     linker
-        .func_wrap("env", "s_byte", |mut caller: Caller<'_, Io>, b: i32| {
-            caller.data_mut().cur.push(b as u8);
-        })
+        .func_wrap(
+            "env",
+            "s_bytes",
+            |mut caller: Caller<'_, Io>, ptr: i32, len: i32| {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("module with s_bytes must export its scratch memory");
+                let mut buf = vec![0u8; len as usize];
+                mem.read(&caller, ptr as usize, &mut buf)
+                    .expect("s_bytes read");
+                caller.data_mut().cur.extend_from_slice(&buf);
+            },
+        )
         .unwrap();
     linker
         .func_wrap("env", "s_push", |mut caller: Caller<'_, Io>| {
@@ -142,7 +153,7 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         })
         .unwrap();
     // Field storage: set_field stores [key, value]; get_field reads via
-    // gf_fetch (length, after popping the key) + gf_byte (bytes).
+    // gf_fetch (length, after popping the key) + gf_read (chunks into scratch).
     linker
         .func_wrap("env", "set_field", |mut caller: Caller<'_, Io>| {
             let d = caller.data_mut();
@@ -160,13 +171,23 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         })
         .unwrap();
     linker
-        .func_wrap("env", "gf_byte", |caller: Caller<'_, Io>, i: i32| -> i32 {
-            caller
-                .data()
-                .result
-                .get(i as usize)
-                .map_or(0, |&b| b as i32)
-        })
+        .func_wrap(
+            "env",
+            "gf_read",
+            |mut caller: Caller<'_, Io>, ptr: i32, start: i32, maxlen: i32| -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("module with gf_read must export its scratch memory");
+                let d = caller.data();
+                let start = start as usize;
+                let end = d.result.len().min(start + maxlen as usize);
+                let chunk = d.result.get(start..end).unwrap_or_default().to_vec();
+                mem.write(&mut caller, ptr as usize, &chunk)
+                    .expect("gf_read write");
+                chunk.len() as i32
+            },
+        )
         .unwrap();
 
     let instance = linker

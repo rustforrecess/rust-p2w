@@ -582,7 +582,7 @@ print(\"sum of evens:\", total)
         let src = "def grow():\n    set_attr(\"#box\", \"fill\", \"gold\")\n    set_text(\"#msg\", \"hi\")\n    play_sound(\"beep\")\non(\"#box\", \"click\", grow)\n";
         let wat = compile_to_wat(src).unwrap();
         for imp in [
-            r#"(import "env" "s_byte""#,
+            r#"(import "env" "s_bytes""#,
             r#"(import "env" "dom_set_attr""#,
             r#"(import "env" "dom_set_text""#,
             r#"(import "env" "play_sound""#,
