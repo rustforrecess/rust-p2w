@@ -56,6 +56,12 @@ cargo fmt --check
 cargo fmt --manifest-path runtime/Cargo.toml --check
 ```
 
+After touching `runtime/` (unsafe offset arithmetic — CI enforces this too):
+
+```bash
+cargo +nightly miri test --manifest-path runtime/Cargo.toml
+```
+
 Root `cargo fmt` does NOT reach `runtime/` or `tools/mathwat/` — they
 have their own manifests, and CI checks the runtime separately.
 

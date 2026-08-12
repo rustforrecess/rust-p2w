@@ -22,3 +22,16 @@ jobs:
       - run: cargo test --manifest-path runtime/Cargo.toml
       - run: cargo clippy --manifest-path runtime/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path runtime/Cargo.toml --check
+
+  # The runtime is ~3k lines of unsafe offset arithmetic; Miri interprets the
+  # whole test suite and rejects any undefined behavior (misalignment, OOB,
+  # aliasing). ~8s of runtime — cheap insurance on the code both backends'
+  # futures sit on.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test --manifest-path runtime/Cargo.toml
