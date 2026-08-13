@@ -41,6 +41,7 @@ mod lint;
 mod llvm;
 mod math_wat;
 mod parser;
+mod repr;
 mod reuse;
 mod roles;
 
