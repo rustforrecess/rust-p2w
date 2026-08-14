@@ -59,6 +59,7 @@ Full fractional `**` and math.exp/log/log2/log10/pow, via libm compiled to WAT (
 | `2 ** 2.5` | value | `5.65685424949238` |
 | `2 ** -1.5` | value | `0.35355339059327373` |
 | `math.exp(1.0)` | value | `2.7182818284590455` |
+| `random.randint(1, 6) [seed 42]` | value | `2` |
 | `math.log(10.0)` | value | `2.302585092994046` |
 | `math.log2(8.0)` | value | `3.0` |
 | `math.log10(1000.0)` | value | `3.0` |

@@ -64,6 +64,11 @@ pub fn probe(src: &str) -> Outcome {
     linker
         .func_wrap("env", "read_char", |_: Caller<'_, Vec<u8>>| -> i32 { -1 })
         .unwrap();
+    // The per-attempt seed (42 everywhere in tests, so `import random`
+    // probes pin one reproducible sequence).
+    linker
+        .func_wrap("env", "seed", |_: Caller<'_, Vec<u8>>| -> i32 { 42 })
+        .unwrap();
 
     let instance = match linker.instantiate(&mut store, &module) {
         Ok(i) => i,
@@ -163,6 +168,10 @@ pub fn groups() -> Vec<Group> {
                 e!("2 ** 2.5"),
                 e!("2 ** -1.5"),
                 p("math.exp(1.0)", "import math\nprint(math.exp(1.0))\n"),
+                p(
+                    "random.randint(1, 6) [seed 42]",
+                    "import random\nprint(random.randint(1, 6))\n",
+                ),
                 p("math.log(10.0)", "import math\nprint(math.log(10.0))\n"),
                 p("math.log2(8.0)", "import math\nprint(math.log2(8.0))\n"),
                 p(

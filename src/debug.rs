@@ -1726,6 +1726,9 @@ enum Task {
     SortedKw,
     /// Pop one argument; push `math.<func>(arg)`.
     MathCall(String, usize),
+    /// `random.<fn>` with N evaluated args (shuffle-on-a-variable is handled
+    /// at dispatch, where the scope is reachable).
+    RandomCall(String, usize),
     /// Pop `n` values and print them (space-joined + newline).
     Print(usize),
     /// Discard the top operand (an expression statement's result).
@@ -1850,6 +1853,10 @@ pub struct Vm {
     /// Pre-supplied input lines served to `input()` during stepping (the VM has
     /// no real stdin; the IDE fills this from its input box via `set_stdin`).
     stdin: std::collections::VecDeque<String>,
+    /// xorshift64* state — the bit-exact mirror of the compiled backend's
+    /// $rnd helpers. Seeded 42 like the test hosts' env.seed, so the Vm and
+    /// the compiled module produce the SAME sequence under test.
+    rnd: u64,
 }
 
 impl Vm {
@@ -1877,6 +1884,7 @@ impl Vm {
             watch_hit: None,
             last_return: None,
             stdin: std::collections::VecDeque::new(),
+            rnd: rnd_seed(42),
         };
         vm.settle();
         Ok(vm)
@@ -2412,6 +2420,15 @@ impl Vm {
                 }
                 args.reverse();
                 self.push_op(math_call(&func, &args)?);
+            }
+            Task::RandomCall(func, n) => {
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    args.push(self.pop_op()?);
+                }
+                args.reverse();
+                let v = random_call(&mut self.rnd, &func, &mut args)?;
+                self.push_op(v);
             }
             Task::Print(n) => {
                 let mut vals = Vec::with_capacity(n);
@@ -2954,13 +2971,43 @@ impl Vm {
                     }
                     return Ok(());
                 }
-                // `math.sqrt(x)` etc. — a module function (unless `math` is a
-                // variable). Arity is checked in math_call.
+                // `math.sqrt(x)` / `random.randint(...)` — a module function
+                // (unless shadowed by a variable). Arity checked in the call.
                 if let ExprKind::Name(m) = &obj.kind
-                    && m == "math"
+                    && (m == "math" || m == "random")
                     && self.lookup(m).is_none()
                 {
-                    self.push_task(Task::MathCall(method.clone(), args.len()));
+                    // shuffle on a named list mutates through the scope NOW
+                    // (the append precedent) — everything else goes through a
+                    // task over evaluated args.
+                    if m == "random"
+                        && method == "shuffle"
+                        && let [arg] = args.as_slice()
+                        && let ExprKind::Name(xs) = &arg.kind
+                    {
+                        let rnd = &mut self.rnd;
+                        match self.frames.last_mut().and_then(|f| f.scope.get_mut(xs)) {
+                            Some(Value::List(items)) => {
+                                let mut i = items.len().saturating_sub(1);
+                                while i > 0 {
+                                    let j = (rnd_next(rnd) % (i as u64 + 1)) as usize;
+                                    items.swap(i, j);
+                                    i -= 1;
+                                }
+                                self.push_op(Value::None);
+                                return Ok(());
+                            }
+                            _ => {
+                                return Err("random.shuffle() needs a list variable".into());
+                            }
+                        }
+                    }
+                    let task = if m == "random" {
+                        Task::RandomCall(method.clone(), args.len())
+                    } else {
+                        Task::MathCall(method.clone(), args.len())
+                    };
+                    self.push_task(task);
                     for a in args.iter().rev() {
                         self.push_task(Task::Eval(Rc::new(a.clone())));
                     }
@@ -3465,13 +3512,15 @@ fn math_call(func: &str, args: &[Value]) -> Result<Value, String> {
     })
 }
 
-/// `import name1, name2, …` — only `math` exists in the subset. A no-op on
+/// `import name1, name2, …` — `math` and `random` exist in the subset
+/// (from-imports arrive colon-encoded, e.g. "random:randint"). A no-op on
 /// success (the compiled backends treat it the same); a bad module is an error.
 fn check_import(names: &[String]) -> Result<(), String> {
     for m in names {
-        if m != "math" {
+        let module = m.split_once(':').map_or(m.as_str(), |(md, _)| md);
+        if module != "math" && module != "random" {
             return Err(format!(
-                "module '{m}' isn't available (only 'math' for now)"
+                "module '{module}' isn't available (only 'math' and 'random' for now)"
             ));
         }
     }
@@ -3495,6 +3544,66 @@ fn sorted_reverse_args<'a>(name: &str, args: &'a [Expr]) -> Option<(&'a Expr, &'
 /// Builtins beyond both debug evaluators' inline core set — numeric reductions,
 /// sorting, and the range/enumerate/zip materializers. Returns `Ok(None)` if
 /// `name` isn't one of these, so the caller falls through to its own error.
+/// Seed exactly like the WAT `$rnd_init`: odd nonzero state, churned 3x.
+fn rnd_seed(s: i32) -> u64 {
+    let mut st = ((s as u32 as u64) << 1) | 1;
+    for _ in 0..3 {
+        rnd_next(&mut st);
+    }
+    st
+}
+
+/// xorshift64* (12/25/27, Vigna's multiplier) — must stay bit-identical to
+/// the WAT `$rnd_next`; a divergence here is a language fork.
+fn rnd_next(st: &mut u64) -> u64 {
+    let mut x = *st;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *st = x;
+    x.wrapping_mul(2685821657736338717)
+}
+
+/// `random.<fn>(args)` in the Vm — same arms as `gen_random_call`.
+fn random_call(st: &mut u64, func: &str, args: &mut [Value]) -> Result<Value, String> {
+    match (func, &mut *args) {
+        ("random", []) => Ok(Value::Float(
+            (rnd_next(st) >> 11) as f64 * 1.110_223_024_625_156_5e-16,
+        )),
+        ("randint", [Value::Int(a), Value::Int(b)]) => {
+            let (a, b) = (*a, *b);
+            if a > b {
+                return Err("ValueError: randint(a, b) needs a <= b — the low end first".into());
+            }
+            let span = ((b as i128) - (a as i128) + 1) as u64;
+            Ok(Value::Int(a + (rnd_next(st) % span) as i64))
+        }
+        ("choice", [Value::List(items)]) => {
+            if items.is_empty() {
+                return Err("IndexError: cannot choose from an empty sequence".into());
+            }
+            let i = (rnd_next(st) % items.len() as u64) as usize;
+            Ok(items[i].clone())
+        }
+        ("shuffle", [Value::List(items)]) => {
+            let mut i = items.len().saturating_sub(1);
+            while i > 0 {
+                let j = (rnd_next(st) % (i as u64 + 1)) as usize;
+                items.swap(i, j);
+                i -= 1;
+            }
+            Ok(Value::None)
+        }
+        ("seed", [Value::Int(n)]) => {
+            *st = rnd_seed(*n as i32);
+            Ok(Value::None)
+        }
+        _ => Err(format!(
+            "random.{func}() got arguments it doesn't understand"
+        )),
+    }
+}
+
 fn builtin_extra(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
     // Bare math names bound by `from math import ...`. The COMPILER enforces
     // that the import is present (unknown function otherwise); the
@@ -4655,6 +4764,21 @@ mod tests {
             vm2.step();
         }
         assert_eq!(vm2.output(), "-1\n");
+    }
+
+    #[test]
+    fn vm_random_matches_the_compiled_backend_bit_for_bit() {
+        // The Vm's xorshift mirror seeded 42 must reproduce EXACTLY the
+        // digits the compiled module produces under the test hosts'
+        // env.seed = 42 — pinned in tests/exec.rs
+        // (random_is_deterministic_from_the_host_seed). A drift here is a
+        // language fork between Run and Step.
+        let src = "import random\nprint(random.randint(1, 100))\nprint(random.random())\nxs = [1, 2, 3, 4, 5]\nrandom.shuffle(xs)\nprint(xs)\nprint(random.choice(xs))\n";
+        let mut vm = Vm::new(src).unwrap();
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(vm.output(), "70\n0.3458877553122256\n[1, 2, 3, 5, 4]\n1\n");
     }
 
     #[test]

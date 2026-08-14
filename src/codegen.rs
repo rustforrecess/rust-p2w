@@ -142,30 +142,54 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                 // "module:name" is the parser's encoding of `from module
                 // import name`; a bare entry is a plain `import module`.
                 if let Some((module, func)) = m.split_once(':') {
-                    if module != "math" {
-                        return Err(CompileError::at(
-                            s.line,
-                            format!("module '{module}' isn't available (only 'math' for now)"),
-                        ));
+                    match module {
+                        "math" => {
+                            if !MATH_FNS.contains(&func) {
+                                return Err(CompileError::at(
+                                    s.line,
+                                    format!("math has no function '{func}'"),
+                                ));
+                            }
+                            g.from_math.insert(func.to_string());
+                        }
+                        "random" => {
+                            if !RANDOM_FNS.contains(&func) {
+                                return Err(CompileError::at(
+                                    s.line,
+                                    format!("random has no function '{func}'"),
+                                ));
+                            }
+                            g.from_random.insert(func.to_string());
+                        }
+                        _ => {
+                            return Err(CompileError::at(
+                                s.line,
+                                format!(
+                                    "module '{module}' isn't available (only 'math' and 'random' for now)"
+                                ),
+                            ));
+                        }
                     }
-                    if !MATH_FNS.contains(&func) {
-                        return Err(CompileError::at(
-                            s.line,
-                            format!("math has no function '{func}'"),
-                        ));
-                    }
-                    g.from_math.insert(func.to_string());
                 } else {
-                    if m != "math" {
+                    if m != "math" && m != "random" {
                         return Err(CompileError::at(
                             s.line,
-                            format!("module '{m}' isn't available (only 'math' for now)"),
+                            format!(
+                                "module '{m}' isn't available (only 'math' and 'random' for now)"
+                            ),
                         ));
                     }
                     g.imported.insert(m.clone());
                 }
             }
         }
+    }
+
+    // The PRNG is guest-side and seeded from the host's per-attempt seed, so
+    // programs are deterministic per attempt and identical across backends.
+    if g.imported.contains("random") || !g.from_random.is_empty() {
+        g.uses_random = true;
+        g.uses_seed = true;
     }
 
     // Pass 1.5: top-level slot inference. The prefix rule: count how many
@@ -226,6 +250,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         ..Default::default()
     };
     let mut body = Body::new();
+    if g.uses_random {
+        body.push("(call $rnd_init (call $seed))");
+    }
     if !g.classes.is_empty() {
         cx.locals
             .push((".cd".to_string(), "(ref null $DICT)".to_string()));
@@ -390,6 +417,14 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             module
                 .raw
                 .push(r#"(memory $mem (export "memory") 1)"#.to_string());
+        }
+    }
+    if g.uses_random {
+        module
+            .globals
+            .push("(global $rnd (mut i64) (i64.const 1))".into());
+        for f in random_helpers() {
+            module.funcs.push(f);
         }
     }
     if g.uses_math {
@@ -1112,6 +1147,135 @@ fn raise_helpers() -> Vec<Func> {
 /// The always-present boxed-value runtime: box/unbox/bool/truthy/print.
 /// Every name `from math import ...` may bind — exactly the set
 /// `gen_math_call` lowers, so importing and calling cannot disagree.
+/// Every name `from random import ...` may bind — exactly the set
+/// `gen_random_call` lowers, so importing and calling cannot disagree.
+const RANDOM_FNS: &[&str] = &["random", "randint", "choice", "shuffle", "seed"];
+
+/// The guest-side PRNG: xorshift64* (shifts 12/25/27, Vigna's multiplier).
+/// Chosen for being tiny enough to implement IDENTICALLY three times — this
+/// WAT, the native runtime, and the debug interpreter — because random's
+/// whole contract here is "same seed, same sequence, every backend".
+/// Deliberately NOT CPython's Mersenne Twister: sequences are pinned to OUR
+/// digits, like the libm decision.
+fn random_helpers() -> Vec<Func> {
+    let mut fs = Vec::new();
+
+    // $rnd_init(seed): force an odd nonzero state, then churn three times so
+    // small seeds don't produce visibly-correlated first draws.
+    let mut b = Body::new();
+    b.push("(global.set $rnd (i64.or (i64.shl (i64.extend_i32_u (local.get $s)) (i64.const 1)) (i64.const 1)))");
+    for _ in 0..3 {
+        b.push("(drop (call $rnd_next))");
+    }
+    fs.push(Func {
+        signature: "(func $rnd_init (param $s i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $rnd_next: xorshift64* — state advances, output is state * multiplier.
+    let mut b = Body::new();
+    b.push("(local.set $x (global.get $rnd))");
+    b.push("(local.set $x (i64.xor (local.get $x) (i64.shr_u (local.get $x) (i64.const 12))))");
+    b.push("(local.set $x (i64.xor (local.get $x) (i64.shl (local.get $x) (i64.const 25))))");
+    b.push("(local.set $x (i64.xor (local.get $x) (i64.shr_u (local.get $x) (i64.const 27))))");
+    b.push("(global.set $rnd (local.get $x))");
+    b.push("(i64.mul (local.get $x) (i64.const 2685821657736338717))");
+    fs.push(Func {
+        signature: "(func $rnd_next (result i64)".into(),
+        locals: vec!["(local $x i64)".into()],
+        body: b,
+    });
+
+    // $rnd_float: 53 uniform bits -> [0, 1), CPython's random() range.
+    let mut b = Body::new();
+    b.push(
+        "(struct.new $FLOAT (f64.mul (f64.convert_i64_u (i64.shr_u (call $rnd_next) (i64.const 11))) (f64.const 1.1102230246251565e-16)))",
+    );
+    fs.push(Func {
+        signature: "(func $rnd_float (result (ref null eq))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $rnd_int(a, b): inclusive randint. Span fits u32 even at full i32
+    // range, so the i64 modulo is exact; modulo bias is negligible against a
+    // 64-bit draw.
+    let mut b = Body::new();
+    b.push("(if (i32.gt_s (local.get $a) (local.get $b)) (then");
+    b.push_in(1, "(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        1,
+        "ValueError: randint(a, b) needs a <= b — the low end first",
+    );
+    b.push_in(1, "(call $write_char (i32.const 10))");
+    b.push_in(1, "unreachable");
+    b.push("))");
+    b.push("(local.set $span (i64.add (i64.sub (i64.extend_i32_s (local.get $b)) (i64.extend_i32_s (local.get $a))) (i64.const 1)))");
+    b.push("(call $box (i32.add (local.get $a) (i32.wrap_i64 (i64.rem_u (call $rnd_next) (local.get $span)))))");
+    fs.push(Func {
+        signature: "(func $rnd_int (param $a i32) (param $b i32) (result (ref null eq))".into(),
+        locals: vec!["(local $span i64)".into()],
+        body: b,
+    });
+
+    // $rnd_choice(xs): a uniform index into any sequence py_len accepts.
+    let mut b = Body::new();
+    b.push("(local.set $n (call $py_len (local.get $xs)))");
+    b.push("(if (i32.eqz (local.get $n)) (then");
+    b.push_in(1, "(call $write_char (i32.const 10))");
+    push_text(
+        &mut b,
+        1,
+        "IndexError: cannot choose from an empty sequence",
+    );
+    b.push_in(1, "(call $write_char (i32.const 10))");
+    b.push_in(1, "unreachable");
+    b.push("))");
+    b.push("(call $py_index (local.get $xs) (i32.wrap_i64 (i64.rem_u (call $rnd_next) (i64.extend_i32_s (local.get $n)))))");
+    fs.push(Func {
+        signature: "(func $rnd_choice (param $xs (ref null eq)) (result (ref null eq))".into(),
+        locals: vec!["(local $n i32)".into()],
+        body: b,
+    });
+
+    // $rnd_shuffle(xs): Fisher–Yates, in place, high index down to 1.
+    let mut b = Body::new();
+    b.push("(local.set $i (i32.sub (call $py_len (local.get $xs)) (i32.const 1)))");
+    b.push("(block $done (loop $next");
+    b.push_in(1, "(br_if $done (i32.le_s (local.get $i) (i32.const 0)))");
+    b.push_in(
+        1,
+        "(local.set $j (i32.wrap_i64 (i64.rem_u (call $rnd_next) (i64.extend_i32_s (i32.add (local.get $i) (i32.const 1))))))",
+    );
+    b.push_in(
+        1,
+        "(local.set $tmp (call $py_index (local.get $xs) (local.get $i)))",
+    );
+    b.push_in(
+        1,
+        "(call $py_set_subscript (local.get $xs) (call $box (local.get $i)) (call $py_index (local.get $xs) (local.get $j)))",
+    );
+    b.push_in(
+        1,
+        "(call $py_set_subscript (local.get $xs) (call $box (local.get $j)) (local.get $tmp))",
+    );
+    b.push_in(1, "(local.set $i (i32.sub (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $next)))");
+    fs.push(Func {
+        signature: "(func $rnd_shuffle (param $xs (ref null eq))".into(),
+        locals: vec![
+            "(local $i i32)".into(),
+            "(local $j i32)".into(),
+            "(local $tmp (ref null eq))".into(),
+        ],
+        body: b,
+    });
+
+    fs
+}
+
 const MATH_FNS: &[&str] = &[
     "sqrt", "fabs", "floor", "ceil", "trunc", "exp", "log", "log2", "log10", "pow",
 ];
@@ -5780,6 +5944,9 @@ struct Gen {
     /// bare `sqrt(x)` routes to gen_math_call. A user `def` of the same
     /// name shadows the import (checked first at the call site).
     from_math: std::collections::HashSet<String>,
+    /// Names bound by `from random import ...` — same contract as `from_math`.
+    from_random: std::collections::HashSet<String>,
+    uses_random: bool,
     /// Fractional-capable `**` or math.exp/log/log2/log10/pow anywhere:
     /// splice the vendored libm WAT (src/math_wat.rs) into the module.
     uses_math: bool,
@@ -6509,6 +6676,67 @@ impl Gen {
     /// int (Python's behavior). sqrt/fabs/floor/ceil/trunc are single WASM
     /// instructions; exp/log/log2/log10/pow call the vendored libm WAT
     /// (src/math_wat.rs), spliced in only when one of them is used.
+    /// `random.<fn>(args)` — every arm draws from the guest-side xorshift
+    /// state, so sequences are reproducible from the host seed alone.
+    fn gen_random_call(
+        &mut self,
+        cx: &mut FuncCx,
+        method: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<String> {
+        let arity = |want: usize| -> Result<()> {
+            if args.len() != want {
+                return Err(CompileError::at(
+                    line,
+                    format!(
+                        "random.{method}() takes {want} argument{}",
+                        if want == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        match method {
+            "random" => {
+                arity(0)?;
+                Ok("(call $rnd_float)".into())
+            }
+            "randint" => {
+                arity(2)?;
+                let a = self.value_expr(cx, &args[0])?;
+                let b = self.value_expr(cx, &args[1])?;
+                Ok(format!(
+                    "(call $rnd_int (call $unbox {a}) (call $unbox {b}))"
+                ))
+            }
+            "choice" => {
+                arity(1)?;
+                let xs = self.value_expr(cx, &args[0])?;
+                Ok(format!("(call $rnd_choice {xs})"))
+            }
+            "shuffle" => {
+                arity(1)?;
+                let xs = self.value_expr(cx, &args[0])?;
+                let tmp = cx.scratch_local(VAL);
+                Ok(format!(
+                    "(block (result (ref null eq)) (local.set ${tmp} {xs}) (call $rnd_shuffle (local.get ${tmp})) (global.get $NONE))"
+                ))
+            }
+            "seed" => {
+                arity(1)?;
+                let n = self.value_expr(cx, &args[0])?;
+                Ok(format!(
+                    "(block (result (ref null eq)) (call $rnd_init (call $unbox {n})) (global.get $NONE))"
+                ))
+            }
+            _ => Err(CompileError::at(
+                line,
+                format!("random has no function '{method}'"),
+            )),
+        }
+    }
+
     fn gen_math_call(
         &mut self,
         cx: &mut FuncCx,
@@ -7514,8 +7742,12 @@ impl Gen {
                         str_lit(method)
                     ));
                 }
-                // `math.fn(...)` — a module function, not a value method.
+                // `math.fn(...)` / `random.fn(...)` — a module function, not
+                // a value method.
                 if self.is_module_ref(cx, recv) {
+                    if matches!(&recv.kind, ExprKind::Name(m) if m == "random") {
+                        return self.gen_random_call(cx, method, args, e.line);
+                    }
                     return self.gen_math_call(cx, method, args, e.line);
                 }
                 // `"template".format(...)` with a literal template (a class with
@@ -8226,6 +8458,9 @@ impl Gen {
                     }
                 }
                 let Some(&total) = self.funcs.get(n) else {
+                    if self.from_random.contains(n.as_str()) {
+                        return self.gen_random_call(cx, n, args, e.line);
+                    }
                     // `from math import sqrt` makes the bare name callable.
                     // Checked AFTER user functions, so a `def sqrt` shadows
                     // the import, matching CPython's later-binding-wins.

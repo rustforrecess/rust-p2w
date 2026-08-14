@@ -357,6 +357,63 @@ fn type_annotations_compile_and_are_ignored() {
     );
 }
 
+// --- import random: seeded, guest-side, deterministic per attempt ---
+
+#[test]
+fn random_is_deterministic_from_the_host_seed() {
+    // The host seed (42 in this harness) fully determines every draw: the
+    // PRNG is guest-side xorshift64*, so the same program replays exactly —
+    // per attempt, and identically on every backend. These digits are OURS
+    // (not CPython's Mersenne Twister), pinned like the libm digits.
+    assert_output(
+        "import random
+print(random.randint(1, 100))
+print(random.random())
+xs = [1, 2, 3, 4, 5]
+random.shuffle(xs)
+print(xs)
+print(random.choice(xs))
+from random import randint
+print(randint(1, 6))",
+        "70
+0.3458877553122256
+[1, 2, 3, 5, 4]
+1
+2
+",
+    );
+    // random.seed(n) rebases the sequence deterministically.
+    assert_output(
+        "import random
+random.seed(7)
+print(random.randint(1, 10))
+random.seed(7)
+print(random.randint(1, 10))",
+        "3
+3
+",
+    );
+}
+
+#[test]
+fn random_error_cases() {
+    assert_raises(
+        "import random
+print(random.randint(5, 1))",
+        "ValueError: randint(a, b) needs a <= b",
+    );
+    assert_raises(
+        "import random
+xs = []
+print(random.choice(xs))",
+        "IndexError: cannot choose from an empty sequence",
+    );
+    let err = rust_p2w::compile_to_wat("import random\nprint(random.gauss(0, 1))").unwrap_err();
+    assert!(err.contains("random has no function 'gauss'"), "{err}");
+    let err = rust_p2w::compile_to_wat("from random import gauss\n").unwrap_err();
+    assert!(err.contains("random has no function 'gauss'"), "{err}");
+}
+
 // --- and / or: Python value semantics + short-circuit ---
 
 #[test]
