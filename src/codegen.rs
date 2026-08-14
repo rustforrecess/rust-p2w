@@ -59,8 +59,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         if let StmtKind::Def {
             name,
             params,
+            param_types,
             defaults,
-            ..
+            return_type,
+            body,
         } = &s.kind
         {
             if name == "print" {
@@ -74,6 +76,31 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             }
             g.func_defaults.insert(name.clone(), defaults.clone());
             g.func_params.insert(name.clone(), params.clone());
+            // Typed call convention. A rebound param keeps Python's freedom
+            // to change type, so it stays boxed; scalar annotations on the
+            // rest become raw i32/f64 params.
+            let mut rebound = std::collections::HashSet::new();
+            collect_assigned(body, &mut rebound);
+            let preprs: Vec<Repr> = params
+                .iter()
+                .zip(param_types)
+                .map(|(p, t)| {
+                    if rebound.contains(p) {
+                        Repr::Boxed
+                    } else {
+                        match crate::repr::repr_of_ann(t) {
+                            r @ (Repr::Int | Repr::Float) => r,
+                            _ => Repr::Boxed,
+                        }
+                    }
+                })
+                .collect();
+            g.func_param_reprs.insert(name.clone(), preprs);
+            let ret = match crate::repr::repr_of_ann(return_type) {
+                r @ (Repr::Int | Repr::Float) if all_paths_return(body) => r,
+                _ => Repr::Boxed,
+            };
+            g.func_ret_reprs.insert(name.clone(), ret);
         }
     }
     for s in stmts {
@@ -141,11 +168,61 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         }
     }
 
+    // Pass 1.5: top-level slot inference. The prefix rule: count how many
+    // leading statements are plain assignments; only globals FIRST BOUND in
+    // that prefix may be typed (nothing else has run yet, so no code path —
+    // including a function body reading the global — can observe it
+    // uninitialized).
+    {
+        let mut greprs = infer_slot_reprs(stmts, &HashMap::new(), &g.func_ret_reprs);
+        let mut demoted = std::collections::HashSet::new();
+        collect_loop_and_comp_vars(stmts, &mut demoted);
+        // Straight-line top-level reads before the first assignment demote
+        // (same rule as function bodies: never let a typed slot read 0 where
+        // the boxed null would have trapped).
+        collect_maybe_unassigned_reads(stmts, &mut std::collections::HashSet::new(), &mut demoted);
+        // A global READ inside a def body can be observed before any
+        // top-level assignment runs (an early call, or a handler after
+        // _start) — those must additionally be bound in the leading
+        // all-assignments prefix, where nothing else can have run yet.
+        let mut fn_reads = std::collections::HashSet::new();
+        for st in stmts {
+            if let StmtKind::Def { params, body, .. } = &st.kind {
+                let mut locals = std::collections::HashSet::new();
+                collect_assigned(body, &mut locals);
+                for p in params {
+                    locals.insert(p.clone());
+                }
+                collect_maybe_unassigned_reads(body, &mut locals, &mut fn_reads);
+            }
+        }
+        let mut prefix_bound = std::collections::HashSet::new();
+        for st in stmts {
+            match &st.kind {
+                StmtKind::Assign(name, _) | StmtKind::AnnAssign { name, .. } => {
+                    prefix_bound.insert(name.clone());
+                }
+                // Defs/classes/imports don't run top-level code; they don't
+                // end the prefix.
+                StmtKind::Def { .. } | StmtKind::ClassDef { .. } | StmtKind::Import(_) => {}
+                _ => break,
+            }
+        }
+        greprs.retain(|n, r| {
+            matches!(r, Repr::Int | Repr::Float)
+                && !demoted.contains(n)
+                && (!fn_reads.contains(n) || prefix_bound.contains(n))
+        });
+        g.global_reprs = greprs;
+    }
+
     // Pass 2a: top-level statements become _start. Classes are built first
     // (their method tables must exist before any user code constructs an
     // instance), then top-level variables (which become module globals).
     let mut cx = FuncCx {
         is_top: true,
+        greprs: g.global_reprs.clone(),
+        rets: g.func_ret_reprs.clone(),
         ..Default::default()
     };
     let mut body = Body::new();
@@ -263,9 +340,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         .globals
         .push("(global $NONE (ref $NONE_T) (struct.new $NONE_T))".into());
     for name in &g.globals {
-        module.globals.push(format!(
-            "(global $g_{name} (mut (ref null eq)) (ref.null eq))"
-        ));
+        module.globals.push(match g.global_reprs.get(name) {
+            Some(Repr::Int) => format!("(global $g_{name} (mut i32) (i32.const 0))"),
+            Some(Repr::Float) => format!("(global $g_{name} (mut f64) (f64.const 0))"),
+            _ => format!("(global $g_{name} (mut (ref null eq)) (ref.null eq))"),
+        });
     }
     for name in g.classes.keys() {
         module.globals.push(format!(
@@ -5749,6 +5828,17 @@ struct Gen {
     /// Default-value expressions for the trailing parameters of each function
     /// (evaluated at the call site to fill omitted arguments).
     func_defaults: HashMap<String, Vec<Expr>>,
+    /// Typed call convention (annotations, trusted like the native emitter):
+    /// per-param reprs and the return repr of each user function. Boxed
+    /// everywhere unless `: int`/`: float` (param never rebound in the body)
+    /// or `-> int`/`-> float` (every terminating path returns a value).
+    func_param_reprs: HashMap<String, Vec<Repr>>,
+    func_ret_reprs: HashMap<String, Repr>,
+    /// Module globals with raw scalar wasm representations. Typed ONLY when
+    /// inference proves every top-level binding Int/Float AND the first
+    /// binding is in the leading all-assignments prefix — so nothing can run
+    /// (and read a zero) before the global holds a real value.
+    global_reprs: HashMap<String, Repr>,
     /// Parameter names of each function, for binding keyword arguments.
     func_params: HashMap<String, Vec<String>>,
     /// User classes: name -> base class name (None if no base). Collected in
@@ -5847,6 +5937,16 @@ struct FuncCx {
     /// Typed-slot tier: locals proven Int/Float by the SHARED inference
     /// (src/repr.rs) live in raw i32/f64 wasm locals. Absent = boxed.
     reprs: HashMap<String, Repr>,
+    /// The enclosing function's scalar return repr, when its `-> T`
+    /// annotation types the wasm result. None = boxed (ref null eq).
+    ret_scalar: Option<Repr>,
+    /// User functions' return reprs (a per-function copy of
+    /// `Gen::func_ret_reprs`), so inference can type `x = f()` without
+    /// borrowing `self` inside the emitters.
+    rets: HashMap<String, Repr>,
+    /// Typed module globals (a copy of `Gen::global_reprs`), consulted for
+    /// names that are NOT locals (`vars` decides which is which).
+    greprs: HashMap<String, Repr>,
 }
 
 impl FuncCx {
@@ -5895,7 +5995,18 @@ impl Gen {
                 let value = self.value_expr(cx, expr)?;
                 if cx.is_top {
                     self.ensure_global(name);
-                    out.push(format!("(global.set $g_{name} {value})"));
+                    if let Some(r) = cx.greprs.get(name.as_str()).copied() {
+                        let store = match self.scalar_expr(cx, expr, r) {
+                            Some(sc) => sc,
+                            None => match r {
+                                Repr::Int => format!("(call $unbox {value})"),
+                                _ => format!("(call $unbox_f64 {value})"),
+                            },
+                        };
+                        out.push(format!("(global.set $g_{name} {store})"));
+                    } else {
+                        out.push(format!("(global.set $g_{name} {value})"));
+                    }
                 } else if let Some(r) = cx.reprs.get(name.as_str()).copied() {
                     // Typed slot: store the raw scalar. The inference proved
                     // every binding of this name has repr `r`, so the direct
@@ -6010,6 +6121,21 @@ impl Gen {
                         s.line,
                         "'return' can only be used inside a function",
                     ));
+                }
+                if let (Some(r), Some(e)) = (cx.ret_scalar, value.as_ref()) {
+                    self.type_of(cx, e)?;
+                    let raw = match self.scalar_expr(cx, e, r) {
+                        Some(sc) => sc,
+                        None => {
+                            let boxed = self.value_expr(cx, e)?;
+                            match r {
+                                Repr::Int => format!("(call $unbox {boxed})"),
+                                _ => format!("(call $unbox_f64 {boxed})"),
+                            }
+                        }
+                    };
+                    out.push(format!("(return {raw})"));
+                    return Ok(());
                 }
                 let v = match value {
                     Some(e) => {
@@ -6248,7 +6374,11 @@ impl Gen {
         cx.locals.push((ctr.clone(), "i32".to_string()));
         let set_var = if cx.is_top {
             self.ensure_global(var);
-            format!("(global.set $g_{var} (call $box (local.get ${ctr})))")
+            if matches!(cx.greprs.get(var), Some(Repr::Int)) {
+                format!("(global.set $g_{var} (local.get ${ctr}))")
+            } else {
+                format!("(global.set $g_{var} (call $box (local.get ${ctr})))")
+            }
         } else if matches!(cx.reprs.get(var), Some(Repr::Int)) {
             // Typed slot: the counter IS the value — no box per iteration.
             format!("(local.set ${var} (local.get ${ctr}))")
@@ -6287,7 +6417,20 @@ impl Gen {
     /// names assigned anywhere in the body (plus parameters) are locals;
     /// everything else resolves to module globals.
     fn gen_def(&mut self, name: &str, params: &[String], body: &[Stmt]) -> Result<Func> {
-        let mut cx = FuncCx::default();
+        let mut cx = FuncCx {
+            rets: self.func_ret_reprs.clone(),
+            greprs: self.global_reprs.clone(),
+            ..Default::default()
+        };
+        let preprs = self
+            .func_param_reprs
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| vec![Repr::Boxed; params.len()]);
+        cx.ret_scalar = match self.func_ret_reprs.get(name) {
+            Some(r @ (Repr::Int | Repr::Float)) => Some(*r),
+            _ => None,
+        };
         for p in params {
             cx.vars.insert(p.clone(), Ty::Value);
         }
@@ -6299,10 +6442,11 @@ impl Gen {
         // to "unknown" and demote whatever they flow into, exactly like the
         // native emitter's unannotated-param case.
         let mut fixed = HashMap::new();
-        for p in params {
-            fixed.insert(p.clone(), Repr::Boxed);
+        for (p, r) in params.iter().zip(&preprs) {
+            fixed.insert(p.clone(), *r);
         }
-        let mut reprs = infer_slot_reprs(body, &fixed, &HashMap::new());
+        let rets = cx.rets.clone();
+        let mut reprs = infer_slot_reprs(body, &fixed, &rets);
         // Phase-1 exclusions, all conservative: loop variables (gen_for /
         // gen_foreach still bind boxed) and any name a comprehension binds
         // (comp_for reuses the local for boxed elements).
@@ -6315,6 +6459,12 @@ impl Gen {
         collect_maybe_unassigned_reads(body, &mut std::collections::HashSet::new(), &mut demoted);
         for n in &demoted {
             reprs.remove(n);
+        }
+        // Typed params read like typed locals (raw get; boxed contexts box).
+        for (p, r) in params.iter().zip(&preprs) {
+            if matches!(r, Repr::Int | Repr::Float) {
+                reprs.insert(p.clone(), *r);
+            }
         }
         cx.reprs = reprs;
         let mut local_names: Vec<&String> = assigned.iter().collect();
@@ -6337,15 +6487,31 @@ impl Gen {
 
         let mut b = Body::new();
         self.stmts(&mut cx, body, &mut b)?;
-        // Falling off the end returns None, like Python.
-        b.push("(global.get $NONE)");
+        match cx.ret_scalar {
+            // Every terminating path is `return <expr>` (pass 1 checked), so
+            // the tail is unreachable; say so instead of pushing a boxed None
+            // into a scalar result.
+            Some(_) => b.push("(unreachable)"),
+            // Falling off the end returns None, like Python.
+            None => b.push("(global.get $NONE)"),
+        }
 
         let param_decls: String = params
             .iter()
-            .map(|p| format!(" (param ${p} (ref null eq))"))
+            .zip(&preprs)
+            .map(|(p, r)| match r {
+                Repr::Int => format!(" (param ${p} i32)"),
+                Repr::Float => format!(" (param ${p} f64)"),
+                _ => format!(" (param ${p} (ref null eq))"),
+            })
             .collect();
+        let result_ty = match cx.ret_scalar {
+            Some(Repr::Int) => "i32",
+            Some(Repr::Float) => "f64",
+            _ => "(ref null eq)",
+        };
         Ok(Func {
-            signature: format!("(func $f_{name}{param_decls} (result (ref null eq))"),
+            signature: format!("(func $f_{name}{param_decls} (result {result_ty})"),
             locals: cx
                 .locals
                 .iter()
@@ -6986,7 +7152,13 @@ impl Gen {
                 } else if cx.vars.contains_key(n) {
                     Ok(format!("(local.get ${n})"))
                 } else if self.is_global(n) {
-                    Ok(format!("(global.get $g_{n})"))
+                    Ok(match cx.greprs.get(n.as_str()) {
+                        Some(Repr::Int) => format!("(call $box (global.get $g_{n}))"),
+                        Some(Repr::Float) => {
+                            format!("(struct.new $FLOAT (global.get $g_{n}))")
+                        }
+                        _ => format!("(global.get $g_{n})"),
+                    })
                 } else if let Some(id) = self.handler_id(n) {
                     // A bare zero-arg function used as a value (e.g. an event
                     // handler `on_click(greet)`) becomes its `__dispatch` id,
@@ -8115,6 +8287,11 @@ impl Gen {
                     }
                 }
 
+                let preprs = self
+                    .func_param_reprs
+                    .get(n)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Repr::Boxed; total]);
                 let mut wat = format!("(call $f_{n}");
                 for (j, slot) in slots.into_iter().enumerate() {
                     let bound = match slot {
@@ -8131,10 +8308,31 @@ impl Gen {
                         }
                     };
                     wat.push(' ');
-                    wat.push_str(&self.value_expr(cx, &bound)?);
+                    let lowered = match preprs.get(j) {
+                        Some(r @ (Repr::Int | Repr::Float)) => {
+                            match self.scalar_expr(cx, &bound, *r) {
+                                Some(sc) => sc,
+                                None => {
+                                    let boxed = self.value_expr(cx, &bound)?;
+                                    match r {
+                                        Repr::Int => format!("(call $unbox {boxed})"),
+                                        _ => format!("(call $unbox_f64 {boxed})"),
+                                    }
+                                }
+                            }
+                        }
+                        _ => self.value_expr(cx, &bound)?,
+                    };
+                    wat.push_str(&lowered);
                 }
                 wat.push(')');
-                Ok(wat)
+                // A scalar return in this boxed context gets boxed here; the
+                // scalar_expr Call arm consumes it raw instead.
+                match self.func_ret_reprs.get(n) {
+                    Some(Repr::Int) => Ok(format!("(call $box {wat})")),
+                    Some(Repr::Float) => Ok(format!("(struct.new $FLOAT {wat})")),
+                    _ => Ok(wat),
+                }
             }
         }
     }
@@ -8142,6 +8340,9 @@ impl Gen {
     /// Generate WAT producing the raw i32 of `e` — a constant directly,
     /// anything else via `$unbox`.
     fn i32_expr(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
+        if let Some(sc) = self.scalar_expr(cx, e, Repr::Int) {
+            return Ok(sc);
+        }
         if let Some(v) = const_int(e) {
             return match i32::try_from(v) {
                 Ok(v32) => Ok(format!("(i32.const {v32})")),
@@ -8213,10 +8414,16 @@ impl Gen {
     /// convert exactly). Returns None when either side isn't provable —
     /// the caller falls back to the boxed helpers.
     fn scalar_cmp(&mut self, cx: &mut FuncCx, op: BinOp, a: &Expr, b: &Expr) -> Option<String> {
-        let empty = HashMap::new();
-        let look = |n: &str| cx.reprs.get(n).copied();
-        let ra = infer_expr_repr(a, &look, &empty)?;
-        let rb = infer_expr_repr(b, &look, &empty)?;
+        let rets = cx.rets.clone();
+        let look = |n: &str| {
+            if cx.vars.contains_key(n) || cx.reprs.contains_key(n) {
+                cx.reprs.get(n).copied()
+            } else {
+                cx.greprs.get(n).copied()
+            }
+        };
+        let ra = infer_expr_repr(a, &look, &rets)?;
+        let rb = infer_expr_repr(b, &look, &rets)?;
         if !matches!(ra, Repr::Int | Repr::Float) || !matches!(rb, Repr::Int | Repr::Float) {
             return None;
         }
@@ -8260,9 +8467,15 @@ impl Gen {
     /// and float / checks its divisor ($f_div). Same observable behavior,
     /// no boxing, no dynamic dispatch.
     fn scalar_expr(&mut self, cx: &mut FuncCx, e: &Expr, want: Repr) -> Option<String> {
-        let empty = HashMap::new();
-        let look = |n: &str| cx.reprs.get(n).copied();
-        let r = infer_expr_repr(e, &look, &empty)?;
+        let rets = cx.rets.clone();
+        let look = |n: &str| {
+            if cx.vars.contains_key(n) || cx.reprs.contains_key(n) {
+                cx.reprs.get(n).copied()
+            } else {
+                cx.greprs.get(n).copied()
+            }
+        };
+        let r = infer_expr_repr(e, &look, &rets)?;
         if r != want && !(want == Repr::Float && r == Repr::Int) {
             return None;
         }
@@ -8273,12 +8486,75 @@ impl Gen {
             }
             (ExprKind::Int(v), Repr::Float) => Some(format!("(f64.const {})", *v as f64)),
             (ExprKind::Float(f), Repr::Float) => Some(format!("(f64.const {f})")),
-            (ExprKind::Name(n), _) => match (cx.reprs.get(n.as_str())?, want) {
-                (Repr::Int, Repr::Int) => Some(format!("(local.get ${n})")),
-                (Repr::Float, Repr::Float) => Some(format!("(local.get ${n})")),
-                (Repr::Int, Repr::Float) => Some(format!("(f64.convert_i32_s (local.get ${n}))")),
-                _ => None,
-            },
+            (ExprKind::Name(n), _) => {
+                let (r, get) = if cx.vars.contains_key(n) || cx.reprs.contains_key(n.as_str()) {
+                    (*cx.reprs.get(n.as_str())?, format!("(local.get ${n})"))
+                } else {
+                    (*cx.greprs.get(n.as_str())?, format!("(global.get $g_{n})"))
+                };
+                match (r, want) {
+                    (Repr::Int, Repr::Int) | (Repr::Float, Repr::Float) => Some(get),
+                    (Repr::Int, Repr::Float) => Some(format!("(f64.convert_i32_s {get})")),
+                    _ => None,
+                }
+            }
+            (ExprKind::Call(f, args), _) => {
+                // A user function whose typed return matches: emit the raw
+                // call (arg lowering happens in value_expr's Call arm — reuse
+                // it by asking for the boxed form and unwrapping would double
+                // the work, so lower here the same way).
+                let ret = *cx.rets.get(f.as_str())?;
+                if !(ret == want || (want == Repr::Float && ret == Repr::Int)) {
+                    return None;
+                }
+                if args.iter().any(|a| matches!(a.kind, ExprKind::Kwarg(..))) {
+                    return None; // kwarg reorder lives in the boxed path
+                }
+                let total = *self.funcs.get(f.as_str())?;
+                let defaults = self
+                    .func_defaults
+                    .get(f.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                if args.len() + defaults.len() < total || args.len() > total {
+                    return None; // arity error: let the boxed path report it
+                }
+                let preprs = self
+                    .func_param_reprs
+                    .get(f.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| vec![Repr::Boxed; total]);
+                let mut wat = format!("(call $f_{f}");
+                for j in 0..total {
+                    let bound = if j < args.len() {
+                        args[j].clone()
+                    } else {
+                        defaults[j - (total - defaults.len())].clone()
+                    };
+                    wat.push(' ');
+                    let lowered = match preprs.get(j) {
+                        Some(r2 @ (Repr::Int | Repr::Float)) => {
+                            match self.scalar_expr(cx, &bound, *r2) {
+                                Some(sc) => sc,
+                                None => {
+                                    let boxed = self.value_expr(cx, &bound).ok()?;
+                                    match r2 {
+                                        Repr::Int => format!("(call $unbox {boxed})"),
+                                        _ => format!("(call $unbox_f64 {boxed})"),
+                                    }
+                                }
+                            }
+                        }
+                        _ => self.value_expr(cx, &bound).ok()?,
+                    };
+                    wat.push_str(&lowered);
+                }
+                wat.push(')');
+                if want == Repr::Float && ret == Repr::Int {
+                    return Some(format!("(f64.convert_i32_s {wat})"));
+                }
+                Some(wat)
+            }
             (ExprKind::Unary(UnOp::Neg, i), Repr::Int) => {
                 let x = self.scalar_expr(cx, i, Repr::Int)?;
                 Some(format!("(call $i_neg {x})"))
@@ -8768,6 +9044,32 @@ fn collect_loop_and_comp_vars(body: &[Stmt], out: &mut std::collections::HashSet
     }
 }
 
+/// Every terminating path through `body` ends in `return <expr>` — the
+/// precondition for giving a function a raw scalar wasm result. Bare
+/// `return` and falling off the end both return None, which a scalar
+/// result cannot represent, so they fail the check (the annotation then
+/// simply doesn't type the signature; nothing is rejected).
+fn all_paths_return(body: &[Stmt]) -> bool {
+    match body.last() {
+        Some(s) => match &s.kind {
+            StmtKind::Return(v) => v.is_some(),
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                all_paths_return(body)
+                    && elifs.iter().all(|(_, b)| all_paths_return(b))
+                    && else_body.as_ref().is_some_and(|b| all_paths_return(b))
+            }
+            // Loops may run zero times; anything else doesn't return.
+            _ => false,
+        },
+        None => false,
+    }
+}
+
 /// Names assigned anywhere in a statement list (assignment targets and
 /// for-loop variables) — Python's "assigned anywhere in the body = local".
 fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
@@ -9091,9 +9393,10 @@ mod tests {
     #[test]
     fn variable_then_print() {
         let wat = compile("x = 5\nprint(x)").unwrap();
-        assert!(wat.contains("(global $g_x (mut (ref null eq)) (ref.null eq))"));
-        assert!(wat.contains("(global.set $g_x (ref.i31 (i32.const 5)))"));
-        assert!(wat.contains("(call $print_value (global.get $g_x))"));
+        // A provably-int module global is a raw i32 global now.
+        assert!(wat.contains("(global $g_x (mut i32) (i32.const 0))"));
+        assert!(wat.contains("(global.set $g_x (i32.const 5))"));
+        assert!(wat.contains("(call $print_value (call $box (global.get $g_x)))"));
     }
 
     #[test]
@@ -9125,7 +9428,7 @@ mod tests {
         let wat = compile("x = 3\nif x < 5:\n    print(1)\nelse:\n    print(2)\n").unwrap();
         // Comparison conditions skip the boxed-bool round-trip; the operands
         // stay boxed so a custom dunder could run.
-        assert!(wat.contains("(if (call $py_lt (global.get $g_x) (ref.i31 (i32.const 5)))"));
+        assert!(wat.contains("(if (i32.lt_s (global.get $g_x) (i32.const 5))"));
         assert!(wat.contains("(then"));
         assert!(wat.contains("(else"));
     }
@@ -9136,18 +9439,19 @@ mod tests {
             "x = 2\nif x < 1:\n    print(1)\nelif x < 3:\n    print(2)\nelse:\n    print(3)\n";
         let wat = compile(src).unwrap();
         // Two conditions compile to two direct comparisons in _start.
-        assert_eq!(wat.matches("(if (call $py_lt").count(), 2);
+        assert!(wat.contains("(if (i32.lt_s (global.get $g_x) (i32.const 1))"));
+        assert!(wat.contains("(if (i32.lt_s (global.get $g_x) (i32.const 3))"));
     }
 
     #[test]
     fn for_loop_uses_raw_i32_counter() {
         let wat = compile("for i in range(3):\n    print(i)\n").unwrap();
-        assert!(wat.contains("(global $g_i (mut (ref null eq)) (ref.null eq))"));
+        assert!(wat.contains("(global $g_i (mut i32) (i32.const 0))"));
         assert!(wat.contains("(local $.f0 i32)"));
         assert!(wat.contains("(local.set $.f0 (i32.const 0))"));
         assert!(wat.contains("(br_if $b0 (i32.ge_s (local.get $.f0) (i32.const 3)))"));
-        // The Python-visible loop variable gets the boxed counter.
-        assert!(wat.contains("(global.set $g_i (call $box (local.get $.f0)))"));
+        // The Python-visible loop variable IS the raw counter now.
+        assert!(wat.contains("(global.set $g_i (local.get $.f0))"));
         assert!(wat.contains("(local.set $.f0 (i32.add (local.get $.f0) (i32.const 1)))"));
     }
 
@@ -9156,7 +9460,7 @@ mod tests {
         let wat = compile("n = 3\nfor i in range(0, n):\n    n = n + 1\n").unwrap();
         // The end bound is unboxed once into an i32 scratch local.
         assert!(wat.contains("(local $.t0 i32)"));
-        assert!(wat.contains("(local.set $.t0 (call $unbox (global.get $g_n)))"));
+        assert!(wat.contains("(local.set $.t0 (global.get $g_n))"));
         assert!(wat.contains("(br_if $b0 (i32.ge_s (local.get $.f0) (local.get $.t0)))"));
     }
 
@@ -9202,9 +9506,7 @@ mod tests {
     #[test]
     fn while_emits_loop_with_negated_test() {
         let wat = compile("i = 3\nwhile i > 0:\n    i = i - 1\n").unwrap();
-        assert!(wat.contains(
-            "(br_if $b0 (i32.eqz (call $py_gt (global.get $g_i) (ref.i31 (i32.const 0)))))"
-        ));
+        assert!(wat.contains("(br_if $b0 (i32.eqz (i32.gt_s (global.get $g_i) (i32.const 0))))"));
         assert!(wat.contains("(br $l0)"));
     }
 
@@ -9298,7 +9600,7 @@ mod tests {
     #[test]
     fn float_literals_fold_to_float_structs() {
         let wat = compile("x = 3.5\nprint(-2.5)").unwrap();
-        assert!(wat.contains("(global.set $g_x (struct.new $FLOAT (f64.const 3.5)))"));
+        assert!(wat.contains("(global.set $g_x (f64.const 3.5))"));
         assert!(wat.contains("(struct.new $FLOAT (f64.const -2.5))"));
     }
 
@@ -9333,7 +9635,7 @@ mod tests {
         let wat = compile("x = 1\ndef f():\n    x = 2\n    return x\nprint(f(), x)\n").unwrap();
         // Global x exists; inside f, x is a local — and a provably-int one,
         // so the typed-slot tier gives it a raw i32 slot (boxed on return).
-        assert!(wat.contains("(global $g_x (mut (ref null eq)) (ref.null eq))"));
+        assert!(wat.contains("(global $g_x (mut i32) (i32.const 0))"));
         assert!(wat.contains("(local $x i32)"));
         assert!(wat.contains("(local.set $x (i32.const 2))"));
         assert!(wat.contains("(return (call $box (local.get $x)))"));

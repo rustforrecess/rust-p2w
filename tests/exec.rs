@@ -334,16 +334,21 @@ fn pass_is_a_no_op() {
 
 #[test]
 fn type_annotations_compile_and_are_ignored() {
-    // Annotated params and a return type must compile and run identically to
-    // the untyped form — annotations are hints, not runtime checks.
+    // Annotated params and a return type compile and run identically for
+    // truthful annotations — and scalar ones now TYPE the wasm signature
+    // (raw i32/f64 params/result, the typed call convention).
     assert_output(
         "def add(a: int, b: int) -> int:\n    return a + b\nprint(add(2, 3))",
         "5\n",
     );
-    // A "wrong" annotation doesn't change behaviour (no enforcement).
-    assert_output(
+    // A LYING scalar annotation traps at the boundary — the same contract
+    // the native backend has always had ("a lying annotation traps at the
+    // call, with or without us"), which this backend now matches instead
+    // of silently ignoring the annotation. The full type checker will move
+    // this to a compile error with a real message.
+    assert_raises(
         "def label(x: str) -> int:\n    return x\nprint(label(\"hi\"))",
-        "hi\n",
+        "TypeError",
     );
     // A subscripted type annotation (list[int]) is accepted too.
     assert_output(

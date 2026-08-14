@@ -123,8 +123,8 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `n = 5; n.append(1)` | trap | `AttributeError: 'int' object has no attribute 'append'` |
 | `n = 5; for x in n` | trap | `TypeError: a 'int' is one single value, so a for loop has nothing to go through. A loop needs a list, some text, a dict or a set — or use range(n) to count.` |
 | `x: int = 'no'` | value | `no` |
-| `def f() -> int: return 'x'` | value | `x` |
-| `def f(n: int) called with str` | value | `x` |
+| `def f() -> int: return 'x'` | trap | `TypeError: expected a number, got 'str'` |
+| `def f(n: int) called with str` | trap | `TypeError: expected a number, got 'str'` |
 | `wrong arity` | compile error | `line 3: f() is missing a required argument 'b'` |
 | `call a number` | compile error | `line 2: unknown function 'total'` |
 | `read before assignment` | compile error | `line 2: unknown name 'q' (define it with `q = ...` first)` |
