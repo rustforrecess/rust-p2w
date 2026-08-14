@@ -106,6 +106,12 @@ fn num(v: Value) -> Option<i64> {
 // run reclaims everything at once; ref counting (retain/release) reclaims
 // mid-run. Strings are the first heap type; lists/dicts follow.
 
+// Kani models the whole arena array symbolically — 64K cells is hours of
+// solver time, and the allocator invariants are size-independent, so the
+// proofs run against a small arena.
+#[cfg(kani)]
+const HEAP_SIZE: usize = 2048;
+#[cfg(not(kani))]
 const HEAP_SIZE: usize = 64 * 1024; // device build tunes this to available SRAM
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2982,9 +2988,9 @@ fn to_fixed(x: f64, prec: i32) -> Value {
 /// Halt on an unrecoverable runtime error. On the device this will report over
 /// USB-CDC and stop; for now it panics (host) / loops (device).
 fn trap(_msg: &str) -> ! {
-    #[cfg(test)]
+    #[cfg(any(test, kani))]
     panic!("p2w runtime trap: {_msg}");
-    #[cfg(not(test))]
+    #[cfg(not(any(test, kani)))]
     {
         // SAY WHAT HAPPENED. This used to discard the message and spin, which
         // meant every runtime error on the device — all ~100 trap sites — was
@@ -3009,11 +3015,11 @@ fn trap(_msg: &str) -> ! {
 }
 
 /// Panic handler for `no_std` artifacts — the host run-oracle's static lib and
-/// the eventual bare-metal device build. (Under `cfg(test)` the crate is `std`,
-/// which supplies its own handler, so this is excluded there.) Anything that
-/// panics here — a Rust overflow check, say — is an unrecoverable bug, so we
-/// halt like `trap`.
-#[cfg(not(test))]
+/// the eventual bare-metal device build. (Under `cfg(test)` and `cfg(kani)`
+/// the crate links `std`, which supplies its own handler, so this is
+/// excluded there.) Anything that panics here — a Rust overflow check, say —
+/// is an unrecoverable bug, so we halt like `trap`.
+#[cfg(not(any(test, kani)))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {
@@ -3756,4 +3762,61 @@ mod tests {
     // which aborts rather than unwinds, so it can't be asserted with
     // `#[should_panic]`. The detection logic itself is straightforward; the
     // happy-path arithmetic tests above cover the encode/decode round trip.
+}
+
+#[cfg(kani)]
+mod proofs {
+    //! Bounded proofs over the allocator — the layer every backend's memory
+    //! story sits on, and the layer that produced the alloc-returns-0 bug.
+    //! Run in CI (kani job) and locally via WSL: `cargo kani --manifest-path
+    //! runtime/Cargo.toml`. Bounds are small (the solver pays per byte), but
+    //! within them these hold for EVERY input, not a sample.
+    use super::*;
+
+    /// alloc's postcondition, for all sizes in bound: a nonzero, 4-aligned,
+    /// in-bounds offset whose block never extends past the arena — or a
+    /// loud trap (panic here). Returning 0 was the corruption bug's door.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn alloc_is_aligned_nonzero_in_bounds() {
+        heap_reset();
+        let n: usize = kani::any();
+        kani::assume(n <= 32);
+        let off = alloc(n);
+        assert!(off != 0, "alloc must never return 0");
+        assert!(off % 4 == 0, "payloads are 4-aligned");
+        assert!(off + n <= HEAP_SIZE, "block stays inside the arena");
+    }
+
+    /// Two live allocations never overlap, for any sizes in bound.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn live_allocations_are_disjoint() {
+        heap_reset();
+        let a_n: usize = kani::any();
+        let b_n: usize = kani::any();
+        kani::assume(a_n <= 32 && b_n <= 32);
+        let a = alloc(a_n);
+        let b = alloc(b_n);
+        assert!(a + a_n <= b || b + b_n <= a, "live blocks must be disjoint");
+    }
+
+    /// Free-then-alloc of the same size reuses the freed block (first-fit,
+    /// whole-block) and the reused offset still satisfies the postcondition.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn freelist_reuse_returns_the_freed_block() {
+        heap_reset();
+        let n: usize = kani::any();
+        kani::assume(n > 0 && n <= 32);
+        let a = alloc(n);
+        let survivor = alloc(8);
+        dealloc(a);
+        let b = alloc(n);
+        assert!(b == a, "first-fit must reuse the freed block");
+        assert!(
+            b + n <= survivor || survivor + 8 <= b,
+            "reuse must not overlap the survivor"
+        );
+    }
 }

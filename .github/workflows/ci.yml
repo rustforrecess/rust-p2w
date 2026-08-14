@@ -27,6 +27,18 @@ jobs:
   # whole test suite and rejects any undefined behavior (misalignment, OOB,
   # aliasing). ~8s of runtime — cheap insurance on the code both backends'
   # futures sit on.
+  # Bounded proofs over the allocator (runtime/src/lib.rs cfg(kani) module):
+  # alloc postconditions, disjointness, freelist reuse — hold for EVERY input
+  # within bounds, not a sample. The proofs run against a 2KB arena model
+  # (invariants are size-independent; 64K symbolic cells is hours of solver).
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo install kani-verifier --locked
+      - run: kani setup
+      - run: cargo kani --manifest-path runtime/Cargo.toml
+
   miri:
     runs-on: ubuntu-latest
     steps:

@@ -60,6 +60,8 @@ After touching `runtime/` (unsafe offset arithmetic — CI enforces this too):
 
 ```bash
 cargo +nightly miri test --manifest-path runtime/Cargo.toml
+# and the bounded proofs (Kani has no Windows build — run via WSL):
+wsl -d Ubuntu-24.04 -- bash -lc "cd /mnt/c/Code/P2W/rust-p2w/runtime && CARGO_TARGET_DIR=/tmp/kani-target RUSTC_WRAPPER= ~/.cargo/bin/cargo-kani kani"
 ```
 
 Root `cargo fmt` does NOT reach `runtime/` or `tools/mathwat/` — they
