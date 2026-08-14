@@ -6249,6 +6249,9 @@ impl Gen {
         let set_var = if cx.is_top {
             self.ensure_global(var);
             format!("(global.set $g_{var} (call $box (local.get ${ctr})))")
+        } else if matches!(cx.reprs.get(var), Some(Repr::Int)) {
+            // Typed slot: the counter IS the value — no box per iteration.
+            format!("(local.set ${var} (local.get ${ctr}))")
         } else {
             format!("(local.set ${var} (call $box (local.get ${ctr})))")
         };
@@ -8697,13 +8700,15 @@ fn collect_loop_and_comp_vars(body: &[Stmt], out: &mut std::collections::HashSet
                 expr(e, out)
             }
             StmtKind::For {
-                var,
                 start,
                 end,
                 step,
                 body,
+                ..
             } => {
-                out.insert(var.clone());
+                // For-range counters are NOT demoted: gen_for binds the raw
+                // hidden counter straight into a typed slot (the inference
+                // joins the var at Int, matching the native emitter).
                 expr(start, out);
                 expr(end, out);
                 expr(step, out);
