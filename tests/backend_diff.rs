@@ -5,7 +5,7 @@
 //! chose:
 //!
 //! * **WASM-GC** (`compile_to_wat`) — the browser IDE path. Values are
-//!   `(ref null eq)`, memory is the engine's problem, no linear memory.
+//!   `(ref null any)`, memory is the engine's problem, no linear memory.
 //! * **Linear memory** (`compile_to_llvm_ir` + `runtime/`) — the Pico target,
 //!   and also what the component/jco path runs. Reference counted, and it has
 //!   `libm`, so it can do things the GC backend cannot.

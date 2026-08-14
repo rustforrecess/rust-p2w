@@ -1,6 +1,6 @@
 //! WAT code generation — boxed WASM-GC value model.
 //!
-//! Every runtime value is a `(ref null eq)` (the universal type), following
+//! Every runtime value is a `(ref null any)` (the universal type), following
 //! the reference p2w compiler's boxed design:
 //!
 //! - small ints are `i31ref`; ints outside the 31-bit range spill to an
@@ -32,7 +32,7 @@ use std::collections::HashMap;
 type Result<T> = std::result::Result<T, CompileError>;
 
 /// The universal boxed value type.
-const VAL: &str = "(ref null eq)";
+const VAL: &str = "(ref null any)";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Ty {
@@ -309,7 +309,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module.types.push("(type $STR (array (mut i8)))".into());
     module
         .types
-        .push("(type $ITEMS (array (mut (ref null eq))))".into());
+        .push("(type $ITEMS (array (mut (ref null any))))".into());
     // A list is a Vec: logical length + a capacity-sized item array.
     module
         .types
@@ -335,7 +335,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // CLASSES_DESIGN.md). Methods dispatch via $MFUNC function references;
     // instance attrs and class method tables reuse $DICT.
     module.types.push(
-        "(type $MFUNC (func (param (ref null eq)) (param (ref null eq)) (result (ref null eq))))"
+        "(type $MFUNC (func (param (ref null any)) (param (ref null any)) (result (ref null any))))"
             .into(),
     );
     module
@@ -370,7 +370,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module.globals.push(match g.global_reprs.get(name) {
             Some(Repr::Int) => format!("(global $g_{name} (mut i32) (i32.const 0))"),
             Some(Repr::Float) => format!("(global $g_{name} (mut f64) (f64.const 0))"),
-            _ => format!("(global $g_{name} (mut (ref null eq)) (ref.null eq))"),
+            _ => format!("(global $g_{name} (mut (ref null any)) (ref.null eq))"),
         });
     }
     for name in g.classes.keys() {
@@ -525,7 +525,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         b.push_in(1, "(br $chunk)))");
         b.push("(call $s_push)");
         module.funcs.push(Func {
-            signature: "(func $marshal_str (param $v (ref null eq))".into(),
+            signature: "(func $marshal_str (param $v (ref null any))".into(),
             locals: vec![
                 "(local $s (ref null $STR))".into(),
                 "(local $n i32)".into(),
@@ -586,7 +586,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         b.push_in(1, "(br $chunk)))");
         b.push("(local.get $s)");
         module.funcs.push(Func {
-            signature: "(func $get_value (result (ref null eq))".into(),
+            signature: "(func $get_value (result (ref null any))".into(),
             locals: vec![
                 "(local $n i32)".into(),
                 "(local $s (ref null $STR))".into(),
@@ -642,10 +642,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         b.push("(call $print_value (local.get $x))");
         b.push("(call $write_char (i32.const 10))");
         module.funcs.push(Func {
-            signature: "(func $show (param $x (ref null eq))".into(),
+            signature: "(func $show (param $x (ref null any))".into(),
             locals: vec![
                 "(local $cls (ref null $CLASS))".into(),
-                "(local $m (ref null eq))".into(),
+                "(local $m (ref null any))".into(),
             ],
             body: b,
         });
@@ -685,7 +685,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         b.push_in(1, "(br $chunk)))");
         b.push("(local.get $s)");
         module.funcs.push(Func {
-            signature: "(func $get_field (result (ref null eq))".into(),
+            signature: "(func $get_field (result (ref null any))".into(),
             locals: vec![
                 "(local $n i32)".into(),
                 "(local $s (ref null $STR))".into(),
@@ -757,7 +757,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push(")");
     push_text(&mut b, 0, "object");
     fs.push(Func {
-        signature: "(func $type_name (param $r (ref null eq))".into(),
+        signature: "(func $type_name (param $r (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -783,7 +783,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $raise_type_num (param $r (ref null eq))".into(),
+        signature: "(func $raise_type_num (param $r (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -804,7 +804,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $raise_index (param $r (ref null eq))".into(),
+        signature: "(func $raise_index (param $r (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -817,7 +817,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $raise_key (param $k (ref null eq))".into(),
+        signature: "(func $raise_key (param $k (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -960,7 +960,7 @@ fn raise_helpers() -> Vec<Func> {
         b.push("(call $write_char (i32.const 10))");
         b.push("unreachable");
         fs.push(Func {
-            signature: format!("(func {fname} (param $r (ref null eq))"),
+            signature: format!("(func {fname} (param $r (ref null any))"),
             locals: vec![],
             body: b,
         });
@@ -982,7 +982,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $raise_not_iterable (param $r (ref null eq))".into(),
+        signature: "(func $raise_not_iterable (param $r (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -998,7 +998,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $raise_no_attr (param $obj (ref null eq)) (param $name (ref null eq))"
+        signature: "(func $raise_no_attr (param $obj (ref null any)) (param $name (ref null any))"
             .into(),
         locals: vec![],
         body: b,
@@ -1019,7 +1019,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("unreachable");
     fs.push(Func {
         signature:
-            "(func $raise_method_value (param $obj (ref null eq)) (param $name (ref null eq))"
+            "(func $raise_method_value (param $obj (ref null any)) (param $name (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -1193,7 +1193,7 @@ fn random_helpers() -> Vec<Func> {
         "(struct.new $FLOAT (f64.mul (f64.convert_i64_u (i64.shr_u (call $rnd_next) (i64.const 11))) (f64.const 1.1102230246251565e-16)))",
     );
     fs.push(Func {
-        signature: "(func $rnd_float (result (ref null eq))".into(),
+        signature: "(func $rnd_float (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -1215,7 +1215,7 @@ fn random_helpers() -> Vec<Func> {
     b.push("(local.set $span (i64.add (i64.sub (i64.extend_i32_s (local.get $b)) (i64.extend_i32_s (local.get $a))) (i64.const 1)))");
     b.push("(call $box (i32.add (local.get $a) (i32.wrap_i64 (i64.rem_u (call $rnd_next) (local.get $span)))))");
     fs.push(Func {
-        signature: "(func $rnd_int (param $a i32) (param $b i32) (result (ref null eq))".into(),
+        signature: "(func $rnd_int (param $a i32) (param $b i32) (result (ref null any))".into(),
         locals: vec!["(local $span i64)".into()],
         body: b,
     });
@@ -1235,7 +1235,7 @@ fn random_helpers() -> Vec<Func> {
     b.push("))");
     b.push("(call $py_index (local.get $xs) (i32.wrap_i64 (i64.rem_u (call $rnd_next) (i64.extend_i32_s (local.get $n)))))");
     fs.push(Func {
-        signature: "(func $rnd_choice (param $xs (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $rnd_choice (param $xs (ref null any)) (result (ref null any))".into(),
         locals: vec!["(local $n i32)".into()],
         body: b,
     });
@@ -1264,11 +1264,11 @@ fn random_helpers() -> Vec<Func> {
     b.push_in(1, "(local.set $i (i32.sub (local.get $i) (i32.const 1)))");
     b.push_in(1, "(br $next)))");
     fs.push(Func {
-        signature: "(func $rnd_shuffle (param $xs (ref null eq))".into(),
+        signature: "(func $rnd_shuffle (param $xs (ref null any))".into(),
         locals: vec![
             "(local $i i32)".into(),
             "(local $j i32)".into(),
-            "(local $tmp (ref null eq))".into(),
+            "(local $tmp (ref null any))".into(),
         ],
         body: b,
     });
@@ -1285,7 +1285,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $box: i32 -> value (i31 when it fits, $INT struct otherwise).
     let mut b = Body::new();
-    b.push("(if (result (ref null eq))");
+    b.push("(if (result (ref null any))");
     b.push_in(
         2,
         "(i32.eq (i32.shr_s (i32.shl (local.get $v) (i32.const 1)) (i32.const 1)) (local.get $v))",
@@ -1293,7 +1293,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(1, "(then (ref.i31 (local.get $v)))");
     b.push_in(1, "(else (struct.new $INT (local.get $v))))");
     fs.push(Func {
-        signature: "(func $box (param $v i32) (result (ref null eq))".into(),
+        signature: "(func $box (param $v i32) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -1322,18 +1322,18 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $raise_type_num (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $unbox (param $r (ref null eq)) (result i32)".into(),
+        signature: "(func $unbox (param $r (ref null any)) (result i32)".into(),
         locals: vec![],
         body: b,
     });
 
     // $bool: i32 (0/1) -> the singleton $TRUE/$FALSE.
     let mut b = Body::new();
-    b.push("(if (result (ref null eq)) (local.get $v)");
+    b.push("(if (result (ref null any)) (local.get $v)");
     b.push_in(1, "(then (global.get $TRUE))");
     b.push_in(1, "(else (global.get $FALSE)))");
     fs.push(Func {
-        signature: "(func $bool (param $v i32) (result (ref null eq))".into(),
+        signature: "(func $bool (param $v i32) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -1350,7 +1350,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(else (f64.convert_i32_s (call $unbox (local.get $r)))))",
     );
     fs.push(Func {
-        signature: "(func $unbox_f64 (param $r (ref null eq)) (result f64)".into(),
+        signature: "(func $unbox_f64 (param $r (ref null any)) (result f64)".into(),
         locals: vec![],
         body: b,
     });
@@ -1362,7 +1362,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $either_float (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
+            "(func $either_float (param $a (ref null any)) (param $b (ref null any)) (result i32)"
                 .into(),
         locals: vec![],
         body: b,
@@ -1411,7 +1411,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(i32.ne (call $unbox (local.get $r)) (i32.const 0))");
     fs.push(Func {
-        signature: "(func $truthy (param $r (ref null eq)) (result i32)".into(),
+        signature: "(func $truthy (param $r (ref null any)) (result i32)".into(),
         locals: vec![],
         body: b,
     });
@@ -1456,7 +1456,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $raise_no_len (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $py_len (param $r (ref null eq)) (result i32)".into(),
+        signature: "(func $py_len (param $r (ref null any)) (result i32)".into(),
         locals: vec![],
         body: b,
     });
@@ -1481,7 +1481,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $raise_not_iterable (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $py_iter_len (param $r (ref null eq)) (result i32)".into(),
+        signature: "(func $py_iter_len (param $r (ref null any)) (result i32)".into(),
         locals: vec![],
         body: b,
     });
@@ -1534,8 +1534,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(array.set $STR (local.get $c) (i32.const 0) (array.get_u $STR (ref.cast (ref $STR) (local.get $r)) (local.get $i)))");
     b.push("(local.get $c)");
     fs.push(Func {
-        signature: "(func $py_index (param $r (ref null eq)) (param $i i32) (result (ref null eq))"
-            .into(),
+        signature:
+            "(func $py_index (param $r (ref null any)) (param $i i32) (result (ref null any))"
+                .into(),
         locals: vec!["(local $n i32)".into(), "(local $c (ref null $STR))".into()],
         body: b,
     });
@@ -1558,7 +1559,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(array.set $ITEMS (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $r))) (local.get $i) (local.get $v))");
     fs.push(Func {
         signature:
-            "(func $py_set_index (param $r (ref null eq)) (param $i i32) (param $v (ref null eq))"
+            "(func $py_set_index (param $r (ref null any)) (param $i i32) (param $v (ref null any))"
                 .into(),
         locals: vec!["(local $n i32)".into()],
         body: b,
@@ -1592,7 +1593,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $NONE)");
     fs.push(Func {
         signature:
-            "(func $list_append (param $l (ref null eq)) (param $v (ref null eq)) (result (ref null eq))"
+            "(func $list_append (param $l (ref null any)) (param $v (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $lst (ref null $LIST))".into(),
@@ -1617,7 +1618,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(i32.const -1)");
     fs.push(Func {
         signature:
-            "(func $set_find (param $s (ref null $SET)) (param $v (ref null eq)) (result i32)"
+            "(func $set_find (param $s (ref null $SET)) (param $v (ref null any)) (result i32)"
                 .into(),
         locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
         body: b,
@@ -1646,7 +1647,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(array.set $ITEMS (local.get $items) (local.get $len) (local.get $v))");
     b.push("(struct.set $SET 0 (local.get $s) (i32.add (local.get $len) (i32.const 1)))");
     fs.push(Func {
-        signature: "(func $set_insert (param $s (ref null $SET)) (param $v (ref null eq))".into(),
+        signature: "(func $set_insert (param $s (ref null $SET)) (param $v (ref null any))".into(),
         locals: vec![
             "(local $items (ref null $ITEMS))".into(),
             "(local $new (ref null $ITEMS))".into(),
@@ -1685,7 +1686,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br $next)))");
     b.push("(local.get $s)");
     fs.push(Func {
-        signature: "(func $py_set (param $it (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_set (param $it (ref null any)) (result (ref null any))".into(),
         locals: vec![
             "(local $s (ref null $SET))".into(),
             "(local $n i32)".into(),
@@ -1710,7 +1711,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br $next)))");
     b.push("(local.get $l)");
     fs.push(Func {
-        signature: "(func $py_list (param $it (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_list (param $it (ref null any)) (result (ref null any))".into(),
         locals: vec![
             "(local $l (ref null $LIST))".into(),
             "(local $n i32)".into(),
@@ -1725,7 +1726,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.set $l (ref.cast (ref $LIST) (call $py_list (local.get $it))))");
     b.push("(struct.new $TUPLE (struct.get $LIST 0 (local.get $l)) (struct.get $LIST 1 (local.get $l)))");
     fs.push(Func {
-        signature: "(func $py_tuple (param $it (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_tuple (param $it (ref null any)) (result (ref null any))".into(),
         locals: vec!["(local $l (ref null $LIST))".into()],
         body: b,
     });
@@ -1850,14 +1851,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $out)");
     fs.push(Func {
         signature:
-            "(func $py_setop (param $a (ref null eq)) (param $b (ref null eq)) (param $mode i32) (result (ref null eq))"
+            "(func $py_setop (param $a (ref null any)) (param $b (ref null any)) (param $mode i32) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $sa (ref null $SET))".into(),
             "(local $sb (ref null $SET))".into(),
             "(local $out (ref null $SET))".into(),
             "(local $i i32)".into(),
-            "(local $e (ref null eq))".into(),
+            "(local $e (ref null any))".into(),
             "(local $found i32)".into(),
         ],
         body: b,
@@ -1885,7 +1886,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $TRUE)");
     fs.push(Func {
         signature:
-            "(func $set_method (param $r (ref null eq)) (param $o (ref null eq)) (param $mode i32) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $set_method (param $r (ref null any)) (param $o (ref null any)) (param $mode i32) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $rs (ref null $SET))".into(),
@@ -1912,7 +1913,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $NONE)");
     fs.push(Func {
         signature:
-            "(func $dict_update (param $r (ref null eq)) (param $o (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $dict_update (param $r (ref null any)) (param $o (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $od (ref null $DICT))".into(),
@@ -1929,7 +1930,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $NONE)");
     fs.push(Func {
         signature:
-            "(func $dict_clear (param $r (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $dict_clear (param $r (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -1946,7 +1947,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $default)");
     fs.push(Func {
         signature:
-            "(func $dict_setdefault (param $r (ref null eq)) (param $key (ref null eq)) (param $default (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $dict_setdefault (param $r (ref null any)) (param $key (ref null any)) (param $default (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $dd (ref null $DICT))".into(),
@@ -1982,18 +1983,18 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(1, "(br $sl)))");
-    b.push("(if (result (ref null eq)) (i32.or (local.get $all_str) (local.get $all_num))");
+    b.push("(if (result (ref null any)) (i32.or (local.get $all_str) (local.get $all_num))");
     b.push_in(1, "(then (call $py_sorted (local.get $s) (i32.const 0)))");
     b.push_in(1, "(else (local.get $s)))");
     fs.push(Func {
-        signature: "(func $set_display_seq (param $s (ref null $SET)) (result (ref null eq))"
+        signature: "(func $set_display_seq (param $s (ref null $SET)) (result (ref null any))"
             .into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $all_str i32)".into(),
             "(local $all_num i32)".into(),
-            "(local $e (ref null eq))".into(),
+            "(local $e (ref null any))".into(),
         ],
         body: b,
     });
@@ -2027,7 +2028,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
-            "(local $seq (ref null eq))".into(),
+            "(local $seq (ref null any))".into(),
         ],
         body: b,
     });
@@ -2061,7 +2062,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         }
         fs.push(Func {
             signature: format!(
-                "(func {fname} (param $r (ref null eq)) (param $v (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                "(func {fname} (param $r (ref null any)) (param $v (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
                 "(local $ss (ref null $SET))".into(),
@@ -2090,7 +2091,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(i32.const -1)");
     fs.push(Func {
         signature:
-            "(func $dict_find (param $d (ref null $DICT)) (param $k (ref null eq)) (result i32)"
+            "(func $dict_find (param $d (ref null $DICT)) (param $k (ref null any)) (result i32)"
                 .into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
@@ -2106,7 +2107,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(array.get $ITEMS (struct.get $DICT 2 (local.get $dict)) (local.get $i))");
     fs.push(Func {
         signature:
-            "(func $dict_get (param $d (ref null eq)) (param $k (ref null eq)) (result (ref null eq))"
+            "(func $dict_get (param $d (ref null any)) (param $k (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $dict (ref null $DICT))".into(),
@@ -2165,7 +2166,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(struct.set $DICT 0 (local.get $dict) (i32.add (local.get $len) (i32.const 1)))");
     fs.push(Func {
         signature:
-            "(func $dict_set (param $d (ref null eq)) (param $k (ref null eq)) (param $v (ref null eq))"
+            "(func $dict_set (param $d (ref null any)) (param $k (ref null any)) (param $v (ref null any))"
                 .into(),
         locals: vec![
             "(local $dict (ref null $DICT))".into(),
@@ -2199,7 +2200,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $py_index (local.get $r) (call $unbox (local.get $k)))");
     fs.push(Func {
         signature:
-            "(func $py_subscript (param $r (ref null eq)) (param $k (ref null eq)) (result (ref null eq))"
+            "(func $py_subscript (param $r (ref null any)) (param $k (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -2214,7 +2215,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $py_set_index (local.get $r) (call $unbox (local.get $k)) (local.get $v))");
     fs.push(Func {
         signature:
-            "(func $py_set_subscript (param $r (ref null eq)) (param $k (ref null eq)) (param $v (ref null eq))"
+            "(func $py_set_subscript (param $r (ref null any)) (param $k (ref null any)) (param $v (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -2351,7 +2352,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $str)");
     fs.push(Func {
         signature:
-            "(func $py_slice (param $r (ref null eq)) (param $sv (ref null eq)) (param $ev (ref null eq)) (param $tv (ref null eq)) (result (ref null eq))"
+            "(func $py_slice (param $r (ref null any)) (param $sv (ref null any)) (param $ev (ref null any)) (param $tv (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $n i32)".into(),
@@ -2468,7 +2469,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(i32.const 0)");
     fs.push(Func {
         signature:
-            "(func $list_contains (param $l (ref null $LIST)) (param $item (ref null eq)) (result i32)"
+            "(func $list_contains (param $l (ref null $LIST)) (param $item (ref null any)) (result i32)"
                 .into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
@@ -2493,7 +2494,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(i32.const 0)");
     fs.push(Func {
         signature:
-            "(func $tuple_contains (param $l (ref null $TUPLE)) (param $item (ref null eq)) (result i32)"
+            "(func $tuple_contains (param $l (ref null $TUPLE)) (param $item (ref null any)) (result i32)"
                 .into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
@@ -2584,8 +2585,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $raise_not_iter (local.get $c))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $py_in (param $item (ref null eq)) (param $c (ref null eq)) (result i32)"
-            .into(),
+        signature:
+            "(func $py_in (param $item (ref null any)) (param $c (ref null any)) (result i32)"
+                .into(),
         locals: vec![],
         body: b,
     });
@@ -2667,7 +2669,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(1, "(then");
     b.push_in(
         2,
-        "(return (if (result (ref null eq)) (struct.get_u $BOOL 0 (ref.cast (ref $BOOL) (local.get $r)))",
+        "(return (if (result (ref null any)) (struct.get_u $BOOL 0 (ref.cast (ref $BOOL) (local.get $r)))",
     );
     b.push_in(
         3,
@@ -2701,7 +2703,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $raise_no_str (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $to_str (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $to_str (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -2721,7 +2723,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (ref.test (ref $OBJECT) (local.get $r)) (then (return (call $object_to_str (local.get $r) (i32.const 0)))))");
     b.push("(call $to_str (local.get $r))");
     fs.push(Func {
-        signature: "(func $repr_str (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $repr_str (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -2780,13 +2782,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         let mut locals = vec![
             "(local $n i32)".to_string(),
             "(local $i i32)".to_string(),
-            "(local $res (ref null eq))".to_string(),
+            "(local $res (ref null any))".to_string(),
         ];
         if ty == "$SET" {
-            locals.push("(local $seq (ref null eq))".to_string());
+            locals.push("(local $seq (ref null any))".to_string());
         }
         fs.push(Func {
-            signature: format!("(func {fname} (param $s (ref null {ty})) (result (ref null eq))"),
+            signature: format!("(func {fname} (param $s (ref null {ty})) (result (ref null any))"),
             locals,
             body: b,
         });
@@ -2824,11 +2826,11 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br $next)))");
     b.push(format!("(call $py_add (local.get $res) {})", str_lit("}")));
     fs.push(Func {
-        signature: "(func $dict_to_str (param $d (ref null $DICT)) (result (ref null eq))".into(),
+        signature: "(func $dict_to_str (param $d (ref null $DICT)) (result (ref null any))".into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
-            "(local $res (ref null eq))".into(),
+            "(local $res (ref null any))".into(),
         ],
         body: b,
     });
@@ -2865,11 +2867,11 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     ));
     fs.push(Func {
         signature:
-            "(func $object_to_str (param $obj (ref null eq)) (param $prefer_str i32) (result (ref null eq))"
+            "(func $object_to_str (param $obj (ref null any)) (param $prefer_str i32) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $cls (ref null $CLASS))".into(),
-            "(local $m (ref null eq))".into(),
+            "(local $m (ref null any))".into(),
         ],
         body: b,
     });
@@ -2931,7 +2933,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (local.get $neg) (then (local.set $res (call $py_add (array.new_fixed $STR 1 (i32.const 45)) (local.get $res)))))");
     b.push("(local.get $res)");
     fs.push(Func {
-        signature: "(func $f64_to_fixed (param $x f64) (param $prec i32) (result (ref null eq))"
+        signature: "(func $f64_to_fixed (param $x f64) (param $prec i32) (result (ref null any))"
             .into(),
         locals: vec![
             "(local $neg i32)".into(),
@@ -2941,7 +2943,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(local $ip i32)".into(),
             "(local $fp i32)".into(),
             "(local $k i32)".into(),
-            "(local $res (ref null eq))".into(),
+            "(local $res (ref null any))".into(),
             "(local $frac (ref null $STR))".into(),
         ],
         body: b,
@@ -2961,7 +2963,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $out)");
     fs.push(Func {
         signature:
-            "(func $str_pad (param $s (ref null eq)) (param $width i32) (param $fill i32) (param $align i32) (result (ref null eq))"
+            "(func $str_pad (param $s (ref null any)) (param $width i32) (param $fill i32) (param $align i32) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -2975,7 +2977,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $py_abs: float-aware absolute value.
     let mut b = Body::new();
-    b.push("(if (result (ref null eq)) (ref.test (ref $FLOAT) (local.get $r))");
+    b.push("(if (result (ref null any)) (ref.test (ref $FLOAT) (local.get $r))");
     b.push_in(
         1,
         "(then (struct.new $FLOAT (f64.abs (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))))",
@@ -2988,7 +2990,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(1, "))");
     fs.push(Func {
-        signature: "(func $py_abs (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_abs (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec!["(local $v i32)".into()],
         body: b,
     });
@@ -3029,12 +3031,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         b.push_in(2, "(br $l)))");
         b.push("(local.get $acc)");
         fs.push(Func {
-            signature: format!("(func {name} (param $seq (ref null eq)) (result (ref null eq))"),
+            signature: format!("(func {name} (param $seq (ref null any)) (result (ref null any))"),
             locals: vec![
                 "(local $n i32)".into(),
                 "(local $i i32)".into(),
-                "(local $acc (ref null eq))".into(),
-                "(local $el (ref null eq))".into(),
+                "(local $acc (ref null any))".into(),
+                "(local $el (ref null any))".into(),
             ],
             body: b,
         });
@@ -3044,7 +3046,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     let mut b = Body::new();
     b.push("(call $bool (call $truthy (local.get $r)))");
     fs.push(Func {
-        signature: "(func $py_bool (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_bool (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -3054,7 +3056,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     let mut b = Body::new();
     b.push("(call $box (i32.trunc_sat_f64_s (f64.nearest (call $unbox_f64 (local.get $r)))))");
     fs.push(Func {
-        signature: "(func $py_round1 (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_round1 (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -3071,7 +3073,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(struct.new $FLOAT (f64.div (f64.nearest (f64.mul (local.get $x) (local.get $scale))) (local.get $scale)))");
     fs.push(Func {
-        signature: "(func $py_round2 (param $r (ref null eq)) (param $n i32) (result (ref null eq))".into(),
+        signature:
+            "(func $py_round2 (param $r (ref null any)) (param $n i32) (result (ref null any))"
+                .into(),
         locals: vec![
             "(local $x f64)".into(),
             "(local $scale f64)".into(),
@@ -3097,7 +3101,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(call $box (call $unbox (local.get $r)))");
     fs.push(Func {
-        signature: "(func $py_int (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_int (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -3176,7 +3180,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_int_parse (local.get $s))))");
     b.push("(call $box (i32.mul (local.get $sign) (local.get $acc)))");
     fs.push(Func {
-        signature: "(func $str_to_int (param $s (ref null $STR)) (result (ref null eq))".into(),
+        signature: "(func $str_to_int (param $s (ref null $STR)) (result (ref null any))".into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
@@ -3208,7 +3212,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(call $print_value (local.get $r))");
     fs.push(Func {
-        signature: "(func $print_repr (param $r (ref null eq))".into(),
+        signature: "(func $print_repr (param $r (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -3429,7 +3433,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $box (local.get $acc))");
     fs.push(Func {
         signature:
-            "(func $py_pow (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $py_pow (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $e i32)".into(),
@@ -3532,7 +3536,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(3, ")))");
     b.push_in(1, "(else (call $write_i32 (call $unbox (local.get $r)))))");
     fs.push(Func {
-        signature: "(func $print_value (param $r (ref null eq))".into(),
+        signature: "(func $print_value (param $r (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -3549,7 +3553,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(struct.new $LIST (i32.add (local.get $na) (local.get $nb)) (local.get $items))");
     fs.push(Func {
         signature:
-            "(func $list_concat (param $a (ref null $LIST)) (param $b (ref null $LIST)) (result (ref null eq))"
+            "(func $list_concat (param $a (ref null $LIST)) (param $b (ref null $LIST)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $na i32)".into(),
@@ -3619,7 +3623,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $s)");
     fs.push(Func {
         signature:
-            "(func $seq_repeat (param $s (ref null eq)) (param $n i32) (result (ref null eq))"
+            "(func $seq_repeat (param $s (ref null any)) (param $n i32) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $len i32)".into(),
@@ -3647,7 +3651,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(then (return (call $list_concat (ref.cast (ref $LIST) (local.get $a)) (ref.cast (ref $LIST) (local.get $b)))))",
     );
     b.push(")");
-    b.push("(if (result (ref null eq))");
+    b.push("(if (result (ref null any))");
     b.push_in(
         2,
         "(i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
@@ -3672,7 +3676,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(1, "(else");
     b.push_in(
         2,
-        "(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))",
+        "(if (result (ref null any)) (call $either_float (local.get $a) (local.get $b))",
     );
     b.push_in(
         3,
@@ -3684,7 +3688,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $py_add (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $py_add (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $sa (ref null $STR))".into(),
@@ -3716,7 +3720,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(if (call $obj_has (local.get $a) {n}) (then (return (call $obj_call1 (local.get $a) (local.get $b) {n}))))",
             n = str_lit(dunder)
         ));
-        b.push("(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))");
+        b.push("(if (result (ref null any)) (call $either_float (local.get $a) (local.get $b))");
         b.push_in(
             1,
             format!("(then (struct.new $FLOAT ({f_instr} (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))))"),
@@ -3727,7 +3731,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         );
         fs.push(Func {
             signature: format!(
-                "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+                "(func {name} (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
             ),
             locals: vec![],
             body: b,
@@ -3791,7 +3795,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         ));
         fs.push(Func {
             signature: format!(
-                "(func {name} (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
+                "(func {name} (param $a (ref null any)) (param $b (ref null any)) (result i32)"
             ),
             locals: vec![
                 "(local $sa (ref null $STR))".into(),
@@ -3811,7 +3815,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(struct.new $FLOAT (f64.div (call $unbox_f64 (local.get $a)) (local.get $fb)))");
     fs.push(Func {
         signature:
-            "(func $py_div (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $py_div (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec!["(local $fb f64)".into()],
         body: b,
@@ -3819,7 +3823,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $py_neg: unary minus across int/float.
     let mut b = Body::new();
-    b.push("(if (result (ref null eq)) (ref.test (ref $FLOAT) (local.get $r))");
+    b.push("(if (result (ref null any)) (ref.test (ref $FLOAT) (local.get $r))");
     b.push_in(
         1,
         "(then (struct.new $FLOAT (f64.neg (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))))",
@@ -3829,7 +3833,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(else (call $box (i32.sub (i32.const 0) (call $unbox (local.get $r))))))",
     );
     fs.push(Func {
-        signature: "(func $py_neg (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_neg (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -3838,7 +3842,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     let mut b = Body::new();
     b.push("(call $box (i32.xor (call $unbox (local.get $r)) (i32.const -1)))");
     fs.push(Func {
-        signature: "(func $py_invert (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_invert (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -3850,7 +3854,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $box (i32.shl (call $unbox (local.get $a)) (call $unbox (local.get $b))))");
     fs.push(Func {
         signature:
-            "(func $py_shl (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $py_shl (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -3859,7 +3863,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $box (i32.shr_s (call $unbox (local.get $a)) (call $unbox (local.get $b))))");
     fs.push(Func {
         signature:
-            "(func $py_shr (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $py_shr (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -3907,7 +3911,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         n = str_lit("__eq__")
     ));
     b.push("(if (i32.or (ref.test (ref $OBJECT) (local.get $a)) (ref.test (ref $OBJECT) (local.get $b)))");
-    b.push_in(1, "(then (return (ref.eq (local.get $a) (local.get $b))))");
+    // Identity needs eq refs; a future non-eq value (an internalized JS
+    // string) must compare UNEQUAL here, not trap the cast.
+    b.push_in(
+        1,
+        "(then (return (if (result i32) (i32.and (ref.test (ref eq) (local.get $a)) (ref.test (ref eq) (local.get $b))) (then (ref.eq (ref.cast (ref eq) (local.get $a)) (ref.cast (ref eq) (local.get $b)))) (else (i32.const 0)))))",
+    );
     b.push(")");
     b.push("(if (i32.or (ref.test (ref $NONE_T) (local.get $a)) (ref.test (ref $NONE_T) (local.get $b)))");
     b.push_in(
@@ -3982,7 +3991,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(f64.eq (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))");
     fs.push(Func {
-        signature: "(func $py_eq (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
+        signature: "(func $py_eq (param $a (ref null any)) (param $b (ref null any)) (result i32)"
             .into(),
         locals: vec![],
         body: b,
@@ -4015,10 +4024,10 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $lst)");
     fs.push(Func {
         signature:
-            "(func $range_list (param $start i32) (param $end i32) (param $step i32) (result (ref null eq))"
+            "(func $range_list (param $start i32) (param $end i32) (param $step i32) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $lst (ref null eq))".into(),
+            "(local $lst (ref null any))".into(),
             "(local $i i32)".into(),
         ],
         body: b,
@@ -4054,10 +4063,10 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $lst)");
     fs.push(Func {
         signature:
-            "(func $enumerate (param $seq (ref null eq)) (param $start i32) (result (ref null eq))"
+            "(func $enumerate (param $seq (ref null any)) (param $start i32) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $lst (ref null eq))".into(),
+            "(local $lst (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $tup (ref null $ITEMS))".into(),
@@ -4097,10 +4106,10 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $lst)");
     fs.push(Func {
         signature:
-            "(func $zip2 (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $zip2 (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $lst (ref null eq))".into(),
+            "(local $lst (ref null any))".into(),
             "(local $na i32)".into(),
             "(local $nb i32)".into(),
             "(local $n i32)".into(),
@@ -4160,7 +4169,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(struct.new $LIST (local.get $n) (local.get $items))");
     fs.push(Func {
         signature:
-            "(func $dict_view (param $d (ref null eq)) (param $which i32) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $dict_view (param $d (ref null any)) (param $which i32) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $dd (ref null $DICT))".into(),
@@ -4189,9 +4198,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(local.get $acc)");
     fs.push(Func {
-        signature: "(func $py_sum (param $seq (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_sum (param $seq (ref null any)) (result (ref null any))".into(),
         locals: vec![
-            "(local $acc (ref null eq))".into(),
+            "(local $acc (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $i i32)".into(),
         ],
@@ -4220,7 +4229,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         b.push_in(2, "(br $next)))");
         b.push(format!("(global.get {miss})"));
         fs.push(Func {
-            signature: format!("(func {fname} (param $seq (ref null eq)) (result (ref null eq))"),
+            signature: format!("(func {fname} (param $seq (ref null any)) (result (ref null any))"),
             locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
             body: b,
         });
@@ -4283,7 +4292,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push("(f64.lt (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))");
     fs.push(Func {
-        signature: "(func $sort_lt (param $a (ref null eq)) (param $b (ref null eq)) (result i32)"
+        signature: "(func $sort_lt (param $a (ref null any)) (param $b (ref null any)) (result i32)"
             .into(),
         locals: vec![],
         body: b,
@@ -4335,14 +4344,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(struct.new $LIST (local.get $n) (local.get $items))");
     fs.push(Func {
         signature:
-            "(func $py_sorted (param $seq (ref null eq)) (param $rev i32) (result (ref null eq))"
+            "(func $py_sorted (param $seq (ref null any)) (param $rev i32) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $j i32)".into(),
             "(local $items (ref null $ITEMS))".into(),
-            "(local $key (ref null eq))".into(),
+            "(local $key (ref null any))".into(),
             "(local $cmp i32)".into(),
         ],
         body: b,
@@ -4378,7 +4387,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $NONE)");
     fs.push(Func {
         signature:
-            "(func $list_sort (param $r (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $list_sort (param $r (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ll (ref null $LIST))".into(),
@@ -4386,7 +4395,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $j i32)".into(),
-            "(local $key (ref null eq))".into(),
+            "(local $key (ref null any))".into(),
         ],
         body: b,
     });
@@ -4417,14 +4426,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $NONE)");
     fs.push(Func {
         signature:
-            "(func $list_reverse (param $r (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $list_reverse (param $r (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ll (ref null $LIST))".into(),
             "(local $items (ref null $ITEMS))".into(),
             "(local $lo i32)".into(),
             "(local $hi i32)".into(),
-            "(local $key (ref null eq))".into(),
+            "(local $key (ref null any))".into(),
         ],
         body: b,
     });
@@ -4446,7 +4455,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $NONE)");
     fs.push(Func {
         signature:
-            "(func $list_extend (param $r (ref null eq)) (param $it (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $list_extend (param $r (ref null any)) (param $it (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec!["(local $n i32)".into(), "(local $i i32)".into()],
         body: b,
@@ -4477,7 +4486,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(global.get $NONE)");
     fs.push(Func {
         signature:
-            "(func $list_insert (param $r (ref null eq)) (param $iv (ref null eq)) (param $x (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $list_insert (param $r (ref null any)) (param $iv (ref null any)) (param $x (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ll (ref null $LIST))".into(),
@@ -4517,7 +4526,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $str_count (local.get $r) (local.get $v) (local.get $name) (local.get $args))");
     fs.push(Func {
         signature:
-            "(func $py_count (param $r (ref null eq)) (param $v (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $py_count (param $r (ref null any)) (param $v (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $n i32)".into(),
@@ -4557,12 +4566,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $call_method (local.get $r) (local.get $name) (local.get $args))");
     fs.push(Func {
         signature:
-            "(func $py_index_of (param $r (ref null eq)) (param $v (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $py_index_of (param $r (ref null any)) (param $v (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
-            "(local $res (ref null eq))".into(),
+            "(local $res (ref null any))".into(),
         ],
         body: b,
     });
@@ -4639,7 +4648,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         b.push("(local.get $out)");
         fs.push(Func {
             signature: format!(
-                "(func {name} (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                "(func {name} (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
                 "(local $ss (ref null $STR))".into(),
@@ -4694,7 +4703,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $str_sub (local.get $ss) (local.get $start) (i32.sub (local.get $end) (local.get $start)))");
     fs.push(Func {
         signature:
-            "(func $str_strip (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_strip (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -4788,14 +4797,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $lst)");
     fs.push(Func {
         signature:
-            "(func $str_split (param $s (ref null eq)) (param $sep (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_split (param $s (ref null any)) (param $sep (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $start i32)".into(),
-            "(local $lst (ref null eq))".into(),
+            "(local $lst (ref null any))".into(),
             "(local $sepc (ref null $STR))".into(),
             "(local $sl i32)".into(),
         ],
@@ -4858,7 +4867,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $out)");
     fs.push(Func {
         signature:
-            "(func $str_join (param $sep (ref null eq)) (param $it (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_join (param $sep (ref null any)) (param $it (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $sepc (ref null $STR))".into(),
@@ -4953,7 +4962,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $out)");
     fs.push(Func {
         signature:
-            "(func $str_replace (param $s (ref null eq)) (param $old (ref null eq)) (param $new (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_replace (param $s (ref null any)) (param $old (ref null any)) (param $new (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -4997,7 +5006,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         ));
         fs.push(Func {
             signature: format!(
-                "(func {fname} (param $s (ref null eq)) (param $p (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                "(func {fname} (param $s (ref null any)) (param $p (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
                 "(local $ss (ref null $STR))".into(),
@@ -5044,7 +5053,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $box (local.get $cnt))");
     fs.push(Func {
         signature:
-            "(func $str_count (param $s (ref null eq)) (param $sub (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_count (param $s (ref null any)) (param $sub (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -5080,7 +5089,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $box (i32.const -1))");
     fs.push(Func {
         signature:
-            "(func $str_find (param $s (ref null eq)) (param $sub (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_find (param $s (ref null any)) (param $sub (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -5121,7 +5130,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         b.push("(global.get $TRUE)");
         fs.push(Func {
             signature: format!(
-                "(func {fname} (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                "(func {fname} (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
                 "(local $ss (ref null $STR))".into(),
@@ -5159,7 +5168,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $out)");
     fs.push(Func {
         signature:
-            "(func $str_capitalize (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_capitalize (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -5200,7 +5209,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $out)");
     fs.push(Func {
         signature:
-            "(func $str_title (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_title (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -5248,7 +5257,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         b.push("(call $str_sub (local.get $ss) (local.get $start) (i32.sub (local.get $end) (local.get $start)))");
         fs.push(Func {
             signature: format!(
-                "(func {fname} (param $s (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+                "(func {fname} (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
                 "(local $ss (ref null $STR))".into(),
@@ -5283,7 +5292,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $out)");
     fs.push(Func {
         signature:
-            "(func $str_zfill (param $s (ref null eq)) (param $wv (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $str_zfill (param $s (ref null any)) (param $wv (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $ss (ref null $STR))".into(),
@@ -5339,7 +5348,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(local.get $default)");
     fs.push(Func {
         signature:
-            "(func $dict_get_default (param $d (ref null eq)) (param $key (ref null eq)) (param $default (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $dict_get_default (param $d (ref null any)) (param $key (ref null any)) (param $default (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $dd (ref null $DICT))".into(),
@@ -5401,7 +5410,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(call $call_method (local.get $r) (local.get $name) (local.get $args))");
     fs.push(Func {
         signature:
-            "(func $py_pop (param $r (ref null eq)) (param $arg (ref null eq)) (param $default (ref null eq)) (param $nargs i32) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $py_pop (param $r (ref null any)) (param $arg (ref null any)) (param $default (ref null any)) (param $nargs i32) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $dd (ref null $DICT))".into(),
@@ -5409,7 +5418,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(local $idx i32)".into(),
             "(local $li i32)".into(),
             "(local $n i32)".into(),
-            "(local $val (ref null eq))".into(),
+            "(local $val (ref null any))".into(),
         ],
         body: b,
     });
@@ -5505,7 +5514,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
     b.push("(struct.new $FLOAT (f64.mul (local.get $sign) (local.get $acc)))");
     fs.push(Func {
-        signature: "(func $str_to_float (param $s (ref null $STR)) (result (ref null eq))".into(),
+        signature: "(func $str_to_float (param $s (ref null $STR)) (result (ref null any))".into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
@@ -5528,7 +5537,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push("(struct.new $FLOAT (call $unbox_f64 (local.get $r)))");
     fs.push(Func {
-        signature: "(func $py_float (param $r (ref null eq)) (result (ref null eq))".into(),
+        signature: "(func $py_float (param $r (ref null any)) (result (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -5540,7 +5549,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 /// the `$i32_floordiv` helper.
 fn py_floordiv_helper() -> Func {
     let mut b = Body::new();
-    b.push("(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))");
+    b.push("(if (result (ref null any)) (call $either_float (local.get $a) (local.get $b))");
     b.push_in(1, "(then");
     b.push_in(2, "(local.set $fb (call $unbox_f64 (local.get $b)))");
     b.push_in(
@@ -5558,7 +5567,7 @@ fn py_floordiv_helper() -> Func {
     );
     Func {
         signature:
-            "(func $py_floordiv (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $py_floordiv (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec!["(local $fb f64)".into()],
         body: b,
@@ -5569,7 +5578,7 @@ fn py_floordiv_helper() -> Func {
 /// divisor; zero divisor traps); ints use the `$i32_floormod` helper.
 fn py_mod_helper() -> Func {
     let mut b = Body::new();
-    b.push("(if (result (ref null eq)) (call $either_float (local.get $a) (local.get $b))");
+    b.push("(if (result (ref null any)) (call $either_float (local.get $a) (local.get $b))");
     b.push_in(1, "(then");
     b.push_in(2, "(local.set $fa (call $unbox_f64 (local.get $a)))");
     b.push_in(2, "(local.set $fb (call $unbox_f64 (local.get $b)))");
@@ -5588,7 +5597,7 @@ fn py_mod_helper() -> Func {
     );
     Func {
         signature:
-            "(func $py_mod (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $py_mod (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec!["(local $fa f64)".into(), "(local $fb f64)".into()],
         body: b,
@@ -5628,7 +5637,7 @@ fn class_helpers() -> Vec<Func> {
     b.push("(ref.null eq)");
     fs.push(Func {
         signature:
-            "(func $class_lookup_method (param $class (ref null $CLASS)) (param $name (ref null eq)) (result (ref null eq))"
+            "(func $class_lookup_method (param $class (ref null $CLASS)) (param $name (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $c (ref null $CLASS))".into(),
@@ -5654,9 +5663,9 @@ fn class_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $dispatch_from (param $obj (ref null eq)) (param $class (ref null $CLASS)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $dispatch_from (param $obj (ref null any)) (param $class (ref null $CLASS)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
-        locals: vec!["(local $m (ref null eq))".into()],
+        locals: vec!["(local $m (ref null any))".into()],
         body: b,
     });
 
@@ -5673,7 +5682,7 @@ fn class_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $call_method (param $obj (ref null eq)) (param $name (ref null eq)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $call_method (param $obj (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -5697,11 +5706,11 @@ fn class_helpers() -> Vec<Func> {
     b.push("(local.get $obj)");
     fs.push(Func {
         signature:
-            "(func $instantiate (param $class (ref null $CLASS)) (param $args (ref null eq)) (result (ref null eq))"
+            "(func $instantiate (param $class (ref null $CLASS)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $obj (ref null eq))".into(),
-            "(local $init (ref null eq))".into(),
+            "(local $obj (ref null any))".into(),
+            "(local $init (ref null any))".into(),
         ],
         body: b,
     });
@@ -5739,12 +5748,12 @@ fn class_helpers() -> Vec<Func> {
     b.push("(local.get $m)");
     fs.push(Func {
         signature:
-            "(func $obj_getattr (param $obj (ref null eq)) (param $name (ref null eq)) (result (ref null eq))"
+            "(func $obj_getattr (param $obj (ref null any)) (param $name (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
             "(local $idx i32)".into(),
             "(local $attrs (ref null $DICT))".into(),
-            "(local $m (ref null eq))".into(),
+            "(local $m (ref null any))".into(),
         ],
         body: b,
     });
@@ -5756,7 +5765,7 @@ fn class_helpers() -> Vec<Func> {
         "(call $print_str (ref.cast (ref null $STR) (call $object_to_str (local.get $obj) (local.get $prefer_str))))",
     );
     fs.push(Func {
-        signature: "(func $object_display (param $obj (ref null eq)) (param $prefer_str i32)"
+        signature: "(func $object_display (param $obj (ref null any)) (param $prefer_str i32)"
             .into(),
         locals: vec![],
         body: b,
@@ -5773,7 +5782,7 @@ fn class_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $obj_has (param $obj (ref null eq)) (param $name (ref null eq)) (result i32)"
+            "(func $obj_has (param $obj (ref null any)) (param $name (ref null any)) (result i32)"
                 .into(),
         locals: vec![],
         body: b,
@@ -5788,7 +5797,7 @@ fn class_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $obj_call1 (param $obj (ref null eq)) (param $arg (ref null eq)) (param $name (ref null eq)) (result (ref null eq))"
+            "(func $obj_call1 (param $obj (ref null any)) (param $arg (ref null any)) (param $name (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -5799,7 +5808,7 @@ fn class_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $obj_call0 (param $obj (ref null eq)) (param $name (ref null eq)) (result (ref null eq))"
+            "(func $obj_call0 (param $obj (ref null any)) (param $name (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -5817,7 +5826,7 @@ fn class_helpers() -> Vec<Func> {
     );
     fs.push(Func {
         signature:
-            "(func $obj_setattr (param $obj (ref null eq)) (param $name (ref null eq)) (param $val (ref null eq))"
+            "(func $obj_setattr (param $obj (ref null any)) (param $name (ref null any)) (param $val (ref null any))"
                 .into(),
         locals: vec![],
         body: b,
@@ -5873,7 +5882,7 @@ fn read_line_helper() -> Func {
     b.push("(array.copy $STR $STR (local.get $out) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $len))");
     b.push("(local.get $out)");
     Func {
-        signature: "(func $read_line (result (ref null eq))".into(),
+        signature: "(func $read_line (result (ref null any))".into(),
         locals: vec![
             "(local $cap i32)".into(),
             "(local $len i32)".into(),
@@ -6089,7 +6098,7 @@ struct FuncCx {
     /// (src/repr.rs) live in raw i32/f64 wasm locals. Absent = boxed.
     reprs: HashMap<String, Repr>,
     /// The enclosing function's scalar return repr, when its `-> T`
-    /// annotation types the wasm result. None = boxed (ref null eq).
+    /// annotation types the wasm result. None = boxed (ref null any).
     ret_scalar: Option<Repr>,
     /// User functions' return reprs (a per-function copy of
     /// `Gen::func_ret_reprs`), so inference can type `x = f()` without
@@ -6589,7 +6598,7 @@ impl Gen {
         collect_assigned(body, &mut assigned);
         // Typed-slot tier (phase 1): the shared inference proves which locals
         // are Int/Float on every binding. Params stay boxed (they arrive as
-        // (ref null eq)), so they are `fixed` at Boxed — reads of them resolve
+        // (ref null any)), so they are `fixed` at Boxed — reads of them resolve
         // to "unknown" and demote whatever they flow into, exactly like the
         // native emitter's unannotated-param case.
         let mut fixed = HashMap::new();
@@ -6653,13 +6662,13 @@ impl Gen {
             .map(|(p, r)| match r {
                 Repr::Int => format!(" (param ${p} i32)"),
                 Repr::Float => format!(" (param ${p} f64)"),
-                _ => format!(" (param ${p} (ref null eq))"),
+                _ => format!(" (param ${p} (ref null any))"),
             })
             .collect();
         let result_ty = match cx.ret_scalar {
             Some(Repr::Int) => "i32",
             Some(Repr::Float) => "f64",
-            _ => "(ref null eq)",
+            _ => "(ref null any)",
         };
         Ok(Func {
             signature: format!("(func $f_{name}{param_decls} (result {result_ty})"),
@@ -6720,14 +6729,14 @@ impl Gen {
                 let xs = self.value_expr(cx, &args[0])?;
                 let tmp = cx.scratch_local(VAL);
                 Ok(format!(
-                    "(block (result (ref null eq)) (local.set ${tmp} {xs}) (call $rnd_shuffle (local.get ${tmp})) (global.get $NONE))"
+                    "(block (result (ref null any)) (local.set ${tmp} {xs}) (call $rnd_shuffle (local.get ${tmp})) (global.get $NONE))"
                 ))
             }
             "seed" => {
                 arity(1)?;
                 let n = self.value_expr(cx, &args[0])?;
                 Ok(format!(
-                    "(block (result (ref null eq)) (call $rnd_init (call $unbox {n})) (global.get $NONE))"
+                    "(block (result (ref null any)) (call $rnd_init (call $unbox {n})) (global.get $NONE))"
                 ))
             }
             _ => Err(CompileError::at(
@@ -6967,7 +6976,7 @@ impl Gen {
 
         Ok(Func {
             signature: format!(
-                "(func $m_{class}_{} (type $MFUNC) (param ${self_name} (ref null eq)) (param $.args (ref null eq)) (result (ref null eq))",
+                "(func $m_{class}_{} (type $MFUNC) (param ${self_name} (ref null any)) (param $.args (ref null any)) (result (ref null any))",
                 m.name
             ),
             locals: cx
@@ -7322,7 +7331,7 @@ impl Gen {
         Ok(b)
     }
 
-    /// Generate WAT producing the boxed `(ref null eq)` value of `e`.
+    /// Generate WAT producing the boxed `(ref null any)` value of `e`.
     fn value_expr(&mut self, cx: &mut FuncCx, e: &Expr) -> Result<String> {
         // Fold integer constants — this is also where literals are
         // range-checked instead of silently wrapping.
@@ -7407,7 +7416,7 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 let t = cx.scratch_local(VAL);
                 Ok(format!(
-                    "(if (result (ref null eq)) (call $truthy (local.tee ${t} {lhs})) (then {rhs}) (else (local.get ${t})))"
+                    "(if (result (ref null any)) (call $truthy (local.tee ${t} {lhs})) (then {rhs}) (else (local.get ${t})))"
                 ))
             }
             ExprKind::Bin(BinOp::Or, a, b) => {
@@ -7415,7 +7424,7 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 let t = cx.scratch_local(VAL);
                 Ok(format!(
-                    "(if (result (ref null eq)) (call $truthy (local.tee ${t} {lhs})) (then (local.get ${t})) (else {rhs}))"
+                    "(if (result (ref null any)) (call $truthy (local.tee ${t} {lhs})) (then (local.get ${t})) (else {rhs}))"
                 ))
             }
             ExprKind::Bin(BinOp::Add, a, b) => {
@@ -7658,7 +7667,7 @@ impl Gen {
                 let mut s = String::new();
                 body.render(0, &mut s);
                 Ok(format!(
-                    "(block (result (ref null eq))\n{s}(local.get ${acc}))"
+                    "(block (result (ref null any))\n{s}(local.get ${acc}))"
                 ))
             }
             ExprKind::DictComp {
@@ -7676,7 +7685,7 @@ impl Gen {
                 let mut s = String::new();
                 body.render(0, &mut s);
                 Ok(format!(
-                    "(block (result (ref null eq))\n{s}(local.get ${acc}))"
+                    "(block (result (ref null any))\n{s}(local.get ${acc}))"
                 ))
             }
             ExprKind::SetComp { element, clauses } => {
@@ -7704,7 +7713,7 @@ impl Gen {
                 let t = self.value_expr(cx, then)?;
                 let o = self.value_expr(cx, orelse)?;
                 Ok(format!(
-                    "(if (result (ref null eq)) (call $truthy {c}) (then {t}) (else {o}))"
+                    "(if (result (ref null any)) (call $truthy {c}) (then {t}) (else {o}))"
                 ))
             }
             ExprKind::MethodCall(recv, method, args) => {
@@ -8202,14 +8211,14 @@ impl Gen {
                         "flash" if args.is_empty() => {
                             self.uses_dom = true;
                             return Ok(
-                                "(block (result (ref null eq)) (call $flash) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $flash) (global.get $NONE))"
                                     .to_string(),
                             );
                         }
                         "beep" if args.is_empty() => {
                             self.uses_dom = true;
                             return Ok(
-                                "(block (result (ref null eq)) (call $beep) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $beep) (global.get $NONE))"
                                     .to_string(),
                             );
                         }
@@ -8217,7 +8226,7 @@ impl Gen {
                             self.uses_dom = true;
                             let h = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $on_click (call $unbox {h})) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $on_click (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         // Layer 3: string-argument capabilities. Each string is
@@ -8230,7 +8239,7 @@ impl Gen {
                             let name = self.value_expr(cx, &args[1])?;
                             let val = self.value_expr(cx, &args[2])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {name}) (call $marshal_str {val}) (call $dom_set_attr) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {sel}) (call $marshal_str {name}) (call $marshal_str {val}) (call $dom_set_attr) (global.get $NONE))"
                             ));
                         }
                         // add_element(parent, tag, id): dynamic DOM/SVG creation —
@@ -8242,7 +8251,7 @@ impl Gen {
                             let tag = self.value_expr(cx, &args[1])?;
                             let id = self.value_expr(cx, &args[2])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {parent}) (call $marshal_str {tag}) (call $marshal_str {id}) (call $add_element) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {parent}) (call $marshal_str {tag}) (call $marshal_str {id}) (call $add_element) (global.get $NONE))"
                             ));
                         }
                         // pointer_x()/pointer_y(): the current event's pointer
@@ -8261,7 +8270,7 @@ impl Gen {
                             let sel = self.value_expr(cx, &args[0])?;
                             let text = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {text}) (call $dom_set_text) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {sel}) (call $marshal_str {text}) (call $dom_set_text) (global.get $NONE))"
                             ));
                         }
                         // set_position(sel, x, y): the selector goes through the
@@ -8272,14 +8281,14 @@ impl Gen {
                             let x = self.i32_expr(cx, &args[1])?;
                             let y = self.i32_expr(cx, &args[2])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $set_position {x} {y}) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {sel}) (call $set_position {x} {y}) (global.get $NONE))"
                             ));
                         }
                         "play_sound" if args.len() == 1 => {
                             self.uses_dom_str = true;
                             let name = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {name}) (call $play_sound) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {name}) (call $play_sound) (global.get $NONE))"
                             ));
                         }
                         // emit_html(html): marshal an HTML string to the host, which
@@ -8289,7 +8298,7 @@ impl Gen {
                             self.uses_emit_html = true;
                             let html = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {html}) (call $emit_html) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {html}) (call $emit_html) (global.get $NONE))"
                             ));
                         }
                         // show(x): render x._repr_html_() as HTML if defined, else
@@ -8299,7 +8308,7 @@ impl Gen {
                             self.uses_emit_html = true;
                             let v = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $show {v}) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $show {v}) (global.get $NONE))"
                             ));
                         }
                         // every(ms, handler): run a zero-arg handler repeatedly —
@@ -8314,7 +8323,7 @@ impl Gen {
                             self.uses_timer = true;
                             let h = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $on_frame (call $unbox {h})) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $on_frame (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         "every" if args.len() == 2 => {
@@ -8323,7 +8332,7 @@ impl Gen {
                             let ms = self.i32_expr(cx, &args[0])?;
                             let h = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $every {ms} (call $unbox {h})) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $every {ms} (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         // on_key(keyname, handler): run a handler when a specific
@@ -8335,7 +8344,7 @@ impl Gen {
                             let key = self.value_expr(cx, &args[0])?;
                             let h = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $key_on (call $unbox {h})) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {key}) (call $key_on (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         // get_value(selector): read an element's value/text back
@@ -8345,7 +8354,7 @@ impl Gen {
                             self.uses_dom_str = true;
                             let sel = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $get_value))"
+                                "(block (result (ref null any)) (call $marshal_str {sel}) (call $get_value))"
                             ));
                         }
                         // on(selector, event, handler): general event wiring.
@@ -8356,7 +8365,7 @@ impl Gen {
                             let ev = self.value_expr(cx, &args[1])?;
                             let h = self.value_expr(cx, &args[2])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {sel}) (call $marshal_str {ev}) (call $dom_on (call $unbox {h})) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {sel}) (call $marshal_str {ev}) (call $dom_on (call $unbox {h})) (global.get $NONE))"
                             ));
                         }
                         // seed() -> a host-provided per-attempt integer (the
@@ -8374,7 +8383,7 @@ impl Gen {
                             let score = self.value_expr(cx, &args[0])?;
                             let trace = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {trace}) (call $report (call $unbox_f64 {score})) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {trace}) (call $report (call $unbox_f64 {score})) (global.get $NONE))"
                             ));
                         }
                         // evidence(key, value): a structured observable for the ECD
@@ -8385,7 +8394,7 @@ impl Gen {
                             let key = self.value_expr(cx, &args[0])?;
                             let val = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $marshal_str {val}) (call $evidence) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {key}) (call $marshal_str {val}) (call $evidence) (global.get $NONE))"
                             ));
                         }
                         // set_field(key, value) / get_field(key): the platform
@@ -8396,14 +8405,14 @@ impl Gen {
                             let key = self.value_expr(cx, &args[0])?;
                             let val = self.value_expr(cx, &args[1])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $marshal_str {val}) (call $set_field) (global.get $NONE))"
+                                "(block (result (ref null any)) (call $marshal_str {key}) (call $marshal_str {val}) (call $set_field) (global.get $NONE))"
                             ));
                         }
                         "get_field" if args.len() == 1 => {
                             self.uses_fields = true;
                             let key = self.value_expr(cx, &args[0])?;
                             return Ok(format!(
-                                "(block (result (ref null eq)) (call $marshal_str {key}) (call $get_field))"
+                                "(block (result (ref null any)) (call $marshal_str {key}) (call $get_field))"
                             ));
                         }
                         // input([prompt]) -> a line from stdin (newline
@@ -8413,7 +8422,7 @@ impl Gen {
                             if args.len() == 1 {
                                 let p = self.value_expr(cx, &args[0])?;
                                 return Ok(format!(
-                                    "(block (result (ref null eq)) (call $print_str (ref.cast (ref null $STR) (call $to_str {p}))) (call $read_line))"
+                                    "(block (result (ref null any)) (call $print_str (ref.cast (ref null $STR) (call $to_str {p}))) (call $read_line))"
                                 ));
                             }
                             return Ok("(call $read_line)".to_string());
@@ -9775,7 +9784,7 @@ mod tests {
     fn and_or_short_circuit_shape() {
         let wat = compile("print(2 and 1)").unwrap();
         assert!(wat.contains(
-            "(if (result (ref null eq)) (call $truthy (local.tee $.t0 (ref.i31 (i32.const 2)))) (then (ref.i31 (i32.const 1))) (else (local.get $.t0)))"
+            "(if (result (ref null any)) (call $truthy (local.tee $.t0 (ref.i31 (i32.const 2)))) (then (ref.i31 (i32.const 1))) (else (local.get $.t0)))"
         ));
         let wat = compile("print(4 or 2)").unwrap();
         assert!(wat.contains("(then (local.get $.t0)) (else (ref.i31 (i32.const 2)))"));
@@ -9853,7 +9862,7 @@ mod tests {
     fn def_compiles_to_a_function() {
         let wat = compile("def add(a, b):\n    return a + b\nprint(add(2, 3))\n").unwrap();
         assert!(wat.contains(
-            "(func $f_add (param $a (ref null eq)) (param $b (ref null eq)) (result (ref null eq))"
+            "(func $f_add (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
         ));
         assert!(wat.contains("(call $f_add (ref.i31 (i32.const 2)) (ref.i31 (i32.const 3)))"));
         // Falling off the end returns None.
