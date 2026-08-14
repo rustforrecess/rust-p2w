@@ -26,6 +26,7 @@
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::emit::{Body, Func, Module};
 use crate::error::CompileError;
+use crate::repr::{Repr, infer_expr_repr, infer_slot_reprs};
 use std::collections::HashMap;
 
 type Result<T> = std::result::Result<T, CompileError>;
@@ -770,6 +771,42 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(i32.wrap_i64 (local.get $r))");
     fs.push(Func {
         signature: "(func $ck32 (param $r i64) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // Typed-slot arithmetic: the scalar twins of $py_add/$py_sub/$py_mul's
+    // int arms. Same overflow discipline — widen to i64, narrow via $ck32 —
+    // so a typed slot can never wrap where the boxed path would raise.
+    for (name, op) in [
+        ("$i_add", "i64.add"),
+        ("$i_sub", "i64.sub"),
+        ("$i_mul", "i64.mul"),
+    ] {
+        let mut b = Body::new();
+        b.push(format!(
+            "(call $ck32 ({op} (i64.extend_i32_s (local.get $a)) (i64.extend_i32_s (local.get $b))))"
+        ));
+        fs.push(Func {
+            signature: format!("(func {name} (param $a i32) (param $b i32) (result i32)"),
+            locals: vec![],
+            body: b,
+        });
+    }
+    let mut b = Body::new();
+    b.push("(call $ck32 (i64.sub (i64.const 0) (i64.extend_i32_s (local.get $a))))");
+    fs.push(Func {
+        signature: "(func $i_neg (param $a i32) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+    // $f_div: float division with Python's zero check (silent inf would be a
+    // wrong answer — same reasoning as $py_div).
+    let mut b = Body::new();
+    b.push("(if (f64.eq (local.get $b) (f64.const 0)) (then (call $raise_zero_div)))");
+    b.push("(f64.div (local.get $a) (local.get $b))");
+    fs.push(Func {
+        signature: "(func $f_div (param $a f64) (param $b f64) (result f64)".into(),
         locals: vec![],
         body: b,
     });
@@ -5807,6 +5844,9 @@ struct FuncCx {
     /// real `self`. `None` at top level and in plain functions.
     current_class: Option<String>,
     self_name: Option<String>,
+    /// Typed-slot tier: locals proven Int/Float by the SHARED inference
+    /// (src/repr.rs) live in raw i32/f64 wasm locals. Absent = boxed.
+    reprs: HashMap<String, Repr>,
 }
 
 impl FuncCx {
@@ -5856,6 +5896,21 @@ impl Gen {
                 if cx.is_top {
                     self.ensure_global(name);
                     out.push(format!("(global.set $g_{name} {value})"));
+                } else if let Some(r) = cx.reprs.get(name.as_str()).copied() {
+                    // Typed slot: store the raw scalar. The inference proved
+                    // every binding of this name has repr `r`, so the direct
+                    // emitter handles it — and when it declines (a shape it
+                    // doesn't cover), unboxing the boxed value is still
+                    // correct, just slower.
+                    let store = match self.scalar_expr(cx, expr, r) {
+                        Some(sc) => sc,
+                        None => match r {
+                            Repr::Int => format!("(call $unbox {value})"),
+                            _ => format!("(call $unbox_f64 {value})"),
+                        },
+                    };
+                    out.push(format!("(local.set ${name} {store})"));
+                    return Ok(());
                 } else {
                     // Function locals are pre-registered by gen_def.
                     out.push(format!("(local.set ${name} {value})"));
@@ -6235,11 +6290,45 @@ impl Gen {
         }
         let mut assigned = std::collections::HashSet::new();
         collect_assigned(body, &mut assigned);
+        // Typed-slot tier (phase 1): the shared inference proves which locals
+        // are Int/Float on every binding. Params stay boxed (they arrive as
+        // (ref null eq)), so they are `fixed` at Boxed — reads of them resolve
+        // to "unknown" and demote whatever they flow into, exactly like the
+        // native emitter's unannotated-param case.
+        let mut fixed = HashMap::new();
+        for p in params {
+            fixed.insert(p.clone(), Repr::Boxed);
+        }
+        let mut reprs = infer_slot_reprs(body, &fixed, &HashMap::new());
+        // Phase-1 exclusions, all conservative: loop variables (gen_for /
+        // gen_foreach still bind boxed) and any name a comprehension binds
+        // (comp_for reuses the local for boxed elements).
+        let mut demoted = std::collections::HashSet::new();
+        collect_loop_and_comp_vars(body, &mut demoted);
+        // A boxed local starts null, so use-before-assign is a loud NameError
+        // at runtime; a raw i32/f64 slot would silently read 0. Keep the slot
+        // ONLY when every read is preceded by a straight-line assignment —
+        // assignments inside a branch or loop don't count for code after it.
+        collect_maybe_unassigned_reads(body, &mut std::collections::HashSet::new(), &mut demoted);
+        for n in &demoted {
+            reprs.remove(n);
+        }
+        cx.reprs = reprs;
         let mut local_names: Vec<&String> = assigned.iter().collect();
         local_names.sort(); // deterministic output
         for a in local_names {
             if !cx.vars.contains_key(a) {
-                cx.ensure_local(a);
+                match cx.reprs.get(a.as_str()) {
+                    Some(Repr::Int) => {
+                        cx.vars.insert(a.to_string(), Ty::Value);
+                        cx.locals.push((a.to_string(), "i32".to_string()));
+                    }
+                    Some(Repr::Float) => {
+                        cx.vars.insert(a.to_string(), Ty::Value);
+                        cx.locals.push((a.to_string(), "f64".to_string()));
+                    }
+                    _ => cx.ensure_local(a),
+                }
             }
         }
 
@@ -6885,7 +6974,13 @@ impl Gen {
             ExprKind::Bool(false) => Ok("(global.get $FALSE)".into()),
             ExprKind::NoneLit => Ok("(global.get $NONE)".into()),
             ExprKind::Name(n) => {
-                if cx.vars.contains_key(n) {
+                if let Some(r) = cx.reprs.get(n.as_str()) {
+                    // Typed slot read in a boxed context: box it.
+                    Ok(match r {
+                        Repr::Int => format!("(call $box (local.get ${n}))"),
+                        _ => format!("(struct.new $FLOAT (local.get ${n}))"),
+                    })
+                } else if cx.vars.contains_key(n) {
                     Ok(format!("(local.get ${n})"))
                 } else if self.is_global(n) {
                     Ok(format!("(global.get $g_{n})"))
@@ -8067,6 +8162,14 @@ impl Gen {
                 let c = self.cond_i32(cx, inner)?;
                 Ok(format!("(i32.eqz {c})"))
             }
+            ExprKind::Bin(op, a, b)
+                if matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) && self.scalar_cmp(cx, *op, a, b).is_some() =>
+            {
+                Ok(self.scalar_cmp(cx, *op, a, b).unwrap())
+            }
             ExprKind::Bin(BinOp::Eq, a, b) => {
                 let lhs = self.value_expr(cx, a)?;
                 let rhs = self.value_expr(cx, b)?;
@@ -8092,7 +8195,126 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call {} {lhs} {rhs})", cmp_helper(*op).unwrap()))
             }
-            _ => Ok(format!("(call $truthy {})", self.value_expr(cx, e)?)),
+            _ => {
+                // A provably-Int expression is truthy iff nonzero — no boxing.
+                if let Some(sc) = self.scalar_expr(cx, e, Repr::Int) {
+                    return Ok(format!("(i32.ne {sc} (i32.const 0))"));
+                }
+                Ok(format!("(call $truthy {})", self.value_expr(cx, e)?))
+            }
+        }
+    }
+
+    /// A direct comparison when BOTH sides are provably numeric: Int/Int
+    /// compares as i32, anything involving Float compares as f64 (ints
+    /// convert exactly). Returns None when either side isn't provable —
+    /// the caller falls back to the boxed helpers.
+    fn scalar_cmp(&mut self, cx: &mut FuncCx, op: BinOp, a: &Expr, b: &Expr) -> Option<String> {
+        let empty = HashMap::new();
+        let look = |n: &str| cx.reprs.get(n).copied();
+        let ra = infer_expr_repr(a, &look, &empty)?;
+        let rb = infer_expr_repr(b, &look, &empty)?;
+        if !matches!(ra, Repr::Int | Repr::Float) || !matches!(rb, Repr::Int | Repr::Float) {
+            return None;
+        }
+        if ra == Repr::Int && rb == Repr::Int {
+            let (x, y) = (
+                self.scalar_expr(cx, a, Repr::Int)?,
+                self.scalar_expr(cx, b, Repr::Int)?,
+            );
+            let w = match op {
+                BinOp::Eq => "i32.eq",
+                BinOp::Ne => "i32.ne",
+                BinOp::Lt => "i32.lt_s",
+                BinOp::Le => "i32.le_s",
+                BinOp::Gt => "i32.gt_s",
+                BinOp::Ge => "i32.ge_s",
+                _ => return None,
+            };
+            return Some(format!("({w} {x} {y})"));
+        }
+        let (x, y) = (
+            self.scalar_expr(cx, a, Repr::Float)?,
+            self.scalar_expr(cx, b, Repr::Float)?,
+        );
+        let w = match op {
+            BinOp::Eq => "f64.eq",
+            BinOp::Ne => "f64.ne",
+            BinOp::Lt => "f64.lt",
+            BinOp::Le => "f64.le",
+            BinOp::Gt => "f64.gt",
+            BinOp::Ge => "f64.ge",
+            _ => return None,
+        };
+        Some(format!("({w} {x} {y})"))
+    }
+
+    /// Emit `e` as a raw scalar of repr `want` (Int -> i32, Float -> f64),
+    /// or None when any part isn't provable — callers fall back to the boxed
+    /// path, which is always correct. Arithmetic stays CHECKED: +,-,* widen
+    /// to i64 and narrow through $ck32 (OverflowError), //,% call the same
+    /// $i32_floordiv/$i32_floormod the boxed path uses (ZeroDivisionError),
+    /// and float / checks its divisor ($f_div). Same observable behavior,
+    /// no boxing, no dynamic dispatch.
+    fn scalar_expr(&mut self, cx: &mut FuncCx, e: &Expr, want: Repr) -> Option<String> {
+        let empty = HashMap::new();
+        let look = |n: &str| cx.reprs.get(n).copied();
+        let r = infer_expr_repr(e, &look, &empty)?;
+        if r != want && !(want == Repr::Float && r == Repr::Int) {
+            return None;
+        }
+        match (&e.kind, want) {
+            (ExprKind::Int(v), Repr::Int) => {
+                let v32 = i32::try_from(*v).ok()?;
+                Some(format!("(i32.const {v32})"))
+            }
+            (ExprKind::Int(v), Repr::Float) => Some(format!("(f64.const {})", *v as f64)),
+            (ExprKind::Float(f), Repr::Float) => Some(format!("(f64.const {f})")),
+            (ExprKind::Name(n), _) => match (cx.reprs.get(n.as_str())?, want) {
+                (Repr::Int, Repr::Int) => Some(format!("(local.get ${n})")),
+                (Repr::Float, Repr::Float) => Some(format!("(local.get ${n})")),
+                (Repr::Int, Repr::Float) => Some(format!("(f64.convert_i32_s (local.get ${n}))")),
+                _ => None,
+            },
+            (ExprKind::Unary(UnOp::Neg, i), Repr::Int) => {
+                let x = self.scalar_expr(cx, i, Repr::Int)?;
+                Some(format!("(call $i_neg {x})"))
+            }
+            (ExprKind::Unary(UnOp::Neg, i), Repr::Float) => {
+                let x = self.scalar_expr(cx, i, Repr::Float)?;
+                Some(format!("(f64.neg {x})"))
+            }
+            (ExprKind::Bin(op, a, b), Repr::Int) => {
+                let x = self.scalar_expr(cx, a, Repr::Int)?;
+                let y = self.scalar_expr(cx, b, Repr::Int)?;
+                let f = match op {
+                    BinOp::Add => "$i_add",
+                    BinOp::Sub => "$i_sub",
+                    BinOp::Mul => "$i_mul",
+                    BinOp::FloorDiv => {
+                        self.uses_floordiv = true;
+                        "$i32_floordiv"
+                    }
+                    BinOp::Mod => {
+                        self.uses_floormod = true;
+                        "$i32_floormod"
+                    }
+                    _ => return None,
+                };
+                Some(format!("(call {f} {x} {y})"))
+            }
+            (ExprKind::Bin(op, a, b), Repr::Float) => {
+                let x = self.scalar_expr(cx, a, Repr::Float)?;
+                let y = self.scalar_expr(cx, b, Repr::Float)?;
+                match op {
+                    BinOp::Add => Some(format!("(f64.add {x} {y})")),
+                    BinOp::Sub => Some(format!("(f64.sub {x} {y})")),
+                    BinOp::Mul => Some(format!("(f64.mul {x} {y})")),
+                    BinOp::Div => Some(format!("(call $f_div {x} {y})")),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 }
@@ -8208,6 +8430,336 @@ fn const_float(e: &Expr) -> Option<f64> {
         ExprKind::Float(f) => Some(*f),
         ExprKind::Unary(UnOp::Neg, inner) => const_float(inner).map(|v| -v),
         _ => None,
+    }
+}
+
+/// Names phase 1 of the typed-slot tier must NOT type: loop variables
+/// (gen_for/gen_foreach still bind boxed values) and comprehension variables
+/// (comp_for stores boxed elements through the same local). Conservative
+/// full-expression walk, so a comp nested anywhere still demotes its name.
+/// Reads that MIGHT happen before the name's first assignment, in
+/// document order. `defined` = names assigned on every path so far (a
+/// nested block inherits a copy; its assignments don't escape). Any name
+/// read while not in `defined` lands in `demote` — its slot must stay
+/// boxed so the use-before-assign NameError survives.
+fn collect_maybe_unassigned_reads(
+    body: &[Stmt],
+    defined: &mut std::collections::HashSet<String>,
+    demote: &mut std::collections::HashSet<String>,
+) {
+    fn reads(
+        e: &Expr,
+        defined: &std::collections::HashSet<String>,
+        demote: &mut std::collections::HashSet<String>,
+    ) {
+        match &e.kind {
+            ExprKind::Name(n) => {
+                if !defined.contains(n) {
+                    demote.insert(n.clone());
+                }
+            }
+            ExprKind::Unary(_, i) => reads(i, defined, demote),
+            ExprKind::Bin(_, a, b) => {
+                reads(a, defined, demote);
+                reads(b, defined, demote);
+            }
+            ExprKind::Call(_, args) | ExprKind::List(args) | ExprKind::Tuple(args) => {
+                for a in args {
+                    reads(a, defined, demote);
+                }
+            }
+            ExprKind::MethodCall(obj, _, args) => {
+                reads(obj, defined, demote);
+                for a in args {
+                    reads(a, defined, demote);
+                }
+            }
+            ExprKind::Dict(pairs) => {
+                for (k, v) in pairs {
+                    reads(k, defined, demote);
+                    reads(v, defined, demote);
+                }
+            }
+            ExprKind::Index(a, b) => {
+                reads(a, defined, demote);
+                reads(b, defined, demote);
+            }
+            ExprKind::Slice {
+                obj,
+                start,
+                stop,
+                step,
+            } => {
+                reads(obj, defined, demote);
+                for o in [start, stop, step].into_iter().flatten() {
+                    reads(o, defined, demote);
+                }
+            }
+            ExprKind::Attr(a, _) | ExprKind::Kwarg(_, a) => reads(a, defined, demote),
+            ExprKind::IfExp { cond, then, orelse } => {
+                reads(cond, defined, demote);
+                reads(then, defined, demote);
+                reads(orelse, defined, demote);
+            }
+            // Comprehension vars are demoted wholesale elsewhere; their
+            // bodies still read outer names.
+            ExprKind::ListComp { element, clauses } | ExprKind::SetComp { element, clauses } => {
+                reads(element, defined, demote);
+                for c in clauses {
+                    match c {
+                        CompClause::For { iter, .. } => reads(iter, defined, demote),
+                        CompClause::If(e2) => reads(e2, defined, demote),
+                    }
+                }
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                clauses,
+            } => {
+                reads(key, defined, demote);
+                reads(value, defined, demote);
+                for c in clauses {
+                    match c {
+                        CompClause::For { iter, .. } => reads(iter, defined, demote),
+                        CompClause::If(e2) => reads(e2, defined, demote),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in body {
+        match &st.kind {
+            StmtKind::Assign(name, e) | StmtKind::AnnAssign { name, value: e, .. } => {
+                reads(e, defined, demote);
+                defined.insert(name.clone());
+            }
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => reads(e, defined, demote),
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                reads(cond, defined, demote);
+                let mut d = defined.clone();
+                collect_maybe_unassigned_reads(body, &mut d, demote);
+                for (c, b) in elifs {
+                    reads(c, defined, demote);
+                    let mut d = defined.clone();
+                    collect_maybe_unassigned_reads(b, &mut d, demote);
+                }
+                if let Some(b) = else_body {
+                    let mut d = defined.clone();
+                    collect_maybe_unassigned_reads(b, &mut d, demote);
+                }
+            }
+            StmtKind::While { cond, body } => {
+                reads(cond, defined, demote);
+                let mut d = defined.clone();
+                collect_maybe_unassigned_reads(body, &mut d, demote);
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                reads(start, defined, demote);
+                reads(end, defined, demote);
+                reads(step, defined, demote);
+                let mut d = defined.clone();
+                d.insert(var.clone());
+                collect_maybe_unassigned_reads(body, &mut d, demote);
+            }
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => {
+                reads(iterable, defined, demote);
+                let mut d = defined.clone();
+                d.insert(var.clone());
+                collect_maybe_unassigned_reads(body, &mut d, demote);
+            }
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                reads(target, defined, demote);
+                reads(index, defined, demote);
+                reads(value, defined, demote);
+            }
+            StmtKind::SetAttr { obj, value, .. } => {
+                reads(obj, defined, demote);
+                reads(value, defined, demote);
+            }
+            StmtKind::UnpackAssign { targets, value } => {
+                reads(value, defined, demote);
+                for t in targets {
+                    if let ExprKind::Name(n) = &t.kind {
+                        defined.insert(n.clone());
+                    } else {
+                        reads(t, defined, demote);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_loop_and_comp_vars(body: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    fn expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        match &e.kind {
+            ExprKind::ListComp { element, clauses } => {
+                expr(element, out);
+                clauses_vars(clauses, out);
+            }
+            ExprKind::SetComp { element, clauses } => {
+                expr(element, out);
+                clauses_vars(clauses, out);
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                clauses,
+            } => {
+                expr(key, out);
+                expr(value, out);
+                clauses_vars(clauses, out);
+            }
+            ExprKind::Unary(_, i) => expr(i, out),
+            ExprKind::Bin(_, a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            ExprKind::Call(_, args) | ExprKind::List(args) | ExprKind::Tuple(args) => {
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            ExprKind::MethodCall(obj, _, args) => {
+                expr(obj, out);
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            ExprKind::Dict(pairs) => {
+                for (k, v) in pairs {
+                    expr(k, out);
+                    expr(v, out);
+                }
+            }
+            ExprKind::Index(a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            ExprKind::Slice {
+                obj,
+                start,
+                stop,
+                step,
+            } => {
+                expr(obj, out);
+                for o in [start, stop, step].into_iter().flatten() {
+                    expr(o, out);
+                }
+            }
+            ExprKind::Attr(a, _) | ExprKind::Kwarg(_, a) => expr(a, out),
+            ExprKind::IfExp { cond, then, orelse } => {
+                expr(cond, out);
+                expr(then, out);
+                expr(orelse, out);
+            }
+            _ => {}
+        }
+    }
+    fn clauses_vars(clauses: &[CompClause], out: &mut std::collections::HashSet<String>) {
+        for c in clauses {
+            match c {
+                CompClause::For { vars, iter } => {
+                    for v in vars {
+                        out.insert(v.clone());
+                    }
+                    expr(iter, out);
+                }
+                CompClause::If(e) => expr(e, out),
+            }
+        }
+    }
+    for st in body {
+        match &st.kind {
+            StmtKind::Assign(_, e) | StmtKind::AnnAssign { value: e, .. } | StmtKind::Expr(e) => {
+                expr(e, out)
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                out.insert(var.clone());
+                expr(start, out);
+                expr(end, out);
+                expr(step, out);
+                collect_loop_and_comp_vars(body, out);
+            }
+            StmtKind::ForEach {
+                var,
+                iterable,
+                body,
+            } => {
+                out.insert(var.clone());
+                expr(iterable, out);
+                collect_loop_and_comp_vars(body, out);
+            }
+            StmtKind::While { cond, body } => {
+                expr(cond, out);
+                collect_loop_and_comp_vars(body, out);
+            }
+            StmtKind::If {
+                cond,
+                body,
+                elifs,
+                else_body,
+            } => {
+                expr(cond, out);
+                collect_loop_and_comp_vars(body, out);
+                for (c, b) in elifs {
+                    expr(c, out);
+                    collect_loop_and_comp_vars(b, out);
+                }
+                if let Some(b) = else_body {
+                    collect_loop_and_comp_vars(b, out);
+                }
+            }
+            StmtKind::Return(Some(e)) => expr(e, out),
+            StmtKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                expr(target, out);
+                expr(index, out);
+                expr(value, out);
+            }
+            StmtKind::SetAttr { obj, value, .. } => {
+                expr(obj, out);
+                expr(value, out);
+            }
+            StmtKind::UnpackAssign { targets, value } => {
+                for t in targets {
+                    expr(t, out);
+                }
+                expr(value, out);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -8774,10 +9326,12 @@ mod tests {
     #[test]
     fn function_locals_shadow_globals() {
         let wat = compile("x = 1\ndef f():\n    x = 2\n    return x\nprint(f(), x)\n").unwrap();
-        // Global x exists; inside f, x is a local.
+        // Global x exists; inside f, x is a local — and a provably-int one,
+        // so the typed-slot tier gives it a raw i32 slot (boxed on return).
         assert!(wat.contains("(global $g_x (mut (ref null eq)) (ref.null eq))"));
-        assert!(wat.contains("(local $x (ref null eq))"));
-        assert!(wat.contains("(local.set $x (ref.i31 (i32.const 2)))"));
+        assert!(wat.contains("(local $x i32)"));
+        assert!(wat.contains("(local.set $x (i32.const 2))"));
+        assert!(wat.contains("(return (call $box (local.get $x)))"));
     }
 
     #[test]
