@@ -854,24 +854,8 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // Typed-slot arithmetic: the scalar twins of $py_add/$py_sub/$py_mul's
-    // int arms. Same overflow discipline — widen to i64, narrow via $ck32 —
-    // so a typed slot can never wrap where the boxed path would raise.
-    for (name, op) in [
-        ("$i_add", "i64.add"),
-        ("$i_sub", "i64.sub"),
-        ("$i_mul", "i64.mul"),
-    ] {
-        let mut b = Body::new();
-        b.push(format!(
-            "(call $ck32 ({op} (i64.extend_i32_s (local.get $a)) (i64.extend_i32_s (local.get $b))))"
-        ));
-        fs.push(Func {
-            signature: format!("(func {name} (param $a i32) (param $b i32) (result i32)"),
-            locals: vec![],
-            body: b,
-        });
-    }
+    // Typed-slot arithmetic inlines the i64 widen at each site; only the
+    // unary negation keeps a helper (and $ck32 stays the shared trap gate).
     let mut b = Body::new();
     b.push("(call $ck32 (i64.sub (i64.const 0) (i64.extend_i32_s (local.get $a))))");
     fs.push(Func {
@@ -8566,10 +8550,21 @@ impl Gen {
             (ExprKind::Bin(op, a, b), Repr::Int) => {
                 let x = self.scalar_expr(cx, a, Repr::Int)?;
                 let y = self.scalar_expr(cx, b, Repr::Int)?;
+                // +,-,* inline the i64 widen directly; $ck32 stays the one
+                // call (the trap gate needs its operand twice — a helper is
+                // cleaner than a scratch local per expression).
+                let wide = match op {
+                    BinOp::Add => Some("i64.add"),
+                    BinOp::Sub => Some("i64.sub"),
+                    BinOp::Mul => Some("i64.mul"),
+                    _ => None,
+                };
+                if let Some(w) = wide {
+                    return Some(format!(
+                        "(call $ck32 ({w} (i64.extend_i32_s {x}) (i64.extend_i32_s {y})))"
+                    ));
+                }
                 let f = match op {
-                    BinOp::Add => "$i_add",
-                    BinOp::Sub => "$i_sub",
-                    BinOp::Mul => "$i_mul",
                     BinOp::FloorDiv => {
                         self.uses_floordiv = true;
                         "$i32_floordiv"
