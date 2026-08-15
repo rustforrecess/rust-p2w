@@ -43,8 +43,84 @@ unequal instead of trapping.
 | 4 | marshalling: strings pass as externref straight through host calls (runner.rs + exec host signature change); scratch batching stays for `get_value`-style inbound | e2e 18/18; marshal bench |
 | 5 | bench + record: strbuild, marshal suite, IDE memory profile | numbers into the memory entry |
 
+## Stage 3 spec — decided 2026-08-16, execute mechanically
+
+**Value model.** A string is a JS string stored INTERNALIZED in the
+universal value: `(any.convert_extern <externref>)` produces `(ref null
+any)` and lives anywhere a value lives. At use sites, externalize back
+(`extern.convert_any`) and call the builtin. Type dispatch: there is no
+`ref.test` for internalized externs — `is_str(v)` = externalize + call
+`wasm:js-string.test`. (Externalized i31s/structs become JS numbers/
+opaque objects; `test` correctly answers 0 for them.) Every polymorphic
+helper's string arm switches from `ref.test (ref $STR)` to this.
+
+**Encoding note.** $STR was UTF-8 bytes, so len()/indexing counted BYTES
+(wrong vs CPython off-ASCII). JS strings are UTF-16 units — for ASCII
+identical (suite-neutral), for BMP text actually CLOSER to CPython.
+Document, don't fight.
+
+**Host seam changes riding in this stage** (they delete complexity the
+cutover would otherwise have to bridge; both hosts are trivial):
+- `env.write_str (param externref)` — print's string arm becomes ONE
+  call (replaces the per-byte write_char walk).
+- `env.f64_str (param f64) (result externref)` — str(float); both hosts
+  own the CPython-exact repr already (py_float_repr / IDE formatter).
+- `env.read_line (result externref)` — input() stops byte-assembling.
+- `s_str (param externref)` — the arg-stack push for DOM/report/
+  evidence/fields becomes one externref (subsumes most of stage 4;
+  scratch-page batching remains only for gv/gf INBOUND, which also
+  simplify: `gv_fetch`/`gf_fetch` RETURN externref directly).
+
+**Literals.** `str_lit(text)` interns text -> one imported global
+`(import "'" "<text>" (global $lit_N (ref extern)))`; use =
+`(any.convert_extern (global.get $lit_N))`. Gen keeps the intern map;
+imports rendered before other imports. WAT-escape the name.
+
+**Lowering table** (helpers keep their names where possible):
+| today | becomes |
+|---|---|
+| $str_eq | `equals` builtin |
+| $str_lt | `compare` builtin < 0 |
+| $py_add str arm | `concat` |
+| $py_len str arm | `length` |
+| index s[i] | `substring i i+1` (negative-index fixups stay) |
+| slice | `substring` (existing bound clamps stay) |
+| $str_contains/$str_find/$str_count/$str_match_at | charCodeAt loops over both strings (keep algorithms, swap array.get_u -> charCodeAt) |
+| upper/lower/capitalize/title | charCodeAt + ASCII case math + build via scratch (array (mut i16)) + fromCharCodeArray (matches current ASCII-only behavior) |
+| strip family | charCodeAt trims + substring |
+| split/join/replace/zfill/pad | same loop rewrites over charCodeAt/concat/substring |
+| $str_to_int/$str_to_float | charCodeAt parsing walks (algorithms unchanged) |
+| $i32_to_str | digit loop into scratch i16 array + fromCharCodeArray |
+| $to_str float arm | env.f64_str |
+| print/repr str arms | env.write_str (repr adds quotes via concat with literal `'`) |
+| $marshal_str | externalize + `s_str` host call |
+| input() | env.read_line |
+| dict/set membership | VERIFY: containers are linear-scan over $py_eq (no string hashing) — then equals-builtin via $py_eq is sufficient. If a hash exists anywhere, charCodeAt-loop it |
+| $read_char | stays for the char-level API only if something still uses it; else delete |
+
+**One scratch `(array (mut i16))` type** (`$U16S`) added to the type
+section for build-a-string loops and intoCharCodeArray staging.
+
+**Order of execution** (each step compiles; suite green only at the end
+of the batch — this stage is atomic-ish, budget a full session):
+1. Type section: drop nothing yet; add $U16S + the builtin imports
+   (emitted only when strings are used — but strings are used by print
+   of anything via repr paths, so effectively always; fine).
+2. str_lit -> literal-global interning.
+3. The is_str dispatch swap in every polymorphic helper.
+4. The lowering table, top to bottom.
+5. Host seams (exec/common/harness/runner get write_str/f64_str/
+   read_line/s_str/gv/gf-externref).
+6. Delete $STR array type + dead helpers; suite + probe docs
+   byte-identical; e2e 18/18.
+
+## Status
+
 ## Status
 
 - [x] Stage 0: survey — 197 eq-universal sites, 1 `ref.eq`, 233 `$STR` touches
 - [x] Stage 1: universal value is (ref null any); ref.eq guarded; suite 100% green unchanged
-- [ ] Stage 2–5
+- [x] Stage 2: wasmtime polyfill of wasm:js-string (tests/common/mod.rs) + literal mechanism DECIDED = the quote-module imports (import name IS the literal; V8 gets importedStringConstants at compile); contract test tests/js_string_host.rs green
+- [ ] Stage 3 (spec above; execution = one full session)
+- [ ] Stage 4 residue: gv/gf inbound + IDE runner + e2e
+- [ ] Stage 5 bench + record
