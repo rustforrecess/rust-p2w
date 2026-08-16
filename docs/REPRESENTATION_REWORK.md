@@ -132,4 +132,4 @@ of the batch — this stage is atomic-ish, budget a full session):
   assemble UTF-16 units (surrogate pairs included — café 🦀 prints).
   Suite 100% green, RUNTIME_SEMANTICS byte-identical, $STR deleted.
 - [x] Stage 4: IDE runner passes the js-string compile options via Reflect (acornstem-ide); full e2e 18/18 on the JS-strings build. gv/gf inbound stays on the scratch protocol (works; externref returns = optional later).
-- [ ] Stage 5 bench + record
+- [x] Stage 5: real-Chrome bench (acornstem-ide bench_js_strings, data-URL page, median of 7): strbuild pre-cutover 279.2ms -> JS strings 73.3ms (~3.8x). Campaign COMPLETE.
