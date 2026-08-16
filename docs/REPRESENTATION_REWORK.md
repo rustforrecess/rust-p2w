@@ -121,6 +121,15 @@ of the batch — this stage is atomic-ish, budget a full session):
 - [x] Stage 0: survey — 197 eq-universal sites, 1 `ref.eq`, 233 `$STR` touches
 - [x] Stage 1: universal value is (ref null any); ref.eq guarded; suite 100% green unchanged
 - [x] Stage 2: wasmtime polyfill of wasm:js-string (tests/common/mod.rs) + literal mechanism DECIDED = the quote-module imports (import name IS the literal; V8 gets importedStringConstants at compile); contract test tests/js_string_host.rs green
-- [ ] Stage 3 (spec above; execution = one full session)
+- [x] Stage 3 EXECUTED: strings are JS strings. ONE DESIGN CHANGE from the
+  spec: strings are NOT bare internalized externs — they are wrapped in
+  `(type $JSSTR (struct (field (ref extern))))`, because wasmtime 44
+  panics its is_subtype libcall on ANY concrete ref.test that sees an
+  internalized extern (and i32.or chains are not short-circuit, so
+  ordering alone cannot protect them). The wrapper makes is_str one
+  native ref.test (faster than the builtin `test` host call) and kills
+  the panic class by construction. Encoding shift verified: hosts now
+  assemble UTF-16 units (surrogate pairs included — café 🦀 prints).
+  Suite 100% green, RUNTIME_SEMANTICS byte-identical, $STR deleted.
 - [ ] Stage 4 residue: gv/gf inbound + IDE runner + e2e
 - [ ] Stage 5 bench + record

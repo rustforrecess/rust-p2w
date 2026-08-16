@@ -8,6 +8,8 @@
 //! these can.
 
 use std::sync::OnceLock;
+mod common;
+
 use wasmtime::{Caller, Config, Engine, Linker, Module, OptLevel, Store};
 
 /// One shared Engine for the whole suite: Engine is internally refcounted
@@ -65,8 +67,33 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
     );
     let mut linker: Linker<Io> = Linker::new(engine());
     linker
-        .func_wrap("env", "write_char", |mut caller: Caller<'_, Io>, c: i32| {
-            caller.data_mut().out.push(c as u8);
+        .func_wrap("env", "write_char", {
+            // Fn+Send+Sync required: surrogate state as an atomic (0 = none).
+            let hi = std::sync::atomic::AtomicU32::new(0);
+            move |mut caller: Caller<'_, Io>, c: i32| {
+                // UTF-16 code units in (surrogate pairs across calls),
+                // UTF-8 bytes out (see common/mod.rs).
+                let u = c as u32 as u16;
+                use std::sync::atomic::Ordering;
+                let prev = hi.swap(0, Ordering::Relaxed);
+                let cp: u32 = match (prev, u) {
+                    (0, 0xD800..=0xDBFF) => {
+                        hi.store(0x1_0000 | u as u32, Ordering::Relaxed);
+                        return;
+                    }
+                    (p, 0xDC00..=0xDFFF) if p != 0 => {
+                        let h = p & 0xFFFF;
+                        0x10000 + (((h - 0xD800) << 10) | (u as u32 - 0xDC00))
+                    }
+                    (_, _) => u as u32,
+                };
+                let c = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
+                let mut buf = [0u8; 4];
+                caller
+                    .data_mut()
+                    .out
+                    .extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
         })
         .unwrap();
     linker
@@ -190,6 +217,8 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         )
         .unwrap();
 
+    common::add_js_string_builtins(&mut linker);
+    common::define_string_literals(&mut linker, &mut store, &module);
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("instantiate");

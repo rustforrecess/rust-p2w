@@ -51,6 +51,7 @@ const I31_MAX: i64 = (1 << 30) - 1;
 const I31_MIN: i64 = -(1 << 30);
 
 pub fn generate(stmts: &[Stmt]) -> Result<String> {
+    STR_LITS.with(|t| t.borrow_mut().clear());
     let mut g = Gen::default();
 
     // Pass 1: collect function and class signatures so calls/construction
@@ -297,6 +298,31 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     }
 
     let mut module = Module::default();
+    // Strings are JS strings (externref, internalized into the universal
+    // value). The builtins arrive as imports — native in the browser
+    // (compile option { builtins: ['js-string'], importedStringConstants:
+    // \"'\" }), polyfilled by the wasmtime hosts (tests/common).
+    for imp in [
+        r#"(import "wasm:js-string" "test" (func $js_test (param externref) (result i32)))"#,
+        r#"(import "wasm:js-string" "length" (func $js_length (param externref) (result i32)))"#,
+        r#"(import "wasm:js-string" "charCodeAt" (func $js_charCodeAt (param externref) (param i32) (result i32)))"#,
+        r#"(import "wasm:js-string" "concat" (func $js_concat (param externref) (param externref) (result (ref extern))))"#,
+        r#"(import "wasm:js-string" "equals" (func $js_equals (param externref) (param externref) (result i32)))"#,
+        r#"(import "wasm:js-string" "compare" (func $js_compare (param externref) (param externref) (result i32)))"#,
+        r#"(import "wasm:js-string" "substring" (func $js_substring (param externref) (param i32) (param i32) (result (ref extern))))"#,
+        r#"(import "wasm:js-string" "fromCharCode" (func $js_fromCharCode (param i32) (result (ref extern))))"#,
+        r#"(import "wasm:js-string" "fromCharCodeArray" (func $js_fromCharCodeArray (param (ref null $U16S)) (param i32) (param i32) (result (ref extern))))"#,
+        r#"(import "wasm:js-string" "intoCharCodeArray" (func $js_intoCharCodeArray (param externref) (param (ref null $U16S)) (param i32) (result i32)))"#,
+    ] {
+        module.imports.push(imp.into());
+    }
+    module.types.push("(type $U16S (array (mut i16)))".into());
+    // A string is a JS string WRAPPED in a one-field struct: ordinary GC
+    // value, so ref.test dispatch works natively (and wasmtime 44 never
+    // sees an internalized extern, whose subtype check it panics on).
+    module
+        .types
+        .push("(type $JSSTR (struct (field (ref extern))))".into());
     module.types.push("(type $INT (struct (field i32)))".into());
     module.types.push("(type $BOOL (struct (field i8)))".into());
     module
@@ -306,7 +332,6 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // NOTE: WASM-GC type canonicalization is structural — keep these
     // shapes distinct or ref.test misfires (see $BOOL's i8 field; $NONE_T
     // must stay the only fieldless struct).
-    module.types.push("(type $STR (array (mut i8)))".into());
     module
         .types
         .push("(type $ITEMS (array (mut (ref null any))))".into());
@@ -343,7 +368,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         .push("(type $METHOD (struct (field (ref $MFUNC))))".into());
     // $CLASS self-references via $base, so it lives in a singleton rec group.
     module.types.push(
-        "(rec (type $CLASS (struct (field (ref $STR)) (field (ref null $DICT)) (field (ref null $CLASS)))))".into(),
+        "(rec (type $CLASS (struct (field (ref null any)) (field (ref null $DICT)) (field (ref null $CLASS)))))".into(),
     );
     module
         .types
@@ -419,6 +444,16 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                 .push(r#"(memory $mem (export "memory") 1)"#.to_string());
         }
     }
+    // Drain the literal intern table — every str_lit() call above has
+    // registered its text; each becomes one imported constant global.
+    STR_LITS.with(|t| {
+        for (i, text) in t.borrow().iter().enumerate() {
+            module.imports.push(format!(
+                r#"(import "'" "{}" (global $lit{i} (ref extern)))"#,
+                wat_escape(text)
+            ));
+        }
+    });
     if g.uses_random {
         module
             .globals
@@ -500,9 +535,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         }
         // $marshal_str(v): str()-coerce, then push its bytes as one arg string.
         let mut b = Body::new();
-        b.push("(local.set $s (ref.cast (ref $STR) (call $to_str (local.get $v))))");
+        b.push("(local.set $s (call $to_str (local.get $v)))");
         b.push("(call $s_begin)");
-        b.push("(local.set $n (array.len (local.get $s)))");
+        b.push("(local.set $n (call $slen (local.get $s)))");
         b.push("(block $done (loop $chunk");
         b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
         b.push_in(1, "(local.set $c (i32.sub (local.get $n) (local.get $i)))");
@@ -516,7 +551,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         b.push_in(
             2,
             "(i32.store8 (i32.add (i32.const 32768) (local.get $j)) \
-             (array.get_u $STR (local.get $s) (i32.add (local.get $i) (local.get $j))))",
+             (call $sat (local.get $s) (i32.add (local.get $i) (local.get $j))))",
         );
         b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
         b.push_in(2, "(br $copy)))");
@@ -527,7 +562,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module.funcs.push(Func {
             signature: "(func $marshal_str (param $v (ref null any))".into(),
             locals: vec![
-                "(local $s (ref null $STR))".into(),
+                "(local $s (ref null any))".into(),
                 "(local $n i32)".into(),
                 "(local $i i32)".into(),
                 "(local $c i32)".into(),
@@ -561,10 +596,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             module.imports.push(imp.into());
         }
         // $get_value(): with the selector already on the arg stack, fetch the
-        // element's value/text and build a $STR from the returned bytes.
+        // element's value/text and build a string from the returned units.
         let mut b = Body::new();
         b.push("(local.set $n (call $gv_fetch))");
-        b.push("(local.set $s (array.new_default $STR (local.get $n)))");
+        b.push("(local.set $s (array.new_default $U16S (local.get $n)))");
         b.push("(block $done (loop $chunk");
         b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
         b.push_in(
@@ -577,19 +612,19 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         b.push_in(2, "(br_if $cdone (i32.ge_u (local.get $j) (local.get $c)))");
         b.push_in(
             2,
-            "(array.set $STR (local.get $s) (i32.add (local.get $i) (local.get $j)) \
+            "(array.set $U16S (ref.cast (ref $U16S) (local.get $s)) (i32.add (local.get $i) (local.get $j)) \
              (i32.load8_u (i32.add (i32.const 32768) (local.get $j))))",
         );
         b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
         b.push_in(2, "(br $copy)))");
         b.push_in(1, "(local.set $i (i32.add (local.get $i) (local.get $c)))");
         b.push_in(1, "(br $chunk)))");
-        b.push("(local.get $s)");
+        b.push("(call $finish (local.get $s))");
         module.funcs.push(Func {
             signature: "(func $get_value (result (ref null any))".into(),
             locals: vec![
                 "(local $n i32)".into(),
-                "(local $s (ref null $STR))".into(),
+                "(local $s (ref null any))".into(),
                 "(local $i i32)".into(),
                 "(local $c i32)".into(),
                 "(local $j i32)".into(),
@@ -663,7 +698,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         }
         let mut b = Body::new();
         b.push("(local.set $n (call $gf_fetch))");
-        b.push("(local.set $s (array.new_default $STR (local.get $n)))");
+        b.push("(local.set $s (array.new_default $U16S (local.get $n)))");
         b.push("(block $done (loop $chunk");
         b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
         b.push_in(
@@ -676,19 +711,19 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         b.push_in(2, "(br_if $cdone (i32.ge_u (local.get $j) (local.get $c)))");
         b.push_in(
             2,
-            "(array.set $STR (local.get $s) (i32.add (local.get $i) (local.get $j)) \
+            "(array.set $U16S (ref.cast (ref $U16S) (local.get $s)) (i32.add (local.get $i) (local.get $j)) \
              (i32.load8_u (i32.add (i32.const 32768) (local.get $j))))",
         );
         b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
         b.push_in(2, "(br $copy)))");
         b.push_in(1, "(local.set $i (i32.add (local.get $i) (local.get $c)))");
         b.push_in(1, "(br $chunk)))");
-        b.push("(local.get $s)");
+        b.push("(call $finish (local.get $s))");
         module.funcs.push(Func {
             signature: "(func $get_field (result (ref null any))".into(),
             locals: vec![
                 "(local $n i32)".into(),
-                "(local $s (ref null $STR))".into(),
+                "(local $s (ref null any))".into(),
                 "(local $i i32)".into(),
                 "(local $c i32)".into(),
                 "(local $j i32)".into(),
@@ -709,8 +744,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
 
 /// Emit `write_char` calls spelling out `text` (for runtime messages).
 fn push_text(b: &mut Body, depth: usize, text: &str) {
-    for c in text.bytes() {
-        b.push_in(depth, format!("(call $write_char (i32.const {c}))"));
+    // write_char carries UTF-16 code units now (strings are JS strings), so
+    // message text emits per CHAR — the host reassembles surrogate pairs.
+    for c in text.chars() {
+        let mut units = [0u16; 2];
+        for u in c.encode_utf16(&mut units) {
+            b.push_in(depth, format!("(call $write_char (i32.const {u}))"));
+        }
     }
 }
 
@@ -723,6 +763,7 @@ fn raise_helpers() -> Vec<Func> {
 
     // $type_name: print the Python type name of a value.
     let mut b = Body::new();
+    b.push("(if (call $is_str (local.get $r)) (then (call $write_char (i32.const 115)) (call $write_char (i32.const 116)) (call $write_char (i32.const 114)) (return)))");
     b.push("(if (ref.is_null (local.get $r))");
     b.push_in(1, "(then");
     push_text(&mut b, 2, "unassigned");
@@ -733,7 +774,7 @@ fn raise_helpers() -> Vec<Func> {
         ("(ref.test (ref $INT) (local.get $r))", "int"),
         ("(ref.test (ref $BOOL) (local.get $r))", "bool"),
         ("(ref.test (ref $FLOAT) (local.get $r))", "float"),
-        ("(ref.test (ref $STR) (local.get $r))", "str"),
+        ("(call $is_str (local.get $r))", "str"),
         ("(ref.test (ref $LIST) (local.get $r))", "list"),
         ("(ref.test (ref $TUPLE) (local.get $r))", "tuple"),
         ("(ref.test (ref $SET) (local.get $r))", "set"),
@@ -792,7 +833,7 @@ fn raise_helpers() -> Vec<Func> {
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
     push_text(&mut b, 0, "IndexError: ");
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push("(if (call $is_str (local.get $r))");
     b.push_in(1, "(then");
     push_text(&mut b, 2, "string");
     b.push_in(1, ")");
@@ -886,6 +927,76 @@ fn raise_helpers() -> Vec<Func> {
     fs.push(Func {
         signature: "(func $ck32 (param $r i64) (result i32)".into(),
         locals: vec![],
+        body: b,
+    });
+
+    // Is this universal value a string? Strings are $JSSTR wrappers, so
+    // this is one native ref.test — no host call, no is_subtype landmines.
+    let mut b = Body::new();
+    b.push("(ref.test (ref $JSSTR) (local.get $v))");
+    fs.push(Func {
+        signature: "(func $is_str (param $v (ref null any)) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $unwrap: the JS string inside a $JSSTR value.
+    let mut b = Body::new();
+    b.push("(struct.get $JSSTR 0 (ref.cast (ref $JSSTR) (local.get $v)))");
+    fs.push(Func {
+        signature: "(func $unwrap (param $v (ref null any)) (result (ref extern))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // String primitive wrappers over the builtins: $slen = length, $sat =
+    // charCodeAt — both take the INTERNALIZED value straight from the
+    // universal representation, so old array-walk bodies keep their shape.
+    let mut b = Body::new();
+    b.push("(call $js_length (call $unwrap (local.get $s)))");
+    fs.push(Func {
+        signature: "(func $slen (param $s (ref null any)) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(call $js_charCodeAt (call $unwrap (local.get $s)) (local.get $i))");
+    fs.push(Func {
+        signature: "(func $sat (param $s (ref null any)) (param $i i32) (result i32)".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $finish: a built $U16S code-unit buffer becomes the string VALUE —
+    // fromCharCodeArray then internalize. Every string-builder helper ends
+    // its body with this instead of returning the raw buffer.
+    let mut b = Body::new();
+    b.push("(struct.new $JSSTR (call $js_fromCharCodeArray (ref.cast (ref $U16S) (local.get $buf)) (i32.const 0) (array.len (ref.cast (ref $U16S) (local.get $buf)))))");
+    fs.push(Func {
+        signature: "(func $finish (param $buf (ref null any)) (result (ref null any))".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $scopy: copy N code units into a $U16S buffer from EITHER a string
+    // (charCodeAt) or another buffer (array.get) — the old array.copy sites,
+    // source-polymorphic because builders sometimes stage through buffers.
+    let mut b = Body::new();
+    b.push("(local.set $isstr (call $is_str (local.get $src)))");
+    b.push("(block $done (loop $next");
+    b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
+    b.push_in(1, "(array.set $U16S (ref.cast (ref $U16S) (local.get $dst)) (i32.add (local.get $dpos) (local.get $i))");
+    b.push_in(2, "(if (result i32) (local.get $isstr)");
+    b.push_in(
+        3,
+        "(then (call $sat (local.get $src) (i32.add (local.get $spos) (local.get $i))))",
+    );
+    b.push_in(3, "(else (array.get_u $U16S (ref.cast (ref $U16S) (local.get $src)) (i32.add (local.get $spos) (local.get $i))))))");
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $next)))");
+    fs.push(Func {
+        signature: "(func $scopy (param $dst (ref null any)) (param $dpos i32) (param $src (ref null any)) (param $spos i32) (param $n i32)".into(),
+        locals: vec!["(local $i i32)".into(), "(local $isstr i32)".into()],
         body: b,
     });
 
@@ -993,7 +1104,7 @@ fn raise_helpers() -> Vec<Func> {
     push_text(&mut b, 0, "AttributeError: '");
     b.push("(call $type_name (local.get $obj))");
     push_text(&mut b, 0, "' object has no attribute '");
-    b.push("(call $print_str (ref.cast (ref null $STR) (local.get $name)))");
+    b.push("(call $print_str (local.get $name))");
     push_text(&mut b, 0, "'");
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
@@ -1009,7 +1120,7 @@ fn raise_helpers() -> Vec<Func> {
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
     push_text(&mut b, 0, "TypeError: method '");
-    b.push("(call $print_str (ref.cast (ref null $STR) (local.get $name)))");
+    b.push("(call $print_str (local.get $name))");
     push_text(
         &mut b,
         0,
@@ -1038,7 +1149,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $raise_int_parse (param $s (ref null $STR))".into(),
+        signature: "(func $raise_int_parse (param $s (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -1096,7 +1207,7 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
-        signature: "(func $raise_float_parse (param $s (ref null $STR))".into(),
+        signature: "(func $raise_float_parse (param $s (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -1301,6 +1412,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $unbox: value -> i32 (i31, $BOOL as 0/1, or $INT). Anything else
     // raises a friendly TypeError (or NameError for an unassigned local).
     let mut b = Body::new();
+    b.push("(if (call $is_str (local.get $r)) (then (call $raise_type_num (local.get $r)) (unreachable)))");
     b.push("(if (ref.test (ref i31) (local.get $r))");
     b.push_in(
         1,
@@ -1357,6 +1469,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $either_float: arithmetic promotes to float when either side is one.
     let mut b = Body::new();
+    b.push("(if (i32.or (call $is_str (local.get $a)) (call $is_str (local.get $b))) (then (return (i32.const 0))))");
     b.push(
         "(i32.or (ref.test (ref $FLOAT) (local.get $a)) (ref.test (ref $FLOAT) (local.get $b)))",
     );
@@ -1370,10 +1483,10 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $truthy: value -> i32 0/1 (non-empty string / nonzero number is true).
     let mut b = Body::new();
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push("(if (call $is_str (local.get $r))");
     b.push_in(
         1,
-        "(then (return (i32.ne (array.len (ref.cast (ref $STR) (local.get $r))) (i32.const 0))))",
+        "(then (return (i32.ne (call $slen (local.get $r)) (i32.const 0))))",
     );
     b.push(")");
     b.push("(if (ref.test (ref $FLOAT) (local.get $r))");
@@ -1419,6 +1532,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $py_len: a custom __len__ first, then sequence length (lists, dicts,
     // strings). __len__ returns a Python int, unboxed back to i32.
     let mut b = Body::new();
+    b.push("(if (call $is_str (local.get $r)) (then (return (call $slen (local.get $r)))))");
     b.push(format!(
         "(if (call $obj_has (local.get $r) {n}) (then (return (call $unbox (call $obj_call0 (local.get $r) {n})))))",
         n = str_lit("__len__")
@@ -1435,11 +1549,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(then (return (struct.get $DICT 0 (ref.cast (ref $DICT) (local.get $r)))))",
     );
     b.push(")");
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
-    b.push_in(
-        1,
-        "(then (return (array.len (ref.cast (ref $STR) (local.get $r)))))",
-    );
+    b.push("(if (call $is_str (local.get $r))");
+    b.push_in(1, "(then (return (call $slen (local.get $r))))");
     b.push(")");
     b.push("(if (ref.test (ref $TUPLE) (local.get $r))");
     b.push_in(
@@ -1473,11 +1584,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(if (call $obj_has (local.get $r) {n}) (then (return (call $py_len (local.get $r)))))",
         n = str_lit("__len__")
     ));
-    for ty in ["$LIST", "$STR", "$DICT", "$TUPLE", "$SET"] {
+    for ty in ["$LIST", "$DICT", "$TUPLE", "$SET"] {
         b.push(format!(
             "(if (ref.test (ref {ty}) (local.get $r)) (then (return (call $py_len (local.get $r)))))"
         ));
     }
+    b.push("(if (call $is_str (local.get $r)) (then (return (call $slen (local.get $r)))))");
     b.push("(call $raise_not_iterable (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
@@ -1489,7 +1601,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $py_index: subscript read with Python negative-index normalization;
     // out of range raises IndexError. Strings yield a one-character string.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (i32.or (i32.or (i32.or (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))) (ref.test (ref $DICT) (local.get $r))) (ref.test (ref $TUPLE) (local.get $r))) (ref.test (ref $SET) (local.get $r))))");
+    b.push("(if (i32.eqz (i32.or (i32.or (i32.or (i32.or (ref.test (ref $LIST) (local.get $r)) (call $is_str (local.get $r))) (ref.test (ref $DICT) (local.get $r))) (ref.test (ref $TUPLE) (local.get $r))) (ref.test (ref $SET) (local.get $r))))");
     b.push_in(1, "(then (call $raise_not_sub (local.get $r)))");
     b.push(")");
     b.push("(local.set $n (call $py_len (local.get $r)))");
@@ -1530,14 +1642,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(then (return (array.get $ITEMS (struct.get $DICT 1 (ref.cast (ref $DICT) (local.get $r))) (local.get $i))))",
     );
     b.push(")");
-    b.push("(local.set $c (array.new_default $STR (i32.const 1)))");
-    b.push("(array.set $STR (local.get $c) (i32.const 0) (array.get_u $STR (ref.cast (ref $STR) (local.get $r)) (local.get $i)))");
-    b.push("(local.get $c)");
+    b.push("(local.set $c (array.new_default $U16S (i32.const 1)))");
+    b.push("(array.set $U16S (ref.cast (ref $U16S) (local.get $c)) (i32.const 0) (call $sat (local.get $r) (local.get $i)))");
+    b.push("(call $finish (local.get $c))");
     fs.push(Func {
         signature:
             "(func $py_index (param $r (ref null any)) (param $i i32) (result (ref null any))"
                 .into(),
-        locals: vec!["(local $n i32)".into(), "(local $c (ref null $STR))".into()],
+        locals: vec!["(local $n i32)".into(), "(local $c (ref null any))".into()],
         body: b,
     });
 
@@ -1975,7 +2087,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(
         1,
-        "(if (i32.eqz (ref.test (ref $STR) (local.get $e))) (then (local.set $all_str (i32.const 0))))",
+        "(if (i32.eqz (call $is_str (local.get $e))) (then (local.set $all_str (i32.const 0))))",
     );
     b.push_in(
         1,
@@ -2249,7 +2361,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // boxed, with $NONE for an omitted one; this mirrors CPython's
     // PySlice_AdjustIndices (clamping defaults that depend on the step's sign).
     let mut b = Body::new();
-    b.push("(if (i32.eqz (i32.or (ref.test (ref $LIST) (local.get $r)) (ref.test (ref $STR) (local.get $r))))");
+    b.push("(if (i32.eqz (i32.or (ref.test (ref $LIST) (local.get $r)) (call $is_str (local.get $r))))");
     b.push_in(1, "(then (call $raise_not_sub (local.get $r))))");
     b.push("(local.set $n (call $py_len (local.get $r)))");
     // step: default 1, zero is a ValueError.
@@ -2330,8 +2442,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(return (struct.new $LIST (local.get $count) (local.get $items)))))",
     );
     // string path
-    b.push("(local.set $ssrc (ref.cast (ref $STR) (local.get $r)))");
-    b.push("(local.set $str (array.new_default $STR (local.get $count)))");
+    b.push("(local.set $ssrc (local.get $r))");
+    b.push("(local.set $str (array.new_default $U16S (local.get $count)))");
     b.push("(local.set $i (local.get $start))");
     b.push("(local.set $j (i32.const 0))");
     b.push("(block $sd (loop $sn");
@@ -2341,7 +2453,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(
         1,
-        "(array.set $STR (local.get $str) (local.get $j) (array.get_u $STR (local.get $ssrc) (local.get $i)))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $str)) (local.get $j) (call $sat (local.get $ssrc) (local.get $i)))",
     );
     b.push_in(
         1,
@@ -2349,7 +2461,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(1, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
     b.push_in(1, "(br $sn)))");
-    b.push("(local.get $str)");
+    b.push("(call $finish (local.get $str))");
     fs.push(Func {
         signature:
             "(func $py_slice (param $r (ref null any)) (param $sv (ref null any)) (param $ev (ref null any)) (param $tv (ref null any)) (result (ref null any))"
@@ -2366,8 +2478,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(local $j i32)".into(),
             "(local $src (ref null $ITEMS))".into(),
             "(local $items (ref null $ITEMS))".into(),
-            "(local $ssrc (ref null $STR))".into(),
-            "(local $str (ref null $STR))".into(),
+            "(local $ssrc (ref null any))".into(),
+            "(local $str (ref null any))".into(),
         ],
         body: b,
     });
@@ -2502,8 +2614,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $str_contains: naive substring search (empty needle matches).
     let mut b = Body::new();
-    b.push("(local.set $hl (array.len (local.get $h)))");
-    b.push("(local.set $nl (array.len (local.get $needle)))");
+    b.push("(local.set $hl (call $slen (local.get $h)))");
+    b.push("(local.set $nl (call $slen (local.get $needle)))");
     b.push("(if (i32.eqz (local.get $nl)) (then (return (i32.const 1))))");
     b.push("(block $no");
     b.push_in(1, "(loop $outer");
@@ -2521,9 +2633,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(4, "(br_if $fail (i32.ne");
     b.push_in(
         5,
-        "(array.get_u $STR (local.get $h) (i32.add (local.get $i) (local.get $j)))",
+        "(call $sat (local.get $h) (i32.add (local.get $i) (local.get $j)))",
     );
-    b.push_in(5, "(array.get_u $STR (local.get $needle) (local.get $j))))");
+    b.push_in(5, "(call $sat (local.get $needle) (local.get $j))))");
     b.push_in(4, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
     b.push_in(4, "(br $inner)");
     b.push_in(3, ")");
@@ -2535,7 +2647,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(i32.const 0)");
     fs.push(Func {
         signature:
-            "(func $str_contains (param $h (ref null $STR)) (param $needle (ref null $STR)) (result i32)"
+            "(func $str_contains (param $h (ref null any)) (param $needle (ref null any)) (result i32)"
                 .into(),
         locals: vec![
             "(local $hl i32)".into(),
@@ -2571,14 +2683,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(then (return (i32.ge_s (call $dict_find (ref.cast (ref $DICT) (local.get $c)) (local.get $item)) (i32.const 0))))",
     );
     b.push(")");
-    b.push("(if (ref.test (ref $STR) (local.get $c))");
+    b.push("(if (call $is_str (local.get $c))");
     b.push_in(1, "(then");
-    b.push_in(2, "(if (i32.eqz (ref.test (ref $STR) (local.get $item)))");
+    b.push_in(2, "(if (i32.eqz (call $is_str (local.get $item)))");
     b.push_in(3, "(then (call $raise_in_str (local.get $item)))");
     b.push_in(2, ")");
     b.push_in(
         2,
-        "(return (call $str_contains (ref.cast (ref $STR) (local.get $c)) (ref.cast (ref $STR) (local.get $item))))",
+        "(return (call $str_contains (local.get $c) (local.get $item)))",
     );
     b.push_in(1, ")");
     b.push(")");
@@ -2592,17 +2704,17 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
 
-    // $i32_to_str: decimal digits as a $STR. Works on the unsigned
+    // $i32_to_str: decimal digits as a string. Works on the unsigned
     // magnitude so INT_MIN (whose negation overflows i32) is correct.
     let mut b = Body::new();
     b.push("(if (i32.eqz (local.get $v))");
     b.push_in(1, "(then");
-    b.push_in(2, "(local.set $s (array.new_default $STR (i32.const 1)))");
+    b.push_in(2, "(local.set $s (array.new_default $U16S (i32.const 1)))");
     b.push_in(
         2,
-        "(array.set $STR (local.get $s) (i32.const 0) (i32.const 48))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $s)) (i32.const 0) (i32.const 48))",
     );
-    b.push_in(2, "(return (local.get $s))");
+    b.push_in(2, "(return (call $finish (local.get $s)))");
     b.push_in(1, ")");
     b.push(")");
     b.push("(local.set $neg (i32.lt_s (local.get $v) (i32.const 0)))");
@@ -2622,13 +2734,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br $count)");
     b.push_in(1, ")");
     b.push(")");
-    b.push("(local.set $s (array.new_default $STR (i32.add (local.get $len) (local.get $neg))))");
+    b.push("(local.set $s (array.new_default $U16S (i32.add (local.get $len) (local.get $neg))))");
     b.push("(local.set $i (i32.sub (i32.add (local.get $len) (local.get $neg)) (i32.const 1)))");
     b.push("(block $done");
     b.push_in(1, "(loop $fill");
     b.push_in(
         2,
-        "(array.set $STR (local.get $s) (local.get $i) (i32.add (i32.const 48) (i32.rem_u (local.get $mag) (i32.const 10))))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $s)) (local.get $i) (i32.add (i32.const 48) (i32.rem_u (local.get $mag) (i32.const 10))))",
     );
     b.push_in(
         2,
@@ -2642,19 +2754,19 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (local.get $neg)");
     b.push_in(
         1,
-        "(then (array.set $STR (local.get $s) (i32.const 0) (i32.const 45)))",
+        "(then (array.set $U16S (ref.cast (ref $U16S) (local.get $s)) (i32.const 0) (i32.const 45)))",
     );
     b.push(")");
-    b.push("(local.get $s)");
+    b.push("(call $finish (local.get $s))");
     fs.push(Func {
-        signature: "(func $i32_to_str (param $v i32) (result (ref null $STR))".into(),
+        signature: "(func $i32_to_str (param $v i32) (result (ref null any))".into(),
         locals: vec![
             "(local $neg i32)".into(),
             "(local $mag i32)".into(),
             "(local $tmp i32)".into(),
             "(local $len i32)".into(),
             "(local $i i32)".into(),
-            "(local $s (ref null $STR))".into(),
+            "(local $s (ref null any))".into(),
         ],
         body: b,
     });
@@ -2662,7 +2774,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $to_str: str(x) — strings pass through; ints/bools/None convert.
     // Floats and containers raise a friendly not-yet error.
     let mut b = Body::new();
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push("(if (call $is_str (local.get $r))");
     b.push_in(1, "(then (return (local.get $r)))");
     b.push(")");
     b.push("(if (ref.test (ref $BOOL) (local.get $r))");
@@ -2671,21 +2783,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         2,
         "(return (if (result (ref null any)) (struct.get_u $BOOL 0 (ref.cast (ref $BOOL) (local.get $r)))",
     );
-    b.push_in(
-        3,
-        "(then (array.new_fixed $STR 4 (i32.const 84) (i32.const 114) (i32.const 117) (i32.const 101)))",
-    );
-    b.push_in(
-        3,
-        "(else (array.new_fixed $STR 5 (i32.const 70) (i32.const 97) (i32.const 108) (i32.const 115) (i32.const 101)))))",
-    );
+    b.push_in(3, format!("(then {})", str_lit("True")));
+    b.push_in(3, format!("(else {})))", str_lit("False")));
     b.push_in(1, ")");
     b.push(")");
     b.push("(if (ref.test (ref $NONE_T) (local.get $r))");
-    b.push_in(
-        1,
-        "(then (return (array.new_fixed $STR 4 (i32.const 78) (i32.const 111) (i32.const 110) (i32.const 101))))",
-    );
+    b.push_in(1, format!("(then (return {}))", str_lit("None")));
     b.push(")");
     b.push("(if (i32.or (ref.test (ref i31) (local.get $r)) (ref.test (ref $INT) (local.get $r)))");
     b.push_in(
@@ -2711,7 +2814,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $repr_str: the form used for collection elements — strings get quotes,
     // everything else uses $to_str.
     let mut b = Body::new();
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push("(if (call $is_str (local.get $r))");
     b.push_in(
         1,
         format!(
@@ -2907,7 +3010,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // fracarr: prec digits, zero-padded, filled right-to-left
     b.push_in(
         2,
-        "(local.set $frac (array.new_default $STR (local.get $prec)))",
+        "(local.set $frac (array.new_default $U16S (local.get $prec)))",
     );
     b.push_in(
         2,
@@ -2917,7 +3020,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(3, "(br_if $fd (i32.lt_s (local.get $k) (i32.const 0)))");
     b.push_in(
         3,
-        "(array.set $STR (local.get $frac) (local.get $k) (i32.add (i32.const 48) (i32.rem_u (local.get $fp) (i32.const 10))))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $frac)) (local.get $k) (i32.add (i32.const 48) (i32.rem_u (local.get $fp) (i32.const 10))))",
     );
     b.push_in(
         3,
@@ -2927,10 +3030,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(3, "(br $fl)))");
     b.push_in(
         2,
-        "(local.set $res (call $py_add (call $py_add (local.get $res) (array.new_fixed $STR 1 (i32.const 46))) (local.get $frac)))",
+        format!("(local.set $res (call $py_add (call $py_add (local.get $res) {}) (call $finish (local.get $frac))))", str_lit(".")),
     );
     b.push_in(1, "))");
-    b.push("(if (local.get $neg) (then (local.set $res (call $py_add (array.new_fixed $STR 1 (i32.const 45)) (local.get $res)))))");
+    b.push(format!(
+        "(if (local.get $neg) (then (local.set $res (call $py_add {} (local.get $res)))))",
+        str_lit("-")
+    ));
     b.push("(local.get $res)");
     fs.push(Func {
         signature: "(func $f64_to_fixed (param $x f64) (param $prec i32) (result (ref null any))"
@@ -2944,7 +3050,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(local $fp i32)".into(),
             "(local $k i32)".into(),
             "(local $res (ref null any))".into(),
-            "(local $frac (ref null $STR))".into(),
+            "(local $frac (ref null any))".into(),
         ],
         body: b,
     });
@@ -2952,25 +3058,25 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $str_pad: pad a string to `width` with `fill`, aligned (0=left/1=right/
     // 2=center). Returns the string unchanged if already wide enough.
     let mut b = Body::new();
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
     b.push("(if (i32.ge_s (local.get $n) (local.get $width)) (then (return (local.get $ss))))");
     b.push("(local.set $pad (i32.sub (local.get $width) (local.get $n)))");
     b.push("(local.set $lp (if (result i32) (i32.eq (local.get $align) (i32.const 1)) (then (local.get $pad)) (else (if (result i32) (i32.eq (local.get $align) (i32.const 2)) (then (i32.div_s (local.get $pad) (i32.const 2))) (else (i32.const 0))))))");
-    b.push("(local.set $out (array.new_default $STR (local.get $width)))");
-    b.push("(array.fill $STR (local.get $out) (i32.const 0) (local.get $fill) (local.get $width))");
-    b.push("(array.copy $STR $STR (local.get $out) (local.get $lp) (local.get $ss) (i32.const 0) (local.get $n))");
-    b.push("(local.get $out)");
+    b.push("(local.set $out (array.new_default $U16S (local.get $width)))");
+    b.push("(array.fill $U16S (ref.cast (ref $U16S) (local.get $out)) (i32.const 0) (local.get $fill) (local.get $width))");
+    b.push("(call $scopy (local.get $out) (local.get $lp) (local.get $ss) (i32.const 0) (local.get $n))");
+    b.push("(call $finish (local.get $out))");
     fs.push(Func {
         signature:
             "(func $str_pad (param $s (ref null any)) (param $width i32) (param $fill i32) (param $align i32) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $pad i32)".into(),
             "(local $lp i32)".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $out (ref null any))".into(),
         ],
         body: b,
     });
@@ -3093,11 +3199,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(then (return (call $box (i32.trunc_sat_f64_s (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r)))))))",
     );
     b.push(")");
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
-    b.push_in(
-        1,
-        "(then (return (call $str_to_int (ref.cast (ref $STR) (local.get $r)))))",
-    );
+    b.push("(if (call $is_str (local.get $r))");
+    b.push_in(1, "(then (return (call $str_to_int (local.get $r))))");
     b.push(")");
     b.push("(call $box (call $unbox (local.get $r)))");
     fs.push(Func {
@@ -3110,13 +3213,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // optional sign allowed); anything else is a ValueError. Used by int() and
     // int(input()). Wraps on i32 overflow (the compiler's int range).
     let mut b = Body::new();
-    b.push("(local.set $n (array.len (local.get $s)))");
+    b.push("(local.set $n (call $slen (local.get $s)))");
     // skip leading spaces/tabs
     b.push("(block $sl (loop $sln");
     b.push_in(2, "(br_if $sl (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         2,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(
         2,
@@ -3130,7 +3233,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(1, "(then");
     b.push_in(
         2,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 45))");
     b.push_in(
@@ -3149,7 +3252,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br_if $dl (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         2,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(
         2,
@@ -3168,7 +3271,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br_if $tl (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         2,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(
         2,
@@ -3180,7 +3283,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_int_parse (local.get $s))))");
     b.push("(call $box (i32.mul (local.get $sign) (local.get $acc)))");
     fs.push(Func {
-        signature: "(func $str_to_int (param $s (ref null $STR)) (result (ref null any))".into(),
+        signature: "(func $str_to_int (param $s (ref null any)) (result (ref null any))".into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
@@ -3195,10 +3298,10 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $print_repr: element form used inside list printing — strings get
     // quotes (Python repr), everything else prints as itself.
     let mut b = Body::new();
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push("(if (call $is_str (local.get $r))");
     b.push_in(1, "(then");
     b.push_in(2, "(call $write_char (i32.const 39))"); // '
-    b.push_in(2, "(call $print_str (ref.cast (ref $STR) (local.get $r)))");
+    b.push_in(2, "(call $print_str (local.get $r))");
     b.push_in(2, "(call $write_char (i32.const 39))");
     b.push_in(2, "(return)");
     b.push_in(1, ")");
@@ -3447,20 +3550,20 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $print_str: write a string's bytes through write_char.
     let mut b = Body::new();
-    b.push("(local.set $n (array.len (local.get $s)))");
+    b.push("(local.set $n (call $slen (local.get $s)))");
     b.push("(block $done");
     b.push_in(1, "(loop $next");
     b.push_in(2, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
     b.push_in(
         2,
-        "(call $write_char (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(call $write_char (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(2, "(br $next)");
     b.push_in(1, ")");
     b.push(")");
     fs.push(Func {
-        signature: "(func $print_str (param $s (ref null $STR))".into(),
+        signature: "(func $print_str (param $s (ref null any))".into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
     });
@@ -3468,11 +3571,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $print_value: runtime type dispatch — strings as bytes, floats via the
     // host (which formats Python-style), bools as True/False, ints as digits.
     let mut b = Body::new();
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
-    b.push_in(
-        1,
-        "(then (return (call $print_str (ref.cast (ref $STR) (local.get $r)))))",
-    );
+    b.push("(if (call $is_str (local.get $r))");
+    b.push_in(1, "(then (return (call $print_str (local.get $r))))");
     b.push(")");
     b.push("(if (ref.test (ref $FLOAT) (local.get $r))");
     b.push_in(
@@ -3569,24 +3669,24 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     let mut b = Body::new();
     b.push("(if (i32.lt_s (local.get $n) (i32.const 0)) (then (local.set $n (i32.const 0))))");
     // String: copy the bytes n times into one fresh array.
-    b.push("(if (ref.test (ref $STR) (local.get $s))");
+    b.push("(if (call $is_str (local.get $s))");
     b.push_in(1, "(then");
-    b.push_in(2, "(local.set $sstr (ref.cast (ref $STR) (local.get $s)))");
-    b.push_in(2, "(local.set $len (array.len (local.get $sstr)))");
+    b.push_in(2, "(local.set $sstr (local.get $s))");
+    b.push_in(2, "(local.set $len (call $slen (local.get $sstr)))");
     b.push_in(
         2,
-        "(local.set $ostr (array.new_default $STR (i32.mul (local.get $len) (local.get $n))))",
+        "(local.set $ostr (array.new_default $U16S (i32.mul (local.get $len) (local.get $n))))",
     );
     b.push_in(2, "(local.set $i (i32.const 0))");
     b.push_in(2, "(block $ds (loop $Ls");
     b.push_in(3, "(br_if $ds (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         3,
-        "(array.copy $STR $STR (local.get $ostr) (i32.mul (local.get $i) (local.get $len)) (local.get $sstr) (i32.const 0) (local.get $len))",
+        "(call $scopy (local.get $ostr) (i32.mul (local.get $i) (local.get $len)) (local.get $sstr) (i32.const 0) (local.get $len))",
     );
     b.push_in(3, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(3, "(br $Ls)))");
-    b.push_in(2, "(return (local.get $ostr))");
+    b.push_in(2, "(return (call $finish (local.get $ostr)))");
     b.push_in(1, ")");
     b.push(")");
     // List: copy the backing items n times into one fresh array.
@@ -3628,8 +3728,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         locals: vec![
             "(local $len i32)".into(),
             "(local $i i32)".into(),
-            "(local $sstr (ref null $STR))".into(),
-            "(local $ostr (ref null $STR))".into(),
+            "(local $sstr (ref null any))".into(),
+            "(local $ostr (ref null any))".into(),
             "(local $src (ref null $ITEMS))".into(),
             "(local $items (ref null $ITEMS))".into(),
         ],
@@ -3643,6 +3743,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(if (call $obj_has (local.get $a) {n}) (then (return (call $obj_call1 (local.get $a) (local.get $b) {n}))))",
         n = str_lit("__add__")
     ));
+    // Strings first — an internalized string must never reach a concrete
+    // ref.test (wasmtime's is_subtype panics on host externs), and concat is
+    // one builtin call anyway.
+    b.push("(if (i32.and (call $is_str (local.get $a)) (call $is_str (local.get $b))) (then (return (struct.new $JSSTR (call $js_concat (call $unwrap (local.get $a)) (call $unwrap (local.get $b)))))))");
+    b.push("(if (call $is_str (local.get $a)) (then (call $raise_type_num (local.get $a)) (unreachable)))");
+    b.push("(if (call $is_str (local.get $b)) (then (call $raise_type_num (local.get $b)) (unreachable)))");
     b.push(
         "(if (i32.and (ref.test (ref $LIST) (local.get $a)) (ref.test (ref $LIST) (local.get $b)))",
     );
@@ -3654,22 +3760,22 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (result (ref null any))");
     b.push_in(
         2,
-        "(i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
+        "(i32.and (call $is_str (local.get $a)) (call $is_str (local.get $b)))",
     );
     b.push_in(1, "(then");
-    b.push_in(2, "(local.set $sa (ref.cast (ref $STR) (local.get $a)))");
-    b.push_in(2, "(local.set $sb (ref.cast (ref $STR) (local.get $b)))");
+    b.push_in(2, "(local.set $sa (local.get $a))");
+    b.push_in(2, "(local.set $sb (local.get $b))");
     b.push_in(
         2,
-        "(local.set $out (array.new_default $STR (i32.add (array.len (local.get $sa)) (array.len (local.get $sb)))))",
+        "(local.set $out (array.new_default $U16S (i32.add (call $slen (local.get $sa)) (call $slen (local.get $sb)))))",
     );
     b.push_in(
         2,
-        "(array.copy $STR $STR (local.get $out) (i32.const 0) (local.get $sa) (i32.const 0) (array.len (local.get $sa)))",
+        "(call $scopy (local.get $out) (i32.const 0) (local.get $sa) (i32.const 0) (call $slen (local.get $sa)))",
     );
     b.push_in(
         2,
-        "(array.copy $STR $STR (local.get $out) (array.len (local.get $sa)) (local.get $sb) (i32.const 0) (array.len (local.get $sb)))",
+        "(call $scopy (local.get $out) (call $slen (local.get $sa)) (local.get $sb) (i32.const 0) (call $slen (local.get $sb)))",
     );
     b.push_in(2, "(local.get $out)");
     b.push_in(1, ")");
@@ -3691,9 +3797,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(func $py_add (param $a (ref null any)) (param $b (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $sa (ref null $STR))".into(),
-            "(local $sb (ref null $STR))".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $sa (ref null any))".into(),
+            "(local $sb (ref null any))".into(),
+            "(local $out (ref null any))".into(),
         ],
         body: b,
     });
@@ -3705,6 +3811,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         ("$py_mul", "f64.mul", "i64.mul", "__mul__"),
     ] {
         let mut b = Body::new();
+        // Leftover strings raise before ANY concrete ref.test can see them
+        // (mul's seq arms below claim the valid str * int case first).
+        if name == "$py_sub" {
+            b.push("(if (call $is_str (local.get $a)) (then (call $raise_type_num (local.get $a)) (unreachable)))");
+            b.push("(if (call $is_str (local.get $b)) (then (call $raise_type_num (local.get $b)) (unreachable)))");
+        }
         // `set - set` is set difference (mode 3); other `-` is numeric.
         if name == "$py_sub" {
             b.push("(if (i32.and (ref.test (ref $SET) (local.get $a)) (ref.test (ref $SET) (local.get $b))) (then (return (call $py_setop (local.get $a) (local.get $b) (i32.const 3)))))");
@@ -3713,8 +3825,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         // int side may be inline (i31) or a boxed $INT; guard so a str/list on
         // the other side never reaches the numeric unbox path.
         if name == "$py_mul" {
-            b.push("(if (i32.and (i32.or (ref.test (ref $STR) (local.get $a)) (ref.test (ref $LIST) (local.get $a))) (i32.or (ref.test (ref i31) (local.get $b)) (ref.test (ref $INT) (local.get $b)))) (then (return (call $seq_repeat (local.get $a) (call $unbox (local.get $b))))))");
-            b.push("(if (i32.and (i32.or (ref.test (ref $STR) (local.get $b)) (ref.test (ref $LIST) (local.get $b))) (i32.or (ref.test (ref i31) (local.get $a)) (ref.test (ref $INT) (local.get $a)))) (then (return (call $seq_repeat (local.get $b) (call $unbox (local.get $a))))))");
+            // str * int / int * str first, the string side cleared before any
+            // ref.test runs on the OTHER side.
+            b.push("(if (call $is_str (local.get $a)) (then (if (i32.and (i32.eqz (call $is_str (local.get $b))) (i32.or (ref.test (ref i31) (local.get $b)) (ref.test (ref $INT) (local.get $b)))) (then (return (call $seq_repeat (local.get $a) (call $unbox (local.get $b))))) (else (call $raise_type_num (local.get $b)) (unreachable)))))");
+            b.push("(if (call $is_str (local.get $b)) (then (if (i32.or (ref.test (ref i31) (local.get $a)) (ref.test (ref $INT) (local.get $a))) (then (return (call $seq_repeat (local.get $b) (call $unbox (local.get $a))))) (else (call $raise_type_num (local.get $a)) (unreachable)))))");
+            b.push("(if (i32.and (ref.test (ref $LIST) (local.get $a)) (i32.or (ref.test (ref i31) (local.get $b)) (ref.test (ref $INT) (local.get $b)))) (then (return (call $seq_repeat (local.get $a) (call $unbox (local.get $b))))))");
+            b.push("(if (i32.and (ref.test (ref $LIST) (local.get $b)) (i32.or (ref.test (ref i31) (local.get $a)) (ref.test (ref $INT) (local.get $a)))) (then (return (call $seq_repeat (local.get $b) (call $unbox (local.get $a))))))");
         }
         b.push(format!(
             "(if (call $obj_has (local.get $a) {n}) (then (return (call $obj_call1 (local.get $a) (local.get $b) {n}))))",
@@ -3781,12 +3897,10 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(if (call $obj_has (local.get $a) {n}) (then (return (call $truthy (call $obj_call1 (local.get $a) (local.get $b) {n})))))",
             n = str_lit(dunder)
         ));
-        b.push(
-            "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
-        );
+        b.push("(if (i32.and (call $is_str (local.get $a)) (call $is_str (local.get $b)))");
         b.push_in(1, "(then");
-        b.push_in(2, "(local.set $sa (ref.cast (ref $STR) (local.get $a)))");
-        b.push_in(2, "(local.set $sb (ref.cast (ref $STR) (local.get $b)))");
+        b.push_in(2, "(local.set $sa (local.get $a))");
+        b.push_in(2, "(local.set $sb (local.get $b))");
         b.push_in(2, format!("(return {str_expr})"));
         b.push_in(1, ")");
         b.push(")");
@@ -3798,8 +3912,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
                 "(func {name} (param $a (ref null any)) (param $b (ref null any)) (result i32)"
             ),
             locals: vec![
-                "(local $sa (ref null $STR))".into(),
-                "(local $sb (ref null $STR))".into(),
+                "(local $sa (ref null any))".into(),
+                "(local $sb (ref null any))".into(),
             ],
             body: b,
         });
@@ -3871,8 +3985,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $str_eq: byte-wise string equality.
     let mut b = Body::new();
-    b.push("(local.set $n (array.len (local.get $a)))");
-    b.push("(if (i32.ne (local.get $n) (array.len (local.get $b)))");
+    b.push("(local.set $n (call $slen (local.get $a)))");
+    b.push("(if (i32.ne (local.get $n) (call $slen (local.get $b)))");
     b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
     b.push("(block $done");
@@ -3880,7 +3994,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
     b.push_in(
         2,
-        "(if (i32.ne (array.get_u $STR (local.get $a) (local.get $i)) (array.get_u $STR (local.get $b) (local.get $i)))",
+        "(if (i32.ne (call $sat (local.get $a) (local.get $i)) (call $sat (local.get $b) (local.get $i)))",
     );
     b.push_in(3, "(then (return (i32.const 0)))");
     b.push_in(2, ")");
@@ -3890,9 +4004,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(i32.const 1)");
     fs.push(Func {
-        signature:
-            "(func $str_eq (param $a (ref null $STR)) (param $b (ref null $STR)) (result i32)"
-                .into(),
+        signature: "(func $str_eq (param $a (ref null any)) (param $b (ref null any)) (result i32)"
+            .into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],
         body: b,
     });
@@ -3902,6 +4015,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // by value, string-vs-number is False; numbers (ints, bools as 1/0,
     // floats) compared as f64 (exact for i32).
     let mut b = Body::new();
+    b.push("(if (i32.or (call $is_str (local.get $a)) (call $is_str (local.get $b))) (then (return (if (result i32) (i32.and (call $is_str (local.get $a)) (call $is_str (local.get $b))) (then (call $js_equals (call $unwrap (local.get $a)) (call $unwrap (local.get $b)))) (else (i32.const 0))))))");
     b.push(format!(
         "(if (call $obj_has (local.get $a) {n}) (then (return (call $truthy (call $obj_call1 (local.get $a) (local.get $b) {n})))))",
         n = str_lit("__eq__")
@@ -3976,17 +4090,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
-    b.push(
-        "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
-    );
+    b.push("(if (i32.and (call $is_str (local.get $a)) (call $is_str (local.get $b)))");
     b.push_in(
         1,
-        "(then (return (call $str_eq (ref.cast (ref $STR) (local.get $a)) (ref.cast (ref $STR) (local.get $b)))))",
+        "(then (return (call $str_eq (local.get $a) (local.get $b))))",
     );
     b.push(")");
-    b.push(
-        "(if (i32.or (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
-    );
+    b.push("(if (i32.or (call $is_str (local.get $a)) (call $is_str (local.get $b)))");
     b.push_in(1, "(then (return (i32.const 0)))");
     b.push(")");
     b.push("(f64.eq (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))");
@@ -4238,19 +4348,19 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $str_lt: lexicographic byte comparison, `a < b` (shorter is smaller when
     // it's a prefix). Supports sorting strings.
     let mut b = Body::new();
-    b.push("(local.set $la (array.len (local.get $a)))");
-    b.push("(local.set $lb (array.len (local.get $b)))");
+    b.push("(local.set $la (call $slen (local.get $a)))");
+    b.push("(local.set $lb (call $slen (local.get $b)))");
     b.push("(local.set $m (select (local.get $la) (local.get $lb) (i32.lt_s (local.get $la) (local.get $lb))))");
     b.push("(block $done");
     b.push_in(1, "(loop $next");
     b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $m)))");
     b.push_in(
         2,
-        "(local.set $ca (array.get_u $STR (local.get $a) (local.get $i)))",
+        "(local.set $ca (call $sat (local.get $a) (local.get $i)))",
     );
     b.push_in(
         2,
-        "(local.set $cb (array.get_u $STR (local.get $b) (local.get $i)))",
+        "(local.set $cb (call $sat (local.get $b) (local.get $i)))",
     );
     b.push_in(
         2,
@@ -4266,9 +4376,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(")");
     b.push("(i32.lt_s (local.get $la) (local.get $lb))");
     fs.push(Func {
-        signature:
-            "(func $str_lt (param $a (ref null $STR)) (param $b (ref null $STR)) (result i32)"
-                .into(),
+        signature: "(func $str_lt (param $a (ref null any)) (param $b (ref null any)) (result i32)"
+            .into(),
         locals: vec![
             "(local $la i32)".into(),
             "(local $lb i32)".into(),
@@ -4283,12 +4392,10 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $sort_lt: `a < b` for sorting — lexicographic for two strings, numeric
     // otherwise.
     let mut b = Body::new();
-    b.push(
-        "(if (i32.and (ref.test (ref $STR) (local.get $a)) (ref.test (ref $STR) (local.get $b)))",
-    );
+    b.push("(if (i32.and (call $is_str (local.get $a)) (call $is_str (local.get $b)))");
     b.push_in(
         1,
-        "(then (return (call $str_lt (ref.cast (ref $STR) (local.get $a)) (ref.cast (ref $STR) (local.get $b))))))",
+        "(then (return (call $str_lt (local.get $a) (local.get $b)))))",
     );
     b.push("(f64.lt (call $unbox_f64 (local.get $a)) (call $unbox_f64 (local.get $b)))");
     fs.push(Func {
@@ -4557,7 +4664,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         b.push_in(2, "(call $raise_not_found) (unreachable)");
         b.push_in(1, "))");
     }
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
+    b.push("(if (call $is_str (local.get $r))");
     b.push_in(1, "(then");
     b.push_in(2, "(local.set $res (call $str_find (local.get $r) (local.get $v) (local.get $name) (local.get $args)))");
     b.push_in(2, "(if (i32.lt_s (call $unbox (local.get $res)) (i32.const 0)) (then (call $raise_not_found) (unreachable)))");
@@ -4585,16 +4692,16 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
 
-    // $str_sub: a fresh $STR copy of s[start .. start+len].
+    // $str_sub: a fresh string copy of s[start .. start+len].
     let mut b = Body::new();
-    b.push("(local.set $out (array.new_default $STR (local.get $len)))");
-    b.push("(array.copy $STR $STR (local.get $out) (i32.const 0) (local.get $s) (local.get $start) (local.get $len))");
-    b.push("(local.get $out)");
+    b.push("(local.set $out (array.new_default $U16S (local.get $len)))");
+    b.push("(call $scopy (local.get $out) (i32.const 0) (local.get $s) (local.get $start) (local.get $len))");
+    b.push("(call $finish (local.get $out))");
     fs.push(Func {
         signature:
-            "(func $str_sub (param $s (ref null $STR)) (param $start i32) (param $len i32) (result (ref null $STR))"
+            "(func $str_sub (param $s (ref null any)) (param $start i32) (param $len i32) (result (ref null any))"
                 .into(),
-        locals: vec!["(local $out (ref null $STR))".into()],
+        locals: vec!["(local $out (ref null any))".into()],
         body: b,
     });
 
@@ -4604,14 +4711,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br_if $done (i32.ge_s (local.get $j) (local.get $sl)))");
     b.push_in(
         2,
-        "(if (i32.ne (array.get_u $STR (local.get $h) (i32.add (local.get $at) (local.get $j))) (array.get_u $STR (local.get $sep) (local.get $j))) (then (return (i32.const 0))))",
+        "(if (i32.ne (call $sat (local.get $h) (i32.add (local.get $at) (local.get $j))) (call $sat (local.get $sep) (local.get $j))) (then (return (i32.const 0))))",
     );
     b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
     b.push_in(2, "(br $next)))");
     b.push("(i32.const 1)");
     fs.push(Func {
         signature:
-            "(func $str_match_at (param $h (ref null $STR)) (param $at i32) (param $sep (ref null $STR)) (param $sl i32) (result i32)"
+            "(func $str_match_at (param $h (ref null any)) (param $at i32) (param $sep (ref null any)) (param $sl i32) (result i32)"
                 .into(),
         locals: vec!["(local $j i32)".into()],
         body: b,
@@ -4621,19 +4728,19 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // dispatch (so a class may define these names).
     for (name, lo, hi, delta) in [("$str_upper", 97, 122, -32), ("$str_lower", 65, 90, 32)] {
         let mut b = Body::new();
-        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+        b.push("(if (i32.eqz (call $is_str (local.get $s)))");
         b.push_in(
             1,
             "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
         );
-        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-        b.push("(local.set $n (array.len (local.get $ss)))");
-        b.push("(local.set $out (array.new_default $STR (local.get $n)))");
+        b.push("(local.set $ss (local.get $s))");
+        b.push("(local.set $n (call $slen (local.get $ss)))");
+        b.push("(local.set $out (array.new_default $U16S (local.get $n)))");
         b.push("(block $done (loop $next");
         b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
         b.push_in(
             2,
-            "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+            "(local.set $c (call $sat (local.get $ss) (local.get $i)))",
         );
         b.push_in(
             2,
@@ -4641,21 +4748,21 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         );
         b.push_in(
             2,
-            "(array.set $STR (local.get $out) (local.get $i) (local.get $c))",
+            "(array.set $U16S (ref.cast (ref $U16S) (local.get $out)) (local.get $i) (local.get $c))",
         );
         b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
         b.push_in(2, "(br $next)))");
-        b.push("(local.get $out)");
+        b.push("(call $finish (local.get $out))");
         fs.push(Func {
             signature: format!(
                 "(func {name} (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
-                "(local $ss (ref null $STR))".into(),
+                "(local $ss (ref null any))".into(),
                 "(local $n i32)".into(),
                 "(local $i i32)".into(),
                 "(local $c i32)".into(),
-                "(local $out (ref null $STR))".into(),
+                "(local $out (ref null any))".into(),
             ],
             body: b,
         });
@@ -4663,13 +4770,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $str_strip: drop leading/trailing ASCII whitespace.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s)))");
     b.push_in(
         1,
         "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
     );
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
     b.push("(local.set $start (i32.const 0))");
     b.push("(block $ld (loop $ln");
     b.push_in(
@@ -4678,7 +4785,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(
         2,
-        "(br_if $ld (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (local.get $start)))))",
+        "(br_if $ld (i32.eqz (call $is_space (call $sat (local.get $ss) (local.get $start)))))",
     );
     b.push_in(
         2,
@@ -4693,7 +4800,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(
         2,
-        "(br_if $td (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (i32.sub (local.get $end) (i32.const 1))))))",
+        "(br_if $td (i32.eqz (call $is_space (call $sat (local.get $ss) (i32.sub (local.get $end) (i32.const 1))))))",
     );
     b.push_in(
         2,
@@ -4706,7 +4813,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(func $str_strip (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $start i32)".into(),
             "(local $end i32)".into(),
@@ -4718,13 +4825,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // otherwise split on each occurrence of the separator string (Python
     // semantics, empty tokens kept).
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s)))");
     b.push_in(
         1,
         "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
     );
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
     b.push("(local.set $lst (struct.new $LIST (i32.const 0) (array.new_fixed $ITEMS 0)))");
     b.push("(if (ref.test (ref $NONE_T) (local.get $sep))");
     b.push_in(1, "(then");
@@ -4734,7 +4841,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(4, "(br_if $sk (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         4,
-        "(br_if $sk (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (local.get $i)))))",
+        "(br_if $sk (i32.eqz (call $is_space (call $sat (local.get $ss) (local.get $i)))))",
     );
     b.push_in(4, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(4, "(br $skn)))");
@@ -4744,7 +4851,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(4, "(br_if $tk (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         4,
-        "(br_if $tk (call $is_space (array.get_u $STR (local.get $ss) (local.get $i))))",
+        "(br_if $tk (call $is_space (call $sat (local.get $ss) (local.get $i))))",
     );
     b.push_in(4, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(4, "(br $tkn)))");
@@ -4756,11 +4863,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(1, ")");
     b.push_in(1, "(else");
     // separator split
-    b.push_in(
-        2,
-        "(local.set $sepc (ref.cast (ref $STR) (local.get $sep)))",
-    );
-    b.push_in(2, "(local.set $sl (array.len (local.get $sepc)))");
+    b.push_in(2, "(local.set $sepc (local.get $sep))");
+    b.push_in(2, "(local.set $sl (call $slen (local.get $sepc)))");
     b.push_in(2, "(if (i32.eqz (local.get $sl))");
     b.push_in(
         3,
@@ -4800,12 +4904,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(func $str_split (param $s (ref null any)) (param $sep (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $start i32)".into(),
             "(local $lst (ref null any))".into(),
-            "(local $sepc (ref null $STR))".into(),
+            "(local $sepc (ref null any))".into(),
             "(local $sl i32)".into(),
         ],
         body: b,
@@ -4813,20 +4917,20 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $str_join: join the (string) elements of an iterable with `sep`.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $sep)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $sep)))");
     b.push_in(
         1,
         "(then (return (call $call_method (local.get $sep) (local.get $name) (local.get $args)))))",
     );
-    b.push("(local.set $sepc (ref.cast (ref $STR) (local.get $sep)))");
-    b.push("(local.set $sl (array.len (local.get $sepc)))");
+    b.push("(local.set $sepc (local.get $sep))");
+    b.push("(local.set $sl (call $slen (local.get $sepc)))");
     b.push("(local.set $cnt (call $py_len (local.get $it)))");
     // total length = sum(len(elem)) + sl*(cnt-1)
     b.push("(block $ld (loop $ln");
     b.push_in(2, "(br_if $ld (i32.ge_s (local.get $i) (local.get $cnt)))");
     b.push_in(
         2,
-        "(local.set $total (i32.add (local.get $total) (array.len (ref.cast (ref $STR) (call $py_index (local.get $it) (local.get $i))))))",
+        "(local.set $total (i32.add (local.get $total) (call $slen (call $py_index (local.get $it) (local.get $i)))))",
     );
     b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(2, "(br $ln)))");
@@ -4834,7 +4938,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(if (i32.gt_s (local.get $cnt) (i32.const 0)) (then (local.set $total (i32.add (local.get $total) (i32.mul (local.get $sl) (i32.sub (local.get $cnt) (i32.const 1)))))))",
     );
     // build
-    b.push("(local.set $out (array.new_default $STR (local.get $total)))");
+    b.push("(local.set $out (array.new_default $U16S (local.get $total)))");
     b.push("(local.set $i (i32.const 0))");
     b.push("(local.set $pos (i32.const 0))");
     b.push("(block $bd (loop $bn");
@@ -4843,7 +4947,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(3, "(then");
     b.push_in(
         4,
-        "(array.copy $STR $STR (local.get $out) (local.get $pos) (local.get $sepc) (i32.const 0) (local.get $sl))",
+        "(call $scopy (local.get $out) (local.get $pos) (local.get $sepc) (i32.const 0) (local.get $sl))",
     );
     b.push_in(
         4,
@@ -4851,12 +4955,12 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(
         2,
-        "(local.set $elem (ref.cast (ref $STR) (call $py_index (local.get $it) (local.get $i))))",
+        "(local.set $elem (call $py_index (local.get $it) (local.get $i)))",
     );
-    b.push_in(2, "(local.set $el (array.len (local.get $elem)))");
+    b.push_in(2, "(local.set $el (call $slen (local.get $elem)))");
     b.push_in(
         2,
-        "(array.copy $STR $STR (local.get $out) (local.get $pos) (local.get $elem) (i32.const 0) (local.get $el))",
+        "(call $scopy (local.get $out) (local.get $pos) (local.get $elem) (i32.const 0) (local.get $el))",
     );
     b.push_in(
         2,
@@ -4864,20 +4968,20 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(2, "(br $bn)))");
-    b.push("(local.get $out)");
+    b.push("(call $finish (local.get $out))");
     fs.push(Func {
         signature:
             "(func $str_join (param $sep (ref null any)) (param $it (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $sepc (ref null $STR))".into(),
+            "(local $sepc (ref null any))".into(),
             "(local $sl i32)".into(),
             "(local $cnt i32)".into(),
             "(local $i i32)".into(),
             "(local $total i32)".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $out (ref null any))".into(),
             "(local $pos i32)".into(),
-            "(local $elem (ref null $STR))".into(),
+            "(local $elem (ref null any))".into(),
             "(local $el i32)".into(),
         ],
         body: b,
@@ -4887,17 +4991,17 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // `new` (count, then build to the exact length). Empty `old` returns the
     // original (lenient).
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s)))");
     b.push_in(
         1,
         "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
     );
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $oldc (ref.cast (ref $STR) (local.get $old)))");
-    b.push("(local.set $newc (ref.cast (ref $STR) (local.get $new)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
-    b.push("(local.set $ol (array.len (local.get $oldc)))");
-    b.push("(local.set $nl (array.len (local.get $newc)))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $oldc (local.get $old))");
+    b.push("(local.set $newc (local.get $new))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
+    b.push("(local.set $ol (call $slen (local.get $oldc)))");
+    b.push("(local.set $nl (call $slen (local.get $newc)))");
     b.push("(if (i32.eqz (local.get $ol)) (then (return (local.get $ss))))");
     b.push("(block $cd (loop $cl");
     b.push_in(
@@ -4920,7 +5024,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push(
         "(local.set $total (i32.add (local.get $n) (i32.mul (local.get $cnt) (i32.sub (local.get $nl) (local.get $ol)))))",
     );
-    b.push("(local.set $out (array.new_default $STR (local.get $total)))");
+    b.push("(local.set $out (array.new_default $U16S (local.get $total)))");
     b.push("(local.set $i (i32.const 0))");
     b.push("(local.set $pos (i32.const 0))");
     b.push("(block $bd (loop $bl");
@@ -4938,7 +5042,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(3, "(then");
     b.push_in(
         4,
-        "(array.copy $STR $STR (local.get $out) (local.get $pos) (local.get $newc) (i32.const 0) (local.get $nl))",
+        "(call $scopy (local.get $out) (local.get $pos) (local.get $newc) (i32.const 0) (local.get $nl))",
     );
     b.push_in(
         4,
@@ -4951,7 +5055,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(3, "(else");
     b.push_in(
         4,
-        "(array.set $STR (local.get $out) (local.get $pos) (array.get_u $STR (local.get $ss) (local.get $i)))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $out)) (local.get $pos) (call $sat (local.get $ss) (local.get $i)))",
     );
     b.push_in(
         4,
@@ -4959,22 +5063,22 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(4, "(local.set $i (i32.add (local.get $i) (i32.const 1)))))");
     b.push_in(2, "(br $bl)))");
-    b.push("(local.get $out)");
+    b.push("(call $finish (local.get $out))");
     fs.push(Func {
         signature:
             "(func $str_replace (param $s (ref null any)) (param $old (ref null any)) (param $new (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
-            "(local $oldc (ref null $STR))".into(),
-            "(local $newc (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
+            "(local $oldc (ref null any))".into(),
+            "(local $newc (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $ol i32)".into(),
             "(local $nl i32)".into(),
             "(local $i i32)".into(),
             "(local $cnt i32)".into(),
             "(local $total i32)".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $out (ref null any))".into(),
             "(local $pos i32)".into(),
             "(local $mt i32)".into(),
         ],
@@ -4984,15 +5088,15 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $str_starts / $str_ends: prefix / suffix test, returning a bool value.
     for (fname, at_start) in [("$str_starts", true), ("$str_ends", false)] {
         let mut b = Body::new();
-        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+        b.push("(if (i32.eqz (call $is_str (local.get $s)))");
         b.push_in(
             1,
             "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
         );
-        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-        b.push("(local.set $pc (ref.cast (ref $STR) (local.get $p)))");
-        b.push("(local.set $n (array.len (local.get $ss)))");
-        b.push("(local.set $pl (array.len (local.get $pc)))");
+        b.push("(local.set $ss (local.get $s))");
+        b.push("(local.set $pc (local.get $p))");
+        b.push("(local.set $n (call $slen (local.get $ss)))");
+        b.push("(local.set $pl (call $slen (local.get $pc)))");
         b.push(
             "(if (i32.gt_s (local.get $pl) (local.get $n)) (then (return (global.get $FALSE))))",
         );
@@ -5009,8 +5113,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
                 "(func {fname} (param $s (ref null any)) (param $p (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
-                "(local $ss (ref null $STR))".into(),
-                "(local $pc (ref null $STR))".into(),
+                "(local $ss (ref null any))".into(),
+                "(local $pc (ref null any))".into(),
                 "(local $n i32)".into(),
                 "(local $pl i32)".into(),
             ],
@@ -5022,15 +5126,15 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // index of the first occurrence, or -1. Both fall back to method dispatch
     // for a non-string receiver.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s)))");
     b.push_in(
         1,
         "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
     );
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $subc (ref.cast (ref $STR) (local.get $sub)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
-    b.push("(local.set $sl (array.len (local.get $subc)))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $subc (local.get $sub))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
+    b.push("(local.set $sl (call $slen (local.get $subc)))");
     b.push("(if (i32.eqz (local.get $sl)) (then (return (call $box (i32.add (local.get $n) (i32.const 1))))))");
     b.push("(block $cd (loop $cl");
     b.push_in(
@@ -5056,8 +5160,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(func $str_count (param $s (ref null any)) (param $sub (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
-            "(local $subc (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
+            "(local $subc (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $sl i32)".into(),
             "(local $i i32)".into(),
@@ -5066,15 +5170,15 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s)))");
     b.push_in(
         1,
         "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
     );
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $subc (ref.cast (ref $STR) (local.get $sub)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
-    b.push("(local.set $sl (array.len (local.get $subc)))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $subc (local.get $sub))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
+    b.push("(local.set $sl (call $slen (local.get $subc)))");
     b.push("(block $fd (loop $fl");
     b.push_in(
         2,
@@ -5092,8 +5196,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(func $str_find (param $s (ref null any)) (param $sub (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
-            "(local $subc (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
+            "(local $subc (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $sl i32)".into(),
             "(local $i i32)".into(),
@@ -5107,19 +5211,19 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         ("$str_isalpha", 65, 90, 97, 122),
     ] {
         let mut b = Body::new();
-        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s)))");
+        b.push("(if (i32.eqz (call $is_str (local.get $s)))");
         b.push_in(
             1,
             "(then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))",
         );
-        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-        b.push("(local.set $n (array.len (local.get $ss)))");
+        b.push("(local.set $ss (local.get $s))");
+        b.push("(local.set $n (call $slen (local.get $ss)))");
         b.push("(if (i32.eqz (local.get $n)) (then (return (global.get $FALSE))))");
         b.push("(block $d (loop $l");
         b.push_in(2, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
         b.push_in(
             2,
-            "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+            "(local.set $c (call $sat (local.get $ss) (local.get $i)))",
         );
         b.push_in(
             2,
@@ -5133,7 +5237,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
                 "(func {fname} (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
-                "(local $ss (ref null $STR))".into(),
+                "(local $ss (ref null any))".into(),
                 "(local $n i32)".into(),
                 "(local $i i32)".into(),
                 "(local $c i32)".into(),
@@ -5144,53 +5248,53 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $str_capitalize: first char upper, the rest lower.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
-    b.push("(local.set $out (array.new_default $STR (local.get $n)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
+    b.push("(local.set $out (array.new_default $U16S (local.get $n)))");
     b.push("(block $d (loop $l");
     b.push_in(1, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         1,
-        "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $ss) (local.get $i)))",
     );
     b.push_in(1, "(if (i32.eqz (local.get $i))");
     b.push_in(2, "(then (if (i32.and (i32.ge_u (local.get $c) (i32.const 97)) (i32.le_u (local.get $c) (i32.const 122))) (then (local.set $c (i32.sub (local.get $c) (i32.const 32))))))");
     b.push_in(2, "(else (if (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))) (then (local.set $c (i32.add (local.get $c) (i32.const 32)))))))");
     b.push_in(
         1,
-        "(array.set $STR (local.get $out) (local.get $i) (local.get $c))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $out)) (local.get $i) (local.get $c))",
     );
     b.push_in(
         1,
         "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
     );
-    b.push("(local.get $out)");
+    b.push("(call $finish (local.get $out))");
     fs.push(Func {
         signature:
             "(func $str_capitalize (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $c i32)".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $out (ref null any))".into(),
         ],
         body: b,
     });
 
     // $str_title: first letter of each word upper, the rest lower.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
-    b.push("(local.set $out (array.new_default $STR (local.get $n)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
+    b.push("(local.set $out (array.new_default $U16S (local.get $n)))");
     b.push("(block $d (loop $l");
     b.push_in(1, "(br_if $d (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         1,
-        "(local.set $c (array.get_u $STR (local.get $ss) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $ss) (local.get $i)))",
     );
     b.push_in(1, "(local.set $al (i32.or (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))) (i32.and (i32.ge_u (local.get $c) (i32.const 97)) (i32.le_u (local.get $c) (i32.const 122)))))");
     b.push_in(1, "(if (local.get $al)");
@@ -5199,26 +5303,26 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(3, "(else (if (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))) (then (local.set $c (i32.add (local.get $c) (i32.const 32)))))))))");
     b.push_in(
         1,
-        "(array.set $STR (local.get $out) (local.get $i) (local.get $c))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $out)) (local.get $i) (local.get $c))",
     );
     b.push_in(1, "(local.set $prev (local.get $al))");
     b.push_in(
         1,
         "(local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))",
     );
-    b.push("(local.get $out)");
+    b.push("(call $finish (local.get $out))");
     fs.push(Func {
         signature:
             "(func $str_title (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $i i32)".into(),
             "(local $c i32)".into(),
             "(local $al i32)".into(),
             "(local $prev i32)".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $out (ref null any))".into(),
         ],
         body: b,
     });
@@ -5226,9 +5330,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $str_lstrip / $str_rstrip: one-sided whitespace trim.
     for (fname, left) in [("$str_lstrip", true), ("$str_rstrip", false)] {
         let mut b = Body::new();
-        b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
-        b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-        b.push("(local.set $n (array.len (local.get $ss)))");
+        b.push("(if (i32.eqz (call $is_str (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+        b.push("(local.set $ss (local.get $s))");
+        b.push("(local.set $n (call $slen (local.get $ss)))");
         b.push("(local.set $start (i32.const 0))");
         b.push("(local.set $end (local.get $n))");
         if left {
@@ -5237,7 +5341,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
                 1,
                 "(br_if $d (i32.ge_s (local.get $start) (local.get $end)))",
             );
-            b.push_in(1, "(br_if $d (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (local.get $start)))))");
+            b.push_in(1, "(br_if $d (i32.eqz (call $is_space (call $sat (local.get $ss) (local.get $start)))))");
             b.push_in(
                 1,
                 "(local.set $start (i32.add (local.get $start) (i32.const 1))) (br $l)))",
@@ -5248,7 +5352,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
                 1,
                 "(br_if $d (i32.le_s (local.get $end) (local.get $start)))",
             );
-            b.push_in(1, "(br_if $d (i32.eqz (call $is_space (array.get_u $STR (local.get $ss) (i32.sub (local.get $end) (i32.const 1))))))");
+            b.push_in(1, "(br_if $d (i32.eqz (call $is_space (call $sat (local.get $ss) (i32.sub (local.get $end) (i32.const 1))))))");
             b.push_in(
                 1,
                 "(local.set $end (i32.sub (local.get $end) (i32.const 1))) (br $l)))",
@@ -5260,7 +5364,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
                 "(func {fname} (param $s (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
             ),
             locals: vec![
-                "(local $ss (ref null $STR))".into(),
+                "(local $ss (ref null any))".into(),
                 "(local $n i32)".into(),
                 "(local $start i32)".into(),
                 "(local $end i32)".into(),
@@ -5271,35 +5375,35 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $str_zfill: pad with leading zeros to `width`, keeping a leading sign.
     let mut b = Body::new();
-    b.push("(if (i32.eqz (ref.test (ref $STR) (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
-    b.push("(local.set $ss (ref.cast (ref $STR) (local.get $s)))");
-    b.push("(local.set $n (array.len (local.get $ss)))");
+    b.push("(if (i32.eqz (call $is_str (local.get $s))) (then (return (call $call_method (local.get $s) (local.get $name) (local.get $args)))))");
+    b.push("(local.set $ss (local.get $s))");
+    b.push("(local.set $n (call $slen (local.get $ss)))");
     b.push("(local.set $w (call $unbox (local.get $wv)))");
     b.push("(if (i32.ge_s (local.get $n) (local.get $w)) (then (return (local.get $ss))))");
-    b.push("(local.set $out (array.new_default $STR (local.get $w)))");
-    b.push("(array.fill $STR (local.get $out) (i32.const 0) (i32.const 48) (local.get $w))");
+    b.push("(local.set $out (array.new_default $U16S (local.get $w)))");
+    b.push("(array.fill $U16S (ref.cast (ref $U16S) (local.get $out)) (i32.const 0) (i32.const 48) (local.get $w))");
     // a leading + or - stays in front, zeros after it
-    b.push("(local.set $c (if (result i32) (i32.gt_s (local.get $n) (i32.const 0)) (then (array.get_u $STR (local.get $ss) (i32.const 0))) (else (i32.const 0))))");
+    b.push("(local.set $c (if (result i32) (i32.gt_s (local.get $n) (i32.const 0)) (then (call $sat (local.get $ss) (i32.const 0))) (else (i32.const 0))))");
     b.push("(if (i32.or (i32.eq (local.get $c) (i32.const 43)) (i32.eq (local.get $c) (i32.const 45)))");
     b.push_in(1, "(then");
     b.push_in(
         2,
-        "(array.set $STR (local.get $out) (i32.const 0) (local.get $c))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $out)) (i32.const 0) (local.get $c))",
     );
-    b.push_in(2, "(array.copy $STR $STR (local.get $out) (i32.add (i32.sub (local.get $w) (local.get $n)) (i32.const 1)) (local.get $ss) (i32.const 1) (i32.sub (local.get $n) (i32.const 1))))");
+    b.push_in(2, "(call $scopy (local.get $out) (i32.add (i32.sub (local.get $w) (local.get $n)) (i32.const 1)) (local.get $ss) (i32.const 1) (i32.sub (local.get $n) (i32.const 1))))");
     b.push_in(1, "(else");
-    b.push_in(2, "(array.copy $STR $STR (local.get $out) (i32.sub (local.get $w) (local.get $n)) (local.get $ss) (i32.const 0) (local.get $n))))");
-    b.push("(local.get $out)");
+    b.push_in(2, "(call $scopy (local.get $out) (i32.sub (local.get $w) (local.get $n)) (local.get $ss) (i32.const 0) (local.get $n))))");
+    b.push("(call $finish (local.get $out))");
     fs.push(Func {
         signature:
             "(func $str_zfill (param $s (ref null any)) (param $wv (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
                 .into(),
         locals: vec![
-            "(local $ss (ref null $STR))".into(),
+            "(local $ss (ref null any))".into(),
             "(local $n i32)".into(),
             "(local $w i32)".into(),
             "(local $c i32)".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $out (ref null any))".into(),
         ],
         body: b,
     });
@@ -5426,16 +5530,16 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     // $str_to_float / $py_float: float(x) — parse a string (sign, digits, an
     // optional fraction, an optional exponent) or convert a number to f64.
     let mut b = Body::new();
-    b.push("(local.set $n (array.len (local.get $s)))");
+    b.push("(local.set $n (call $slen (local.get $s)))");
     b.push("(local.set $sign (f64.const 1))");
     b.push("(local.set $acc (f64.const 0))");
     // leading spaces
-    b.push("(block $l1 (loop $l1n (br_if $l1 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l1 (i32.eqz (call $is_space (array.get_u $STR (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l1n)))");
+    b.push("(block $l1 (loop $l1n (br_if $l1 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l1 (i32.eqz (call $is_space (call $sat (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l1n)))");
     // sign
     b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then");
     b.push_in(
         1,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(1, "(if (i32.eq (local.get $c) (i32.const 45)) (then (local.set $sign (f64.const -1)) (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
     b.push_in(1, "(if (i32.eq (local.get $c) (i32.const 43)) (then (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
@@ -5445,7 +5549,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(1, "(br_if $l2 (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         1,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(1, "(br_if $l2 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
     b.push_in(1, "(local.set $acc (f64.add (f64.mul (local.get $acc) (f64.const 10)) (f64.convert_i32_s (i32.sub (local.get $c) (i32.const 48)))))");
@@ -5453,7 +5557,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(1, "(br $l2n)))");
     // fraction (peek without reading past the end)
-    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (array.get_u $STR (local.get $s) (local.get $i))) (else (i32.const 0))))");
+    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (call $sat (local.get $s) (local.get $i))) (else (i32.const 0))))");
     b.push("(if (i32.eq (local.get $c) (i32.const 46)) (then");
     b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(1, "(local.set $scale (f64.const 0.1))");
@@ -5461,7 +5565,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br_if $l3 (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         2,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(2, "(br_if $l3 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
     b.push_in(2, "(local.set $acc (f64.add (local.get $acc) (f64.mul (f64.convert_i32_s (i32.sub (local.get $c) (i32.const 48))) (local.get $scale))))");
@@ -5476,13 +5580,13 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push("(if (i32.eqz (local.get $seen)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
     // exponent (peek without reading past the end)
     b.push("(local.set $esign (i32.const 1))");
-    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (array.get_u $STR (local.get $s) (local.get $i))) (else (i32.const 0))))");
+    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (call $sat (local.get $s) (local.get $i))) (else (i32.const 0))))");
     b.push("(if (i32.or (i32.eq (local.get $c) (i32.const 101)) (i32.eq (local.get $c) (i32.const 69))) (then");
     b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(1, "(if (i32.lt_s (local.get $i) (local.get $n)) (then");
     b.push_in(
         2,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 45)) (then (local.set $esign (i32.const -1)) (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
     b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 43)) (then (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
@@ -5492,7 +5596,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br_if $l4 (i32.ge_s (local.get $i) (local.get $n)))");
     b.push_in(
         2,
-        "(local.set $c (array.get_u $STR (local.get $s) (local.get $i)))",
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
     );
     b.push_in(2, "(br_if $l4 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
     b.push_in(2, "(local.set $exp (i32.add (i32.mul (local.get $exp) (i32.const 10)) (i32.sub (local.get $c) (i32.const 48))))");
@@ -5510,11 +5614,11 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br $l5n)))");
     b.push("))");
     // trailing spaces
-    b.push("(block $l6 (loop $l6n (br_if $l6 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l6 (i32.eqz (call $is_space (array.get_u $STR (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l6n)))");
+    b.push("(block $l6 (loop $l6n (br_if $l6 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l6 (i32.eqz (call $is_space (call $sat (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l6n)))");
     b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
     b.push("(struct.new $FLOAT (f64.mul (local.get $sign) (local.get $acc)))");
     fs.push(Func {
-        signature: "(func $str_to_float (param $s (ref null $STR)) (result (ref null any))".into(),
+        signature: "(func $str_to_float (param $s (ref null any)) (result (ref null any))".into(),
         locals: vec![
             "(local $n i32)".into(),
             "(local $i i32)".into(),
@@ -5530,11 +5634,8 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
     let mut b = Body::new();
-    b.push("(if (ref.test (ref $STR) (local.get $r))");
-    b.push_in(
-        1,
-        "(then (return (call $str_to_float (ref.cast (ref $STR) (local.get $r))))))",
-    );
+    b.push("(if (call $is_str (local.get $r))");
+    b.push_in(1, "(then (return (call $str_to_float (local.get $r)))))");
     b.push("(struct.new $FLOAT (call $unbox_f64 (local.get $r)))");
     fs.push(Func {
         signature: "(func $py_float (param $r (ref null any)) (result (ref null any))".into(),
@@ -5761,9 +5862,7 @@ fn class_helpers() -> Vec<Func> {
     // $object_display: print an instance via its string form ($object_to_str
     // builds it — __str__/__repr__ result or the `<Name object>` default).
     let mut b = Body::new();
-    b.push(
-        "(call $print_str (ref.cast (ref null $STR) (call $object_to_str (local.get $obj) (local.get $prefer_str))))",
-    );
+    b.push("(call $print_str (call $object_to_str (local.get $obj) (local.get $prefer_str)))");
     fs.push(Func {
         signature: "(func $object_display (param $obj (ref null any)) (param $prefer_str i32)"
             .into(),
@@ -5775,6 +5874,7 @@ fn class_helpers() -> Vec<Func> {
     // Non-objects answer 0 — so operator helpers can probe for a dunder
     // (`__add__`, `__eq__`, …) without first knowing the operand's type.
     let mut b = Body::new();
+    b.push("(if (call $is_str (local.get $obj)) (then (return (i32.const 0))))");
     b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
     b.push_in(1, "(then (return (i32.const 0))))");
     b.push(
@@ -5836,12 +5936,12 @@ fn class_helpers() -> Vec<Func> {
 }
 
 /// `$read_line`: read bytes from the `env.read_char` host import until a
-/// newline or EOF (-1), returning a `$STR` with the newline stripped (a stray
+/// newline or EOF (-1), returning a string with the newline stripped (a stray
 /// `\r` is dropped, so `\r\n` input works). Emitted only when `input()` is used.
 fn read_line_helper() -> Func {
     let mut b = Body::new();
     b.push("(local.set $cap (i32.const 16))");
-    b.push("(local.set $buf (array.new_default $STR (local.get $cap)))");
+    b.push("(local.set $buf (array.new_default $U16S (local.get $cap)))");
     b.push("(local.set $len (i32.const 0))");
     b.push("(block $done");
     b.push_in(1, "(loop $next");
@@ -5859,16 +5959,16 @@ fn read_line_helper() -> Func {
     );
     b.push_in(
         6,
-        "(local.set $new (array.new_default $STR (local.get $cap)))",
+        "(local.set $new (array.new_default $U16S (local.get $cap)))",
     );
     b.push_in(
         6,
-        "(array.copy $STR $STR (local.get $new) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $len))",
+        "(call $scopy (local.get $new) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $len))",
     );
     b.push_in(6, "(local.set $buf (local.get $new))))");
     b.push_in(
         4,
-        "(array.set $STR (local.get $buf) (local.get $len) (local.get $c))",
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $buf)) (local.get $len) (local.get $c))",
     );
     b.push_in(
         4,
@@ -5878,18 +5978,18 @@ fn read_line_helper() -> Func {
     b.push_in(1, ")");
     b.push(")");
     // Trim to exactly $len.
-    b.push("(local.set $out (array.new_default $STR (local.get $len)))");
-    b.push("(array.copy $STR $STR (local.get $out) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $len))");
-    b.push("(local.get $out)");
+    b.push("(local.set $out (array.new_default $U16S (local.get $len)))");
+    b.push("(call $scopy (local.get $out) (i32.const 0) (local.get $buf) (i32.const 0) (local.get $len))");
+    b.push("(call $finish (local.get $out))");
     Func {
         signature: "(func $read_line (result (ref null any))".into(),
         locals: vec![
             "(local $cap i32)".into(),
             "(local $len i32)".into(),
             "(local $c i32)".into(),
-            "(local $buf (ref null $STR))".into(),
-            "(local $new (ref null $STR))".into(),
-            "(local $out (ref null $STR))".into(),
+            "(local $buf (ref null any))".into(),
+            "(local $new (ref null any))".into(),
+            "(local $out (ref null any))".into(),
         ],
         body: b,
     }
@@ -8422,7 +8522,7 @@ impl Gen {
                             if args.len() == 1 {
                                 let p = self.value_expr(cx, &args[0])?;
                                 return Ok(format!(
-                                    "(block (result (ref null any)) (call $print_str (ref.cast (ref null $STR) (call $to_str {p}))) (call $read_line))"
+                                    "(block (result (ref null any)) (call $print_str (call $to_str {p})) (call $read_line))"
                                 ));
                             }
                             return Ok("(call $read_line)".to_string());
@@ -8926,11 +9026,42 @@ pub(crate) fn parse_format_spec(
     Ok((is_float, prec_v, width, fill as i32, align_code))
 }
 
-/// WAT for a `$STR` literal from Rust bytes (used for attribute/method-name
-/// keys as well as string literals).
+thread_local! {
+    /// Per-compile string-literal intern table (compile is single-threaded;
+    /// `generate` clears it on entry and drains it into quote-module imports
+    /// at assembly). str_lit is called from Gen-less helper builders, which
+    /// is why this is not a Gen field.
+    static STR_LITS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A string literal as a VALUE: interned to an imported JS-string global
+/// (the quote-module mechanism — the import NAME is the literal), read back
+/// internalized so it lives in the (ref null any) universal value.
 fn str_lit(s: &str) -> String {
-    let bytes: Vec<String> = s.bytes().map(|b| format!("(i32.const {b})")).collect();
-    format!("(array.new_fixed $STR {} {})", bytes.len(), bytes.join(" "))
+    let idx = STR_LITS.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(i) = t.iter().position(|x| x == s) {
+            i
+        } else {
+            t.push(s.to_string());
+            t.len() - 1
+        }
+    });
+    format!("(struct.new $JSSTR (global.get $lit{idx}))")
+}
+
+/// WAT string-escape for an import name (literal text can hold anything).
+fn wat_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for b in s.bytes() {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\{b:02x}")),
+        }
+    }
+    out
 }
 
 /// Constant value of an integer literal (handling unary minus), if it is one.
@@ -9585,12 +9716,14 @@ mod tests {
     }
 
     #[test]
-    fn strings_are_gc_arrays() {
+    fn strings_are_js_strings() {
+        // A string literal is an imported JS-string constant (the quote
+        // module: the import NAME is the literal), wrapped in $JSSTR so
+        // ref.test dispatch stays native GC.
         let wat = compile("x = \"hi\"\nprint(x)").unwrap();
-        assert!(wat.contains("(type $STR (array (mut i8)))"));
-        assert!(wat.contains(
-            "(global.set $g_x (array.new_fixed $STR 2 (i32.const 104) (i32.const 105)))"
-        ));
+        assert!(wat.contains("(type $JSSTR (struct (field (ref extern))))"));
+        assert!(wat.contains(r#"(import "'" "hi" (global "#));
+        assert!(wat.contains("(global.set $g_x (struct.new $JSSTR (global.get $lit"));
         assert!(wat.contains("(call $print_value (global.get $g_x))"));
     }
 
