@@ -131,5 +131,5 @@ of the batch — this stage is atomic-ish, budget a full session):
   the panic class by construction. Encoding shift verified: hosts now
   assemble UTF-16 units (surrogate pairs included — café 🦀 prints).
   Suite 100% green, RUNTIME_SEMANTICS byte-identical, $STR deleted.
-- [ ] Stage 4 residue: gv/gf inbound + IDE runner + e2e
+- [x] Stage 4: IDE runner passes the js-string compile options via Reflect (acornstem-ide); full e2e 18/18 on the JS-strings build. gv/gf inbound stays on the scratch protocol (works; externref returns = optional later).
 - [ ] Stage 5 bench + record
