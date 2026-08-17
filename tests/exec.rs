@@ -93,6 +93,16 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         })
         .unwrap();
     linker
+        .func_wrap(
+            "env",
+            "write_str",
+            |mut caller: Caller<'_, Io>, s: Option<wasmtime::Rooted<wasmtime::ExternRef>>| {
+                let text = common::js_str(&mut caller, &s);
+                caller.data_mut().out.extend_from_slice(text.as_bytes());
+            },
+        )
+        .unwrap();
+    linker
         .func_wrap("env", "write_i32", |mut caller: Caller<'_, Io>, v: i32| {
             caller
                 .data_mut()

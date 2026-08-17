@@ -123,9 +123,43 @@ pub fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
 
     let mut linker: Linker<Io> = Linker::new(&engine);
     linker
-        .func_wrap("env", "write_char", |mut c: Caller<'_, Io>, ch: i32| {
-            c.data_mut().out.push(ch as u8);
+        .func_wrap("env", "write_char", {
+            // Fn+Send+Sync required: surrogate state as an atomic (0 = none).
+            let hi = std::sync::atomic::AtomicU32::new(0);
+            move |mut c: Caller<'_, Io>, ch: i32| {
+                // UTF-16 code units in (surrogate pairs across calls),
+                // UTF-8 bytes out — same contract as the test hosts.
+                let u = ch as u32 as u16;
+                use std::sync::atomic::Ordering;
+                let prev = hi.swap(0, Ordering::Relaxed);
+                let cp: u32 = match (prev, u) {
+                    (0, 0xD800..=0xDBFF) => {
+                        hi.store(0x1_0000 | u as u32, Ordering::Relaxed);
+                        return;
+                    }
+                    (p, 0xDC00..=0xDFFF) if p != 0 => {
+                        let h = p & 0xFFFF;
+                        0x10000 + (((h - 0xD800) << 10) | (u as u32 - 0xDC00))
+                    }
+                    (_, _) => u as u32,
+                };
+                let ch = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
+                let mut buf = [0u8; 4];
+                c.data_mut()
+                    .out
+                    .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
         })
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "write_str",
+            |mut c: Caller<'_, Io>, s: Option<wasmtime::Rooted<wasmtime::ExternRef>>| {
+                let text = crate::js_string_host::js_str(&mut c, &s);
+                c.data_mut().out.extend_from_slice(text.as_bytes());
+            },
+        )
         .unwrap();
     linker
         .func_wrap("env", "write_i32", |mut c: Caller<'_, Io>, v: i32| {
@@ -155,6 +189,9 @@ pub fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
     linker
         .func_wrap("env", "seed", |_: Caller<'_, Io>| -> i32 { 42 })
         .unwrap();
+
+    crate::js_string_host::add_js_string_builtins(&mut linker);
+    crate::js_string_host::define_string_literals(&mut linker, &mut store, &module);
 
     let instance = match linker.instantiate(&mut store, &module) {
         Ok(i) => i,

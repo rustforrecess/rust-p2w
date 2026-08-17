@@ -92,6 +92,10 @@ pub fn try_compile(source: &str) -> Result<String, CompileError> {
 /// feature so a default build keeps one runtime dependency.
 #[cfg(feature = "run")]
 pub mod harness;
+/// The wasm:js-string polyfill the harness links — shared by path-include
+/// with the test hosts so the reference host cannot drift from the rig.
+#[cfg(feature = "run")]
+mod js_string_host;
 
 /// Minimal RFC 8259 string escaping, for the harness's hand-written JSON.
 ///

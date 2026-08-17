@@ -378,6 +378,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         .push(r#"(import "env" "write_char" (func $write_char (param i32)))"#.into());
     module
         .imports
+        .push(r#"(import "env" "write_str" (func $write_str (param externref)))"#.into());
+    module
+        .imports
         .push(r#"(import "env" "write_i32" (func $write_i32 (param i32)))"#.into());
     module
         .imports
@@ -433,16 +436,6 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // so the two regions never meet. Exported so hosts can read and write it.
     let needs_scratch =
         g.uses_dom_str || g.uses_report || g.uses_fields || g.uses_evidence || g.uses_emit_html;
-    // Drain the literal intern table — every str_lit() call above has
-    // registered its text; each becomes one imported constant global.
-    STR_LITS.with(|t| {
-        for (i, text) in t.borrow().iter().enumerate() {
-            module.imports.push(format!(
-                r#"(import "'" "{}" (global $lit{i} (ref extern)))"#,
-                wat_escape(text)
-            ));
-        }
-    });
     if g.uses_random {
         module
             .globals
@@ -639,19 +632,30 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             .imports
             .push(r#"(import "env" "on_frame" (func $on_frame (param i32)))"#.into());
     }
+    // Drain the literal intern table LAST — helpers emitted above (including
+    // the conditional blocks: random, floordiv, input …) register literals
+    // through push_text/str_lit too, so draining any earlier loses theirs.
+    STR_LITS.with(|t| {
+        for (i, text) in t.borrow().iter().enumerate() {
+            module.imports.push(format!(
+                r#"(import "'" "{}" (global $lit{i} (ref extern)))"#,
+                wat_escape(text)
+            ));
+        }
+    });
     Ok(module.render())
 }
 
 /// Emit `write_char` calls spelling out `text` (for runtime messages).
 fn push_text(b: &mut Body, depth: usize, text: &str) {
-    // write_char carries UTF-16 code units now (strings are JS strings), so
-    // message text emits per CHAR — the host reassembles surrogate pairs.
-    for c in text.chars() {
-        let mut units = [0u16; 2];
-        for u in c.encode_utf16(&mut units) {
-            b.push_in(depth, format!("(call $write_char (i32.const {u}))"));
-        }
-    }
+    // Message text is an interned literal written in ONE host call. The old
+    // form emitted a write_char instruction per character — ~5 bytes of code
+    // section per byte of message, across ~100 raise sites; literal-heavy
+    // code paid it worst.
+    b.push_in(
+        depth,
+        format!("(call $write_str (call $unwrap {}))", str_lit(text)),
+    );
 }
 
 /// The error-raising runtime: each $raise_* prints a Python-style message
@@ -3448,20 +3452,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
 
-    // $print_str: write a string's bytes through write_char.
+    // $print_str: the string goes to the host as ITSELF — one call.
     let mut b = Body::new();
-    b.push("(local.set $n (call $slen (local.get $s)))");
-    b.push("(block $done");
-    b.push_in(1, "(loop $next");
-    b.push_in(2, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
-    b.push_in(
-        2,
-        "(call $write_char (call $sat (local.get $s) (local.get $i)))",
-    );
-    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
-    b.push_in(2, "(br $next)");
-    b.push_in(1, ")");
-    b.push(")");
+    b.push("(call $write_str (call $unwrap (local.get $s)))");
     fs.push(Func {
         signature: "(func $print_str (param $s (ref null any))".into(),
         locals: vec!["(local $i i32)".into(), "(local $n i32)".into()],

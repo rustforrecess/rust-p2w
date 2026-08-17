@@ -116,8 +116,6 @@ of the batch — this stage is atomic-ish, budget a full session):
 
 ## Status
 
-## Status
-
 - [x] Stage 0: survey — 197 eq-universal sites, 1 `ref.eq`, 233 `$STR` touches
 - [x] Stage 1: universal value is (ref null any); ref.eq guarded; suite 100% green unchanged
 - [x] Stage 2: wasmtime polyfill of wasm:js-string (tests/common/mod.rs) + literal mechanism DECIDED = the quote-module imports (import name IS the literal; V8 gets importedStringConstants at compile); contract test tests/js_string_host.rs green
@@ -133,3 +131,35 @@ of the batch — this stage is atomic-ish, budget a full session):
   Suite 100% green, RUNTIME_SEMANTICS byte-identical, $STR deleted.
 - [x] Stage 4: IDE runner passes the js-string compile options via Reflect (acornstem-ide); full e2e 18/18 on the JS-strings build. gv/gf inbound stays on the scratch protocol (works; externref returns = optional later).
 - [x] Stage 5: real-Chrome bench (acornstem-ide bench_js_strings, data-URL page, median of 7): strbuild pre-cutover 279.2ms -> JS strings 73.3ms (~3.8x). Campaign COMPLETE.
+
+## Post-campaign addenda
+
+**Zero-copy seam flip (2026-08-16).** Outbound args go over as ONE externref
+(`env.s_str`); `gv_fetch`/`gf_fetch` return `(ref extern)` directly. The
+scratch page, memory export, chunk protocol and copy_out are all deleted —
+this supersedes the stage-4 note above about gv/gf staying on scratch.
+
+**Literal handling at industrial scale (2026-08-17).** Decided posture, after
+asking what changes for literal-heavy NON-kid code:
+
+- Quote-module imports stay the default at every scale. The engine interns
+  each import name against the JS string table, so the text is stored once
+  either way and dedup is free. An import entry's overhead is the entry
+  itself, not a copy of the string.
+- The real ceiling is V8's **100,000-import limit** per module. Kid programs
+  sit orders of magnitude below it; a generated or industrial module could
+  conceivably approach it.
+- The escape hatch, documented not built: passive data segment of UTF-16
+  units + `array.new_data` + `fromCharCodeArray` at init (J2CL's approach
+  before the builtins existed). Build it only when a real consumer nears
+  the ceiling; it trades import entries for one-time init cost.
+- The genuine literal-scale defect was OURS, now fixed: `push_text` emitted
+  raise/message text as one `write_char` CALL PER CHARACTER (~5 bytes of
+  code section per character, across every raise site). Messages are now
+  interned literals written via one `env.write_str` call, and `$print_str`
+  is one host call instead of a per-unit loop. This also un-broke `p2w run`:
+  the fuel harness had never been taught the stage-3 imports (its tests are
+  feature-gated, so the default suite could not see the breakage) — the
+  polyfill now lives in `src/js_string_host.rs`, shared by path-include
+  between the test hosts and the harness so the reference host cannot
+  drift again.
