@@ -3145,18 +3145,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "outside the range of whole numbers")]
     fn multiplication_past_the_int_range_traps() {
+        let _g = heap_guard();
         numeric(p2w_int(1_000_000), p2w_int(1_000_000), |x, y| x * y);
     }
 
     #[test]
     #[should_panic(expected = "outside the range of whole numbers")]
     fn addition_past_the_int_range_traps() {
+        let _g = heap_guard();
         numeric(p2w_int(2_147_483_647), p2w_int(1), |x, y| x + y);
     }
 
     /// ...but the boundary values themselves are fine.
     #[test]
     fn the_edges_of_the_int_range_still_work() {
+        let _g = heap_guard();
         assert_eq!(
             shown(p2w_add(p2w_int(2_147_483_646), p2w_int(1))),
             "2147483647"
@@ -3169,6 +3172,7 @@ mod tests {
 
     #[test]
     fn ints_round_trip_and_print() {
+        let _g = heap_guard();
         assert_eq!(as_int(p2w_int(42)), 42);
         assert_eq!(as_int(p2w_int(-7)), -7);
         assert_eq!(shown(p2w_int(0)), "0");
@@ -3178,6 +3182,7 @@ mod tests {
 
     #[test]
     fn arithmetic_matches_python_for_ints() {
+        let _g = heap_guard();
         assert_eq!(as_int(p2w_add(p2w_int(2), p2w_int(3))), 5);
         assert_eq!(as_int(p2w_mul(p2w_int(6), p2w_int(7))), 42);
         assert_eq!(as_int(p2w_sub(p2w_int(1), p2w_int(4))), -3);
@@ -3190,6 +3195,7 @@ mod tests {
 
     #[test]
     fn bools_none_and_truthiness() {
+        let _g = heap_guard();
         assert_eq!(shown(p2w_bool(1)), "True");
         assert_eq!(shown(p2w_bool(0)), "False");
         assert_eq!(shown(p2w_none()), "None");
@@ -3203,6 +3209,7 @@ mod tests {
 
     #[test]
     fn comparisons_and_equality() {
+        let _g = heap_guard();
         assert_eq!(p2w_lt(p2w_int(1), p2w_int(2)), V_TRUE);
         assert_eq!(p2w_ge(p2w_int(2), p2w_int(2)), V_TRUE);
         assert_eq!(p2w_eq(p2w_int(5), p2w_int(5)), V_TRUE);
@@ -3603,6 +3610,7 @@ mod tests {
 
     #[test]
     fn inline_values_ignore_retain_release() {
+        let _g = heap_guard();
         // retain/release on int/bool/None are safe no-ops.
         let n = p2w_int(7);
         p2w_retain(n);
