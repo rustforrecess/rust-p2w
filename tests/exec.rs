@@ -34,11 +34,9 @@ struct Io {
     input: Vec<u8>,
     pos: usize,
     /// String-marshalling scratch + the pushed-arg stack (for s_*/report).
-    cur: Vec<u8>,
     args: Vec<String>,
     /// Field store + reverse-marshalling result buffer (set_field/get_field).
     fields: std::collections::HashMap<String, String>,
-    result: Vec<u8>,
 }
 
 /// Compile and execute `src` with no stdin.
@@ -59,10 +57,8 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
             out: Vec::new(),
             input: stdin.as_bytes().to_vec(),
             pos: 0,
-            cur: Vec::new(),
             args: Vec::new(),
             fields: std::collections::HashMap::new(),
-            result: Vec::new(),
         },
     );
     let mut linker: Linker<Io> = Linker::new(engine());
@@ -131,34 +127,23 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         .unwrap();
     // String marshalling + report (the platform REPORT capability): build each
     // pushed string from bytes; report() drains [score, trace] and echoes them.
-    linker
-        .func_wrap("env", "s_begin", |mut caller: Caller<'_, Io>| {
-            caller.data_mut().cur.clear();
-        })
-        .unwrap();
+    // Zero-copy arg push: the externref IS the string.
     linker
         .func_wrap(
             "env",
-            "s_bytes",
-            |mut caller: Caller<'_, Io>, ptr: i32, len: i32| {
-                let mem = caller
-                    .get_export("memory")
-                    .and_then(|e| e.into_memory())
-                    .expect("module with s_bytes must export its scratch memory");
-                let mut buf = vec![0u8; len as usize];
-                mem.read(&caller, ptr as usize, &mut buf)
-                    .expect("s_bytes read");
-                caller.data_mut().cur.extend_from_slice(&buf);
+            "s_str",
+            |mut caller: Caller<'_, Io>, s: Option<wasmtime::Rooted<wasmtime::ExternRef>>| {
+                let text = s
+                    .expect("s_str: null")
+                    .data(&mut caller)
+                    .expect("externref data")
+                    .expect("host data")
+                    .downcast_ref::<String>()
+                    .expect("s_str: not a string")
+                    .clone();
+                caller.data_mut().args.push(text);
             },
         )
-        .unwrap();
-    linker
-        .func_wrap("env", "s_push", |mut caller: Caller<'_, Io>| {
-            let d = caller.data_mut();
-            let s = String::from_utf8_lossy(&d.cur).into_owned();
-            d.args.push(s);
-            d.cur.clear();
-        })
         .unwrap();
     linker
         .func_wrap("env", "report", |mut caller: Caller<'_, Io>, score: f64| {
@@ -190,29 +175,14 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         })
         .unwrap();
     linker
-        .func_wrap("env", "gf_fetch", |mut caller: Caller<'_, Io>| -> i32 {
-            let d = caller.data_mut();
-            let key = d.args.pop().unwrap_or_default();
-            d.result = d.fields.get(&key).cloned().unwrap_or_default().into_bytes();
-            d.result.len() as i32
-        })
-        .unwrap();
-    linker
         .func_wrap(
             "env",
-            "gf_read",
-            |mut caller: Caller<'_, Io>, ptr: i32, start: i32, maxlen: i32| -> i32 {
-                let mem = caller
-                    .get_export("memory")
-                    .and_then(|e| e.into_memory())
-                    .expect("module with gf_read must export its scratch memory");
-                let d = caller.data();
-                let start = start as usize;
-                let end = d.result.len().min(start + maxlen as usize);
-                let chunk = d.result.get(start..end).unwrap_or_default().to_vec();
-                mem.write(&mut caller, ptr as usize, &chunk)
-                    .expect("gf_read write");
-                chunk.len() as i32
+            "gf_fetch",
+            |mut caller: Caller<'_, Io>| -> wasmtime::Rooted<wasmtime::ExternRef> {
+                let d = caller.data_mut();
+                let key = d.args.pop().unwrap_or_default();
+                let value = d.fields.get(&key).cloned().unwrap_or_default();
+                wasmtime::ExternRef::new(&mut caller, value).expect("alloc externref")
             },
         )
         .unwrap();

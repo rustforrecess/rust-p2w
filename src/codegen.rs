@@ -433,17 +433,6 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // so the two regions never meet. Exported so hosts can read and write it.
     let needs_scratch =
         g.uses_dom_str || g.uses_report || g.uses_fields || g.uses_evidence || g.uses_emit_html;
-    if needs_scratch {
-        if g.uses_math {
-            module
-                .raw
-                .push(r#"(export "memory" (memory $mw_mem))"#.to_string());
-        } else {
-            module
-                .raw
-                .push(r#"(memory $mem (export "memory") 1)"#.to_string());
-        }
-    }
     // Drain the literal intern table — every str_lit() call above has
     // registered its text; each becomes one imported constant global.
     STR_LITS.with(|t| {
@@ -526,48 +515,16 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // per byte — and in the IDE each of those was wasm -> JS glue -> wasm.
     // Shared by the DOM string ops and report() — emitted once if either is used.
     if needs_scratch {
-        for imp in [
-            r#"(import "env" "s_begin" (func $s_begin))"#,
-            r#"(import "env" "s_bytes" (func $s_bytes (param i32) (param i32)))"#,
-            r#"(import "env" "s_push" (func $s_push))"#,
-        ] {
-            module.imports.push(imp.into());
-        }
-        // $marshal_str(v): str()-coerce, then push its bytes as one arg string.
+        // ZERO-COPY: a p2w string IS a JS string, so pushing an argument to
+        // the host is one call carrying the externref — no copy, no chunks.
+        module
+            .imports
+            .push(r#"(import "env" "s_str" (func $s_str (param externref)))"#.into());
         let mut b = Body::new();
-        b.push("(local.set $s (call $to_str (local.get $v)))");
-        b.push("(call $s_begin)");
-        b.push("(local.set $n (call $slen (local.get $s)))");
-        b.push("(block $done (loop $chunk");
-        b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
-        b.push_in(1, "(local.set $c (i32.sub (local.get $n) (local.get $i)))");
-        b.push_in(
-            1,
-            "(if (i32.gt_u (local.get $c) (i32.const 32768)) (then (local.set $c (i32.const 32768))))",
-        );
-        b.push_in(1, "(local.set $j (i32.const 0))");
-        b.push_in(1, "(block $cdone (loop $copy");
-        b.push_in(2, "(br_if $cdone (i32.ge_u (local.get $j) (local.get $c)))");
-        b.push_in(
-            2,
-            "(i32.store8 (i32.add (i32.const 32768) (local.get $j)) \
-             (call $sat (local.get $s) (i32.add (local.get $i) (local.get $j))))",
-        );
-        b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
-        b.push_in(2, "(br $copy)))");
-        b.push_in(1, "(call $s_bytes (i32.const 32768) (local.get $c))");
-        b.push_in(1, "(local.set $i (i32.add (local.get $i) (local.get $c)))");
-        b.push_in(1, "(br $chunk)))");
-        b.push("(call $s_push)");
+        b.push("(call $s_str (call $unwrap (call $to_str (local.get $v))))");
         module.funcs.push(Func {
             signature: "(func $marshal_str (param $v (ref null any))".into(),
-            locals: vec![
-                "(local $s (ref null any))".into(),
-                "(local $n i32)".into(),
-                "(local $i i32)".into(),
-                "(local $c i32)".into(),
-                "(local $j i32)".into(),
-            ],
+            locals: vec![],
             body: b,
         });
     }
@@ -585,11 +542,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             r#"(import "env" "pointer_y" (func $pointer_y (result i32)))"#,
             r#"(import "env" "play_sound" (func $play_sound))"#,
             r#"(import "env" "dom_on" (func $dom_on (param i32)))"#,
-            // Reverse marshalling: gv_fetch buffers the element's value host-
-            // side and returns its length; gv_read(ptr, start, maxlen) then
-            // copies chunks into the scratch page (was one call per byte).
-            r#"(import "env" "gv_fetch" (func $gv_fetch (result i32)))"#,
-            r#"(import "env" "gv_read" (func $gv_read (param i32) (param i32) (param i32) (result i32)))"#,
+            // Reverse marshalling: the element's value comes back as the JS
+            // string itself — zero-copy, one call.
+            r#"(import "env" "gv_fetch" (func $gv_fetch (result (ref extern))))"#,
             // on_key: pops a key name string + takes the handler id.
             r#"(import "env" "key_on" (func $key_on (param i32)))"#,
         ] {
@@ -598,37 +553,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         // $get_value(): with the selector already on the arg stack, fetch the
         // element's value/text and build a string from the returned units.
         let mut b = Body::new();
-        b.push("(local.set $n (call $gv_fetch))");
-        b.push("(local.set $s (array.new_default $U16S (local.get $n)))");
-        b.push("(block $done (loop $chunk");
-        b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
-        b.push_in(
-            1,
-            "(local.set $c (call $gv_read (i32.const 32768) (local.get $i) (i32.const 32768)))",
-        );
-        b.push_in(1, "(br_if $done (i32.eqz (local.get $c)))");
-        b.push_in(1, "(local.set $j (i32.const 0))");
-        b.push_in(1, "(block $cdone (loop $copy");
-        b.push_in(2, "(br_if $cdone (i32.ge_u (local.get $j) (local.get $c)))");
-        b.push_in(
-            2,
-            "(array.set $U16S (ref.cast (ref $U16S) (local.get $s)) (i32.add (local.get $i) (local.get $j)) \
-             (i32.load8_u (i32.add (i32.const 32768) (local.get $j))))",
-        );
-        b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
-        b.push_in(2, "(br $copy)))");
-        b.push_in(1, "(local.set $i (i32.add (local.get $i) (local.get $c)))");
-        b.push_in(1, "(br $chunk)))");
-        b.push("(call $finish (local.get $s))");
+        b.push("(struct.new $JSSTR (call $gv_fetch))");
         module.funcs.push(Func {
             signature: "(func $get_value (result (ref null any))".into(),
-            locals: vec![
-                "(local $n i32)".into(),
-                "(local $s (ref null any))".into(),
-                "(local $i i32)".into(),
-                "(local $c i32)".into(),
-                "(local $j i32)".into(),
-            ],
+            locals: vec![],
             body: b,
         });
     }
@@ -691,43 +619,15 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         // marshalling (gf_fetch -> length, gf_read -> chunks), like $get_value.
         for imp in [
             r#"(import "env" "set_field" (func $set_field))"#,
-            r#"(import "env" "gf_fetch" (func $gf_fetch (result i32)))"#,
-            r#"(import "env" "gf_read" (func $gf_read (param i32) (param i32) (param i32) (result i32)))"#,
+            r#"(import "env" "gf_fetch" (func $gf_fetch (result (ref extern))))"#,
         ] {
             module.imports.push(imp.into());
         }
         let mut b = Body::new();
-        b.push("(local.set $n (call $gf_fetch))");
-        b.push("(local.set $s (array.new_default $U16S (local.get $n)))");
-        b.push("(block $done (loop $chunk");
-        b.push_in(1, "(br_if $done (i32.ge_u (local.get $i) (local.get $n)))");
-        b.push_in(
-            1,
-            "(local.set $c (call $gf_read (i32.const 32768) (local.get $i) (i32.const 32768)))",
-        );
-        b.push_in(1, "(br_if $done (i32.eqz (local.get $c)))");
-        b.push_in(1, "(local.set $j (i32.const 0))");
-        b.push_in(1, "(block $cdone (loop $copy");
-        b.push_in(2, "(br_if $cdone (i32.ge_u (local.get $j) (local.get $c)))");
-        b.push_in(
-            2,
-            "(array.set $U16S (ref.cast (ref $U16S) (local.get $s)) (i32.add (local.get $i) (local.get $j)) \
-             (i32.load8_u (i32.add (i32.const 32768) (local.get $j))))",
-        );
-        b.push_in(2, "(local.set $j (i32.add (local.get $j) (i32.const 1)))");
-        b.push_in(2, "(br $copy)))");
-        b.push_in(1, "(local.set $i (i32.add (local.get $i) (local.get $c)))");
-        b.push_in(1, "(br $chunk)))");
-        b.push("(call $finish (local.get $s))");
+        b.push("(struct.new $JSSTR (call $gf_fetch))");
         module.funcs.push(Func {
             signature: "(func $get_field (result (ref null any))".into(),
-            locals: vec![
-                "(local $n i32)".into(),
-                "(local $s (ref null any))".into(),
-                "(local $i i32)".into(),
-                "(local $c i32)".into(),
-                "(local $j i32)".into(),
-            ],
+            locals: vec![],
             body: b,
         });
     }
