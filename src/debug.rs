@@ -3573,14 +3573,14 @@ fn random_call(st: &mut u64, func: &str, args: &mut [Value]) -> Result<Value, St
         ("randint", [Value::Int(a), Value::Int(b)]) => {
             let (a, b) = (*a, *b);
             if a > b {
-                return Err("ValueError: randint(a, b) needs a <= b — the low end first".into());
+                return Err(crate::messages::VALUE_RANDINT_ORDER.text.into());
             }
             let span = ((b as i128) - (a as i128) + 1) as u64;
             Ok(Value::Int(a + (rnd_next(st) % span) as i64))
         }
         ("choice", [Value::List(items)]) => {
             if items.is_empty() {
-                return Err("IndexError: cannot choose from an empty sequence".into());
+                return Err(crate::messages::INDEX_CHOICE_EMPTY.text.into());
             }
             let i = (rnd_next(st) % items.len() as u64) as usize;
             Ok(items[i].clone())

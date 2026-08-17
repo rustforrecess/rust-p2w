@@ -658,6 +658,41 @@ fn push_text(b: &mut Body, depth: usize, text: &str) {
     );
 }
 
+/// Emit a table message (`crate::messages`): static runs go out through
+/// `push_text` as interned literals; each `{slot}` calls `fill`, which emits
+/// the wasm that prints that runtime value. Keeping the split here means the
+/// template in the table is the ONLY copy of the text.
+fn push_msg(
+    b: &mut Body,
+    depth: usize,
+    m: &crate::messages::Msg,
+    mut fill: impl FnMut(&mut Body, usize, &str),
+) {
+    let mut rest = m.text;
+    while let Some(i) = rest.find('{') {
+        if i > 0 {
+            push_text(b, depth, &rest[..i]);
+        }
+        let end = i + rest[i..].find('}').expect("unclosed {slot} in message");
+        fill(b, depth, &rest[i + 1..end]);
+        rest = &rest[end + 1..];
+    }
+    if !rest.is_empty() {
+        push_text(b, depth, rest);
+    }
+}
+
+/// `push_msg` filler for messages that have no slots.
+fn no_slots(_: &mut Body, _: usize, slot: &str) {
+    unreachable!("message has unexpected slot {{{slot}}}");
+}
+
+/// `push_msg` filler for the common single `{type}` slot: the runtime type
+/// name of `$r`.
+fn type_of_r(b: &mut Body, depth: usize, _slot: &str) {
+    b.push_in(depth, "(call $type_name (local.get $r))");
+}
+
 /// The error-raising runtime: each $raise_* prints a Python-style message
 /// (on its own line) through write_char, then traps. Bodies end in
 /// `unreachable`, so call sites in value position add their own trailing
@@ -713,18 +748,17 @@ fn raise_helpers() -> Vec<Func> {
     b.push("(call $write_char (i32.const 10))");
     b.push("(if (ref.is_null (local.get $r))");
     b.push_in(1, "(then");
-    push_text(
+    push_msg(
         &mut b,
         2,
-        "NameError: a variable was used before it was given a value",
+        &crate::messages::NAME_USE_BEFORE_ASSIGN,
+        no_slots,
     );
     b.push_in(2, "(call $write_char (i32.const 10))");
     b.push_in(2, "unreachable");
     b.push_in(1, ")");
     b.push(")");
-    push_text(&mut b, 0, "TypeError: expected a number, got '");
-    b.push("(call $type_name (local.get $r))");
-    push_text(&mut b, 0, "'");
+    push_msg(&mut b, 0, &crate::messages::TYPE_EXPECTED_NUMBER, type_of_r);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -736,16 +770,21 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_index: subscript position out of range.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "IndexError: ");
-    b.push("(if (call $is_str (local.get $r))");
-    b.push_in(1, "(then");
-    push_text(&mut b, 2, "string");
-    b.push_in(1, ")");
-    b.push_in(1, "(else");
-    push_text(&mut b, 2, "list");
-    b.push_in(1, ")");
-    b.push(")");
-    push_text(&mut b, 0, " index out of range");
+    push_msg(
+        &mut b,
+        0,
+        &crate::messages::INDEX_OUT_OF_RANGE,
+        |b, d, _| {
+            b.push_in(d, "(if (call $is_str (local.get $r))");
+            b.push_in(d + 1, "(then");
+            push_text(b, d + 2, "string");
+            b.push_in(d + 1, ")");
+            b.push_in(d + 1, "(else");
+            push_text(b, d + 2, "list");
+            b.push_in(d + 1, ")");
+            b.push_in(d, ")");
+        },
+    );
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -757,8 +796,9 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_key: dict lookup miss; the key prints in repr form.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "KeyError: ");
-    b.push("(call $print_repr (local.get $k))");
+    push_msg(&mut b, 0, &crate::messages::KEY_MISSING, |b, d, _| {
+        b.push_in(d, "(call $print_repr (local.get $k))");
+    });
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -770,7 +810,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_zero_div
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "ZeroDivisionError: division by zero");
+    push_msg(&mut b, 0, &crate::messages::ZERO_DIVISION, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -787,12 +827,7 @@ fn raise_helpers() -> Vec<Func> {
     // further) is a separate piece of work tied to the value model.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        0,
-        "OverflowError: this calculation went outside the range of whole \
-         numbers we can store (-2147483648 to 2147483647)",
-    );
+    push_msg(&mut b, 0, &crate::messages::INT_OVERFLOW, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -804,14 +839,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_pow_float: `**` with a fractional exponent.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        0,
-        "TypeError: ** can raise to a whole number, or to 0.5 — a square root, \
-         which the machine does in one step. Other fractional powers need a \
-         maths library this program does not have; try math.sqrt() or a \
-         whole-number power.",
-    );
+    push_msg(&mut b, 0, &crate::messages::TYPE_POW_FRACTIONAL, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -924,54 +952,23 @@ fn raise_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // Type-name-bearing raisers that differ only in their message shape.
-    for (fname, before, after) in [
-        (
-            "$raise_no_len",
-            "TypeError: object of type '",
-            "' has no len()",
-        ),
-        (
-            "$raise_not_sub",
-            "TypeError: '",
-            "' object is not subscriptable",
-        ),
+    // Type-name-bearing raisers that differ only in their message.
+    for (fname, m) in [
+        ("$raise_no_len", &crate::messages::TYPE_NO_LEN),
+        ("$raise_not_sub", &crate::messages::TYPE_NOT_SUBSCRIPTABLE),
         (
             "$raise_no_item_assign",
-            "TypeError: '",
-            "' object does not support item assignment",
+            &crate::messages::TYPE_NO_ITEM_ASSIGN,
         ),
-        (
-            "$raise_no_append",
-            "AttributeError: '",
-            "' object has no attribute 'append'",
-        ),
-        (
-            "$raise_not_iter",
-            "TypeError: argument of type '",
-            "' is not iterable",
-        ),
-        (
-            "$raise_in_str",
-            "TypeError: 'in <string>' requires string as left operand, not '",
-            "'",
-        ),
-        (
-            "$raise_no_str",
-            "TypeError: str() of '",
-            "' values isn't supported yet",
-        ),
-        (
-            "$raise_unhashable",
-            "TypeError: unhashable type: '",
-            "' (a set can't contain it — use a tuple)",
-        ),
+        ("$raise_no_append", &crate::messages::ATTR_NO_APPEND),
+        ("$raise_not_iter", &crate::messages::TYPE_ARG_NOT_ITERABLE),
+        ("$raise_in_str", &crate::messages::TYPE_IN_STRING_LEFT),
+        ("$raise_no_str", &crate::messages::TYPE_STR_UNSUPPORTED),
+        ("$raise_unhashable", &crate::messages::TYPE_UNHASHABLE),
     ] {
         let mut b = Body::new();
         b.push("(call $write_char (i32.const 10))");
-        push_text(&mut b, 0, before);
-        b.push("(call $type_name (local.get $r))");
-        push_text(&mut b, 0, after);
+        push_msg(&mut b, 0, m, type_of_r);
         b.push("(call $write_char (i32.const 10))");
         b.push("unreachable");
         fs.push(Func {
@@ -987,12 +984,11 @@ fn raise_helpers() -> Vec<Func> {
     // the student almost always wanted when the value is a number.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "TypeError: a '");
-    b.push("(call $type_name (local.get $r))");
-    push_text(
+    push_msg(
         &mut b,
         0,
-        "' is one single value, so a for loop has nothing to go through. A loop needs a list, some text, a dict or a set — or use range(n) to count.",
+        &crate::messages::TYPE_FOR_NOT_ITERABLE,
+        type_of_r,
     );
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
@@ -1005,11 +1001,15 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_no_attr: attribute miss (read or method) — names the attribute.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "AttributeError: '");
-    b.push("(call $type_name (local.get $obj))");
-    push_text(&mut b, 0, "' object has no attribute '");
-    b.push("(call $print_str (local.get $name))");
-    push_text(&mut b, 0, "'");
+    push_msg(&mut b, 0, &crate::messages::ATTR_MISSING, |b, d, slot| {
+        b.push_in(
+            d,
+            match slot {
+                "type" => "(call $type_name (local.get $obj))",
+                _ => "(call $print_str (local.get $name))",
+            },
+        );
+    });
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1023,12 +1023,13 @@ fn raise_helpers() -> Vec<Func> {
     // Bound methods aren't first-class in this subset.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "TypeError: method '");
-    b.push("(call $print_str (local.get $name))");
-    push_text(
+    push_msg(
         &mut b,
         0,
-        "' can't be used as a value yet (call it with parentheses)",
+        &crate::messages::TYPE_METHOD_AS_VALUE,
+        |b, d, _| {
+            b.push_in(d, "(call $print_str (local.get $name))");
+        },
     );
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
@@ -1043,13 +1044,9 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_int_parse: int() of a string that isn't a valid integer.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        0,
-        "ValueError: invalid literal for int() with base 10: '",
-    );
-    b.push("(call $print_str (local.get $s))");
-    push_text(&mut b, 0, "'");
+    push_msg(&mut b, 0, &crate::messages::VALUE_INT_PARSE, |b, d, _| {
+        b.push_in(d, "(call $print_str (local.get $s))");
+    });
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1061,7 +1058,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_not_found: .index() of a value that isn't present.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "ValueError: value is not in the sequence");
+    push_msg(&mut b, 0, &crate::messages::VALUE_NOT_IN_SEQUENCE, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1073,11 +1070,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_setop: a set operator (|, &, ^, set - set) on a non-set.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        0,
-        "TypeError: unsupported operand type for a set operation (both sides must be sets)",
-    );
+    push_msg(&mut b, 0, &crate::messages::TYPE_SET_OP, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1089,7 +1082,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_empty: min()/max() of an empty sequence.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "ValueError: arg is an empty sequence");
+    push_msg(&mut b, 0, &crate::messages::VALUE_EMPTY_SEQUENCE, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1101,13 +1094,9 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_float_parse: float() of a string that isn't a valid number.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        0,
-        "ValueError: could not convert string to float: '",
-    );
-    b.push("(call $print_str (local.get $s))");
-    push_text(&mut b, 0, "'");
+    push_msg(&mut b, 0, &crate::messages::VALUE_FLOAT_PARSE, |b, d, _| {
+        b.push_in(d, "(call $print_str (local.get $s))");
+    });
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1119,7 +1108,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_unpack: tuple-unpacking length mismatch.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "ValueError: wrong number of values to unpack");
+    push_msg(&mut b, 0, &crate::messages::VALUE_UNPACK_COUNT, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1131,7 +1120,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_slice_step: slice step of zero.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(&mut b, 0, "ValueError: slice step cannot be zero");
+    push_msg(&mut b, 0, &crate::messages::VALUE_SLICE_STEP_ZERO, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1143,11 +1132,7 @@ fn raise_helpers() -> Vec<Func> {
     // $raise_arity: a method got the wrong number of arguments.
     let mut b = Body::new();
     b.push("(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        0,
-        "TypeError: method called with the wrong number of arguments",
-    );
+    push_msg(&mut b, 0, &crate::messages::TYPE_METHOD_ARITY, no_slots);
     b.push("(call $write_char (i32.const 10))");
     b.push("unreachable");
     fs.push(Func {
@@ -1219,11 +1204,7 @@ fn random_helpers() -> Vec<Func> {
     let mut b = Body::new();
     b.push("(if (i32.gt_s (local.get $a) (local.get $b)) (then");
     b.push_in(1, "(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        1,
-        "ValueError: randint(a, b) needs a <= b — the low end first",
-    );
+    push_msg(&mut b, 1, &crate::messages::VALUE_RANDINT_ORDER, no_slots);
     b.push_in(1, "(call $write_char (i32.const 10))");
     b.push_in(1, "unreachable");
     b.push("))");
@@ -1240,11 +1221,7 @@ fn random_helpers() -> Vec<Func> {
     b.push("(local.set $n (call $py_len (local.get $xs)))");
     b.push("(if (i32.eqz (local.get $n)) (then");
     b.push_in(1, "(call $write_char (i32.const 10))");
-    push_text(
-        &mut b,
-        1,
-        "IndexError: cannot choose from an empty sequence",
-    );
+    push_msg(&mut b, 1, &crate::messages::INDEX_CHOICE_EMPTY, no_slots);
     b.push_in(1, "(call $write_char (i32.const 10))");
     b.push_in(1, "unreachable");
     b.push("))");

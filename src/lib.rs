@@ -88,14 +88,18 @@ pub fn try_compile(source: &str) -> Result<String, CompileError> {
     codegen::generate(&stmts)
 }
 
-/// Executing a program under a fuel budget — `p2w run`. Behind the `run`
-/// feature so a default build keeps one runtime dependency.
 #[cfg(feature = "run")]
 pub mod harness;
 /// The wasm:js-string polyfill the harness links — shared by path-include
 /// with the test hosts so the reference host cannot drift from the rig.
 #[cfg(feature = "run")]
 mod js_string_host;
+/// Executing a program under a fuel budget — `p2w run`. Behind the `run`
+/// feature so a default build keeps one runtime dependency.
+/// The message table: every runtime diagnostic, keyed, in one place. All
+/// three surfaces (codegen, the native runtime, the Stepper) read text from
+/// here so it cannot drift between them.
+pub mod messages;
 
 /// Minimal RFC 8259 string escaping, for the harness's hand-written JSON.
 ///
