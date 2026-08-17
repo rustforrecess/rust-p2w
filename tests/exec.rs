@@ -2676,3 +2676,17 @@ fn sorted_reverse_keyword() {
         "[3, 2, 1]\n",
     );
 }
+
+#[test]
+fn non_ascii_text_survives_both_print_paths() {
+    // The literal fast path (one write_str of the interned literal) and the
+    // boxed-value path must both carry text beyond ASCII: é is two UTF-8
+    // bytes, 🦀 is a surrogate pair in UTF-16. The fast path emitted
+    // write_char per BYTE until 2026-08-17 — mojibake once the hosts started
+    // decoding UTF-16 code units — and nothing pinned it.
+    assert_output("print('café 🦀')", "café 🦀\n");
+    assert_output(
+        "s = 'café 🦀'\nprint(s)\nprint(s + '!')\nprint(len('é'))",
+        "café 🦀\ncafé 🦀!\n1\n",
+    );
+}

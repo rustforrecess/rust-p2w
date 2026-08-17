@@ -6363,10 +6363,11 @@ impl Gen {
             }
             self.type_of(cx, arg)?; // surface literal-misuse errors
             if let ExprKind::Str(s) = &arg.kind {
-                // Literal fast path: no allocation, identical output bytes.
-                for byte in s.bytes() {
-                    emit_char(out, byte);
-                }
+                // Literal fast path: the interned literal goes out in ONE
+                // write_str call. (This used to emit write_char per BYTE,
+                // which turned non-ASCII literals to mojibake once the hosts
+                // started decoding UTF-16 code units.)
+                out.push(format!("(call $write_str (call $unwrap {}))", str_lit(s)));
             } else {
                 let v = self.value_expr(cx, arg)?;
                 out.push(format!("(call $print_value {v})"));
