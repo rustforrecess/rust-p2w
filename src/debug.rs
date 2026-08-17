@@ -649,18 +649,8 @@ impl Stepper {
             StmtKind::UnpackAssign { targets, value } => {
                 let v = self.eval(value)?;
                 let items = to_elements(&v)?;
-                if items.len() < targets.len() {
-                    return Err(format!(
-                        "not enough values to unpack (expected {}, got {})",
-                        targets.len(),
-                        items.len()
-                    ));
-                }
-                if items.len() > targets.len() {
-                    return Err(format!(
-                        "too many values to unpack (expected {})",
-                        targets.len()
-                    ));
+                if items.len() != targets.len() {
+                    return Err(crate::messages::VALUE_UNPACK_COUNT.text.into());
                 }
                 for (target, item) in targets.iter().zip(items) {
                     match &target.kind {
@@ -825,7 +815,10 @@ impl Stepper {
             Value::List(v) | Value::Set(v) | Value::Tuple(v) => Ok(v),
             Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
             Value::Dict(d) => Ok(d.into_iter().map(|(k, _)| k).collect()),
-            other => Err(format!("can't loop over {}", type_name(&other))),
+            other => Err(fill_msg(
+                &crate::messages::TYPE_FOR_NOT_ITERABLE,
+                &[("type", &type_label(&other))],
+            )),
         }
     }
 
@@ -860,7 +853,7 @@ impl Stepper {
                         Value::Int(n) => Ok(Value::Int(-n)),
                         Value::Float(f) => Ok(Value::Float(-f)),
                         Value::Bool(b) => Ok(Value::Int(if b { -1 } else { 0 })),
-                        _ => Err(format!("can't negate {}", type_name(&v))),
+                        _ => Err(expected_number(&v)),
                     },
                     UnOp::Invert => match v {
                         Value::Int(n) => Ok(Value::Int(!n)),
@@ -1025,13 +1018,16 @@ impl Stepper {
                 Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
                 Value::List(l) | Value::Set(l) | Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
                 Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
-                _ => Err(format!("object of type {} has no len()", type_name(v))),
+                _ => Err(fill_msg(
+                    &crate::messages::TYPE_NO_LEN,
+                    &[("type", &type_label(v))],
+                )),
             },
             ("abs", [v]) => match v {
                 Value::Int(n) => Ok(Value::Int(n.abs())),
                 Value::Float(f) => Ok(Value::Float(f.abs())),
                 Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-                _ => Err(format!("bad operand type for abs(): {}", type_name(v))),
+                _ => Err(expected_number(v)),
             },
             ("str", [v]) => Ok(Value::Str(v.py_str())),
             ("int", [v]) => match v {
@@ -1042,16 +1038,19 @@ impl Stepper {
                     .trim()
                     .parse::<i64>()
                     .map(Value::Int)
-                    .map_err(|_| format!("invalid literal for int(): '{s}'")),
-                _ => Err(format!("int() argument can't be {}", type_name(v))),
+                    .map_err(|_| fill_msg(&crate::messages::VALUE_INT_PARSE, &[("text", s)])),
+                _ => Err(expected_number(v)),
             },
-            ("float", [v]) => as_num(v)
-                .map(Value::Float)
-                .or_else(|| match v {
-                    Value::Str(s) => s.trim().parse::<f64>().ok().map(Value::Float),
-                    _ => None,
-                })
-                .ok_or_else(|| format!("can't convert {} to float", type_name(v))),
+            ("float", [v]) => match v {
+                Value::Str(s) => s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::Float)
+                    .map_err(|_| fill_msg(&crate::messages::VALUE_FLOAT_PARSE, &[("text", s)])),
+                _ => as_num(v)
+                    .map(Value::Float)
+                    .ok_or_else(|| expected_number(v)),
+            },
             ("bool", [v]) => Ok(Value::Bool(v.truthy())),
             ("set", []) => Ok(Value::Set(Vec::new())),
             ("set", [v]) => make_set(v),
@@ -1112,14 +1111,19 @@ impl Stepper {
                         return Ok(Value::None);
                     }
                     ("pop", []) => {
-                        return items.pop().ok_or_else(|| "pop from empty list".to_string());
+                        return items.pop().ok_or_else(|| {
+                            fill_msg(&crate::messages::INDEX_OUT_OF_RANGE, &[("seq", "list")])
+                        });
                     }
                     ("pop", [i]) => {
-                        let i = as_int(i).ok_or("pop index must be an integer")?;
+                        let i = as_int(i).ok_or_else(|| expected_number(i))?;
                         let n = items.len() as i64;
                         let real = if i < 0 { i + n } else { i };
                         if real < 0 || real >= n {
-                            return Err("pop index out of range".to_string());
+                            return Err(fill_msg(
+                                &crate::messages::INDEX_OUT_OF_RANGE,
+                                &[("seq", "list")],
+                            ));
                         }
                         return Ok(items.remove(real as usize));
                     }
@@ -1134,7 +1138,12 @@ impl Stepper {
                     if let ("pop", [k]) = (method, vals.as_slice()) {
                         match pairs.iter().position(|(dk, _)| py_eq(dk, k)) {
                             Some(i) => return Ok(pairs.remove(i).1),
-                            None => return Err("pop(key): key not in dict".to_string()),
+                            None => {
+                                return Err(fill_msg(
+                                    &crate::messages::KEY_MISSING,
+                                    &[("key", &k.py_repr())],
+                                ));
+                            }
                         }
                     }
                 }
@@ -1310,7 +1319,12 @@ impl Stepper {
                     Value::List(v) => v,
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                     Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
-                    other => return Err(format!("can't loop over {}", type_name(&other))),
+                    other => {
+                        return Err(fill_msg(
+                            &crate::messages::TYPE_FOR_NOT_ITERABLE,
+                            &[("type", &type_label(&other))],
+                        ));
+                    }
                 };
                 for it in items {
                     scope.insert(var.clone(), it);
@@ -1335,18 +1349,8 @@ impl Stepper {
             StmtKind::UnpackAssign { targets, value } => {
                 let v = Self::eval_in(funcs, scope, out, value)?;
                 let items = to_elements(&v)?;
-                if items.len() < targets.len() {
-                    return Err(format!(
-                        "not enough values to unpack (expected {}, got {})",
-                        targets.len(),
-                        items.len()
-                    ));
-                }
-                if items.len() > targets.len() {
-                    return Err(format!(
-                        "too many values to unpack (expected {})",
-                        targets.len()
-                    ));
+                if items.len() != targets.len() {
+                    return Err(crate::messages::VALUE_UNPACK_COUNT.text.into());
                 }
                 for (target, item) in targets.iter().zip(items) {
                     match &target.kind {
@@ -1396,11 +1400,14 @@ fn assign_index_in(
         .ok_or_else(|| format!("name '{name}' is not defined"))?;
     match slot {
         Value::List(items) => {
-            let i = as_int(&index).ok_or("list indices must be integers")?;
+            let i = as_int(&index).ok_or_else(|| expected_number(&index))?;
             let n = items.len() as i64;
             let real = if i < 0 { i + n } else { i };
             if real < 0 || real >= n {
-                return Err("list assignment index out of range".to_string());
+                return Err(fill_msg(
+                    &crate::messages::INDEX_OUT_OF_RANGE,
+                    &[("seq", "list")],
+                ));
             }
             items[real as usize] = value;
             Ok(())
@@ -1413,10 +1420,14 @@ fn assign_index_in(
             }
             Ok(())
         }
-        Value::Tuple(_) => {
-            Err("a tuple is immutable — you can't change its items (use a list)".to_string())
-        }
-        _ => Err("only lists and dicts support item assignment".to_string()),
+        Value::Tuple(_) => Err(fill_msg(
+            &crate::messages::TYPE_NO_ITEM_ASSIGN,
+            &[("type", "tuple")],
+        )),
+        other => Err(fill_msg(
+            &crate::messages::TYPE_NO_ITEM_ASSIGN,
+            &[("type", &type_label(other))],
+        )),
     }
 }
 
@@ -1425,21 +1436,27 @@ fn assign_index_in(
 fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
     match target {
         Value::List(items) | Value::Tuple(items) => {
-            let i = as_int(index).ok_or("list indices must be integers")?;
+            let i = as_int(index).ok_or_else(|| expected_number(index))?;
             let n = items.len() as i64;
             let real = if i < 0 { i + n } else { i };
             if real < 0 || real >= n {
-                return Err("list index out of range".to_string());
+                return Err(fill_msg(
+                    &crate::messages::INDEX_OUT_OF_RANGE,
+                    &[("seq", "list")],
+                ));
             }
             Ok(items[real as usize].clone())
         }
         Value::Str(s) => {
             let chars: Vec<char> = s.chars().collect();
-            let i = as_int(index).ok_or("string indices must be integers")?;
+            let i = as_int(index).ok_or_else(|| expected_number(index))?;
             let n = chars.len() as i64;
             let real = if i < 0 { i + n } else { i };
             if real < 0 || real >= n {
-                return Err("string index out of range".to_string());
+                return Err(fill_msg(
+                    &crate::messages::INDEX_OUT_OF_RANGE,
+                    &[("seq", "string")],
+                ));
             }
             Ok(Value::Str(chars[real as usize].to_string()))
         }
@@ -1447,8 +1464,11 @@ fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
             .iter()
             .find(|(k, _)| py_eq(k, index))
             .map(|(_, v)| v.clone())
-            .ok_or_else(|| format!("key {} not found", index.py_repr())),
-        _ => Err(format!("{} is not subscriptable", type_name(target))),
+            .ok_or_else(|| fill_msg(&crate::messages::KEY_MISSING, &[("key", &index.py_repr())])),
+        _ => Err(fill_msg(
+            &crate::messages::TYPE_NOT_SUBSCRIPTABLE,
+            &[("type", &type_label(target))],
+        )),
     }
 }
 
@@ -1462,11 +1482,14 @@ fn contains(haystack: &Value, needle: &Value) -> Result<bool, String> {
         Value::Dict(pairs) => Ok(pairs.iter().any(|(k, _)| py_eq(k, needle))),
         Value::Str(s) => match needle {
             Value::Str(sub) => Ok(s.contains(sub.as_str())),
-            _ => Err("'in <string>' requires a string".to_string()),
+            _ => Err(fill_msg(
+                &crate::messages::TYPE_IN_STRING_LEFT,
+                &[("type", &type_label(needle))],
+            )),
         },
-        _ => Err(format!(
-            "argument of type {} is not iterable",
-            type_name(haystack)
+        _ => Err(fill_msg(
+            &crate::messages::TYPE_ARG_NOT_ITERABLE,
+            &[("type", &type_label(haystack))],
         )),
     }
 }
@@ -1480,14 +1503,7 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
                 (Some(x), Some(y)) => x
                     .partial_cmp(&y)
                     .ok_or("can't compare these values (NaN?)")?,
-                _ => {
-                    return Err(format!(
-                        "'{}' not supported between {} and {}",
-                        op_symbol(op),
-                        type_name(l),
-                        type_name(r)
-                    ));
-                }
+                _ => return Err(expected_number_bin(op, l, r)),
             }
         }
     };
@@ -1546,14 +1562,7 @@ fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     }
     let (x, y) = match (as_num(l), as_num(r)) {
         (Some(x), Some(y)) => (x, y),
-        _ => {
-            return Err(format!(
-                "unsupported operand types for {}: {} and {}",
-                op_symbol(op),
-                type_name(l),
-                type_name(r)
-            ));
-        }
+        _ => return Err(expected_number_bin(op, l, r)),
     };
     let ints = both_int(l, r);
     match op {
@@ -1567,19 +1576,19 @@ fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         BinOp::Mul => int_result(x * y, ints),
         BinOp::Div => {
             if y == 0.0 {
-                return Err("division by zero".to_string());
+                return Err(crate::messages::ZERO_DIVISION.text.into());
             }
             Ok(Value::Float(x / y)) // true division is always float
         }
         BinOp::FloorDiv => {
             if y == 0.0 {
-                return Err("integer division or modulo by zero".to_string());
+                return Err(crate::messages::ZERO_DIVISION.text.into());
             }
             Ok(num_result((x / y).floor(), ints))
         }
         BinOp::Mod => {
             if y == 0.0 {
-                return Err("integer division or modulo by zero".to_string());
+                return Err(crate::messages::ZERO_DIVISION.text.into());
             }
             // Python modulo: result takes the divisor's sign.
             Ok(num_result(x - (x / y).floor() * y, ints))
@@ -1620,6 +1629,47 @@ fn int_result(v: f64, ints: bool) -> Result<Value, String> {
     Ok(num_result(v, ints))
 }
 
+/// Format-fill a table message (`crate::messages`): each `{slot}` replaced.
+fn fill_msg(m: &crate::messages::Msg, vals: &[(&str, &str)]) -> String {
+    let mut out = m.text.to_string();
+    for (k, v) in vals {
+        out = out.replace(&format!("{{{k}}}"), v);
+    }
+    out
+}
+
+/// The type label the COMPILED backends print: instances report their class
+/// name, everything else its type name.
+fn type_label(v: &Value) -> String {
+    match v {
+        Value::Object(o) => o.class.clone(),
+        _ => type_name(v).to_string(),
+    }
+}
+
+/// The compiled backends' wrong-type-in-numeric-context error.
+fn expected_number(v: &Value) -> String {
+    fill_msg(
+        &crate::messages::TYPE_EXPECTED_NUMBER,
+        &[("type", &type_label(v))],
+    )
+}
+
+/// Same, for a binary op — mirroring the compiled blame order: `+` blames the
+/// string operand (the string is the odd one out in a numeric context);
+/// everything else blames left-to-right.
+fn expected_number_bin(op: BinOp, l: &Value, r: &Value) -> String {
+    let (lstr, rstr) = (matches!(l, Value::Str(_)), matches!(r, Value::Str(_)));
+    let blame = if matches!(op, BinOp::Add) && lstr != rstr {
+        if lstr { l } else { r }
+    } else if as_num(l).is_none() {
+        l
+    } else {
+        r
+    };
+    expected_number(blame)
+}
+
 fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Object(_) => "object",
@@ -1632,23 +1682,6 @@ fn type_name(v: &Value) -> &'static str {
         Value::Set(_) => "set",
         Value::Dict(_) => "dict",
         Value::None => "NoneType",
-    }
-}
-
-fn op_symbol(op: BinOp) -> &'static str {
-    match op {
-        BinOp::Add => "+",
-        BinOp::Sub => "-",
-        BinOp::Mul => "*",
-        BinOp::Div => "/",
-        BinOp::FloorDiv => "//",
-        BinOp::Mod => "%",
-        BinOp::Pow => "**",
-        BinOp::Lt => "<",
-        BinOp::Le => "<=",
-        BinOp::Gt => ">",
-        BinOp::Ge => ">=",
-        _ => "?",
     }
 }
 
@@ -2391,18 +2424,8 @@ impl Vm {
             Task::Unpack(names) => {
                 let v = self.pop_op()?;
                 let items = to_elements(&v)?;
-                if items.len() < names.len() {
-                    return Err(format!(
-                        "not enough values to unpack (expected {}, got {})",
-                        names.len(),
-                        items.len()
-                    ));
-                }
-                if items.len() > names.len() {
-                    return Err(format!(
-                        "too many values to unpack (expected {})",
-                        names.len()
-                    ));
+                if items.len() != names.len() {
+                    return Err(crate::messages::VALUE_UNPACK_COUNT.text.into());
                 }
                 for (name, item) in names.into_iter().zip(items) {
                     self.top().scope.insert(name, item);
@@ -2622,7 +2645,12 @@ impl Vm {
                     Value::List(v) | Value::Set(v) | Value::Tuple(v) => v,
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                     Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
-                    other => return Err(format!("can't loop over {}", type_name(&other))),
+                    other => {
+                        return Err(fill_msg(
+                            &crate::messages::TYPE_FOR_NOT_ITERABLE,
+                            &[("type", &type_label(&other))],
+                        ));
+                    }
                 };
                 self.push_task(Task::ForEachHead {
                     var,
@@ -2665,9 +2693,9 @@ impl Vm {
             Task::AttrGet(attr) => {
                 let v = self.pop_op()?;
                 let Value::Object(o) = &v else {
-                    return Err(format!(
-                        "only objects have attributes, not {}",
-                        type_name(&v)
+                    return Err(fill_msg(
+                        &crate::messages::ATTR_MISSING,
+                        &[("type", &type_label(&v)), ("name", &attr)],
                     ));
                 };
                 // Instance attrs shadow class variables; the fallback walks
@@ -2692,21 +2720,25 @@ impl Vm {
                         return Ok(());
                     }
                     if c.methods.contains_key(&attr) {
-                        return Err(
-                            "a method isn't a value yet — call it: obj.method(...)".to_string()
-                        );
+                        return Err(fill_msg(
+                            &crate::messages::TYPE_METHOD_AS_VALUE,
+                            &[("name", &attr)],
+                        ));
                     }
                     cur = c.base.clone();
                 }
-                return Err(format!("this object has no attribute '{attr}'"));
+                return Err(fill_msg(
+                    &crate::messages::ATTR_MISSING,
+                    &[("type", &o.class), ("name", &attr)],
+                ));
             }
             Task::StoreAttr(attr) => {
                 let value = self.pop_op()?;
                 let objv = self.pop_op()?;
                 let Value::Object(o) = &objv else {
-                    return Err(format!(
-                        "only objects have attributes, not {}",
-                        type_name(&objv)
+                    return Err(fill_msg(
+                        &crate::messages::ATTR_MISSING,
+                        &[("type", &type_label(&objv)), ("name", &attr)],
                     ));
                 };
                 o.attrs.borrow_mut().insert(attr, value);
@@ -2769,14 +2801,20 @@ impl Vm {
                     };
                     let (owner, _) =
                         self.resolve_method(&inner.class, &method).ok_or_else(|| {
-                            format!("this object has no method '{method}' (or wrong arguments)")
+                            fill_msg(
+                                &crate::messages::ATTR_MISSING,
+                                &[("type", &inner.class), ("name", &method)],
+                            )
                         })?;
                     self.call_method_frame(&owner, &method, recv.clone(), args)?;
                 } else {
                     let mut cell = o.attrs.borrow_mut();
-                    let slot = cell
-                        .get_mut(&attr)
-                        .ok_or_else(|| format!("this object has no attribute '{attr}'"))?;
+                    let slot = cell.get_mut(&attr).ok_or_else(|| {
+                        fill_msg(
+                            &crate::messages::ATTR_MISSING,
+                            &[("type", &o.class), ("name", &attr)],
+                        )
+                    })?;
                     let out = container_method(slot, &method, args)?;
                     drop(cell);
                     self.push_op(out);
@@ -3106,7 +3144,7 @@ impl Vm {
         {
             let (owner, _) = self
                 .resolve_method(&o.class, "__len__")
-                .ok_or("this object has no len() (no __len__)")?;
+                .ok_or_else(|| fill_msg(&crate::messages::TYPE_NO_LEN, &[("type", &o.class)]))?;
             return self.call_method_frame(&owner, "__len__", args[0].clone(), Vec::new());
         }
         if name == "str"
@@ -3211,7 +3249,12 @@ impl Vm {
             .get(owner)
             .and_then(|c| c.methods.get(method))
             .cloned()
-            .ok_or_else(|| format!("no method '{method}' on '{owner}'"))?;
+            .ok_or_else(|| {
+                fill_msg(
+                    &crate::messages::ATTR_MISSING,
+                    &[("type", owner), ("name", method)],
+                )
+            })?;
         if args.len() != f.params.len() - 1 {
             return Err(format!(
                 "{method}() takes {} argument(s) but {} were given",
@@ -3249,9 +3292,7 @@ impl Vm {
             BinOp::Gt => "__gt__",
             BinOp::Ge => "__ge__",
             BinOp::Eq | BinOp::Ne => "__eq__",
-            _ => {
-                return Err("these two values can't be combined with this operator".to_string());
-            }
+            _ => return Err(expected_number_bin(op, &l, &r)),
         };
         if matches!(op, BinOp::Eq | BinOp::Ne) {
             if matches!(op, BinOp::Ne) {
@@ -3276,11 +3317,11 @@ impl Vm {
             return Ok(());
         }
         let Value::Object(o) = &l else {
-            return Err("these two values can't be combined with this operator".to_string());
+            return Err(expected_number_bin(op, &l, &r));
         };
         let (owner, _) = self
             .resolve_method(&o.class, dunder)
-            .ok_or_else(|| format!("this object doesn't support that operator (no {dunder})"))?;
+            .ok_or_else(|| expected_number_bin(op, &l, &r))?;
         self.call_method_frame(&owner, dunder, l.clone(), vec![r])
     }
 
@@ -3368,9 +3409,9 @@ impl Vm {
 /// can't be a member — a tuple can. Mirrors the compiled backends.
 fn check_set_elem(v: &Value) -> Result<(), String> {
     match v {
-        Value::List(_) | Value::Dict(_) | Value::Set(_) => Err(format!(
-            "a set can't contain a {} — use a tuple",
-            type_name(v)
+        Value::List(_) | Value::Dict(_) | Value::Set(_) => Err(fill_msg(
+            &crate::messages::TYPE_UNHASHABLE,
+            &[("type", &type_label(v))],
         )),
         _ => Ok(()),
     }
@@ -3385,7 +3426,10 @@ fn to_elements(v: &Value) -> Result<Vec<Value>, String> {
         Value::List(x) | Value::Set(x) | Value::Tuple(x) => Ok(x.clone()),
         Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
         Value::Dict(d) => Ok(d.iter().map(|(k, _)| k.clone()).collect()),
-        _ => Err(format!("{} object is not iterable", type_name(v))),
+        _ => Err(fill_msg(
+            &crate::messages::TYPE_NO_LEN,
+            &[("type", &type_label(v))],
+        )),
     }
 }
 
@@ -3451,9 +3495,9 @@ fn slice_value(
             }
             Ok(Value::Str(out))
         }
-        _ => Err(format!(
-            "'{}' object is not subscriptable",
-            type_name(target)
+        _ => Err(fill_msg(
+            &crate::messages::TYPE_NOT_SUBSCRIPTABLE,
+            &[("type", &type_label(target))],
         )),
     }
 }
@@ -3763,11 +3807,7 @@ fn make_set(v: &Value) -> Result<Value, String> {
 /// symmetric difference, `-` difference. Insertion-order preserving.
 fn set_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     let (Value::Set(a), Value::Set(b)) = (l, r) else {
-        return Err(format!(
-            "unsupported operand type for a set operation: {} and {}",
-            type_name(l),
-            type_name(r)
-        ));
+        return Err(expected_number_bin(op, l, r));
     };
     let in_set = |set: &[Value], v: &Value| set.iter().any(|y| py_eq(y, v));
     let res: Vec<Value> = match op {
@@ -3809,12 +3849,7 @@ fn bitwise_or_set(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             };
             Ok(Value::Int(z))
         }
-        _ => Err(format!(
-            "unsupported operand type for {}: {} and {}",
-            op_symbol(op),
-            type_name(l),
-            type_name(r)
-        )),
+        _ => Err(expected_number_bin(op, l, r)),
     }
 }
 
@@ -3835,12 +3870,7 @@ fn int_shift(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             };
             Ok(Value::Int(z))
         }
-        _ => Err(format!(
-            "unsupported operand type for {}: {} and {}",
-            op_symbol(op),
-            type_name(l),
-            type_name(r)
-        )),
+        _ => Err(expected_number_bin(op, l, r)),
     }
 }
 
@@ -3938,7 +3968,7 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value, String> {
             Value::Int(n) => Ok(Value::Int(-n)),
             Value::Float(f) => Ok(Value::Float(-f)),
             Value::Bool(b) => Ok(Value::Int(if b { -1 } else { 0 })),
-            _ => Err(format!("can't negate {}", type_name(&v))),
+            _ => Err(expected_number(&v)),
         },
         // `~x` == `-x - 1` (Rust's `!` on a signed int is bitwise NOT). Ints
         // (and bools, which act as 0/1) only — matches CPython and viper.
@@ -3970,13 +4000,16 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
             Value::List(l) | Value::Set(l) | Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
             Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
-            _ => Err(format!("object of type {} has no len()", type_name(v))),
+            _ => Err(fill_msg(
+                &crate::messages::TYPE_NO_LEN,
+                &[("type", &type_label(v))],
+            )),
         },
         ("abs", [v]) => match v {
             Value::Int(n) => Ok(Value::Int(n.abs())),
             Value::Float(f) => Ok(Value::Float(f.abs())),
             Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-            _ => Err(format!("bad operand type for abs(): {}", type_name(v))),
+            _ => Err(expected_number(v)),
         },
         ("str", [v]) => Ok(Value::Str(v.py_str())),
         ("int", [v]) => match v {
@@ -3987,16 +4020,19 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
                 .trim()
                 .parse::<i64>()
                 .map(Value::Int)
-                .map_err(|_| format!("invalid literal for int(): '{s}'")),
-            _ => Err(format!("int() argument can't be {}", type_name(v))),
+                .map_err(|_| fill_msg(&crate::messages::VALUE_INT_PARSE, &[("text", s)])),
+            _ => Err(expected_number(v)),
         },
-        ("float", [v]) => as_num(v)
-            .map(Value::Float)
-            .or_else(|| match v {
-                Value::Str(s) => s.trim().parse::<f64>().ok().map(Value::Float),
-                _ => None,
-            })
-            .ok_or_else(|| format!("can't convert {} to float", type_name(v))),
+        ("float", [v]) => match v {
+            Value::Str(s) => s
+                .trim()
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| fill_msg(&crate::messages::VALUE_FLOAT_PARSE, &[("text", s)])),
+            _ => as_num(v)
+                .map(Value::Float)
+                .ok_or_else(|| expected_number(v)),
+        },
         ("bool", [v]) => Ok(Value::Bool(v.truthy())),
         ("set", []) => Ok(Value::Set(Vec::new())),
         ("set", [v]) => make_set(v),
@@ -4058,13 +4094,18 @@ fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<
                 items.push(v.clone());
                 Ok(Value::None)
             }
-            ("pop", []) => items.pop().ok_or_else(|| "pop from empty list".to_string()),
+            ("pop", []) => items
+                .pop()
+                .ok_or_else(|| fill_msg(&crate::messages::INDEX_OUT_OF_RANGE, &[("seq", "list")])),
             ("pop", [i]) => {
-                let i = as_int(i).ok_or("pop index must be an integer")?;
+                let i = as_int(i).ok_or_else(|| expected_number(i))?;
                 let n = items.len() as i64;
                 let real = if i < 0 { i + n } else { i };
                 if real < 0 || real >= n {
-                    return Err("pop index out of range".to_string());
+                    return Err(fill_msg(
+                        &crate::messages::INDEX_OUT_OF_RANGE,
+                        &[("seq", "list")],
+                    ));
                 }
                 Ok(items.remove(real as usize))
             }
@@ -4081,7 +4122,10 @@ fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<
         Value::Dict(pairs) => match (method, args.as_slice()) {
             ("pop", [k]) => match pairs.iter().position(|(dk, _)| py_eq(dk, k)) {
                 Some(i) => Ok(pairs.remove(i).1),
-                None => Err("pop(key): key not in dict".to_string()),
+                None => Err(fill_msg(
+                    &crate::messages::KEY_MISSING,
+                    &[("key", &k.py_repr())],
+                )),
             },
             _ => Err(unsupported()),
         },
@@ -4653,9 +4697,79 @@ mod tests {
 
     #[test]
     fn tuples_are_immutable() {
-        // Item assignment to a tuple is an error, not a silent mutation.
+        // Item assignment to a tuple is an error, not a silent mutation — and
+        // the words are the compiled backends' words (the message table).
         let err = vm_err("t = (1, 2)\nt[0] = 9\n").expect("should error");
-        assert!(err.contains("immutable"), "{err}");
+        assert!(
+            err.contains("'tuple' object does not support item assignment"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn vm_error_messages_are_the_compiled_backends_messages() {
+        // One row per converged family: the Stepper's words ARE the message
+        // table's words, which are the compiled backends' words. Before the
+        // table the Vm said e.g. "list index out of range" (no exception
+        // name) and "unsupported operand types for -: int and str" where the
+        // compiled program said "TypeError: expected a number, got 'str'".
+        let cases = [
+            (
+                "xs = [1, 2]\nprint(xs[9])\n",
+                "IndexError: list index out of range",
+            ),
+            (
+                "s = 'abc'\nprint(s[9])\n",
+                "IndexError: string index out of range",
+            ),
+            ("d = {'a': 1}\nprint(d['b'])\n", "KeyError: 'b'"),
+            ("print(1 / 0)\n", "ZeroDivisionError: division by zero"),
+            ("print(1 // 0)\n", "ZeroDivisionError: division by zero"),
+            (
+                "xs = [1, 'one']\nprint(xs[0] - xs[1])\n",
+                "TypeError: expected a number, got 'str'",
+            ),
+            (
+                "xs = [1, 'one']\nprint(xs[0] < xs[1])\n",
+                "TypeError: expected a number, got 'str'",
+            ),
+            (
+                "n = 5\nprint(len(n))\n",
+                "TypeError: object of type 'int' has no len()",
+            ),
+            (
+                "n = 5\nprint(n[0])\n",
+                "TypeError: 'int' object is not subscriptable",
+            ),
+            (
+                "a, b = 1, 2, 3\nprint(a)\n",
+                "ValueError: wrong number of values to unpack",
+            ),
+            (
+                "print(int('abc'))\n",
+                "ValueError: invalid literal for int() with base 10: 'abc'",
+            ),
+            (
+                "print(float('abc'))\n",
+                "ValueError: could not convert string to float: 'abc'",
+            ),
+            // Straggler copies in the shared value ops (verified against the
+            // compiled backend by running it):
+            (
+                "n = 5\nprint(list(n))\n",
+                "TypeError: object of type 'int' has no len()",
+            ),
+            (
+                "xs = [1, 'a']\nprint(xs[0] & xs[1])\n",
+                "TypeError: expected a number, got 'str'",
+            ),
+            ("xs = []\nxs.pop()\n", "IndexError: list index out of range"),
+            ("d = {'a': 1}\nprint(d.pop('b'))\n", "KeyError: 'b'"),
+        ];
+        for (src, want) in cases {
+            let err = vm_err(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert_eq!(err, want, "for {src}");
+        }
     }
 
     #[test]
