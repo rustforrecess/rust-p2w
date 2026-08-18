@@ -101,7 +101,7 @@ definition.
 
 | | what it is |
 |---|---|
-| **compiles** | `lexer` `parser` `ast` `hoist` `codegen` (WASM) `llvm` (native) `component` `emit` `reuse` `floatfmt` |
+| **compiles** | `lexer` `parser` `ast` `hoist` `codegen` (WASM) `llvm` (native) `component` `emit` `reuse` `floatfmt` `messages` (every diagnostic, keyed, one table for all three surfaces) |
 | **analyses the AST** | `debug` (interpreter + stepper), `lint` (+ fix ladders), `roles` (variable roles for assessment), `blockly` (blocks ⇄ code), `evidence` (concepts), `builtins` |
 | **analyses the OUTPUT** | `harness` (runs a program under a fuel budget), `capabilities()` — these need no AST, and are the parts with the weakest claim to being here |
 

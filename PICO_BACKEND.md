@@ -197,3 +197,13 @@ execution already proves IR validity + runtime correctness without hardware.
 
 Design for the front-end (lexer/parser/AST) to stay 100% shared with the WASM
 backend; only the emitter + runtime + toolchain differ.
+
+**2026-08-18: `import math` and `import random` work natively.**
+`math.exp/log/log2/log10/sqrt/pow` call the runtime's libm — the same pinned
+libm the WASM backend compiled to WAT, so the targets agree to the last bit —
+and random is the same xorshift64* as the WAT and the Stepper, bit-identical
+by test (the run oracle pins the seed-42 sequence to the WASM backend's exact
+output). The seed arrives through `p2w_host_seed()`, the native analog of the
+WASM `env.seed` import: the host shims return a fixed 42 for determinism; a
+real host supplies a per-attempt value. On the device this becomes one more
+symbol the board support code provides, like `p2w_putc`.

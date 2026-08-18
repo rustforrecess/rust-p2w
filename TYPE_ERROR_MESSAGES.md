@@ -1,7 +1,16 @@
 # What a type error says to a twelve-year-old
 
 A draft of the messages a type checker should produce, one per case in
-`tests/oracle/must-reject/`. **The wording here is a starting point to argue
+`tests/oracle/must-reject/`.
+
+> **Where message text actually lives:** every RUNTIME diagnostic is an entry
+> in [`src/messages.rs`](src/messages.rs) — a stable key plus a template —
+> and all three surfaces (WASM codegen, the native runtime, the Stepper) read
+> it from there. This document is the SPEC for what an entry should say; a
+> wording improvement is a one-line table edit that changes every surface at
+> once. Keys never change once shipped, even when the English does.
+
+**The wording here is a starting point to argue
 with, not a specification to implement verbatim** — it is the part of this work
 that is pedagogy rather than compilers, and it should be corrected by someone
 who has watched students hit these.

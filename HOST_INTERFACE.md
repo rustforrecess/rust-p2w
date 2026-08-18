@@ -187,3 +187,52 @@ for most of what we grant, and the one that does costs a binding generator we
 have no other reason to add yet." That is a position with an expiry date on it,
 and the expiry is the first time a component has to run somewhere we do not
 control.
+
+## Marshalling: the memory decisions an interface author needs
+
+Written for anyone putting a WIT boundary in front of p2w (the Godot embed is
+the first consumer). The two backends made DIFFERENT zero-copy bets, and a
+fast interface leans on the right one; all of this is measured, not assumed
+(`docs/REPRESENTATION_REWORK.md`, MEMORY_MANAGEMENT.md).
+
+**Rule 1 — scalars are free everywhere; design hot APIs scalar-first.** A
+per-frame call is `set_position(i32, i32)`, never a record and never a
+string. This has been the house rule since the first marshalling
+measurements, and it is why the stage APIs look the way they do.
+
+**Rule 2 — know which lane you are on.**
+
+- **WASM-GC lane (browser IDE): reference sharing.** p2w strings ARE JS
+  strings (`wasm:js-string` builtins), so a string crosses to a JS host by
+  reference — zero copy in both directions. This lane exists only where the
+  engine provides the builtins (browsers); it is NOT the lane an embedded
+  host sees.
+- **Linear-memory lane (native, component/jco, and a Godot embed): view
+  sharing.** The runtime's packed arrays — `list[int]` / `list[float]`
+  annotate to `T_IARRAY`/`T_FARRAY`, raw unboxed scalars contiguous in linear
+  memory — are the bulk-data currency. The fast path is a `(ptr, len)` pair
+  against the exported memory, which the host wraps as a view
+  (`PackedInt32Array`/`PackedFloat64Array` on Godot's side, TypedArray in
+  JS): zero copy, and exactly Pyodide's numpy trick. **The canonical ABI
+  COPIES `list<T>` at every call** — so a WIT `list<f64>` in a per-frame
+  signature is a per-frame memcpy. Use WIT records/lists for cold calls and
+  configuration; use view-shaped accessors for anything hot.
+
+**Rule 3 — views have two invalidation hazards, both by design.**
+`memory.grow` moves the buffer (any held view dies — re-fetch the pointer
+after any call that may allocate), and the arena's reset-per-run frees
+everything (never hold a view across runs). A host that re-derives its views
+each frame from a fresh `(ptr, len)` is immune to both and still pays no
+copy.
+
+**Rule 4 — strings and dicts across an embedded boundary are COPIES; budget
+them as such.** The GC lane's string zero-copy does not exist off-browser.
+Keep strings out of per-frame paths (Rule 1); pass enums/ids as ints and
+resolve to names host-side.
+
+**Rule 5 — everything the program can reach is still the import list.**
+A Godot embed grants capabilities the same way every other host does: the
+module's imports are the manifest (`capabilities()`), and the WIT world for
+the embed should be shaped so that stays true — no ambient authority arrives
+through the engine side door.
+

@@ -91,12 +91,26 @@ bash tools/native_run.sh      # ~200 cases through clang + the real runtime; >10
 **`tools/native_run.sh` is the authority for the native backend.** Unit tests
 assert on emitted IR text and will happily pass while the program is wrong.
 
-## Two backends, and they disagree
+## Two backends — now 3 of 108 probes apart
 
 `compile_to_wat` (WASM-GC, browser) and `compile_to_llvm_ir` + `runtime/`
-(linear memory, the board *and* the component/jco path) are different languages
-in places nobody chose — currently 14 of 87 probes.
+(linear memory, the board *and* the component/jco path). After the 2026-08
+divergence sweep the disagreements are 3 of 108, each one recorded and
+understood: annotation semantics (`x: int = 'no'` — GC demotes, native
+trusts; the type checker settles it), native `dict.get`, and the native
+unpack length check. `BACKEND_DIVERGENCE.md`.
 
-**Most of the remainder is one cause: type-ish checks live in the WASM
-backend, so the native one never gets them.** When adding a check, put it in the
-shared front-end. `BACKEND_DIVERGENCE.md`.
+Two structural facts keep it that way:
+
+- **The native entry runs the WASM generator as a checker first** (see
+  `compile_to_llvm_ir`) — compile-time checks apply to both targets by
+  construction. Interim until the type checker extracts them into a real
+  front-end pass; still: when adding a check, put it in the shared front-end.
+- **Every runtime diagnostic's text lives in `src/messages.rs`** — one keyed
+  table read by codegen, the native runtime (path-include), and the Stepper.
+  Never write message text inline in a backend; add a table entry.
+
+When adding a native host import, update BOTH C shims: the run oracle's
+(`tools/native_run.sh`) and the differential harness's embedded one
+(`tests/backend_diff.rs`) — missing the second turns every native probe into
+a link error.

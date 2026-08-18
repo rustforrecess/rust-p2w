@@ -119,10 +119,13 @@ because the ints that generated them are no longer boxed.
 
 1. **Default int width for `: int`.** Recommend **`i32`** (one RP2350 register;
    matches the device word; `i64` available via explicit annotation later).
-2. **Overflow semantics** (typed ints are fixed-width, unlike Python's bignum).
-   Recommend **wraparound by default** (free, matches the hardware/C mental model)
-   with a future `--checked` mode that traps — pedagogically honest when debugging.
-   *This is a real divergence from CPython; document it for learners.*
+2. **Overflow semantics — DECIDED THE OTHER WAY (2026-08): program-visible
+   arithmetic TRAPS.** A silently wrong answer is the worst failure a teaching
+   language can produce, so `numeric()` range-checks every visible int op and
+   `int()` of an out-of-range decimal raises the table's OverflowError — on
+   all three surfaces (RUNTIME_SEMANTICS pins the rows). `make_int` still
+   wraps for INTERNAL uses (hashes, indices). *Still a real divergence from
+   CPython's bignums; the trap is the honest version of it.*
 3. **Boxing a full-width int. DONE.** The inline tagged int is 30-bit, so values
    outside ±2^29 now box to a heap `T_INT` (`[tag][rc][i32]`) instead of
    truncating. `make_int` wraps to `i32` (the value model's int width, matching
