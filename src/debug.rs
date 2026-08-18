@@ -1034,11 +1034,7 @@ impl Stepper {
                 Value::Int(n) => Ok(Value::Int(*n)),
                 Value::Float(f) => Ok(Value::Int(*f as i64)),
                 Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-                Value::Str(s) => s
-                    .trim()
-                    .parse::<i64>()
-                    .map(Value::Int)
-                    .map_err(|_| fill_msg(&crate::messages::VALUE_INT_PARSE, &[("text", s)])),
+                Value::Str(s) => parse_int_str(s),
                 _ => Err(expected_number(v)),
             },
             ("float", [v]) => match v {
@@ -1627,6 +1623,26 @@ fn int_result(v: f64, ints: bool) -> Result<Value, String> {
         );
     }
     Ok(num_result(v, ints))
+}
+
+/// `int(<str>)` with the value model's range: a number outside i32 is an
+/// OverflowError (matching both compiled backends), junk is a ValueError.
+fn parse_int_str(s: &str) -> Result<Value, String> {
+    match s.trim().parse::<i64>() {
+        Ok(n) if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => Ok(Value::Int(n)),
+        Ok(_) => Err(crate::messages::INT_OVERFLOW.text.into()),
+        Err(_) => {
+            // An all-digit string that overflows even i64 is still an
+            // overflow, not junk.
+            let t = s.trim();
+            let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                Err(crate::messages::INT_OVERFLOW.text.into())
+            } else {
+                Err(fill_msg(&crate::messages::VALUE_INT_PARSE, &[("text", s)]))
+            }
+        }
+    }
 }
 
 /// Format-fill a table message (`crate::messages`): each `{slot}` replaced.
@@ -4016,11 +4032,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
             Value::Int(n) => Ok(Value::Int(*n)),
             Value::Float(f) => Ok(Value::Int(*f as i64)),
             Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-            Value::Str(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| fill_msg(&crate::messages::VALUE_INT_PARSE, &[("text", s)])),
+            Value::Str(s) => parse_int_str(s),
             _ => Err(expected_number(v)),
         },
         ("float", [v]) => match v {
@@ -4748,6 +4760,14 @@ mod tests {
             (
                 "print(int('abc'))\n",
                 "ValueError: invalid literal for int() with base 10: 'abc'",
+            ),
+            (
+                "print(int('99999999999'))\n",
+                "OverflowError: this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)",
+            ),
+            (
+                "print(int('2147483648'))\n",
+                "OverflowError: this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)",
             ),
             (
                 "print(float('abc'))\n",

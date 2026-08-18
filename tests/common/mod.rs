@@ -335,6 +335,11 @@ pub fn groups() -> Vec<Group> {
             probes: vec![
                 e!("int('42')"),
                 e!("int('abc')"),
+                // The value model is i32: a parse that doesn't fit is a LOUD
+                // OverflowError on every surface (it silently wrapped once).
+                e!("int('99999999999')"),
+                e!("int('2147483648')"),
+                e!("int('-2147483648')"),
                 e!("int(3.9)"),
                 e!("int(-3.9)"),
                 e!("float('1.5')"),

@@ -170,6 +170,9 @@ The `input()` -> `int()` path is where beginners meet types whether or not the l
 |---|---|---|
 | `int('42')` | value | `42` |
 | `int('abc')` | trap | `ValueError: invalid literal for int() with base 10: 'abc'` |
+| `int('99999999999')` | trap | `OverflowError: this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)` |
+| `int('2147483648')` | trap | `OverflowError: this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)` |
+| `int('-2147483648')` | value | `-2147483648` |
 | `int(3.9)` | value | `3` |
 | `int(-3.9)` | value | `-3` |
 | `float('1.5')` | value | `1.5` |

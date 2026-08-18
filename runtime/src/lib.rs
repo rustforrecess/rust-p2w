@@ -662,13 +662,18 @@ pub extern "C" fn p2w_int_of(v: Value) -> Value {
             n = n * 10 + (b - b'0') as i64;
             // i32 is the value model's int width; -2^31 is reachable only
             // through the negative sign, so allow one past MAX while digits
-            // accumulate and let make_int's wrap settle the sign.
+            // accumulate — the SIGNED check below settles the boundary.
+            // (The old check alone let int('2147483648') wrap to -2^31.)
             if n > i32::MAX as i64 + 1 {
-                trap("int() result is too large for this computer's numbers");
+                trap(messages::INT_OVERFLOW.text);
             }
             i += 1;
         }
-        return make_int(if neg { -n } else { n });
+        let val = if neg { -n } else { n };
+        if val > i32::MAX as i64 || val < i32::MIN as i64 {
+            trap(messages::INT_OVERFLOW.text);
+        }
+        return make_int(val);
     }
     trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(v))
 }

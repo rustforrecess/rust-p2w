@@ -3092,7 +3092,9 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
 
     // $str_to_int: parse a decimal int from a string (surrounding spaces and an
     // optional sign allowed); anything else is a ValueError. Used by int() and
-    // int(input()). Wraps on i32 overflow (the compiler's int range).
+    // int(input()). A value outside i32 — the value model's int range — is an
+    // OverflowError: this used to WRAP SILENTLY, printing a wrong number for
+    // int('99999999999') while the native backend trapped.
     let mut b = Body::new();
     b.push("(local.set $n (call $slen (local.get $s)))");
     // skip leading spaces/tabs
@@ -3141,7 +3143,11 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push_in(
         2,
-        "(local.set $acc (i32.add (i32.mul (local.get $acc) (i32.const 10)) (i32.sub (local.get $c) (i32.const 48))))",
+        "(local.set $acc (i64.add (i64.mul (local.get $acc) (i64.const 10)) (i64.extend_i32_s (i32.sub (local.get $c) (i32.const 48)))))",
+    );
+    b.push_in(
+        2,
+        "(if (i64.gt_s (local.get $acc) (i64.const 2147483648)) (then (call $raise_overflow)))",
     );
     b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
     b.push_in(2, "(br $dln)))");
@@ -3162,7 +3168,11 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     b.push_in(2, "(br $tln)))");
     // any leftover char is junk
     b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_int_parse (local.get $s))))");
-    b.push("(call $box (i32.mul (local.get $sign) (local.get $acc)))");
+    b.push("(local.set $acc (i64.mul (i64.extend_i32_s (local.get $sign)) (local.get $acc)))");
+    b.push(
+        "(if (i32.or (i64.gt_s (local.get $acc) (i64.const 2147483647)) (i64.lt_s (local.get $acc) (i64.const -2147483648))) (then (call $raise_overflow)))",
+    );
+    b.push("(call $box (i32.wrap_i64 (local.get $acc)))");
     fs.push(Func {
         signature: "(func $str_to_int (param $s (ref null any)) (result (ref null any))".into(),
         locals: vec![
@@ -3171,7 +3181,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(local $c i32)".into(),
             "(local $sign i32)".into(),
             "(local $start i32)".into(),
-            "(local $acc i32)".into(),
+            "(local $acc i64)".into(),
         ],
         body: b,
     });
