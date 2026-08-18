@@ -238,7 +238,8 @@ fn backends_agree_or_the_differences_are_written_down() {
         dir.join("putc.c"),
         "#include <stdio.h>\n\
          void p2w_putc(unsigned char c) { putchar(c); fflush(stdout); }\n\
-         int p2w_getc(void) { return getchar(); }\n",
+         int p2w_getc(void) { return getchar(); }\n\
+         int p2w_host_seed(void) { return 42; }\n",
     )
     .expect("putc.c");
 

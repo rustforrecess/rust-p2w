@@ -2789,6 +2789,9 @@ unsafe extern "C" {
     /// The platform byte sink: USB-CDC on the device. (Provided at final link;
     /// host tests supply a stub — see the tests module.)
     fn p2w_putc(c: u8);
+    /// The per-run random seed (fixed 42 in the run oracle, per-attempt on a
+    /// real host) — same contract as the WASM backend's `env.seed`.
+    fn p2w_host_seed() -> i32;
     /// The platform byte source (stdin / USB-CDC): next byte, or a negative
     /// value at end-of-input. (Provided at final link, like `p2w_putc`.)
     fn p2w_getc() -> i32;
@@ -3000,6 +3003,137 @@ fn to_fixed(x: f64, prec: i32) -> Value {
     str_alloc(&buf[..n])
 }
 
+// --- math + random ----------------------------------------------------------
+//
+// The same pinned `libm` the WASM backend compiled to WAT (src/math_wat.rs),
+// so the two targets agree to the LAST BIT; xorshift64* below must stay
+// bit-identical to the WAT `$rnd_next` and the Stepper's `rnd_next` — a
+// divergence is a language fork.
+
+fn math1(v: Value, f: fn(f64) -> f64) -> Value {
+    match fnum(v) {
+        Some(x) => float_alloc(f(x)),
+        None => trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(v)),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_exp(v: Value) -> Value {
+    math1(v, libm::exp)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_log(v: Value) -> Value {
+    math1(v, libm::log)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_log2(v: Value) -> Value {
+    math1(v, libm::log2)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_log10(v: Value) -> Value {
+    math1(v, libm::log10)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_sqrt(v: Value) -> Value {
+    math1(v, libm::sqrt)
+}
+/// `math.pow` is ALWAYS float (CPython), unlike the `**` operator.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_pow(a: Value, b: Value) -> Value {
+    match (fnum(a), fnum(b)) {
+        (Some(x), Some(y)) => float_alloc(libm::pow(x, y)),
+        _ => trap_num2(a, b),
+    }
+}
+
+static mut RND: u64 = 1;
+
+/// xorshift64* (12/25/27, Vigna's multiplier).
+fn rnd_next() -> u64 {
+    unsafe {
+        let mut x = RND;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        RND = x;
+        x.wrapping_mul(2685821657736338717)
+    }
+}
+
+/// Force an odd nonzero state, then churn three times so nearby seeds
+/// don't start with nearby outputs — identical to the WAT `$rnd_init`.
+fn rnd_seed(seed: i32) {
+    unsafe { RND = ((seed as u32 as u64) << 1) | 1 };
+    for _ in 0..3 {
+        rnd_next();
+    }
+}
+
+/// Called once where `import random` appears: seed from the host.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_rnd_init() {
+    rnd_seed(unsafe { p2w_host_seed() });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_rnd_seed(n: Value) {
+    match num(n) {
+        Some(x) => rnd_seed(x as i32),
+        None => trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(n)),
+    }
+}
+
+/// 53 uniform bits -> [0, 1), CPython's random() range.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_random() -> Value {
+    float_alloc((rnd_next() >> 11) as f64 * 1.110_223_024_625_156_5e-16)
+}
+
+/// Inclusive randint. The span fits u64 even at full i32 range, so the
+/// modulo is exact; bias is negligible against a 64-bit draw.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_randint(a: Value, b: Value) -> Value {
+    let (Some(a), Some(b)) = (num(a), num(b)) else {
+        trap_num2(a, b);
+    };
+    if a > b {
+        trap(messages::VALUE_RANDINT_ORDER.text);
+    }
+    let span = (b - a + 1) as u64;
+    make_int(a + (rnd_next() % span) as i64)
+}
+
+/// A uniform element of any container `p2w_len` accepts (owned).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_choice(xs: Value) -> Value {
+    if !(is_heap(xs) && matches!(obj_tag(xs), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE)) {
+        trap_msg(&messages::TYPE_NO_LEN, type_label(xs));
+    }
+    let n = container_len(xs);
+    if n == 0 {
+        trap(messages::INDEX_CHOICE_EMPTY.text);
+    }
+    element_at(xs, (rnd_next() % n as u64) as usize)
+}
+
+/// Fisher–Yates, in place, high index down to 1 (raw slot swaps — net-zero
+/// ownership, no retain/release needed).
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_shuffle(xs: Value) {
+    if !(is_heap(xs) && obj_tag(xs) == T_LIST) {
+        trap_msg(&messages::TYPE_NO_LEN, type_label(xs));
+    }
+    let o = xs as usize;
+    let mut i = coll_len(o).saturating_sub(1);
+    while i > 0 {
+        let j = (rnd_next() % (i as u64 + 1)) as usize;
+        let (a, b) = (list_get(o, i), list_get(o, j));
+        list_set_at(o, i, b);
+        list_set_at(o, j, a);
+        i -= 1;
+    }
+}
+
 /// Halt on an unrecoverable runtime error. On the device this will report over
 /// USB-CDC and stop; for now it panics (host) / loops (device).
 fn trap(msg: &str) -> ! {
@@ -3184,6 +3318,12 @@ mod tests {
     // Satisfy the linker for the test binary (p2w_print references p2w_putc).
     #[unsafe(no_mangle)]
     extern "C" fn p2w_putc(_c: u8) {}
+
+    // ...and the random seed (42, the deterministic-test convention).
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_host_seed() -> i32 {
+        42
+    }
 
     // ...and p2w_input references p2w_getc (immediate end-of-input in tests).
     #[unsafe(no_mangle)]

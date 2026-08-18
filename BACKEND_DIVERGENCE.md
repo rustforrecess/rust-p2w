@@ -13,35 +13,9 @@ Error WORDING is not compared — the two have always phrased things differently
 
 ## Result
 
-**15 of 105 probes disagree.**
+**3 of 108 probes disagree.**
 
 A short list means converging the backends is cheap. A long one means we have been maintaining two languages, and which one is the real student-facing runtime is a decision rather than an accident.
-
-### Arithmetic on numbers
-
-| program | WASM-GC | linear memory |
-|---|---|---|
-| `2147483648` | compile error — `line 1: the number 2147483648 is too big — whole numbers from -2147483648 to 2147483647 ar…` | value — `-2147483648` |
-
-### Floats
-
-| program | WASM-GC | linear memory |
-|---|---|---|
-| `math.exp(1.0)` | value — `2.7182818284590455` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
-| `random.randint(1, 6) [seed 42]` | value — `2` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
-| `math.log(10.0)` | value — `2.302585092994046` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
-| `math.log2(8.0)` | value — `3.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
-| `math.log10(1000.0)` | value — `3.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
-| `math.pow(2, 10)` | value — `1024.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
-
-### Strings
-
-| program | WASM-GC | linear memory |
-|---|---|---|
-| `'ab' - 'b'` | compile error — `line 1: this operator needs numbers on both sides` | trap — `TypeError: expected a number, got 'str' [hung]` |
-| `'ab' + 1` | compile error — `line 1: can't add text and a number together` | trap — `TypeError: expected a number, got 'str' [hung]` |
-| `1 + 'ab'` | compile error — `line 1: can't add text and a number together` | trap — `TypeError: expected a number, got 'str' [hung]` |
-| `'ab' / 2` | compile error — `line 1: this operator needs numbers on both sides` | trap — `TypeError: expected a number, got 'str' [hung]` |
 
 ### Where a wrong type is caught TODAY
 
@@ -54,12 +28,6 @@ A short list means converging the backends is cheap. A long one means we have be
 | program | WASM-GC | linear memory |
 |---|---|---|
 | `{'a': 1}.get('b', 0)` | value — `0` | trap — `method not supported in the native backend yet [hung]` |
-
-### Truthiness and comparison across types
-
-| program | WASM-GC | linear memory |
-|---|---|---|
-| `1 < 'one'` | compile error — `line 1: can't compare text with a number — there's no way to say whether a word is bigger …` | trap — `TypeError: expected a number, got 'str' [hung]` |
 
 ### Unpacking
 

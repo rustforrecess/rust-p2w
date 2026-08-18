@@ -77,6 +77,18 @@ declare i32 @p2w_div(i32, i32)
 declare i32 @p2w_floordiv(i32, i32)
 declare i32 @p2w_mod(i32, i32)
 declare i32 @p2w_pow(i32, i32)
+declare i32 @p2w_math_exp(i32)
+declare i32 @p2w_math_log(i32)
+declare i32 @p2w_math_log2(i32)
+declare i32 @p2w_math_log10(i32)
+declare i32 @p2w_math_sqrt(i32)
+declare i32 @p2w_math_pow(i32, i32)
+declare void @p2w_rnd_init()
+declare void @p2w_rnd_seed(i32)
+declare i32 @p2w_random()
+declare i32 @p2w_randint(i32, i32)
+declare i32 @p2w_choice(i32)
+declare void @p2w_shuffle(i32)
 declare i32 @p2w_neg(i32)
 declare i32 @p2w_lt(i32, i32)
 declare i32 @p2w_le(i32, i32)
@@ -1991,6 +2003,19 @@ impl<'a> FuncEmitter<'a> {
             ))
         };
         match &s.kind {
+            StmtKind::Import(names) => {
+                for n in names {
+                    match n.as_str() {
+                        // Compile-time only: math.* lowers to direct runtime calls.
+                        "math" => {}
+                        // Seed from the host where the import appears (before
+                        // any use; a repeat import just re-seeds identically).
+                        "random" => self.line("call void @p2w_rnd_init()"),
+                        _ => return nope(&format!("`import {n}`")),
+                    }
+                }
+                Ok(())
+            }
             StmtKind::Assign(name, value) => {
                 // FBIP: `data = [f(x) for x in data]` over a unique packed array
                 // maps in place (zero allocation); otherwise it falls through.
@@ -3362,6 +3387,94 @@ impl<'a> FuncEmitter<'a> {
 
     /// `recv.method(args)` -> a name-dispatched runtime call (the runtime
     /// resolves the method on the receiver's type). 0–2 args for now.
+    /// `math.fn(args)` / `random.fn(args)` — direct runtime calls. Args are
+    /// evaluated owned and released after (the runtime borrows them).
+    fn module_call(
+        &mut self,
+        module: &str,
+        method: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<String, String> {
+        let one = |n: usize| -> Result<(), String> {
+            if args.len() == n {
+                Ok(())
+            } else {
+                Err(format!(
+                    "line {line}: {module}.{method}() takes {n} argument(s), got {}",
+                    args.len()
+                ))
+            }
+        };
+        if module == "math" {
+            let f = match method {
+                "exp" => "p2w_math_exp",
+                "log" => "p2w_math_log",
+                "log2" => "p2w_math_log2",
+                "log10" => "p2w_math_log10",
+                "sqrt" => "p2w_math_sqrt",
+                "pow" => {
+                    one(2)?;
+                    let a = self.expr(&args[0])?;
+                    let b = self.expr(&args[1])?;
+                    let r = self.call_value(&format!("call i32 @p2w_math_pow(i32 {a}, i32 {b})"));
+                    self.release(&a);
+                    self.release(&b);
+                    return Ok(r);
+                }
+                _ => {
+                    return Err(format!(
+                        "line {line}: the native (Pico) backend doesn't handle math.{method}() yet"
+                    ));
+                }
+            };
+            one(1)?;
+            let a = self.expr(&args[0])?;
+            let r = self.call_value(&format!("call i32 @{f}(i32 {a})"));
+            self.release(&a);
+            return Ok(r);
+        }
+        match method {
+            "random" => {
+                one(0)?;
+                Ok(self.call_value("call i32 @p2w_random()"))
+            }
+            "randint" => {
+                one(2)?;
+                let a = self.expr(&args[0])?;
+                let b = self.expr(&args[1])?;
+                let r = self.call_value(&format!("call i32 @p2w_randint(i32 {a}, i32 {b})"));
+                self.release(&a);
+                self.release(&b);
+                Ok(r)
+            }
+            "choice" => {
+                one(1)?;
+                let xs = self.expr(&args[0])?;
+                let r = self.call_value(&format!("call i32 @p2w_choice(i32 {xs})"));
+                self.release(&xs);
+                Ok(r)
+            }
+            "shuffle" => {
+                one(1)?;
+                let xs = self.expr(&args[0])?;
+                self.line(&format!("call void @p2w_shuffle(i32 {xs})"));
+                self.release(&xs);
+                Ok(self.call_value("call i32 @p2w_none()"))
+            }
+            "seed" => {
+                one(1)?;
+                let n = self.expr(&args[0])?;
+                self.line(&format!("call void @p2w_rnd_seed(i32 {n})"));
+                self.release(&n);
+                Ok(self.call_value("call i32 @p2w_none()"))
+            }
+            _ => Err(format!(
+                "line {line}: the native (Pico) backend doesn't handle random.{method}() yet"
+            )),
+        }
+    }
+
     fn method_call(&mut self, obj: &Expr, method: &str, args: &[Expr]) -> Result<String, String> {
         // `super().m(args)` — resolved at COMPILE time from the enclosing
         // class's base; a direct call with the original self (methods are
@@ -3406,6 +3519,15 @@ impl<'a> FuncEmitter<'a> {
             return Ok(
                 self.call_value(&format!("call i32 @m_{owner}_{method}({})", ops.join(", ")))
             );
+        }
+        // `math.fn(...)` / `random.fn(...)` — module functions, not value
+        // methods (codegen's is_module_ref rule: the name isn't a variable;
+        // import-before-use was enforced by the checker pass).
+        if let ExprKind::Name(m) = &obj.kind
+            && (m == "math" || m == "random")
+            && !self.vars.iter().any(|v| v == m)
+        {
+            return self.module_call(m, method, args, obj.line);
         }
         // A method name some class defines routes through the generated
         // per-(name, arity) dispatcher: switch on class id -> direct call;

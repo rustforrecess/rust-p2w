@@ -41,6 +41,7 @@ static void report(void) {
   fprintf(stderr, "P2W_ALLOCS=%d\n", p2w_allocs());
 }
 void p2w_putc(unsigned char c) { putchar(c); }
+int p2w_host_seed(void) { return 42; }
 int p2w_getc(void) { return getchar(); }
 __attribute__((constructor)) static void init(void) { atexit(report); }
 EOF
@@ -428,6 +429,10 @@ run_case_in input_line 'x = input()\nprint("got " + x)\n' 'got hello' 'hello\n' 
 run_case_in input_prompt 'name = input("Who? ")\nprint("Hi " + name)\n' 'Who? Hi Ana' 'Ana\n' || fails=$((fails+1))
 run_case_in input_eof 'x = input()\nprint(len(x))\n' '0' '' || fails=$((fails+1))
 run_case_in input_loop 'a = input()\nb = input()\nprint(b + a)\n' 'ba' 'a\nb\n' || fails=$((fails+1))
+# math + random: expected strings are the WASM-GC backend's output for the
+# SAME programs (p2w run, seed 42) — cross-backend parity, bit for bit.
+run_case math_libm 'import math\nprint(math.exp(1.0))\nprint(math.log(10.0))\nprint(math.log2(8.0))\nprint(math.log10(1000.0))\nprint(math.pow(2, 10))\nprint(math.sqrt(2.0))\n' '2.7182818284590455\n2.302585092994046\n3.0\n3.0\n1024.0\n1.4142135623730951' || fails=$((fails+1))
+run_case random_parity 'import random\nprint(random.randint(1, 100))\nprint(random.random())\nxs = [1, 2, 3, 4, 5]\nrandom.shuffle(xs)\nprint(xs)\nprint(random.choice([1]))\nrandom.seed(7)\nprint(random.randint(1, 100))\n' '70\n0.3458877553122256\n[1, 2, 3, 5, 4]\n1\n43' || fails=$((fails+1))
 
 echo "---"
 if [ "$fails" -eq 0 ]; then
