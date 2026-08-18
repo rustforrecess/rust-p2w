@@ -300,6 +300,111 @@ mechanized argument for the transfer model + reuse tokens would be a
 publishable result on its own. **Acceptance:** a machine-checked statement of
 the invariant the oracle currently samples (output ≡ CPython ∧ live == 0).
 
+## The verification frontier (added 2026-08-18) — TODO, each with why
+
+A 2026-08 research survey (searched, not recalled) found the field converging
+on this project's positions: the DORA 2026 report calls generation "solved
+enough" and names specification/verification as where gains are won; MSR RiSE
+declared intent formalization a grand challenge (2026-03); SPLASH 2026 hosts
+the first SpecOps workshop. Every item below is a TODO **because a specific
+recent result made it cheaper or newly legitimate** — the note under each is
+that reason.
+
+### V1. Runtime contracts in the verify-rust-std style
+
+**Why now:** the Rust Foundation/AWS `verify-rust-std` effort (29 published
+challenges; accepted tools Kani, VeriFast, Flux, ESBMC-transcoder) verified
+contracts over the ACTUAL standard library's unsafe code — the same
+discipline our three Kani harnesses apply to the arena, with a
+lessons-learned paper to crib from. Adopting their `requires`/`ensures`
+contract style makes our proofs legible to that ecosystem and lets harnesses
+derive from contracts instead of restating them.
+**Acceptance:** contracts on the runtime's unsafe entry points; Kani proofs
+reference them; Miri/Kani CI unchanged and green.
+
+### V2. Flux over the arena offset arithmetic
+
+**Why now:** Flux (refinement types for Rust) is production-adjacent enough
+to be a verify-rust-std accepted tool. Refinements can prove the
+`rd`/`wr`/offset arithmetic in-bounds *by type*, without authoring a harness
+per property — the cheap upgrade path beyond bounded model checking.
+**Acceptance:** Flux passes on `runtime/` (or a written list of what blocked
+it — that list is itself the finding).
+
+### V3. sequent's certificate tier, per the published blueprint
+
+**Why now:** "Verifying Datalog Reasoning with Lean" (ITP 2025) implements
+exactly the architecture we planned for sequent — an untrusted, fast
+reasoner emits a proof object; a Lean-verified checker validates it against
+mechanized Datalog semantics. And "Capability Safety as Datalog: A
+Foundational Equivalence" (2026) makes `capabilities()`-as-Datalog a
+*theorem-shaped* claim, not an analogy. The design no longer needs
+defending; it needs building against a citable spec.
+**Acceptance:** `capabilities()` (or `may_form_cycle`) emits a derivation;
+sequent independently checks it; a tampered certificate is REJECTED (the
+negative test is the point).
+
+### V4. Surface engine validation as a per-module certificate
+
+**Why now:** nothing new had to be invented — the observation is that every
+emitted module already passes V8/wasmtime *validation*, which IS a formal
+typecheck of the artifact against the mechanized Wasm type system. We just
+never surface it. One field in `p2w check --json` turns an invisible
+guarantee into a visible one, and it is the first rung of the
+certificate-per-artifact story the MDM/verifier work wants.
+**Acceptance:** the JSON reports a validation verdict produced by actually
+validating, not by claiming.
+
+### V5. Translation validation between the two backends
+
+**Why now:** the ladder already chose translation validation over
+whole-compiler proof (churn-tolerant by construction); what's new is
+precedent at both granularities — VeriISLE (ASPLOS 2024) SMT-verifies
+Cranelift's *lowering rules* (partially covering our own trusted base, since
+wasmtime runs on Cranelift), and Alive2-style per-program validation is
+routine for LLVM. Our differential suite is testing; the typed tier's IR is
+the trigger that makes per-program validation buildable.
+**Acceptance:** for a compiled pair, a validator replays both against one
+value-level semantics; the divergence suite becomes a special case of it.
+
+### V6. Mechanize a Wasm-GC core (the open research contribution)
+
+**Why now:** Iris-Wasm mechanized Wasm 1.0 (PLDI 2023) and the lineage now
+covers MSWasm (OOPSLA 2024) and WasmFX (2025-26) — **nobody has mechanized
+Wasm-GC**, the extension our browser backend and every Kotlin/Dart/J2CL
+module stands on. We also hold a concrete motivating artifact: the wasmtime
+`is_subtype` panic our string work found, a soundness-adjacent engine bug in
+exactly the unmechanized territory. Pairs with the typed tier's planned Lean
+soundness story; even a core-calculus fragment is publishable.
+**Acceptance:** a mechanized fragment whose statement covers the `ref.test`/
+subtyping corner the bug lives in.
+
+### V7. The copilot gate grows proof obligations
+
+**Why now:** the LLM-generates/checker-gates loop is now measured, not
+speculative — DafnyPro proves 86% of DafnyBench (POPL 2026), AutoVerus cuts
+Verus proof code ~80%, Clover's spec-consistency gate accepts 87% of correct
+instances with zero adversarial passes. Our decided architecture (the
+compiler as the agent's verifier, lints as feedback) is that loop with
+weaker obligations — and the subset (decidable, no dynamic dispatch) is the
+easiest spec-inference target in the field. When the type checker lands, its
+judgments become obligations the copilot's output must discharge.
+**Acceptance:** generated code reaches a student only through `p2w check`;
+each strengthening of the checker strengthens the gate with no copilot
+changes.
+
+### V8. Pedagogy of verification (the Helium-shaped window)
+
+**Why now:** the pieces just appeared — an experimental study of LLMs
+helping *students* prove correctness in Dafny, miniF2F ported to Dafny, an
+interactive proof mode softening Dafny's auto-active cliff — and nobody has
+assembled them for a language children use. This is the same shape as the
+type-error-pedagogy gap: two literatures, no assembly. Verification literacy
+("the fast test that doesn't count" as a checked property; derivation-based
+messages as baby proofs) has no incumbent.
+**Acceptance:** one shipped lesson where the student's claim about a program
+is discharged by an actual checker, and the evidence stream records it.
+
 ## Reading order
 
 `README.md` → `REUSE_PLAN.md` (staging + invariants) → `src/reuse.rs` (the
