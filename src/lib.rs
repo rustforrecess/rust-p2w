@@ -167,6 +167,15 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String, String> {
     let tokens = lexer::lex(source).map_err(|e| e.to_string())?;
     let stmts = parser::parse(&tokens).map_err(|e| e.to_string())?;
     let stmts = hoist::hoist_nested_functions(stmts).map_err(|e| e.to_string())?;
+    // Run the WASM generator as a CHECKER first, discarding its output. The
+    // compile-time type checks (literal string arithmetic, annotation misuse,
+    // arity…) live inside it, and running the SAME code is the only way the
+    // two targets reject the same programs with the same words — every
+    // GC-compile-error-vs-native-trap divergence row came from skipping this.
+    // Interim by design: the standalone front-end type checker will extract
+    // those checks, and this call disappears with them. The cost is one extra
+    // compile of a kid-sized program on the offline path.
+    codegen::generate(&stmts).map_err(|e| e.to_string())?;
     llvm::emit_llvm_ir(&stmts)
 }
 

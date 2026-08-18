@@ -3966,6 +3966,25 @@ mod tests {
         emit_llvm_ir(&parse(src)).unwrap()
     }
 
+    #[test]
+    fn the_native_entry_rejects_what_the_wasm_backend_rejects() {
+        // compile_to_llvm_ir runs the WASM generator as a checker first, so
+        // the front-door checks apply to both targets — these used to compile
+        // natively and trap at runtime while the browser refused them.
+        for src in [
+            "print('ab' + 1)\n",
+            "print(1 + 'ab')\n",
+            "print('ab' - 'b')\n",
+            "print('ab' / 2)\n",
+            "print(1 < 'one')\n",
+        ] {
+            let err = crate::compile_to_llvm_ir(src).expect_err(src);
+            assert!(err.contains("line 1"), "{src}: {err}");
+        }
+        // …and programs the native backend genuinely compiles still compile.
+        assert!(crate::compile_to_llvm_ir("print(6 * 7)\n").is_ok());
+    }
+
     fn parse(src: &str) -> Vec<Stmt> {
         crate::parser::parse(&crate::lexer::lex(src).unwrap()).unwrap()
     }
