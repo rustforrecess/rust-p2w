@@ -140,6 +140,15 @@ static mut ALLOCS: i32 = 0;
 /// die sooner, so fewer are ever alive at once. Resets with the heap.
 static mut PEAK: i32 = 0;
 
+/// The message table shared with the compiler front-end (`src/messages.rs`,
+/// consts only, `no_std`-clean) — one copy of every diagnostic's text, so this
+/// runtime cannot drift from the WASM backend's words. Same sharing pattern
+/// as the test hosts' `js_string_host.rs`. (dead_code: this backend uses the
+/// entries it can fill — several need names only the front-end knows.)
+#[path = "../../src/messages.rs"]
+#[allow(dead_code)]
+mod messages;
+
 /// Object type tags (in the header's first word).
 const T_STR: u32 = 1;
 /// A boxed `f64`: layout `[tag][rc][f64 (8 bytes)]`. Floats can't be inline —
@@ -393,7 +402,7 @@ pub extern "C" fn p2w_str_of(v: Value) -> Value {
 fn slice_bounds(len: i64, start_v: Value, stop_v: Value, step_v: Value) -> (i64, i64, i64) {
     let step = if step_v == V_NONE { 1 } else { as_int(step_v) };
     if step == 0 {
-        trap("slice step cannot be zero");
+        trap(messages::VALUE_SLICE_STEP_ZERO.text);
     }
     let adjust = |raw: i64| -> i64 {
         let mut i = raw;
@@ -426,7 +435,7 @@ fn slice_bounds(len: i64, start_v: Value, stop_v: Value, step_v: Value) -> (i64,
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_slice(obj: Value, start_v: Value, stop_v: Value, step_v: Value) -> Value {
     if !(is_heap(obj) && matches!(obj_tag(obj), T_STR | T_LIST)) {
-        trap("only lists and strings can be sliced");
+        trap_msg(&messages::TYPE_NOT_SUBSCRIPTABLE, type_label(obj));
     }
     let o = obj as usize;
     let len = rd(o + 8) as i64; // element/byte count (same offset for str and list)
@@ -642,13 +651,13 @@ pub extern "C" fn p2w_int_of(v: Value) -> Value {
             i += 1;
         }
         if i == j {
-            trap("int() got text that isn't a whole number");
+            trap_msg(&messages::VALUE_INT_PARSE, str_as_str(v));
         }
         let mut n: i64 = 0;
         while i < j {
             let b = str_byte(v, i);
             if !b.is_ascii_digit() {
-                trap("int() got text that isn't a whole number");
+                trap_msg(&messages::VALUE_INT_PARSE, str_as_str(v));
             }
             n = n * 10 + (b - b'0') as i64;
             // i32 is the value model's int width; -2^31 is reachable only
@@ -661,7 +670,7 @@ pub extern "C" fn p2w_int_of(v: Value) -> Value {
         }
         return make_int(if neg { -n } else { n });
     }
-    trap("int() needs a number or a numeric string")
+    trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(v))
 }
 
 // --- floats (heap-boxed f64) -----------------------------------------------
@@ -745,14 +754,11 @@ fn numeric<F: Fn(i64, i64) -> i64>(a: Value, b: Value, f: F) -> Value {
             // behaviour on every target.
             let r = f(x, y);
             if r > i32::MAX as i64 || r < i32::MIN as i64 {
-                trap(
-                    "this calculation went outside the range of whole numbers we can store \
-                     (-2147483648 to 2147483647)",
-                );
+                trap(messages::INT_OVERFLOW.text);
             }
             make_int(r)
         }
-        _ => trap("unsupported operand type for a numeric op (heap types are TODO)"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -768,7 +774,7 @@ fn arith<FI: Fn(i64, i64) -> i64, FF: Fn(f64, f64) -> f64>(
     if is_float(a) || is_float(b) {
         match (fnum(a), fnum(b)) {
             (Some(x), Some(y)) => float_alloc(ff(x, y)),
-            _ => trap("unsupported operand type for a numeric op"),
+            _ => trap_num2(a, b),
         }
     } else {
         numeric(a, b, fi)
@@ -901,7 +907,7 @@ pub extern "C" fn p2w_overflow() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_zero_div() -> ! {
-    trap("division by zero")
+    trap(messages::ZERO_DIVISION.text)
 }
 
 #[unsafe(no_mangle)]
@@ -909,11 +915,11 @@ pub extern "C" fn p2w_div(a: Value, b: Value) -> Value {
     match (fnum(a), fnum(b)) {
         (Some(x), Some(y)) => {
             if y == 0.0 {
-                trap("division by zero");
+                trap(messages::ZERO_DIVISION.text);
             }
             float_alloc(x / y)
         }
-        _ => trap("unsupported operand type for /"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -934,7 +940,7 @@ pub extern "C" fn p2w_pow(a: Value, b: Value) -> Value {
     }
     match (fnum(a), fnum(b)) {
         (Some(x), Some(y)) => float_alloc(libm::pow(x, y)),
-        _ => trap("unsupported operand type for **"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -944,17 +950,17 @@ pub extern "C" fn p2w_floordiv(a: Value, b: Value) -> Value {
         return match (fnum(a), fnum(b)) {
             (Some(x), Some(y)) => {
                 if y == 0.0 {
-                    trap("float floor division by zero");
+                    trap(messages::ZERO_DIVISION.text);
                 }
                 float_alloc(libm::floor(x / y))
             }
-            _ => trap("unsupported operand type for //"),
+            _ => trap_num2(a, b),
         };
     }
     match (num(a), num(b)) {
-        (Some(_), Some(0)) => trap("integer division or modulo by zero"),
+        (Some(_), Some(0)) => trap(messages::ZERO_DIVISION.text),
         (Some(x), Some(y)) => make_int(x.div_euclid(y)),
-        _ => trap("unsupported operand type for //"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -964,18 +970,18 @@ pub extern "C" fn p2w_mod(a: Value, b: Value) -> Value {
         return match (fnum(a), fnum(b)) {
             (Some(x), Some(y)) => {
                 if y == 0.0 {
-                    trap("float modulo by zero");
+                    trap(messages::ZERO_DIVISION.text);
                 }
                 // Python's `%` takes the divisor's sign: a - floor(a/b)*b.
                 float_alloc(x - libm::floor(x / y) * y)
             }
-            _ => trap("unsupported operand type for %"),
+            _ => trap_num2(a, b),
         };
     }
     match (num(a), num(b)) {
-        (Some(_), Some(0)) => trap("integer division or modulo by zero"),
+        (Some(_), Some(0)) => trap(messages::ZERO_DIVISION.text),
         (Some(x), Some(y)) => make_int(x.rem_euclid(y)),
-        _ => trap("unsupported operand type for %"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -986,7 +992,7 @@ pub extern "C" fn p2w_neg(a: Value) -> Value {
     }
     match num(a) {
         Some(x) => make_int(-x),
-        None => trap("bad operand type for unary -"),
+        None => trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(a)),
     }
 }
 
@@ -999,12 +1005,12 @@ fn compare<FI: Fn(i64, i64) -> bool, FF: Fn(f64, f64) -> bool>(
     if is_float(a) || is_float(b) {
         return match (fnum(a), fnum(b)) {
             (Some(x), Some(y)) => make_bool(ff(x, y)),
-            _ => trap("unsupported operand type for a comparison"),
+            _ => trap_num2(a, b),
         };
     }
     match (num(a), num(b)) {
         (Some(x), Some(y)) => make_bool(fi(x, y)),
-        _ => trap("unsupported operand type for a comparison"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -1367,15 +1373,17 @@ fn dict_set(o: usize, key: Value, val: Value) {
     set_len(o, len + 1);
 }
 
-/// Normalize an index (negative-from-end) and bounds-check, or trap.
-fn norm_index(index: Value, n: i64) -> i64 {
+/// Normalize an index (negative-from-end) and bounds-check, or trap. `seq`
+/// names the sequence kind in the message ("list"/"string"), matching the
+/// WASM raiser's split.
+fn norm_index(index: Value, n: i64, seq: &str) -> i64 {
     let i = match num(index) {
         Some(i) => i,
-        None => trap("indices must be integers"),
+        None => trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(index)),
     };
     let r = if i < 0 { i + n } else { i };
     if r < 0 || r >= n {
-        trap("index out of range");
+        trap_msg(&messages::INDEX_OUT_OF_RANGE, seq);
     }
     r
 }
@@ -1398,7 +1406,7 @@ pub extern "C" fn p2w_len(v: Value) -> Value {
     {
         return make_int(coll_len(v as usize) as i64);
     }
-    trap("object has no len()")
+    trap_msg(&messages::TYPE_NO_LEN, type_label(v))
 }
 
 /// `target[index]` — string char, list element, or dict value.
@@ -1408,33 +1416,33 @@ pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
         return unsafe { p2w_obj_op(OP_GETITEM, target, index) };
     }
     if !is_heap(target) {
-        trap("object is not subscriptable");
+        trap_msg(&messages::TYPE_NOT_SUBSCRIPTABLE, type_label(target));
     }
     let o = target as usize;
     match obj_tag(target) {
         T_STR => {
-            let i = norm_index(index, coll_len(o) as i64);
+            let i = norm_index(index, coll_len(o) as i64, "string");
             str_alloc(&[str_byte(target, i as usize)])
         }
         T_LIST | T_TUPLE => {
-            let i = norm_index(index, coll_len(o) as i64);
+            let i = norm_index(index, coll_len(o) as i64, "list");
             owned(list_get(o, i as usize)) // hand the caller an owned ref
         }
         // Packed arrays (list[int]/list[float]) hold RAW scalars — box the
         // element into a value on read, mirroring the list arm.
         T_IARRAY => {
-            let i = norm_index(index, coll_len(o) as i64);
+            let i = norm_index(index, coll_len(o) as i64, "list");
             make_int(list_get(o, i as usize) as i32 as i64)
         }
         T_FARRAY => {
-            let i = norm_index(index, coll_len(o) as i64);
+            let i = norm_index(index, coll_len(o) as i64, "list");
             float_alloc(farray_get(o, i as usize))
         }
         T_DICT => match dict_find(o, index) {
             Some(i) => owned(dict_val(o, i)),
-            None => trap("key not found"),
+            None => trap_key(index),
         },
-        _ => trap("object is not subscriptable"),
+        _ => trap_msg(&messages::TYPE_NOT_SUBSCRIPTABLE, type_label(target)),
     }
 }
 
@@ -1442,18 +1450,18 @@ pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_setindex(target: Value, index: Value, value: Value) {
     if !is_heap(target) {
-        trap("object does not support item assignment");
+        trap_msg(&messages::TYPE_NO_ITEM_ASSIGN, type_label(target));
     }
     let o = target as usize;
     match obj_tag(target) {
         T_LIST => {
-            let i = norm_index(index, coll_len(o) as i64);
+            let i = norm_index(index, coll_len(o) as i64, "list");
             p2w_release(list_get(o, i as usize)); // release the replaced element
             list_set_at(o, i as usize, value); // new value transferred in
         }
         T_DICT => dict_set(o, index, value),
-        T_TUPLE => trap("a tuple is immutable — you can't change its items"),
-        _ => trap("object does not support item assignment"),
+        T_TUPLE => trap_msg(&messages::TYPE_NO_ITEM_ASSIGN, "tuple"),
+        _ => trap_msg(&messages::TYPE_NO_ITEM_ASSIGN, type_label(target)),
     }
 }
 
@@ -1496,7 +1504,7 @@ fn seq_of(iterable: Value, tag: u32, err: &str) -> Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_list_append(list: Value, v: Value) -> Value {
     if !(is_heap(list) && obj_tag(list) == T_LIST) {
-        trap("append() expects a list");
+        trap_msg(&messages::ATTR_NO_APPEND, type_label(list));
     }
     list_push(list as usize, v);
     V_NONE
@@ -1699,7 +1707,7 @@ fn checked_index(o: usize, idx: i32, tag: u32) -> usize {
         idx as i64
     };
     if i < 0 || i >= n {
-        trap("index out of range");
+        trap_msg(&messages::INDEX_OUT_OF_RANGE, "list");
     }
     i as usize
 }
@@ -1769,7 +1777,7 @@ pub extern "C" fn p2w_set_of(iterable: Value) -> Value {
     if !(is_heap(iterable)
         && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
-        trap("set() needs an iterable");
+        trap_msg(&messages::TYPE_NO_LEN, type_label(iterable));
     }
     let r = p2w_set_new();
     for i in 0..container_len(iterable) {
@@ -1830,7 +1838,7 @@ pub extern "C" fn p2w_sum(iterable: Value) -> Value {
     if !(is_heap(iterable)
         && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
-        trap("sum() needs an iterable");
+        trap_msg(&messages::TYPE_NO_LEN, type_label(iterable));
     }
     let mut acc = make_int(0);
     for i in 0..container_len(iterable) {
@@ -1855,7 +1863,7 @@ fn value_lt(a: Value, b: Value) -> bool {
     }
     match (fnum(a), fnum(b)) {
         (Some(x), Some(y)) => x < y,
-        _ => trap("min()/max() need numbers or strings"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -1876,11 +1884,11 @@ fn min_max(iterable: Value, want_min: bool) -> Value {
     if !(is_heap(iterable)
         && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
-        trap("min()/max() need an iterable");
+        trap_msg(&messages::TYPE_NO_LEN, type_label(iterable));
     }
     let n = container_len(iterable);
     if n == 0 {
-        trap("min()/max() arg is an empty sequence");
+        trap(messages::VALUE_EMPTY_SEQUENCE.text);
     }
     let mut acc = element_at(iterable, 0);
     for i in 1..n {
@@ -1920,10 +1928,10 @@ pub extern "C" fn p2w_float_of(v: Value) -> Value {
     if is_heap(v) && obj_tag(v) == T_STR {
         match parse_float_str(v) {
             Some(x) => return float_alloc(x),
-            None => trap("could not convert string to float"),
+            None => trap_msg(&messages::VALUE_FLOAT_PARSE, str_as_str(v)),
         }
     }
-    trap("float() needs a number or a numeric string")
+    trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(v))
 }
 
 /// Parse a decimal float from a string value using `core`'s correctly-rounded
@@ -1973,7 +1981,7 @@ pub extern "C" fn p2w_enumerate(iterable: Value, start: i32) -> Value {
     if !(is_heap(iterable)
         && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
-        trap("enumerate() needs an iterable");
+        trap_msg(&messages::TYPE_NO_LEN, type_label(iterable));
     }
     let out = coll_new(T_LIST);
     for i in 0..container_len(iterable) {
@@ -1988,7 +1996,7 @@ pub extern "C" fn p2w_enumerate(iterable: Value, start: i32) -> Value {
 pub extern "C" fn p2w_zip2(a: Value, b: Value) -> Value {
     for v in [a, b] {
         if !(is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE)) {
-            trap("zip() needs iterables");
+            trap_msg(&messages::TYPE_NO_LEN, type_label(v));
         }
     }
     let (la, lb) = (container_len(a), container_len(b));
@@ -2008,7 +2016,7 @@ pub extern "C" fn p2w_sorted(iterable: Value, reverse: Value) -> Value {
     if !(is_heap(iterable)
         && matches!(obj_tag(iterable), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE))
     {
-        trap("sorted() needs an iterable");
+        trap_msg(&messages::TYPE_NO_LEN, type_label(iterable));
     }
     let rev = p2w_truthy(reverse);
     let out = coll_new(T_LIST);
@@ -2049,7 +2057,7 @@ pub extern "C" fn p2w_set_add(set: Value, v: Value) {
     // Set members must be immutable (hashable). A list/dict/set can change, so it
     // can't be a member — use a tuple. (A tuple is allowed.)
     if is_heap(v) && matches!(obj_tag(v), T_LIST | T_DICT | T_SET) {
-        trap("a set can't contain a list, dict, or set — use a tuple");
+        trap_msg(&messages::TYPE_UNHASHABLE, type_label(v));
     }
     if coll_contains(set as usize, v) {
         p2w_release(v); // redundant — the set already owns an equal element
@@ -2063,14 +2071,14 @@ pub extern "C" fn p2w_set_add(set: Value, v: Value) {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_in(value: Value, container: Value) -> Value {
     if !is_heap(container) {
-        trap("argument to `in` is not a container");
+        trap_msg(&messages::TYPE_ARG_NOT_ITERABLE, type_label(container));
     }
     let o = container as usize;
     let found = match obj_tag(container) {
         T_SET | T_LIST | T_TUPLE => coll_contains(o, value),
         T_DICT => dict_find(o, value).is_some(),
         T_STR => str_contains(container, value),
-        _ => trap("argument to `in` is not a container"),
+        _ => trap_msg(&messages::TYPE_ARG_NOT_ITERABLE, type_label(container)),
     };
     make_bool(found)
 }
@@ -2167,7 +2175,7 @@ fn set_subset(a: usize, b: usize) -> bool {
 /// Whether the string `needle` occurs in the string `hay` (naive search).
 fn str_contains(hay: Value, needle: Value) -> bool {
     if !(is_heap(needle) && obj_tag(needle) == T_STR) {
-        trap("the left operand of `in` on a string must be a string");
+        trap_msg(&messages::TYPE_IN_STRING_LEFT, type_label(needle));
     }
     let (hl, nl) = (str_len(hay), str_len(needle));
     if nl == 0 {
@@ -2187,7 +2195,7 @@ pub extern "C" fn p2w_band(a: Value, b: Value) -> Value {
     }
     match (num(a), num(b)) {
         (Some(x), Some(y)) => make_int(x & y),
-        _ => trap("& expects two ints or two sets"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -2199,7 +2207,7 @@ pub extern "C" fn p2w_bor(a: Value, b: Value) -> Value {
     }
     match (num(a), num(b)) {
         (Some(x), Some(y)) => make_int(x | y),
-        _ => trap("| expects two ints or two sets"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -2211,7 +2219,7 @@ pub extern "C" fn p2w_bxor(a: Value, b: Value) -> Value {
     }
     match (num(a), num(b)) {
         (Some(x), Some(y)) => make_int(x ^ y),
-        _ => trap("^ expects two ints or two sets"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -2221,7 +2229,7 @@ pub extern "C" fn p2w_bxor(a: Value, b: Value) -> Value {
 pub extern "C" fn p2w_shl(a: Value, b: Value) -> Value {
     match (num(a), num(b)) {
         (Some(x), Some(y)) => make_int(x.wrapping_shl(y as u32)),
-        _ => trap("<< expects two ints"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -2231,7 +2239,7 @@ pub extern "C" fn p2w_shl(a: Value, b: Value) -> Value {
 pub extern "C" fn p2w_shr(a: Value, b: Value) -> Value {
     match (num(a), num(b)) {
         (Some(x), Some(y)) => make_int(x.wrapping_shr(y as u32)),
-        _ => trap(">> expects two ints"),
+        _ => trap_num2(a, b),
     }
 }
 
@@ -2265,7 +2273,7 @@ fn element_at(c: Value, i: usize) -> Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_iter(c: Value) -> Value {
     if !(is_heap(c) && matches!(obj_tag(c), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE)) {
-        trap("object is not iterable");
+        trap_msg(&messages::TYPE_FOR_NOT_ITERABLE, type_label(c));
     }
     let o = alloc(16);
     if o == 0 {
@@ -2316,7 +2324,7 @@ pub unsafe extern "C" fn p2w_method0(recv: Value, name: *const u8, name_len: i32
         let o = recv as usize;
         let len = coll_len(o);
         if len == 0 {
-            trap("pop from empty list");
+            trap_msg(&messages::INDEX_OUT_OF_RANGE, "list");
         }
         let v = list_get(o, len - 1);
         set_len(o, len - 1);
@@ -2366,7 +2374,7 @@ pub unsafe extern "C" fn p2w_method1(
         if unsafe { name_eq(name, name_len, b"pop") } {
             let o = recv as usize;
             let n = coll_len(o) as i64;
-            let i = norm_index(a, n) as usize;
+            let i = norm_index(a, n, "list") as usize;
             let v = list_get(o, i);
             // shift the tail down by one
             for j in i..(coll_len(o) - 1) {
@@ -2382,7 +2390,7 @@ pub unsafe extern "C" fn p2w_method1(
     if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"pop") } {
         let o = recv as usize;
         let Some(i) = dict_find(o, a) else {
-            trap("pop(key): key not in dict");
+            trap_key(a);
         };
         p2w_release(dict_key(o, i)); // drop the stored key
         let v = dict_val(o, i); // transfer the value out to the caller
@@ -2412,11 +2420,13 @@ pub unsafe extern "C" fn p2w_method1(
             return V_NONE;
         }
         if unsafe { name_eq(name, name_len, b"remove") } {
-            let found = set_remove(o, a);
-            p2w_release(a);
-            if !found {
-                trap("set.remove(x): x not in set");
+            // Trap BEFORE releasing: trap_key reads the key's bytes for the
+            // message, and a trap never returns, so the ref just leaks.
+            if !coll_contains(o, a) {
+                trap_key(a);
             }
+            set_remove(o, a);
+            p2w_release(a);
             return V_NONE;
         }
         // other-set operations: new set, then release the argument.
@@ -2987,25 +2997,129 @@ fn to_fixed(x: f64, prec: i32) -> Value {
 
 /// Halt on an unrecoverable runtime error. On the device this will report over
 /// USB-CDC and stop; for now it panics (host) / loops (device).
-fn trap(_msg: &str) -> ! {
+fn trap(msg: &str) -> ! {
+    trap_fmt(format_args!("{msg}"))
+}
+
+/// Trap with a table message (`messages::…`), every `{slot}` filled by `ty`.
+fn trap_msg(m: &messages::Msg, ty: &str) -> ! {
+    trap_fmt(format_args!("{}", Filled(m.text, ty)))
+}
+
+/// Trap on a wrong-type-in-numeric-context pair: blame the first operand that
+/// isn't numeric — the compiled helpers' blame order.
+fn trap_num2(a: Value, b: Value) -> ! {
+    let blame = if fnum(a).is_none() { a } else { b };
+    trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(blame))
+}
+
+/// KeyError with the key's repr: quoted for a string, the value's printed
+/// form otherwise (`write_value` covers ints, floats, bools, tuples — every
+/// hashable). The byte-to-char fallback mangles non-ASCII inside CONTAINER
+/// keys only; string keys — the common non-ASCII case — take the quoted path.
+fn trap_key(key: Value) -> ! {
+    struct KeyRepr(Value);
+    impl core::fmt::Display for KeyRepr {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            use core::fmt::Write;
+            if is_heap(self.0) && obj_tag(self.0) == T_STR {
+                return write!(f, "'{}'", str_as_str(self.0));
+            }
+            let mut r = Ok(());
+            write_value(self.0, &mut |b| {
+                if r.is_ok() {
+                    r = f.write_char(b as char);
+                }
+            });
+            r
+        }
+    }
+    trap_fmt(format_args!(
+        "{}",
+        Filled(messages::KEY_MISSING.text, KeyRepr(key))
+    ))
+}
+
+/// The Python type name of a value — fills a message's `{type}` slot.
+/// Instances say 'object': the class NAME lives in module data this runtime
+/// cannot see (a recorded gap vs the WASM backend, which prints it).
+fn type_label(v: Value) -> &'static str {
+    if v == V_NONE {
+        return "NoneType";
+    }
+    if v == V_TRUE || v == V_FALSE {
+        return "bool";
+    }
+    if is_int(v) {
+        return "int";
+    }
+    if !is_heap(v) {
+        return "object";
+    }
+    match obj_tag(v) {
+        T_STR => "str",
+        T_FLOAT => "float",
+        T_LIST | T_IARRAY | T_FARRAY => "list",
+        T_DICT => "dict",
+        T_SET => "set",
+        T_TUPLE => "tuple",
+        _ => "object",
+    }
+}
+
+/// Borrow a heap string's bytes as `&str` (runtime strings are UTF-8 by
+/// construction). Only used by trap fills, which never return, so the value
+/// stays live for the borrow's whole life.
+fn str_as_str<'a>(v: Value) -> &'a str {
+    unsafe {
+        let bytes = core::slice::from_raw_parts(heap_base().add(v as usize + 12), str_len(v));
+        core::str::from_utf8_unchecked(bytes)
+    }
+}
+
+/// A message template rendered with every `{slot}` replaced by one fill —
+/// the same walk serves the test panic and the device putc path.
+struct Filled<'a, D: core::fmt::Display>(&'a str, D);
+impl<D: core::fmt::Display> core::fmt::Display for Filled<'_, D> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut rest = self.0;
+        while let Some(i) = rest.find('{') {
+            f.write_str(&rest[..i])?;
+            let Some(close) = rest[i..].find('}') else {
+                return f.write_str(rest);
+            };
+            write!(f, "{}", self.1)?;
+            rest = &rest[i + close + 1..];
+        }
+        f.write_str(rest)
+    }
+}
+
+/// Print a trap message and halt — the shared tail of every trap flavor.
+///
+/// SAY WHAT HAPPENED. This used to discard the message and spin, which
+/// meant every runtime error on the device — all ~100 trap sites — was
+/// an unexplained freeze. The WASM backend prints a message and stops;
+/// a student switching to a board deserves the same sentence.
+fn trap_fmt(_args: core::fmt::Arguments<'_>) -> ! {
     #[cfg(any(test, kani))]
-    panic!("p2w runtime trap: {_msg}");
+    panic!("p2w runtime trap: {_args}");
     #[cfg(not(any(test, kani)))]
     {
-        // SAY WHAT HAPPENED. This used to discard the message and spin, which
-        // meant every runtime error on the device — all ~100 trap sites — was
-        // an unexplained freeze. The WASM backend prints a message and stops;
-        // a student switching to a board deserves the same sentence.
-        //
         // Newline first, matching the WASM raisers, so the message never lands
         // mid-line after a partial `print`.
-        unsafe {
-            p2w_putc(b'\n');
-            for &c in _msg.as_bytes() {
-                p2w_putc(c);
+        struct Sink;
+        impl core::fmt::Write for Sink {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &c in s.as_bytes() {
+                    unsafe { p2w_putc(c) };
+                }
+                Ok(())
             }
-            p2w_putc(b'\n');
         }
+        unsafe { p2w_putc(b'\n') };
+        let _ = core::fmt::write(&mut Sink, _args);
+        unsafe { p2w_putc(b'\n') };
         // Nothing sensible follows a trap: on bare metal there is no process to
         // exit, so halt. The message has already been flushed to the sink.
         loop {

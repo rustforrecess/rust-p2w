@@ -13,7 +13,7 @@ Error WORDING is not compared — the two have always phrased things differently
 
 ## Result
 
-**16 of 104 probes disagree.**
+**15 of 105 probes disagree.**
 
 A short list means converging the backends is cheap. A long one means we have been maintaining two languages, and which one is the real student-facing runtime is a decision rather than an accident.
 
@@ -28,6 +28,7 @@ A short list means converging the backends is cheap. A long one means we have be
 | program | WASM-GC | linear memory |
 |---|---|---|
 | `math.exp(1.0)` | value — `2.7182818284590455` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
+| `random.randint(1, 6) [seed 42]` | value — `2` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
 | `math.log(10.0)` | value — `2.302585092994046` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
 | `math.log2(8.0)` | value — `3.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
 | `math.log10(1000.0)` | value — `3.0` | compile error — `line 1: the native (Pico) backend doesn't handle this statement yet` |
@@ -37,18 +38,16 @@ A short list means converging the backends is cheap. A long one means we have be
 
 | program | WASM-GC | linear memory |
 |---|---|---|
-| `'ab' - 'b'` | compile error — `line 1: this operator needs numbers on both sides` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
-| `'ab' + 1` | compile error — `line 1: can't add text and a number together` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
-| `1 + 'ab'` | compile error — `line 1: can't add text and a number together` | trap — `unsupported operand type for a numeric op (heap types are TODO) [hung]` |
-| `'ab' / 2` | compile error — `line 1: this operator needs numbers on both sides` | trap — `unsupported operand type for / [hung]` |
+| `'ab' - 'b'` | compile error — `line 1: this operator needs numbers on both sides` | trap — `TypeError: expected a number, got 'str' [hung]` |
+| `'ab' + 1` | compile error — `line 1: can't add text and a number together` | trap — `TypeError: expected a number, got 'str' [hung]` |
+| `1 + 'ab'` | compile error — `line 1: can't add text and a number together` | trap — `TypeError: expected a number, got 'str' [hung]` |
+| `'ab' / 2` | compile error — `line 1: this operator needs numbers on both sides` | trap — `TypeError: expected a number, got 'str' [hung]` |
 
 ### Where a wrong type is caught TODAY
 
 | program | WASM-GC | linear memory |
 |---|---|---|
 | `x: int = 'no'` | value — `no` | trap — `expected an int [hung]` |
-| `def f() -> int: return 'x'` | value — `x` | trap — `expected an int [hung]` |
-| `def f(n: int) called with str` | value — `x` | trap — `expected an int [hung]` |
 
 ### Dicts and sets
 
@@ -60,7 +59,7 @@ A short list means converging the backends is cheap. A long one means we have be
 
 | program | WASM-GC | linear memory |
 |---|---|---|
-| `1 < 'one'` | compile error — `line 1: can't compare text with a number — there's no way to say whether a word is bigger …` | trap — `unsupported operand type for a comparison [hung]` |
+| `1 < 'one'` | compile error — `line 1: can't compare text with a number — there's no way to say whether a word is bigger …` | trap — `TypeError: expected a number, got 'str' [hung]` |
 
 ### Unpacking
 
