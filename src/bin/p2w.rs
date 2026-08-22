@@ -462,6 +462,32 @@ mod tests {
     }
 
     #[test]
+    fn string_length_teaches_only_where_the_answers_differ() {
+        // Non-ASCII text: the three-lengths lesson fires, with its ladder,
+        // and the program still runs (lints never gate).
+        let r = check("print(len('café'))\n", false);
+        assert!(r.ok, "{}", r.json);
+        assert!(
+            r.json.contains("string_length_meaning"),
+            "lesson expected: {}",
+            r.json
+        );
+        assert!(r.json.contains("CODE POINTS"), "{}", r.json);
+        assert!(
+            r.json.contains("counting loop"),
+            "ladder expected: {}",
+            r.json
+        );
+        // Plain ASCII: silent — the answers agree and there is no lesson.
+        let r = check("name = 'Ada'\nprint(len('Ada'))\n", false);
+        assert!(
+            !r.json.contains("string_length_meaning"),
+            "ASCII len must stay quiet: {}",
+            r.json
+        );
+    }
+
+    #[test]
     fn concepts_are_reported_for_a_loop() {
         let r = check("for i in range(3):\n    print(i)\n", false);
         assert!(r.json.contains("\"concepts\""), "{}", r.json);

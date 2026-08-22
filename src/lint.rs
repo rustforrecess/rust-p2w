@@ -2033,6 +2033,46 @@ fn check_namespaced(
 // Mechanical lints (a typo, a dead line) have no concept to teach, so they get
 // no ladder (`scaffold` returns `None`) — a one-click fix, not a question.
 
+/// `len()` of text that visibly contains non-ASCII characters — the one
+/// place where "how long is a string" genuinely has three answers (letters a
+/// person sees, code points, bytes). Python picks code points and so do we;
+/// this lint TEACHES the choice instead of hiding it, the way Mojo's
+/// compiler refuses to hide it — but as a lesson with a fading ladder, not a
+/// refusal. Plain ASCII `len(name)` stays silent: the three answers agree
+/// there and a week-two student needs no lecture.
+pub fn string_length_meaning_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
+    let mut out = Vec::new();
+    walk_len_meaning(stmts, &mut out);
+    out.sort_by_key(|(line, _, _)| *line);
+    out
+}
+
+fn walk_len_meaning(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
+    for s in stmts {
+        stmt_exprs(s, &mut |e| find_len_meaning(e, out));
+        for_each_child_block(s, |b, _| walk_len_meaning(b, out));
+    }
+}
+
+fn find_len_meaning(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
+    if let ExprKind::Call(name, args) = &e.kind
+        && name == "len"
+        && let Some(ExprKind::Str(text)) = args.first().map(|a| &a.kind)
+        && !text.is_ascii()
+    {
+        let cps = text.chars().count();
+        let bytes = text.len();
+        out.push((
+            e.line,
+            e.span,
+            format!(
+                "len() here is {cps} — Python counts CODE POINTS. This text also has                  other 'lengths' ({bytes} bytes in memory), and they only differ for                  accents and emoji like these"
+            ),
+        ));
+    }
+    for_each_subexpr(e, &mut |sub| find_len_meaning(sub, out));
+}
+
 // --- The Mojo-bridge profile -------------------------------------------------
 //
 // `p2w check --profile mojo`: findings for constructs OUTSIDE the Python∩Mojo
@@ -2232,6 +2272,10 @@ pub enum LintKind {
     UnreachableCode,
     ShadowedBuiltin,
     SelfComparison,
+    /// len() of visibly non-ASCII text — the string-length-is-three-questions
+    /// lesson, taught where it is true instead of hidden (see
+    /// `string_length_meaning_warnings`).
+    StringLengthMeaning,
     /// A component API def reaching outside its component (step 5d) — the
     /// encapsulation teacher and the WIT/PXC conversion precondition.
     ComponentUnclean,
@@ -2254,6 +2298,11 @@ pub struct Scaffold {
 /// `return`, an undefined name, a type churn).
 pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
     Some(match kind {
+        LintKind::StringLengthMeaning => Scaffold {
+            question: "Three different things could be called this string's 'length': the                        characters a person sees, the code points Python counts, or the bytes                        it takes in memory. Which one do you mean?",
+            hint: "Python's len() always counts CODE POINTS: len('café') is 4, and one emoji                    like '🦀' counts as 1 even though it is 4 bytes. For plain ASCII text all                    the answers agree — accents and emoji are where they split.",
+            fix: "len(s) is the Python answer (code points), and that is what runs here. Some                   languages refuse to pick — Mojo makes you say which length you mean — so if                   this code ever moves, the counting loop transfers everywhere: n = 0, then                   for c in s: n = n + 1.",
+        },
         LintKind::MutableDefault => Scaffold {
             question: "This list (or dict) is made once and shared by EVERY call to the \
                        function. How could you give each call its own fresh one?",

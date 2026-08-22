@@ -343,7 +343,7 @@ pub fn analyze(source: &str) -> (blockly::BlocksOutcome, Vec<Lint>) {
 /// The post-parse half of [`lints`] (see [`analyze`]).
 fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
     #[allow(clippy::type_complexity)] // a literal table; naming it adds nothing
-    let groups: [(LintKind, Vec<(usize, (usize, usize), String)>); 7] = [
+    let groups: [(LintKind, Vec<(usize, (usize, usize), String)>); 8] = [
         (
             LintKind::UndefinedName,
             lint::undefined_name_warnings(stmts),
@@ -368,6 +368,10 @@ fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
         (
             LintKind::SelfComparison,
             lint::self_comparison_warnings(stmts),
+        ),
+        (
+            LintKind::StringLengthMeaning,
+            lint::string_length_meaning_warnings(stmts),
         ),
     ];
     let mut out: Vec<Lint> = Vec::new();
