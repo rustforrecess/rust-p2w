@@ -448,6 +448,7 @@ mod tests {
             ("xs = [1, 'two']\nprint(xs)\n", "ONE"),
             ("import random\nprint(random.randint(1, 6))\n", "random"),
             ("x = 5\nx = 'now text'\nprint(x)\n", "type"),
+            ("print(len('abc'))\n", "len()"),
         ] {
             let r = check(src, true);
             assert!(r.ok, "still compiles as p2w: {src}");

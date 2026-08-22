@@ -2104,6 +2104,23 @@ fn walk_mojo(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
 }
 
 fn find_mojo_exprs(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
+    // len() of a string is a hard ERROR in Mojo 1.0 (UTF-8 makes one length
+    // ambiguous; Python's len(str) means code points). Flagged when the
+    // argument is visibly a string; dynamic cases are the differential
+    // job's to find.
+    if let ExprKind::Call(name, args) = &e.kind
+        && name == "len"
+        && matches!(args.first().map(|a| &a.kind), Some(ExprKind::Str(_)))
+    {
+        out.push((
+            e.line,
+            e.span,
+            "Mojo refuses len() of a string (UTF-8 makes one length ambiguous), \
+             so this program can't cross — count something else, or keep it \
+             Python-only"
+                .to_string(),
+        ));
+    }
     if let ExprKind::List(items) = &e.kind {
         let mut kinds = items.iter().filter_map(mojo_lit_kind);
         if let Some(first) = kinds.next()
