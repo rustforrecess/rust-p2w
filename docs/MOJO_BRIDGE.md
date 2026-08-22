@@ -42,6 +42,24 @@ Mojo 1.0 when concatenated with `tools/mojo/p2w_prelude.mojo`.
    `def main()` by `tools/mojo/wrap.py`; output must match CPython
    byte-for-byte. `not_*.py` cases assert the profile REFUSES them.
 
+## What deeper probing taught (2026-08-22)
+
+**Mojo's `for c in s` yields GRAPHEME CLUSTERS, not code points** — Swift's
+layer, the characters a person sees (their 1.0 also added UAX #29
+segmentation and `count_graphemes()`). Python iterates code points. The two
+agree exactly when every grapheme is one code point: composed accents,
+single emoji — keyboard-typed text. A decomposed accent (e + combining
+mark) or ZWJ emoji splits them (Python 2/3 pieces, Mojo 1). So the counting
+loop transfers for everyday text, and the bridge's claim carries that
+precision. Delicious for the three-lengths lesson: within Mojo itself,
+`len` refuses to pick a layer while iteration picked the HUMAN one — even
+one language answers "how long is a string" two ways.
+
+Their trajectory, for the record: pre-1.0 `len(String)` returned BYTES;
+1.0b1 deprecated it toward `byte_length()`/`count_codepoints()`; 1.0
+removed it with the teaching error and flipped iteration to graphemes. No
+proposal to restore a default exists — for them it is settled.
+
 ## What first contact with Mojo 1.0.0 taught (2026-08-21)
 
 The typed-procedural core passed unmodified on the first run — real Mojo

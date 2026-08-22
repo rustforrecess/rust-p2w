@@ -2301,7 +2301,7 @@ pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
         LintKind::StringLengthMeaning => Scaffold {
             question: "Three different things could be called this string's 'length': the                        characters a person sees, the code points Python counts, or the bytes                        it takes in memory. Which one do you mean?",
             hint: "Python's len() always counts CODE POINTS: len('café') is 4, and one emoji                    like '🦀' counts as 1 even though it is 4 bytes. For plain ASCII text all                    the answers agree — accents and emoji are where they split.",
-            fix: "len(s) is the Python answer (code points), and that is what runs here. Some                   languages refuse to pick — Mojo makes you say which length you mean — so if                   this code ever moves, the counting loop transfers everywhere: n = 0, then                   for c in s: n = n + 1.",
+            fix: "len(s) is the Python answer (code points), and that is what runs here. Some                   languages answer differently — Mojo makes you say which length you mean, and                   its loops count characters a person sees — but for everyday text the counting                   loop agrees everywhere: n = 0, then for c in s: n = n + 1.",
         },
         LintKind::MutableDefault => Scaffold {
             question: "This list (or dict) is made once and shared by EVERY call to the \
