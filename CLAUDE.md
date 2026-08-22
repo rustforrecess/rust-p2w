@@ -61,8 +61,14 @@ After touching `runtime/` (unsafe offset arithmetic — CI enforces this too):
 ```bash
 cargo +nightly miri test --manifest-path runtime/Cargo.toml
 # and the bounded proofs (Kani has no Windows build — run via WSL):
-wsl -d Ubuntu-24.04 -- bash -lc "cd /mnt/c/Code/P2W/rust-p2w/runtime && CARGO_TARGET_DIR=/tmp/kani-target RUSTC_WRAPPER= ~/.cargo/bin/cargo-kani kani"
+wsl -d Ubuntu-26.04 -- bash -lc "cd /mnt/c/Code/P2W/rust-p2w/runtime && CARGO_TARGET_DIR=/tmp/kani-target RUSTC_WRAPPER= ~/.cargo/bin/cargo-kani kani"
 ```
+
+⚠ 2026-08-21: the WSL distro was replaced (Ubuntu-24.04 → fresh
+Ubuntu-26.04), so the local Kani install is GONE until reinstalled
+(`cargo install --locked kani-verifier && cargo kani setup` inside WSL) —
+and the fresh distro's networking was broken when checked. CI's kani job
+still proves the harnesses on every push; rely on it until local WSL works.
 
 Root `cargo fmt` does NOT reach `runtime/` or `tools/mathwat/` — they
 have their own manifests, and CI checks the runtime separately.
