@@ -244,6 +244,30 @@ fn check(source: &str, mojo: bool) -> Report {
     out.push_str(",\n  \"lints\": ");
     out.push_str(&join_array(&items));
 
+    // ---- type advisories (phase A of docs/TYPE_CHECKER_DESIGN.md) -------
+    // Flow-sensitive inference findings with provenance-ledger messages.
+    // Advisory: they never gate, and an empty array is the normal case.
+    let mut items: Vec<String> = Vec::new();
+    for f in rust_p2w::type_findings(source) {
+        let mut it = String::from("{");
+        push_field(&mut it, "severity", &json_str("advice"), true);
+        push_field(&mut it, "code", &json_str(f.code), false);
+        push_field(&mut it, "message", &json_str(&f.message), false);
+        push_field(&mut it, "line", &f.line.to_string(), false);
+        let (a, b) = f.span;
+        push_field(&mut it, "span", &format!("[{a}, {b}]"), false);
+        it.push_str(
+            "
+    }",
+        );
+        items.push(it);
+    }
+    out.push_str(
+        ",
+  \"types\": ",
+    );
+    out.push_str(&join_array(&items));
+
     // ---- capabilities ---------------------------------------------------
     // What the program can actually TOUCH, read out of the module's import
     // list. The subset grants no ambient authority — no filesystem, clock,
@@ -480,6 +504,31 @@ mod tests {
         assert!(s.fix.contains("for c in s"));
         // And it stays quiet where the split isn't real, even when asked.
         assert!(rust_p2w::string_length_lessons("print(len('Ada'))\n").is_empty());
+    }
+
+    #[test]
+    fn type_advisories_ride_the_report_and_never_gate() {
+        // The classic: compiles (ok: true), runs today, and the advisory
+        // names the CAUSE line — phase A in one report.
+        let r = check(
+            "age = '12'
+next_year = age + 1
+print(next_year)
+",
+            false,
+        );
+        assert!(r.ok, "advisories never gate: {}", r.json);
+        assert!(r.json.contains("\"types\""), "{}", r.json);
+        assert!(r.json.contains("type.str-plus-number"), "{}", r.json);
+        assert!(r.json.contains("line 1"), "cause cited: {}", r.json);
+        // Clean code: the section is present and empty.
+        let r = check(
+            "x = 5
+print(x + 3)
+",
+            false,
+        );
+        assert!(r.json.contains("\"types\": []"), "{}", r.json);
     }
 
     #[test]

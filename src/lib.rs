@@ -28,6 +28,7 @@
 mod ast;
 mod blockly;
 mod builtins;
+mod check;
 mod codegen;
 mod component;
 mod debug;
@@ -48,6 +49,7 @@ mod roles;
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
 pub use builtins::{BUILTINS, Builtin, builtins_json};
+pub use check::TypeFinding;
 pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{Status, Stepper, Value, Vm};
 pub use error::{CompileError, ErrorKind};
@@ -271,6 +273,22 @@ pub fn lints(source: &str) -> Vec<Lint> {
     };
     let (stmts, _) = parser::parse_recovering(&toks);
     lints_parsed(&stmts)
+}
+
+/// The type checker, phase A (docs/TYPE_CHECKER_DESIGN.md): ADVISORY
+/// findings from flow-sensitive inference with a provenance ledger —
+/// "`age` is text because line 1 assigned it". Zero behavior change:
+/// compilation is untouched, `Dyn` is silent, and every `tests/oracle/ok/`
+/// program produces nothing (the executable false-positive gate).
+pub fn type_findings(source: &str) -> Vec<TypeFinding> {
+    let Ok(toks) = lexer::lex(source) else {
+        return Vec::new();
+    };
+    let (stmts, _) = parser::parse_recovering(&toks);
+    let Ok(stmts) = hoist::hoist_nested_functions(stmts) else {
+        return Vec::new();
+    };
+    check::type_findings(&stmts)
 }
 
 /// The three-lengths lesson, as an OPT-IN tier — not part of [`lints`].
