@@ -47,3 +47,14 @@ jobs:
         with:
           components: miri
       - run: cargo miri test --manifest-path runtime/Cargo.toml
+
+  # The Mojo bridge (docs/MOJO_BRIDGE.md): programs `p2w check --profile mojo`
+  # calls READY must compile and run under the REAL Mojo compiler with the
+  # shipped prelude, printing exactly what CPython prints — this job turns the
+  # doc's "believed valid Mojo" into "verified". Cases: tests/mojo_bridge/.
+  mojo-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash tools/mojo/mojo_diff.sh
