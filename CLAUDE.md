@@ -78,6 +78,7 @@ have their own manifests, and CI checks the runtime separately.
 | `TYPE_ERROR_MESSAGES.md` | what each type error should say to a twelve-year-old |
 | `TYPE_CHECKER_BRIEF.md` | the handoff/recruitment document |
 | `UPSTREAM_GAP.md` | what upstream p2w has that we do not |
+| `docs/MOJO_BRIDGE.md` | the Python∩Mojo intersection: profile, prelude, and why we look-don't-shift |
 | `tests/oracle/` | the type-system spec, as programs |
 
 ## Testing

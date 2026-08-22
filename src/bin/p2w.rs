@@ -43,14 +43,34 @@ fn main() {
 
     match cmd {
         "check" => {
-            let source = match read_source(rest) {
+            // `--profile mojo` adds the Mojo-bridge findings to the report;
+            // everything else in `rest` is the file argument.
+            let mut mojo = false;
+            let mut file_args: Vec<String> = Vec::new();
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--profile" => match it.next().map(String::as_str) {
+                        Some("mojo") => mojo = true,
+                        other => {
+                            eprintln!(
+                                "p2w: unknown profile {:?} — the only profile is `mojo`",
+                                other.unwrap_or("")
+                            );
+                            std::process::exit(2);
+                        }
+                    },
+                    other => file_args.push(other.to_string()),
+                }
+            }
+            let source = match read_source(&file_args) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("p2w: {e}");
                     std::process::exit(2);
                 }
             };
-            let report = check(&source);
+            let report = check(&source, mojo);
             println!("{}", report.json);
             // Exit code is the CI contract: 0 clean, 1 has errors. Lints alone
             // do not fail a build — they are teaching, not gates.
@@ -131,6 +151,7 @@ p2w — headless compiler harness
 USAGE:
     p2w check [FILE]        compile-check; JSON to stdout
                             exit 0 = compiles, 1 = errors, 2 = bad invocation
+                            --profile mojo  adds the Mojo-bridge findings
     p2w concepts [FILE]     concept evidence only, as JSON
     p2w run [FILE]          execute it under a fuel budget; JSON to stdout
                             --fuel N, --stdin TEXT  (needs --features run)
@@ -160,8 +181,8 @@ struct Report {
 }
 
 /// The whole check: does it compile, what is wrong, what is worth teaching,
-/// what concepts does it touch.
-fn check(source: &str) -> Report {
+/// what concepts does it touch. `mojo` adds the Mojo-bridge profile section.
+fn check(source: &str, mojo: bool) -> Report {
     let compile = rust_p2w::try_compile(source);
     let ok = compile.is_ok();
 
@@ -246,6 +267,33 @@ fn check(source: &str) -> Report {
     // for*, not just whether it is well-formed.
     out.push_str(",\n  \"concepts\": ");
     out.push_str(&concept_array(source));
+
+    // ---- Mojo-bridge profile (opt-in) ------------------------------------
+    // Findings for constructs outside the Python∩Mojo intersection. `ready`
+    // means: still valid Python (always true of p2w), and believed valid
+    // Mojo 1.0 as well, given tools/mojo/p2w_prelude.mojo. docs/MOJO_BRIDGE.md
+    // records what "believed" rests on and how it gets verified.
+    if mojo {
+        let findings = rust_p2w::mojo_profile(source);
+        let mut items: Vec<String> = Vec::new();
+        for (line, (a, b), message) in &findings {
+            let mut it = String::from("{");
+            push_field(&mut it, "message", &json_str(message), true);
+            push_field(&mut it, "line", &line.to_string(), false);
+            push_field(&mut it, "span", &format!("[{a}, {b}]"), false);
+            it.push_str("\n    }");
+            items.push(it);
+        }
+        out.push_str(",\n  \"mojo_profile\": {\n    \"ready\": ");
+        out.push_str(if ok && findings.is_empty() {
+            "true"
+        } else {
+            "false"
+        });
+        out.push_str(",\n    \"findings\": ");
+        out.push_str(&join_array(&items).replace('\n', "\n  "));
+        out.push_str("\n  }");
+    }
 
     out.push_str("\n}");
     Report { ok, json: out }
@@ -361,7 +409,7 @@ mod tests {
 
     #[test]
     fn clean_program_reports_ok_and_no_errors() {
-        let r = check("print('hello')\n");
+        let r = check("print('hello')\n", false);
         assert!(r.ok, "should compile: {}", r.json);
         assert!(r.json.contains("\"ok\": true"));
         assert!(r.json.contains("\"errors\": []"));
@@ -369,7 +417,7 @@ mod tests {
 
     #[test]
     fn broken_program_reports_an_error_with_a_code() {
-        let r = check("for i in range(3)\n    print(i)\n");
+        let r = check("for i in range(3)\n    print(i)\n", false);
         assert!(!r.ok, "should not compile: {}", r.json);
         assert!(r.json.contains("\"ok\": false"));
         assert!(r.json.contains("\"severity\": \"error\""));
@@ -377,8 +425,44 @@ mod tests {
     }
 
     #[test]
+    fn the_mojo_profile_is_opt_in_and_judges_the_intersection() {
+        // Without the flag: no section at all (the report shape is stable).
+        let r = check("print('hello')\n", false);
+        assert!(!r.json.contains("mojo_profile"), "{}", r.json);
+
+        // A typed procedural program IS the intersection: ready.
+        let r = check(
+            "def double(n: int) -> int:\n    return n * 2\nprint(double(21))\n",
+            true,
+        );
+        assert!(r.json.contains("\"ready\": true"), "{}", r.json);
+
+        // Each construct outside the intersection is a finding, not an error:
+        // the program stays valid p2w/Python either way.
+        for (src, expect) in [
+            (
+                "class Dog:\n    def __init__(self):\n        self.n = 1\nd = Dog()\n",
+                "classes",
+            ),
+            ("name = 'Ada'\nprint(f'hi {name}')\n", "f-strings"),
+            ("xs = [1, 'two']\nprint(xs)\n", "ONE"),
+            ("import random\nprint(random.randint(1, 6))\n", "random"),
+            ("x = 5\nx = 'now text'\nprint(x)\n", "type"),
+        ] {
+            let r = check(src, true);
+            assert!(r.ok, "still compiles as p2w: {src}");
+            assert!(r.json.contains("\"ready\": false"), "{src}: {}", r.json);
+            assert!(
+                r.json.contains(expect),
+                "{src} should mention {expect}: {}",
+                r.json
+            );
+        }
+    }
+
+    #[test]
     fn concepts_are_reported_for_a_loop() {
-        let r = check("for i in range(3):\n    print(i)\n");
+        let r = check("for i in range(3):\n    print(i)\n", false);
         assert!(r.json.contains("\"concepts\""), "{}", r.json);
         assert!(
             r.json.contains("\"loop\""),
@@ -399,7 +483,7 @@ mod tests {
 
     #[test]
     fn the_report_states_what_the_program_can_reach() {
-        let r = check("print(1)\n");
+        let r = check("print(1)\n", false);
         assert!(r.json.contains("\"capabilities\""), "{}", r.json);
         assert!(r.json.contains("\"write_char\""), "{}", r.json);
         // A program that only prints must not claim the input capability.
@@ -409,7 +493,7 @@ mod tests {
     #[test]
     fn a_broken_program_claims_no_capabilities() {
         // No module, no manifest. Guessing would be worse than silence.
-        let r = check("for i in range(3)\n    print(i)\n");
+        let r = check("for i in range(3)\n    print(i)\n", false);
         assert!(!r.ok);
         assert!(r.json.contains("\"capabilities\": []"), "{}", r.json);
     }
@@ -417,7 +501,10 @@ mod tests {
     #[test]
     fn a_lint_carries_its_fix_ladder() {
         // Mutable default is the canonical scaffolded lint.
-        let r = check("def f(x, acc=[]):\n    acc.append(x)\n    return acc\n");
+        let r = check(
+            "def f(x, acc=[]):\n    acc.append(x)\n    return acc\n",
+            false,
+        );
         if r.json.contains("mutable_default") {
             assert!(
                 r.json.contains("\"scaffold\"") && r.json.contains("\"question\""),

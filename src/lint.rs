@@ -2033,6 +2033,177 @@ fn check_namespaced(
 // Mechanical lints (a typo, a dead line) have no concept to teach, so they get
 // no ladder (`scaffold` returns `None`) — a one-click fix, not a question.
 
+// --- The Mojo-bridge profile -------------------------------------------------
+//
+// `p2w check --profile mojo`: findings for constructs OUTSIDE the Python∩Mojo
+// intersection. p2w programs stay valid Python ALWAYS; a program with no
+// findings here is additionally believed valid Mojo 1.0 (with the shipped
+// `tools/mojo/p2w_prelude.mojo` aliasing the lowercase type names). "Believed"
+// is honest: this v1 list covers what Mojo 1.0 documents as absent or
+// different; the planned differential job (compile profile-clean oracle
+// programs with the real, now-Apache-2.0 Mojo compiler) is what will refine
+// it. See docs/MOJO_BRIDGE.md for the whole story and its reopen conditions.
+
+/// Findings for the Mojo-bridge profile: (line, span, message) per construct
+/// that keeps this program from ALSO being a valid Mojo program.
+pub fn mojo_profile_warnings(source: &str, stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
+    let mut out = Vec::new();
+    // f-strings desugar at parse (to `+`/str() chains), so the AST cannot see
+    // them — the token stream can. Mojo 1.0 has no f-strings.
+    if let Ok(tokens) = crate::lexer::lex(source) {
+        for t in &tokens {
+            if matches!(t.tok, crate::lexer::Tok::FStr(_)) {
+                out.push((
+                    t.line,
+                    (t.start, t.end),
+                    "Mojo has no f-strings — build this text with `+` and `str(...)` \
+                     to keep the program Mojo-ready"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    walk_mojo(stmts, &mut out);
+    // Mojo's variable rule IS the type-churn rule (a name keeps its first
+    // type), so those findings are part of this profile verbatim.
+    out.extend(type_churn_warnings(stmts));
+    out.sort_by_key(|(line, _, _)| *line);
+    out
+}
+
+fn walk_mojo(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::ClassDef { name, .. } => out.push((
+                s.line,
+                s.span,
+                format!(
+                    "Mojo doesn't have classes yet (its structs are close, but \
+                     inheritance has no Mojo form) — `class {name}` keeps this \
+                     program Python-only for now"
+                ),
+            )),
+            StmtKind::Import(names) => {
+                for n in names {
+                    if n == "random" {
+                        out.push((
+                            s.line,
+                            s.span,
+                            "Python's `random` module has no direct Mojo equivalent — \
+                             the p2w prelude doesn't map it yet"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        stmt_exprs(s, &mut |e| find_mojo_exprs(e, out));
+        for_each_child_block(s, |b, _| walk_mojo(b, out));
+    }
+}
+
+fn find_mojo_exprs(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
+    if let ExprKind::List(items) = &e.kind {
+        let mut kinds = items.iter().filter_map(mojo_lit_kind);
+        if let Some(first) = kinds.next()
+            && let Some(other) = kinds.find(|k| *k != first)
+        {
+            out.push((
+                e.line,
+                e.span,
+                format!(
+                    "this list mixes {first} and {other} — a Mojo list holds ONE \
+                     element type. Use a tuple for a few different things, or make \
+                     the elements the same type"
+                ),
+            ));
+        }
+    }
+    for_each_subexpr(e, &mut |sub| find_mojo_exprs(sub, out));
+}
+
+/// The literal kind of an element, for the homogeneity check — non-literals
+/// return None and are not judged (a variable's type isn't knowable here).
+fn mojo_lit_kind(e: &Expr) -> Option<&'static str> {
+    match &e.kind {
+        ExprKind::Int(_) => Some("int"),
+        ExprKind::Float(_) => Some("float"),
+        ExprKind::Bool(_) => Some("bool"),
+        ExprKind::Str(_) => Some("str"),
+        ExprKind::NoneLit => Some("None"),
+        _ => None,
+    }
+}
+
+/// Visit each DIRECT subexpression of `e` (one level; callers recurse).
+fn for_each_subexpr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    match &e.kind {
+        ExprKind::Unary(_, x) | ExprKind::Attr(x, _) | ExprKind::Kwarg(_, x) => f(x),
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) => {
+            f(a);
+            f(b);
+        }
+        ExprKind::Call(_, xs) | ExprKind::List(xs) | ExprKind::Tuple(xs) => {
+            for x in xs {
+                f(x);
+            }
+        }
+        ExprKind::Dict(pairs) => {
+            for (k, v) in pairs {
+                f(k);
+                f(v);
+            }
+        }
+        ExprKind::MethodCall(o, _, xs) => {
+            f(o);
+            for x in xs {
+                f(x);
+            }
+        }
+        ExprKind::Slice {
+            obj,
+            start,
+            stop,
+            step,
+        } => {
+            f(obj);
+            for x in [start, stop, step].into_iter().flatten() {
+                f(x);
+            }
+        }
+        ExprKind::IfExp { cond, then, orelse } => {
+            f(cond);
+            f(then);
+            f(orelse);
+        }
+        ExprKind::ListComp { element, clauses } | ExprKind::SetComp { element, clauses } => {
+            f(element);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => f(iter),
+                    CompClause::If(cond) => f(cond),
+                }
+            }
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            clauses,
+        } => {
+            f(key);
+            f(value);
+            for c in clauses {
+                match c {
+                    CompClause::For { iter, .. } => f(iter),
+                    CompClause::If(cond) => f(cond),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Which diagnostic produced a lint — used to look up its fix scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintKind {

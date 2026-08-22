@@ -273,6 +273,18 @@ pub fn lints(source: &str) -> Vec<Lint> {
     lints_parsed(&stmts)
 }
 
+/// The Mojo-bridge profile (`p2w check --profile mojo`): findings for
+/// constructs outside the Python∩Mojo intersection. Empty = this program is
+/// believed valid Mojo 1.0 too, given the shipped prelude
+/// (`tools/mojo/p2w_prelude.mojo`). See `docs/MOJO_BRIDGE.md`.
+pub fn mojo_profile(source: &str) -> Vec<(usize, (usize, usize), String)> {
+    let Ok(toks) = lexer::lex(source) else {
+        return Vec::new();
+    };
+    let (stmts, _) = parser::parse_recovering(&toks);
+    lint::mojo_profile_warnings(source, &stmts)
+}
+
 /// Component-clean lints for every stamped instance of the given component
 /// kinds (LESSON_PLAYER.md step 5d). `specs` = one `(id-prefix, recorded API)`
 /// pair per component kind; instances (`grid`, `grid2`, …) are discovered from
