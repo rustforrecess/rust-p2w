@@ -462,29 +462,24 @@ mod tests {
     }
 
     #[test]
-    fn string_length_teaches_only_where_the_answers_differ() {
-        // Non-ASCII text: the three-lengths lesson fires, with its ladder,
-        // and the program still runs (lints never gate).
+    fn string_length_lesson_is_an_opt_in_tier_not_a_default_lint() {
+        // The default path shows a young student ONE view — "len counts
+        // characters" — by saying NOTHING: no lesson lint, ASCII or not.
         let r = check("print(len('café'))\n", false);
         assert!(r.ok, "{}", r.json);
         assert!(
-            r.json.contains("string_length_meaning"),
-            "lesson expected: {}",
-            r.json
-        );
-        assert!(r.json.contains("CODE POINTS"), "{}", r.json);
-        assert!(
-            r.json.contains("counting loop"),
-            "ladder expected: {}",
-            r.json
-        );
-        // Plain ASCII: silent — the answers agree and there is no lesson.
-        let r = check("name = 'Ada'\nprint(len('Ada'))\n", false);
-        assert!(
             !r.json.contains("string_length_meaning"),
-            "ASCII len must stay quiet: {}",
+            "the lesson must not reach the default tier: {}",
             r.json
         );
+        // The advanced tier asks for it and gets the ladder.
+        let lessons = rust_p2w::string_length_lessons("print(len('café'))\n");
+        assert_eq!(lessons.len(), 1);
+        let s = rust_p2w::scaffold(lessons[0].kind).expect("ladder");
+        assert!(s.hint.contains("CODE POINTS"));
+        assert!(s.fix.contains("for c in s"));
+        // And it stays quiet where the split isn't real, even when asked.
+        assert!(rust_p2w::string_length_lessons("print(len('Ada'))\n").is_empty());
     }
 
     #[test]

@@ -273,6 +273,30 @@ pub fn lints(source: &str) -> Vec<Lint> {
     lints_parsed(&stmts)
 }
 
+/// The three-lengths lesson, as an OPT-IN tier — not part of [`lints`].
+/// The default story a young student lives with is ONE view, and it is
+/// true: "len counts characters" (`len('café')` is 4, `len('🦀')` is 1).
+/// This lesson — that "length" splits into characters/code points/bytes,
+/// and that languages disagree — is for the advanced tier (the Mojo bridge,
+/// a Unicode lesson), where the ambiguity is the subject rather than noise.
+/// Fires only where the split is real: len() of visibly non-ASCII text.
+/// Pair each finding with `scaffold(LintKind::StringLengthMeaning)`.
+pub fn string_length_lessons(source: &str) -> Vec<Lint> {
+    let Ok(toks) = lexer::lex(source) else {
+        return Vec::new();
+    };
+    let (stmts, _) = parser::parse_recovering(&toks);
+    lint::string_length_meaning_warnings(&stmts)
+        .into_iter()
+        .map(|(line, span, message)| Lint {
+            line,
+            span,
+            message,
+            kind: LintKind::StringLengthMeaning,
+        })
+        .collect()
+}
+
 /// The Mojo-bridge profile (`p2w check --profile mojo`): findings for
 /// constructs outside the Python∩Mojo intersection. Empty = this program is
 /// believed valid Mojo 1.0 too, given the shipped prelude
@@ -343,7 +367,7 @@ pub fn analyze(source: &str) -> (blockly::BlocksOutcome, Vec<Lint>) {
 /// The post-parse half of [`lints`] (see [`analyze`]).
 fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
     #[allow(clippy::type_complexity)] // a literal table; naming it adds nothing
-    let groups: [(LintKind, Vec<(usize, (usize, usize), String)>); 8] = [
+    let groups: [(LintKind, Vec<(usize, (usize, usize), String)>); 7] = [
         (
             LintKind::UndefinedName,
             lint::undefined_name_warnings(stmts),
@@ -368,10 +392,6 @@ fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
         (
             LintKind::SelfComparison,
             lint::self_comparison_warnings(stmts),
-        ),
-        (
-            LintKind::StringLengthMeaning,
-            lint::string_length_meaning_warnings(stmts),
         ),
     ];
     let mut out: Vec<Lint> = Vec::new();
