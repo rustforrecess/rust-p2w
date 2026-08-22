@@ -16,7 +16,14 @@ intersection and make membership checkable.
 The claim, precisely: every p2w program is valid Python (the permanent
 invariant, unchanged); a p2w program with **zero findings from
 `p2w check --profile mojo`** is additionally believed to compile and run as
-Mojo 1.0 when concatenated with `tools/mojo/p2w_prelude.mojo`.
+Mojo 1.0 when concatenated with `tools/mojo/p2w_prelude.mojo`, **with the
+same output for text whose characters are single code points** (composed
+accents, single emoji — keyboard-typed text). Text that splits — combining
+marks, ZWJ emoji — is REFUSED by the profile where it appears in the
+program, because Python and Mojo would both run it and print different
+counts: silent divergence, the one failure class worse than an error.
+Exotic text arriving at RUNTIME (typed into `input()`) is outside any
+static claim; that residual gap is documented below, not hidden.
 
 ## The three pieces
 
@@ -87,6 +94,11 @@ output. Three corrections came from the compiler, not the docs:
   otherwise.
 - **Stdlib surface.** `math` mostly maps; `random` doesn't yet; anything
   else is discovered by the differential job, not asserted here.
+- **Runtime text.** The profile refuses grapheme-splitting LITERALS, but a
+  string typed into `input()` at runtime reaches iteration unchecked — a
+  decomposed accent or ZWJ emoji there prints different counts on the two
+  sides. No static check can close this; it is the price of the layers
+  disagreeing, and the three-lengths lesson is where a student learns it.
 
 ## Reopen conditions (for the larger shift-to-Mojo question)
 

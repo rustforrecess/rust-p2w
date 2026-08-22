@@ -2143,7 +2143,35 @@ fn walk_mojo(stmts: &[Stmt], out: &mut Vec<(usize, (usize, usize), String)>) {
     }
 }
 
+/// Scalars that make one visible character out of SEVERAL code points —
+/// where Python (code points) and Mojo (graphemes) count text differently,
+/// so the same loop prints different numbers: SILENT divergence, the class
+/// the bridge must refuse. Combining diacritics, the zero-width joiner,
+/// variation selectors, skin-tone modifiers. Not a full UAX #29 table —
+/// the differential job is the backstop for what this misses.
+fn is_grapheme_splitting(c: char) -> bool {
+    matches!(u32::from(c),
+        0x0300..=0x036F      // combining diacritical marks
+        | 0x200D             // zero-width joiner (emoji sequences)
+        | 0xFE00..=0xFE0F    // variation selectors
+        | 0x1F3FB..=0x1F3FF  // skin-tone modifiers
+    )
+}
+
 fn find_mojo_exprs(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
+    // A literal whose text splits into different counts per language is
+    // refused OUTRIGHT: iterating or measuring it would RUN on both sides
+    // and print different answers — worse than failing to compile.
+    if let ExprKind::Str(text) = &e.kind
+        && text.chars().any(is_grapheme_splitting)
+    {
+        out.push((
+            e.line,
+            e.span,
+            "this text contains joining or combining marks — Python counts its              pieces (code points) while Mojo counts what a person sees              (graphemes), so the SAME program would print different numbers.              Not Mojo-ready"
+                .to_string(),
+        ));
+    }
     // len() of a string is a hard ERROR in Mojo 1.0 (UTF-8 makes one length
     // ambiguous; Python's len(str) means code points). Flagged when the
     // argument is visibly a string; dynamic cases are the differential
