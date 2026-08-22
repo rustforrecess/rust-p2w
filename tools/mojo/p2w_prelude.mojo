@@ -3,20 +3,21 @@
 # A p2w program that passes `p2w check --profile mojo` uses Python's lowercase
 # type names in its annotations — real Python, CPython-runnable, the p2w
 # invariant. Mojo spells the same types with capitals. These compile-time
-# aliases close that gap so the program TEXT compiles unchanged as Mojo:
+# bindings close that gap so the program TEXT compiles unchanged as Mojo:
 # the shim lives here, on Mojo's side, never in the student's program.
 #
-# STATUS: v1, differential verification pending. The planned job compiles the
-# profile-clean oracle programs with the real Mojo compiler (Apache 2.0 since
-# 2026-08-18) and diffs their output; until it lands, this file is the spec
-# of intent, exercised by hand.
+# STATUS: verified against Mojo 1.0.0 (ed45d567) by the mojo-bridge CI job —
+# tests/mojo_bridge/ programs run under real Mojo and match CPython's output
+# byte-for-byte. (`comptime`, not `alias`: 1.0 deprecated the old keyword.)
 
-alias int = Int
-alias float = Float64
-alias str = String
-alias bool = Bool
+comptime int = Int
+comptime float = Float64
+comptime str = String
+comptime bool = Bool
 
-# Deliberately NOT mapped in v1 — the profile flags programs that need these:
+# Deliberately NOT mapped — the profile flags programs that need these:
+#   * len() of a string: a hard ERROR in Mojo 1.0 (UTF-8 makes one length
+#     ambiguous; Python's len(str) means code points). No clean shim exists.
 #   * Python's `random` module (Mojo's random has different names/semantics)
 #   * f-strings (no Mojo equivalent; the profile suggests `+` and `str(...)`)
 #   * classes (Mojo's Phase 3 hasn't begun — there is nothing to map to)

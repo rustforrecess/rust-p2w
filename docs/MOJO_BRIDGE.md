@@ -35,11 +35,29 @@ Mojo 1.0 when concatenated with `tools/mojo/p2w_prelude.mojo`.
    Python 3.14's lazy annotations soften this eventually, but we don't lean
    on it.)
 
-3. **The verification job (planned, and the reason to believe any of this):**
-   compile the profile-clean oracle programs with the real Mojo compiler and
-   diff their output — the same differential pattern as the CPython oracle
-   and BACKEND_DIVERGENCE. Until it lands, "believed valid Mojo" is a
-   documented intent, not a verified claim, and this file says so.
+3. **The verification job (`mojo-bridge` in CI, tools/mojo/mojo_diff.sh):**
+   every program in `tests/mojo_bridge/` the profile calls ready is compiled
+   and run by the REAL Mojo compiler (installed from Modular's conda channel
+   via pixi), with the prelude prepended and top-level statements wrapped in
+   `def main()` by `tools/mojo/wrap.py`; output must match CPython
+   byte-for-byte. `not_*.py` cases assert the profile REFUSES them.
+
+## What first contact with Mojo 1.0.0 taught (2026-08-21)
+
+The typed-procedural core passed unmodified on the first run — real Mojo
+compiled and ran the arithmetic and float cases with CPython-identical
+output. Three corrections came from the compiler, not the docs:
+
+- **`len(<str>)` is a hard ERROR in Mojo** — UTF-8 makes a single length
+  ambiguous (bytes? code points? graphemes?), and Python's `len(str)` means
+  code points. No clean prelude shim exists, so the profile flags visible
+  cases and the differential job catches dynamic ones.
+- **Implicit variable declaration is deprecated even in `def`** (a warning
+  in 1.0; presumably gone in 2.0). The annotated first assignment —
+  `s: str = ...`, valid Python, our typed house style — is the
+  future-proof spelling. The intersection is narrowing toward exactly the
+  house style we already teach.
+- **`alias` became `comptime`** in 1.0; the prelude uses the new keyword.
 
 ## Honest gaps that no bridge closes
 
