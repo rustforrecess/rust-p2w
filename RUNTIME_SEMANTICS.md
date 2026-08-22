@@ -107,6 +107,11 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `'b' >= 'c'` | value | `False` |
 | `'Zoe' < 'amy'` | value | `True` |
 | `'app' < 'apple'` | value | `True` |
+| `len('café')` | value | `4` |
+| `len('🦀')` | value | `1` |
+| `'café'[3]` | value | `é` |
+| `'a🦀b'[1]` | value | `🦀` |
+| `for c in 'héé'` | value | `h ⏎ é ⏎ é` |
 | `'ab' - 'b'` | compile error | `line 1: this operator needs numbers on both sides` |
 | `'ab' + 1` | compile error | `line 1: can't add text and a number together` |
 | `1 + 'ab'` | compile error | `line 1: can't add text and a number together` |

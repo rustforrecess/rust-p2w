@@ -434,6 +434,20 @@ run_case_in input_loop 'a = input()\nb = input()\nprint(b + a)\n' 'ba' 'a\nb\n' 
 run_case math_libm 'import math\nprint(math.exp(1.0))\nprint(math.log(10.0))\nprint(math.log2(8.0))\nprint(math.log10(1000.0))\nprint(math.pow(2, 10))\nprint(math.sqrt(2.0))\n' '2.7182818284590455\n2.302585092994046\n3.0\n3.0\n1024.0\n1.4142135623730951' || fails=$((fails+1))
 run_case random_parity 'import random\nprint(random.randint(1, 100))\nprint(random.random())\nxs = [1, 2, 3, 4, 5]\nrandom.shuffle(xs)\nprint(xs)\nprint(random.choice([1]))\nrandom.seed(7)\nprint(random.randint(1, 100))\n' '70\n0.3458877553122256\n[1, 2, 3, 5, 4]\n1\n43' || fails=$((fails+1))
 
+# --- Mojo-bridge cases (docs/MOJO_BRIDGE.md Lane 1) --------------------------
+# Every profile-ready bridge case must ALSO compile through the native
+# backend and match CPython, so "valid Mojo too" and "runs on the board"
+# stay the same set of programs. Expected output comes from CPython itself.
+PY=python3
+command -v python3 >/dev/null 2>&1 || PY=python
+for bcase in tests/mojo_bridge/*.py; do
+  bname="mojo_$(basename "$bcase" .py)"
+  [[ "$bname" == mojo_not_* ]] && continue
+  bwant=$(PYTHONIOENCODING=utf-8 "$PY" "$bcase" | tr -d '\r')
+  bsrc=$(cat "$bcase")
+  run_case "$bname" "$bsrc" "$bwant" || fails=$((fails+1))
+done
+
 echo "---"
 if [ "$fails" -eq 0 ]; then
   echo "all native-run cases passed"

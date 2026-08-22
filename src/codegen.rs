@@ -1410,10 +1410,118 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
 
-    // $py_len: a custom __len__ first, then sequence length (lists, dicts,
-    // strings). __len__ returns a Python int, unboxed back to i32.
+    // $str_cp_len: CODE POINTS in a string — what Python's len(str) means.
+    // The representation counts UTF-16 units, so an astral character (a
+    // surrogate pair) is two units but ONE code point. $slen stays the
+    // internal unit length for string algorithms.
     let mut b = Body::new();
-    b.push("(if (call $is_str (local.get $r)) (then (return (call $slen (local.get $r)))))");
+    b.push("(local.set $n (call $slen (local.get $s)))");
+    b.push("(block $done");
+    b.push_in(1, "(loop $next");
+    b.push_in(2, "(br_if $done (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        2,
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(if (i32.and (i32.ge_s (local.get $c) (i32.const 55296)) (i32.le_s (local.get $c) (i32.const 56319)))",
+    );
+    b.push_in(
+        3,
+        "(then (local.set $i (i32.add (local.get $i) (i32.const 2))))",
+    );
+    b.push_in(
+        3,
+        "(else (local.set $i (i32.add (local.get $i) (i32.const 1))))",
+    );
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $k (i32.add (local.get $k) (i32.const 1)))");
+    b.push_in(2, "(br $next)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.get $k)");
+    fs.push(Func {
+        signature: "(func $str_cp_len (param $s (ref null any)) (result i32)".into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $k i32)".into(),
+            "(local $c i32)".into(),
+        ],
+        body: b,
+    });
+
+    // $str_cp_at: the $k-th CODE POINT of a string, as a one-character
+    // string (both units of a surrogate pair). Bounds are the caller's
+    // job ($py_index checks against $str_cp_len).
+    let mut b = Body::new();
+    b.push("(block $found");
+    b.push_in(1, "(loop $walk");
+    b.push_in(2, "(br_if $found (i32.le_s (local.get $k) (i32.const 0)))");
+    b.push_in(
+        2,
+        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
+    );
+    b.push_in(
+        2,
+        "(if (i32.and (i32.ge_s (local.get $c) (i32.const 55296)) (i32.le_s (local.get $c) (i32.const 56319)))",
+    );
+    b.push_in(
+        3,
+        "(then (local.set $i (i32.add (local.get $i) (i32.const 2))))",
+    );
+    b.push_in(
+        3,
+        "(else (local.set $i (i32.add (local.get $i) (i32.const 1))))",
+    );
+    b.push_in(2, ")");
+    b.push_in(2, "(local.set $k (i32.sub (local.get $k) (i32.const 1)))");
+    b.push_in(2, "(br $walk)");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.set $c (call $sat (local.get $s) (local.get $i)))");
+    b.push(
+        "(if (i32.and (i32.ge_s (local.get $c) (i32.const 55296)) (i32.le_s (local.get $c) (i32.const 56319)))",
+    );
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $buf (array.new_default $U16S (i32.const 2)))",
+    );
+    b.push_in(
+        2,
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $buf)) (i32.const 0) (local.get $c))",
+    );
+    b.push_in(
+        2,
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $buf)) (i32.const 1) (call $sat (local.get $s) (i32.add (local.get $i) (i32.const 1))))",
+    );
+    b.push_in(2, "(return (call $finish (local.get $buf)))");
+    b.push_in(1, ")");
+    b.push(")");
+    b.push("(local.set $buf (array.new_default $U16S (i32.const 1)))");
+    b.push(
+        "(array.set $U16S (ref.cast (ref $U16S) (local.get $buf)) (i32.const 0) (local.get $c))",
+    );
+    b.push("(call $finish (local.get $buf))");
+    fs.push(Func {
+        signature:
+            "(func $str_cp_at (param $s (ref null any)) (param $k i32) (result (ref null any))"
+                .into(),
+        locals: vec![
+            "(local $i i32)".into(),
+            "(local $c i32)".into(),
+            "(local $buf (ref null any))".into(),
+        ],
+        body: b,
+    });
+
+    // $py_len: a custom __len__ first, then sequence length (lists, dicts,
+    // strings). __len__ returns a Python int, unboxed back to i32. For
+    // strings the length is CODE POINTS (CPython's meaning), not units.
+    let mut b = Body::new();
+    b.push("(if (call $is_str (local.get $r)) (then (return (call $str_cp_len (local.get $r)))))");
     b.push(format!(
         "(if (call $obj_has (local.get $r) {n}) (then (return (call $unbox (call $obj_call0 (local.get $r) {n})))))",
         n = str_lit("__len__")
@@ -1431,7 +1539,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
     );
     b.push(")");
     b.push("(if (call $is_str (local.get $r))");
-    b.push_in(1, "(then (return (call $slen (local.get $r))))");
+    b.push_in(1, "(then (return (call $str_cp_len (local.get $r))))");
     b.push(")");
     b.push("(if (ref.test (ref $TUPLE) (local.get $r))");
     b.push_in(
@@ -1470,7 +1578,7 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
             "(if (ref.test (ref {ty}) (local.get $r)) (then (return (call $py_len (local.get $r)))))"
         ));
     }
-    b.push("(if (call $is_str (local.get $r)) (then (return (call $slen (local.get $r)))))");
+    b.push("(if (call $is_str (local.get $r)) (then (return (call $str_cp_len (local.get $r)))))");
     b.push("(call $raise_not_iterable (local.get $r))");
     b.push("unreachable");
     fs.push(Func {
@@ -1523,14 +1631,15 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(then (return (array.get $ITEMS (struct.get $DICT 1 (ref.cast (ref $DICT) (local.get $r))) (local.get $i))))",
     );
     b.push(")");
-    b.push("(local.set $c (array.new_default $U16S (i32.const 1)))");
-    b.push("(array.set $U16S (ref.cast (ref $U16S) (local.get $c)) (i32.const 0) (call $sat (local.get $r) (local.get $i)))");
-    b.push("(call $finish (local.get $c))");
+    // Strings: the i-th CODE POINT (bounds were checked against $str_cp_len
+    // via $py_len above), so indexing and iteration agree with CPython even
+    // for astral characters.
+    b.push("(call $str_cp_at (local.get $r) (local.get $i))");
     fs.push(Func {
         signature:
             "(func $py_index (param $r (ref null any)) (param $i i32) (result (ref null any))"
                 .into(),
-        locals: vec!["(local $n i32)".into(), "(local $c (ref null any))".into()],
+        locals: vec!["(local $n i32)".into()],
         body: b,
     });
 

@@ -257,6 +257,15 @@ pub fn groups() -> Vec<Group> {
                 // that surprise people, so they are pinned.
                 e!("'Zoe' < 'amy'"),
                 e!("'app' < 'apple'"),
+                // Non-ASCII: len/index/iteration mean CODE POINTS (CPython's
+                // rule). Until 2026-08-22 the three surfaces gave three
+                // different answers here (UTF-16 units / UTF-8 bytes / code
+                // points) — and no probe was non-ASCII, so nothing noticed.
+                e!("len('café')"),
+                e!("len('🦀')"),
+                e!("'café'[3]"),
+                e!("'a🦀b'[1]"),
+                p("for c in 'héé'", "for c in 'héé':\n    print(c)\n"),
                 e!("'ab' - 'b'"),
                 e!("'ab' + 1"),
                 e!("1 + 'ab'"),

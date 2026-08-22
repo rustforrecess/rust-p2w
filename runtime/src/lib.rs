@@ -1403,10 +1403,15 @@ pub extern "C" fn p2w_len(v: Value) -> Value {
         }
         return r;
     }
+    // len(str) is CODE POINTS (CPython's meaning) — the byte length stays
+    // internal. Everything else reports its stored element count.
+    if is_heap(v) && obj_tag(v) == T_STR {
+        return make_int(str_cp_len(v) as i64);
+    }
     if is_heap(v)
         && matches!(
             obj_tag(v),
-            T_STR | T_LIST | T_DICT | T_IARRAY | T_FARRAY | T_SET | T_TUPLE
+            T_LIST | T_DICT | T_IARRAY | T_FARRAY | T_SET | T_TUPLE
         )
     {
         return make_int(coll_len(v as usize) as i64);
@@ -1426,8 +1431,11 @@ pub extern "C" fn p2w_index(target: Value, index: Value) -> Value {
     let o = target as usize;
     match obj_tag(target) {
         T_STR => {
-            let i = norm_index(index, coll_len(o) as i64, "string");
-            str_alloc(&[str_byte(target, i as usize)])
+            // Index by CODE POINT, like CPython — a byte index handed back
+            // broken pieces of any multi-byte character ('héllo'[1] was
+            // the first byte of é, mojibake).
+            let i = norm_index(index, str_cp_len(target) as i64, "string");
+            str_cp_at(target, i as usize)
         }
         T_LIST | T_TUPLE => {
             let i = norm_index(index, coll_len(o) as i64, "list");
@@ -2259,16 +2267,68 @@ pub extern "C" fn p2w_invert(a: Value) -> Value {
 
 // --- iteration protocol ----------------------------------------------------
 
-/// Number of elements a for-each yields over `c`.
+/// The byte width of a UTF-8 sequence from its lead byte.
+fn utf8_width(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b & 0xE0 == 0xC0 {
+        2
+    } else if b & 0xF0 == 0xE0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// CODE POINTS in a string — what Python's len(str) means. Strings are
+/// stored UTF-8, so this counts non-continuation bytes; the raw byte length
+/// (`str_len`/`coll_len`) stays the internal unit for string algorithms.
+fn str_cp_len(v: Value) -> usize {
+    let n = str_len(v);
+    let mut k = 0;
+    for i in 0..n {
+        if str_byte(v, i) & 0xC0 != 0x80 {
+            k += 1;
+        }
+    }
+    k
+}
+
+/// The `k`-th code point of a string, as a fresh one-character string.
+/// Bounds are the caller's job (checked against `str_cp_len`).
+fn str_cp_at(v: Value, k: usize) -> Value {
+    let n = str_len(v);
+    let mut i = 0;
+    let mut seen = 0;
+    while i < n {
+        let w = utf8_width(str_byte(v, i)).min(n - i);
+        if seen == k {
+            let mut buf = [0u8; 4];
+            for (j, slot) in buf.iter_mut().enumerate().take(w) {
+                *slot = str_byte(v, i + j);
+            }
+            return str_alloc(&buf[..w]);
+        }
+        seen += 1;
+        i += w;
+    }
+    str_alloc(&[])
+}
+
+/// Number of elements a for-each yields over `c` — code points for a
+/// string (CPython's meaning), stored length for everything else.
 fn container_len(c: Value) -> usize {
+    if obj_tag(c) == T_STR {
+        return str_cp_len(c);
+    }
     coll_len(c as usize)
 }
 
 /// The element at position `i` of a for-each over `c` (list element, string
-/// char, dict key, or set member).
+/// CHARACTER — a whole code point, not a byte — dict key, or set member).
 fn element_at(c: Value, i: usize) -> Value {
     match obj_tag(c) {
-        T_STR => str_alloc(&[str_byte(c, i)]), // freshly allocated -> already owned
+        T_STR => str_cp_at(c, i), // freshly allocated -> already owned
         T_LIST | T_SET | T_TUPLE => owned(list_get(c as usize, i)),
         T_DICT => owned(dict_key(c as usize, i)),
         _ => trap("object is not iterable"),
