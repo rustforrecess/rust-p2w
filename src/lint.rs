@@ -2299,6 +2299,13 @@ pub fn error_scaffold(code: &str) -> Option<Scaffold> {
                    numbers, but it can't add a number to text.",
             fix: "int(...) turns the text into a number first — e.g. `int(age) + 1`.",
         },
+        "type.calling-a-value" => Scaffold {
+            question: "What did the earlier line put in this name?",
+            hint: "Round brackets after a name mean \"run this function\". This name holds \
+                   a plain value, and a value isn't something that runs.",
+            fix: "If you meant to multiply, write `name * 3`. If you meant a function, it \
+                  needs a `def` with that name — and a different name for the value.",
+        },
         "type.str-in-arithmetic" => Scaffold {
             question: "\"ab\" + \"cd\" gives \"abcd\". What would \"abcd\" - \"cd\" mean — \
                        remove it from the end, from anywhere, or every copy?",

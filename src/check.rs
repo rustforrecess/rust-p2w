@@ -107,7 +107,11 @@ struct FnSig {
 /// Phase C: the finding codes that are compile ERRORS now, not advice —
 /// promoted one rule at a time, each with its semantics-row diff read and
 /// blessed (docs/TYPE_CHECKER_DESIGN.md D4). Everything else stays advisory.
-pub const GATED: &[&str] = &["type.str-plus-number", "type.str-in-arithmetic"];
+pub const GATED: &[&str] = &[
+    "type.str-plus-number",
+    "type.str-in-arithmetic",
+    "type.calling-a-value",
+];
 
 pub fn is_gated(code: &str) -> bool {
     GATED.contains(&code)
@@ -751,12 +755,9 @@ impl Checker {
                 span: e.span,
                 code: "type.calling-a-value",
                 message: format!(
-                    "`{name}` is {} — line {} {} — so it can't be called like a function. \
-                     Did the parentheses mean something else, or was `{name}` meant to stay \
-                     a function?",
+                    "`{name}` is {} (line {}), not something you can call.",
                     f.ty.name(),
                     f.line,
-                    f.why,
                 ),
             });
             for a in args {

@@ -132,7 +132,7 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `def f() -> int: return 'x'` | trap | `TypeError: expected a number, got 'str'` |
 | `def f(n: int) called with str` | trap | `TypeError: expected a number, got 'str'` |
 | `wrong arity` | compile error | `line 3: f() is missing a required argument 'b'` |
-| `call a number` | compile error | `line 2: unknown function 'total'` |
+| `call a number` | compile error | `line 2: `total` is a whole number (line 1), not something you can call.` |
 | `read before assignment` | compile error | `line 2: unknown name 'q' (define it with `q = ...` first)` |
 
 ## Lists
