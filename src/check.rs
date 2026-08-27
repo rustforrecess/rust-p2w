@@ -111,6 +111,9 @@ pub const GATED: &[&str] = &[
     "type.str-plus-number",
     "type.str-in-arithmetic",
     "type.calling-a-value",
+    "type.indexing-a-single-value",
+    "type.len-of-single-value",
+    "type.for-over-single-value",
 ];
 
 pub fn is_gated(code: &str) -> bool {
@@ -355,12 +358,12 @@ impl Checker {
                                 line: s.line,
                                 span: s.span,
                                 code: "type.for-over-single-value",
-                                message: format!(
-                                    "this loop needs something with items in it, but it was \
-                                     given {}{} — a single value has nothing to step through. \
-                                     range(n) counts, if counting was the plan",
-                                    ity.name(),
-                                    prov_clause(&prov),
+                                message: single_value_message(
+                                    &prov,
+                                    &ity,
+                                    "and a loop needs a group to step through — a list, some \
+                                     text, a dict or a set. range(n) counts, if counting was \
+                                     the plan",
                                 ),
                             });
                             Ty::Dyn
@@ -550,11 +553,10 @@ impl Checker {
                             line: e.line,
                             span: e.span,
                             code: "type.indexing-a-single-value",
-                            message: format!(
-                                "square brackets pick an item out of a collection, but this \
-                                 is {}{} — a single value has no items to pick",
-                                oty.name(),
-                                prov_clause(&prov),
+                            message: single_value_message(
+                                &prov,
+                                &oty,
+                                "so there's nothing inside it to get with square brackets",
                             ),
                         });
                         (Ty::Dyn, None)
@@ -811,11 +813,11 @@ impl Checker {
                             line: e.line,
                             span: e.span,
                             code: "type.len-of-single-value",
-                            message: format!(
-                                "len() counts a collection's items, but this is {}{} — a \
-                                 single value has no items to count",
-                                t.name(),
-                                prov_clause(&prov),
+                            message: single_value_message(
+                                &prov,
+                                &t,
+                                "and len() counts the items in a group — a single value \
+                                 isn't a group",
                             ),
                         });
                     }
@@ -876,6 +878,20 @@ fn prov_clause(p: &Option<Fact>) -> String {
     match p {
         Some(f) => format!(" (line {} {})", f.line, f.why),
         None => String::new(),
+    }
+}
+
+/// TYPE_ERROR_MESSAGES.md, "`score = 42` then `score[0]`": name what the
+/// value IS and where it became that, then the consequence.
+fn single_value_message(p: &Option<Fact>, ty: &Ty, consequence: &str) -> String {
+    match p {
+        Some(f) => format!(
+            "{} holds one value — {} (line {}) — {consequence}.",
+            f.name_or("this"),
+            ty.name(),
+            f.line
+        ),
+        None => format!("this is {}, one single value, {consequence}.", ty.name()),
     }
 }
 

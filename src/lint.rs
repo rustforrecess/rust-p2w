@@ -2306,6 +2306,27 @@ pub fn error_scaffold(code: &str) -> Option<Scaffold> {
             fix: "If you meant to multiply, write `name * 3`. If you meant a function, it \
                   needs a `def` with that name — and a different name for the value.",
         },
+        "type.indexing-a-single-value" => Scaffold {
+            question: "Square brackets pull one item out of a group. What group is this name?",
+            hint: "The earlier line gave it a single value, not a list. A single value has \
+                   no first item — it IS the value.",
+            fix: "Use the name on its own. If you meant a list, write `name = [42]`.",
+        },
+        "type.len-of-single-value" => Scaffold {
+            question: "len() counts how many things are in a group. Is this name a group?",
+            hint: "The earlier line gave it one value. One number isn't a group of things \
+                   to count.",
+            fix: "If you meant the number itself, use it directly. If you meant a group, \
+                  start it as a list: `name = [ ... ]`.",
+        },
+        "type.for-over-single-value" => Scaffold {
+            question: "A loop steps through the items of a group. What group did you want \
+                       it to step through?",
+            hint: "The earlier line gave this name one value. To count up to it, a loop \
+                   needs range(); to visit items, it needs a list, some text, a dict or a set.",
+            fix: "`for i in range(name):` counts from 0 up to it. `for x in [ ... ]:` visits \
+                  items.",
+        },
         "type.str-in-arithmetic" => Scaffold {
             question: "\"ab\" + \"cd\" gives \"abcd\". What would \"abcd\" - \"cd\" mean — \
                        remove it from the end, from anywhere, or every copy?",

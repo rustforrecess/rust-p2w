@@ -4747,12 +4747,14 @@ mod tests {
                 "xs = [1, 'one']\nprint(xs[0] < xs[1])\n",
                 "TypeError: expected a number, got 'str'",
             ),
+            // Via a mixed list (Dyn to the checker) — the static shapes are
+            // compile errors since phase C, rule 3.
             (
-                "n = 5\nprint(len(n))\n",
+                "xs = [5, 'a']\nprint(len(xs[0]))\n",
                 "TypeError: object of type 'int' has no len()",
             ),
             (
-                "n = 5\nprint(n[0])\n",
+                "xs = [5, 'a']\nprint(xs[0][0])\n",
                 "TypeError: 'int' object is not subscriptable",
             ),
             (

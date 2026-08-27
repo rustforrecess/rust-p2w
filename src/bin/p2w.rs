@@ -555,11 +555,11 @@ print(next_year)
         assert!(r.json.contains("Line 1"), "cause cited: {}", r.json);
         // A rule still at the advisory tier: compiles (ok: true), reported
         // under "types", never gates.
-        let r = check("score = 42\nprint(score[0])\n", false);
+        let r = check("n = 5\nw = 'b'\nprint(n < w)\n", false);
         assert!(r.ok, "advisories never gate: {}", r.json);
         assert!(r.json.contains("\"types\""), "{}", r.json);
         assert!(
-            r.json.contains("type.indexing-a-single-value"),
+            r.json.contains("type.comparing-text-with-number"),
             "{}",
             r.json
         );

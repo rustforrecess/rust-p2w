@@ -124,10 +124,10 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | program | where | result |
 |---|---|---|
 | `age = '12'; age + 1` | compile error | `line 2: `age` holds text, not a number, so a number can't be added to it. Line 1 put quotes around `12`, and quotes make text.` |
-| `n = 5; n[0]` | trap | `TypeError: 'int' object is not subscriptable` |
-| `n = 5; len(n)` | trap | `TypeError: object of type 'int' has no len()` |
+| `n = 5; n[0]` | compile error | `line 2: `n` holds one value — a whole number (line 1) — so there's nothing inside it to get with square brackets.` |
+| `n = 5; len(n)` | compile error | `line 2: `n` holds one value — a whole number (line 1) — and len() counts the items in a group — a single value isn't a group.` |
 | `n = 5; n.append(1)` | trap | `AttributeError: 'int' object has no attribute 'append'` |
-| `n = 5; for x in n` | trap | `TypeError: a 'int' is one single value, so a for loop has nothing to go through. A loop needs a list, some text, a dict or a set — or use range(n) to count.` |
+| `n = 5; for x in n` | compile error | `line 2: `n` holds one value — a whole number (line 1) — and a loop needs a group to step through — a list, some text, a dict or a set. range(n) counts, if…` |
 | `x: int = 'no'` | value | `no` |
 | `def f() -> int: return 'x'` | trap | `TypeError: expected a number, got 'str'` |
 | `def f(n: int) called with str` | trap | `TypeError: expected a number, got 'str'` |

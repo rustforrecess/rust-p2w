@@ -45,6 +45,8 @@ fn cases(name: &str) -> Vec<(String, String)> {
 /// the "still to do" set honest: anything not named here is a real gap.
 const ALREADY_REJECTED: &[&str] = &[
     "calling-a-number.py",
+    // Caught by the type checker (phase C, rule 3).
+    "indexing-a-number.py",
     // Caught by the type checker (phase C, rule 1): cause-line message.
     "string-plus-int.py",
     "subtracting-strings.py",

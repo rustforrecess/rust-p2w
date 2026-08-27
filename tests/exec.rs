@@ -1075,8 +1075,10 @@ fn index_and_key_errors() {
         "d = {\"a\": 1}\nprint(d[\"missing\"])",
         "KeyError: 'missing'",
     );
+    // Via a mixed list (Dyn to the checker): the static shape `x = 5; x[0]`
+    // is a compile error since phase C, rule 3.
     assert_raises(
-        "x = 5\nprint(x[0])",
+        "xs = [5, 'a']\nprint(xs[0][0])",
         "TypeError: 'int' object is not subscriptable",
     );
     assert_raises(
@@ -1098,7 +1100,7 @@ fn zero_division_errors() {
 #[test]
 fn len_and_method_errors() {
     assert_raises(
-        "x = 5\nprint(len(x))",
+        "xs = [5, 'a']\nprint(len(xs[0]))",
         "TypeError: object of type 'int' has no len()",
     );
     assert_raises(
