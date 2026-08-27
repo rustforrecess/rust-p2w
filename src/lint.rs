@@ -2330,6 +2330,15 @@ pub fn error_scaffold(code: &str) -> Option<Scaffold> {
             fix: "Pass the kind the parameter asks for, e.g. `area(3, 4)` without the \
                   quotes — or int(...) to convert text that holds a number.",
         },
+        "type.missing-return" => Scaffold {
+            question: "Which situation makes this function skip its `return`? What should it \
+                       give back then?",
+            hint: "Every path through a function should hand something back. An `if` \
+                   without an `else` is a path that returns nothing — Python quietly hands \
+                   back None there.",
+            fix: "Add an `else:` that returns the same kind of thing, or put a final \
+                  `return ...` after the `if`.",
+        },
         "type.comparing-text-with-number" => Scaffold {
             question: "Is a word bigger than 5? What would that even mean?",
             hint: "`<` and `>` order two numbers, or two pieces of text alphabetically — \

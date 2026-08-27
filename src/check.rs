@@ -14,6 +14,7 @@
 //! program must produce ZERO findings.
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind};
+use crate::lint::for_each_child_block;
 use std::collections::HashMap;
 
 /// One advisory finding: a stable key, a derivation-rendered message, and
@@ -118,6 +119,7 @@ pub const GATED: &[&str] = &[
     "type.return-contradicts-signature",
     "type.argument-contradicts-signature",
     "type.comparing-text-with-number",
+    "type.missing-return",
 ];
 
 pub fn is_gated(code: &str) -> bool {
@@ -210,6 +212,7 @@ pub fn type_findings(stmts: &[Stmt]) -> Vec<TypeFinding> {
                 &mut fenv,
                 ret.as_ref().map(|(t, l, n)| (t.clone(), *l, *n)),
             );
+            ck.total_function(name, s.line, s.span, body);
         }
     }
     ck.out
@@ -464,6 +467,34 @@ impl Checker {
                 _ => {}
             }
         }
+    }
+
+    /// Total functions (design D6a, decided 2026-08-23): if any path gives
+    /// back a value, every path must. An `if` without an `else` that holds
+    /// the only `return` is a path that returns nothing — Python hands back
+    /// None there, and "what should it give back when the number is small?"
+    /// is the lesson.
+    fn total_function(&mut self, name: &str, line: usize, span: (usize, usize), body: &[Stmt]) {
+        let Some(value_line) = first_value_return(body) else {
+            return; // a procedure: no value returned anywhere, nothing owed
+        };
+        let bare = first_bare_return(body);
+        if definitely_returns(body) && bare.is_none() {
+            return;
+        }
+        let gap = match bare {
+            Some(b) => format!("line {b} returns without one"),
+            None => "it can also finish without one".to_string(),
+        };
+        self.out.push(TypeFinding {
+            line,
+            span,
+            code: "type.missing-return",
+            message: format!(
+                "`{name}` gives back a value on some paths (line {value_line}) but {gap} \
+                 — what should it give back in the other case?"
+            ),
+        });
     }
 
     /// A loop body runs zero-or-more times: walk it once for findings, then
@@ -841,6 +872,71 @@ impl Checker {
     }
 }
 
+/// The line of the first `return <value>` anywhere in the body, if any.
+fn first_value_return(stmts: &[Stmt]) -> Option<usize> {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Return(Some(_)) => return Some(s.line),
+            _ => {
+                let mut found = None;
+                for_each_child_block(s, |b, _| {
+                    if found.is_none() {
+                        found = first_value_return(b);
+                    }
+                });
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The line of the first bare `return` (no value) anywhere in the body.
+fn first_bare_return(stmts: &[Stmt]) -> Option<usize> {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Return(None) => return Some(s.line),
+            _ => {
+                let mut found = None;
+                for_each_child_block(s, |b, _| {
+                    if found.is_none() {
+                        found = first_bare_return(b);
+                    }
+                });
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether every path through `stmts` ends in a `return`: the last statement
+/// is a return, or an if/elif/else whose every arm definitely returns.
+/// Loops never count (they may run zero times) — conservative on purpose.
+fn definitely_returns(stmts: &[Stmt]) -> bool {
+    match stmts.last().map(|s| &s.kind) {
+        Some(StmtKind::Return(_)) => true,
+        Some(StmtKind::If {
+            body,
+            elifs,
+            else_body,
+            ..
+        }) => {
+            let Some(else_body) = else_body else {
+                return false;
+            };
+            definitely_returns(body)
+                && elifs.iter().all(|(_, b)| definitely_returns(b))
+                && definitely_returns(else_body)
+        }
+        _ => false,
+    }
+}
+
 fn num_join(a: &Ty, b: &Ty) -> Ty {
     if *a == Ty::Float || *b == Ty::Float {
         Ty::Float
@@ -1043,6 +1139,33 @@ mod tests {
             "xs = [1, 2, 3]\nprint(xs[0] + 1)\n",
             "name = input()\nprint(\"hi \" + name)\n",
             "x = 5\nif x > 3:\n    y = 1\nelse:\n    y = 2\nprint(y + 1)\n",
+        ] {
+            let f = findings(src);
+            assert!(f.is_empty(), "false positive on {src:?}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn total_functions_every_path_must_return_when_any_does() {
+        let f = findings(
+            "def label(n: int) -> str:\n    if n > 5:\n        return \"big\"\nprint(label(2))\n",
+        );
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "type.missing-return");
+        assert!(f[0].message.contains("line 3"), "{}", f[0].message);
+        // A bare `return` next to value returns is the same gap.
+        let f = findings("def f(n):\n    if n:\n        return 1\n    return\n");
+        assert_eq!(f.len(), 1, "{f:?}");
+        // Total shapes stay silent: if/else both return; early return then
+        // final return; a procedure with no value returns at all; a loop
+        // followed by a return.
+        for src in [
+            "def f(n):\n    if n > 5:\n        return 1\n    else:\n        return 2\n",
+            "def f(n):\n    if n > 5:\n        return 1\n    return 2\n",
+            "def f(n):\n    print(n)\n",
+            "def f(n):\n    if n:\n        return\n    print(n)\n",
+            "def f(xs):\n    for x in xs:\n        print(x)\n    return 0\n",
+            "def f(n):\n    if n > 5:\n        return 1\n    elif n > 2:\n        return 2\n    else:\n        return 3\n",
         ] {
             let f = findings(src);
             assert!(f.is_empty(), "false positive on {src:?}: {f:?}");

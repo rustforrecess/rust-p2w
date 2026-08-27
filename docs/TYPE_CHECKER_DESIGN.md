@@ -113,7 +113,10 @@ construction); no solver, no SMT (decided — intervals later if wanted).
 **D6 — The two open pedagogy questions, DECIDED (2026-08-23):**
 (a) a function that sometimes returns nothing → total functions: if any
 path returns a value, every path must ("what should it give back
-when..."). NOT YET IMPLEMENTED — the next checker rule. (b) heterogeneous
+when..."). ✅ IMPLEMENTED as `type.missing-return` (gated): value returns
+on some paths with a fall-through or bare `return` elsewhere is a compile
+error at the `def`, naming the returning line; the oracle's open question
+moved to `must-reject/` as decided. (b) heterogeneous
 lists / type-changing rebinding / disagreeing branches → advisory-first
 for a full phase; gate only after the false-positive rate on real student
 programs is known. Currently silent (`Dyn`) in the pass; the type-churn

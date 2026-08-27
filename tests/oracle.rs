@@ -48,6 +48,8 @@ const ALREADY_REJECTED: &[&str] = &[
     "annotation-contradicted.py",
     "argument-type-wrong.py",
     "calling-a-number.py",
+    // Caught by the type checker (D6a, decided: total functions).
+    "function-with-no-return.py",
     // Caught by the type checker (phase C, rule 3).
     "indexing-a-number.py",
     // Caught by the type checker (phase C, rule 4).

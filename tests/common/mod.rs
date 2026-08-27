@@ -293,6 +293,10 @@ pub fn groups() -> Vec<Group> {
                     "def f(n: int) -> int:\n    return n\nprint(f('x'))\n",
                 ),
                 p("wrong arity", "def f(a, b):\n    return a\nprint(f(1))\n"),
+                p(
+                    "return on some paths only",
+                    "def f(n):\n    if n > 0:\n        return 1\nprint(f(0))\n",
+                ),
                 p("call a number", "total = 5\nprint(total(3))\n"),
                 p(
                     "read before assignment",
