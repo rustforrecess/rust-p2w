@@ -98,14 +98,15 @@ bash tools/native_run.sh      # ~200 cases through clang + the real runtime; >10
 **`tools/native_run.sh` is the authority for the native backend.** Unit tests
 assert on emitted IR text and will happily pass while the program is wrong.
 
-## Two backends — now 3 of 108 probes apart
+## Two backends — 0 of 114 probes apart
 
 `compile_to_wat` (WASM-GC, browser) and `compile_to_llvm_ir` + `runtime/`
-(linear memory, the board *and* the component/jco path). After the 2026-08
-divergence sweep the disagreements are 3 of 108, each one recorded and
-understood: annotation semantics (`x: int = 'no'` — GC demotes, native
-trusts; the type checker settles it), native `dict.get`, and the native
-unpack length check. `BACKEND_DIVERGENCE.md`.
+(linear memory, the board *and* the component/jco path). As of 2026-08-24
+BACKEND_DIVERGENCE.md reads "No divergences in the current matrix": the
+2026-08 sweep took it 18 → 3, the type checker's phase D removed the
+annotation row, and native `dict.get` + the unpack length check closed the
+last two. Keep it there — every new probe row is a claim both targets must
+agree on.
 
 Two structural facts keep it that way:
 

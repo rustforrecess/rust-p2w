@@ -104,6 +104,7 @@ declare void @p2w_write_char(i32)
 ; whole-number overflow: checked arithmetic + the runtime's reporter
 declare void @p2w_overflow()
 declare void @p2w_zero_div()
+declare void @p2w_unpack_check(i32, i32)
 declare {i32, i1} @llvm.sadd.with.overflow.i32(i32, i32)
 declare {i32, i1} @llvm.ssub.with.overflow.i32(i32, i32)
 declare {i32, i1} @llvm.smul.with.overflow.i32(i32, i32)
@@ -2287,6 +2288,15 @@ impl<'a> FuncEmitter<'a> {
 
     fn emit_unpack(&mut self, targets: &[Expr], value: &Expr, line: usize) -> Result<(), String> {
         let (v, vr) = self.expr_typed(value)?;
+        // The element count must match the targets — CPython's ValueError,
+        // the WASM backend's $raise_unpack. Was the last silent-wrong-answer
+        // row in BACKEND_DIVERGENCE (`a, b = 1, 2, 3` bound a = 1 natively).
+        let bv = self.as_boxed(v.clone(), vr);
+        self.line(&format!(
+            "call void @p2w_unpack_check(i32 {bv}, i32 {})",
+            targets.len()
+        ));
+        self.release_if_owned(&bv, boxes_to_new_temp(vr));
         let id = self.next_label;
         self.next_label += 1;
         let uname = format!("__unpack{id}");

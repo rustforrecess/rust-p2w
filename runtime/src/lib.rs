@@ -1393,6 +1393,19 @@ fn norm_index(index: Value, n: i64, seq: &str) -> i64 {
     r
 }
 
+/// `a, b = v` — the element count must match the targets exactly (CPython's
+/// ValueError; the WASM backend's $raise_unpack). Borrows `v`. Checked
+/// before any target is bound, so a mismatch never half-assigns.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_unpack_check(v: Value, n: i32) {
+    if !(is_heap(v) && matches!(obj_tag(v), T_STR | T_LIST | T_DICT | T_SET | T_TUPLE)) {
+        trap_msg(&messages::TYPE_NO_LEN, type_label(v));
+    }
+    if container_len(v) != n as usize {
+        trap(messages::VALUE_UNPACK_COUNT.text);
+    }
+}
+
 /// `len(v)` for any collection (string/list/dict all store len at +8).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_len(v: Value) -> Value {
@@ -2452,6 +2465,17 @@ pub unsafe extern "C" fn p2w_method1(
     // `d.pop(key)` — remove the pair and hand its value out (owned). Backs
     // `del d[key]`, which desugars to a discarded pop. Missing key traps, like
     // CPython's KeyError (the subset has no exceptions to catch it).
+    // `d.get(key)` — the value, or None when absent. The key was transferred
+    // to us: release it after the lookup.
+    if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"get") } {
+        let o = recv as usize;
+        let r = match dict_find(o, a) {
+            Some(i) => owned(dict_val(o, i)),
+            None => V_NONE,
+        };
+        p2w_release(a);
+        return r;
+    }
     if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"pop") } {
         let o = recv as usize;
         let Some(i) = dict_find(o, a) else {
@@ -2535,12 +2559,28 @@ pub unsafe extern "C" fn p2w_method1(
 /// `name` must point to `name_len` valid bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn p2w_method2(
-    _recv: Value,
-    _name: *const u8,
-    _name_len: i32,
-    _a: Value,
-    _b: Value,
+    recv: Value,
+    name: *const u8,
+    name_len: i32,
+    a: Value,
+    b: Value,
 ) -> Value {
+    // `d.get(key, default)` — CPython's idiom for a lookup that can't raise
+    // (the thing to teach before exceptions). Both args were transferred:
+    // the key is released after the lookup; the default is handed back
+    // (still owned) when the key is absent, released when it was found.
+    if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"get") } {
+        let o = recv as usize;
+        let r = match dict_find(o, a) {
+            Some(i) => {
+                p2w_release(b);
+                owned(dict_val(o, i))
+            }
+            None => b,
+        };
+        p2w_release(a);
+        return r;
+    }
     trap("method not supported in the native backend yet")
 }
 
