@@ -1,6 +1,8 @@
 # The type checker — working design (to argue with)
 
-Status: PROPOSAL, 2026-08-23. This is the design half that
+Status: EXECUTED through phase D (2026-08-23/24, commits acf7353 → the
+rule-4 landing); the open pedagogy questions in D6 and tier-2 items remain.
+Originally a PROPOSAL; kept as the design of record. This is the design half that
 `TYPE_CHECKER_BRIEF.md` deliberately withheld — the brief stays a
 requirements/recruitment document, and if a collaborator takes the project
 they may replace everything below. Until one does, this is the plan of
@@ -89,24 +91,33 @@ and stays on the table for tier 2, decided ALONGSIDE the memory model
   real content: the pass is the single home for every NEW check and for
   every check phase C promotes; legacy checks migrate opportunistically as
   phase C touches them, never as a relocation campaign.
-- **Phase C — the decided rules gate.** Type-changing rebinding,
-  mixed-type branches, heterogeneous list use — compile errors with
-  ladders. A LANGUAGE CHANGE: the semantics rows that move get read and
-  blessed deliberately; the "caught TODAY" table shifts left.
-- **Phase D — annotations mean what they say.** `x: int = 'no'` is a
-  compile error (deleting the demote-vs-trust divergence row); a lying
-  annotation can no longer reach either backend's runtime.
+- **Phase C — the confident rules gate. ✅ DONE, four commits, one per
+  rule:** text in arithmetic (rule 1), calling a value (2), single-value
+  index/len/loop (3), signature contradictions + text-vs-number comparison
+  (4). Each moved its RUNTIME_SEMANTICS rows trap → compile error with
+  TYPE_ERROR_MESSAGES' wording and a ladder, read and blessed. The
+  Step/Run/native surfaces all gate through one `check::gate()`. What was
+  DEFERRED from the original phase-C list, per the D6(b) decision:
+  type-changing rebinding, disagreeing branches, heterogeneous lists —
+  they RUN today and stay advisory-first.
+- **Phase D — annotations mean what they say. ✅ DONE (rule 4).**
+  `x: int = 'no'` is a compile error; the demote-vs-trust divergence row
+  is gone — BACKEND_DIVERGENCE 3 → 2, the survivors being native
+  `dict.get` and the unpack length check, both mechanical.
 
 **D5 — Perf budget: ≤5ms on the largest oracle program, measured in CI.**
 The pass runs per keystroke in the browser IDE. Single forward pass with
 one fixpoint over loops (join per the RPython rule = fast by
 construction); no solver, no SMT (decided — intervals later if wanted).
 
-**D6 — The two open pedagogy questions get decided IN Phase C, by Jason:**
-(a) a function that sometimes returns nothing — propose: if any path
-returns a value, every path must (total functions, taught as "what should
-it give back when..."); (b) how loudly heterogeneous-list legacy programs
-degrade — propose: ladder-first advisory for a full phase before gating.
+**D6 — The two open pedagogy questions, DECIDED (2026-08-23):**
+(a) a function that sometimes returns nothing → total functions: if any
+path returns a value, every path must ("what should it give back
+when..."). NOT YET IMPLEMENTED — the next checker rule. (b) heterogeneous
+lists / type-changing rebinding / disagreeing branches → advisory-first
+for a full phase; gate only after the false-positive rate on real student
+programs is known. Currently silent (`Dyn`) in the pass; the type-churn
+lint carries the rebinding case as advice.
 
 ## Acceptance (executable, already in the tree)
 

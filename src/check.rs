@@ -114,6 +114,10 @@ pub const GATED: &[&str] = &[
     "type.indexing-a-single-value",
     "type.len-of-single-value",
     "type.for-over-single-value",
+    "type.annotation-contradicted",
+    "type.return-contradicts-signature",
+    "type.argument-contradicts-signature",
+    "type.comparing-text-with-number",
 ];
 
 pub fn is_gated(code: &str) -> bool {
@@ -265,8 +269,7 @@ impl Checker {
                             span: s.span,
                             code: "type.annotation-contradicted",
                             message: format!(
-                                "`{name}` says it will be {} — but this line gives it {}{}. \
-                                 One of the two is what you meant",
+                                "you said `{name}` would be {}, but gave it {}{}.",
                                 declared.name(),
                                 actual.name(),
                                 prov_clause(&prov),
@@ -397,9 +400,8 @@ impl Checker {
                             span: s.span,
                             code: "type.return-contradicts-signature",
                             message: format!(
-                                "line {sig_line} promises `{fname}` gives back {} — this \
-                                 return hands back {}{}. The promise and the return should \
-                                 agree",
+                                "`{fname}` promises to give back {} (line {sig_line}), but this \
+                                 returns {}{}.",
                                 declared.name(),
                                 actual.0.name(),
                                 prov_clause(&actual.1),
@@ -783,8 +785,7 @@ impl Checker {
                         span: e.span,
                         code: "type.argument-contradicts-signature",
                         message: format!(
-                            "`{name}` asks for {} for `{pname}` (line {}) — this call hands \
-                             it {}{}",
+                            "`{name}` wants {} for `{pname}` (line {}), but this passes {}{}.",
                             want.name(),
                             sig.line,
                             at.name(),

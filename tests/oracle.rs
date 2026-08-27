@@ -44,9 +44,14 @@ fn cases(name: &str) -> Vec<(String, String)> {
 /// Listing them explicitly means each one is a regression guard, and it keeps
 /// the "still to do" set honest: anything not named here is a real gap.
 const ALREADY_REJECTED: &[&str] = &[
+    // Caught by the type checker (phase C, rule 4 — annotations mean it).
+    "annotation-contradicted.py",
+    "argument-type-wrong.py",
     "calling-a-number.py",
     // Caught by the type checker (phase C, rule 3).
     "indexing-a-number.py",
+    // Caught by the type checker (phase C, rule 4).
+    "return-type-contradicted.py",
     // Caught by the type checker (phase C, rule 1): cause-line message.
     "string-plus-int.py",
     "subtracting-strings.py",

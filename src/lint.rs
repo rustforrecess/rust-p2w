@@ -2306,6 +2306,37 @@ pub fn error_scaffold(code: &str) -> Option<Scaffold> {
             fix: "If you meant to multiply, write `name * 3`. If you meant a function, it \
                   needs a `def` with that name — and a different name for the value.",
         },
+        "type.annotation-contradicted" => Scaffold {
+            question: "You wrote a type after the name. Is the value on this line that kind \
+                       of thing?",
+            hint: "`: int` is a promise about what this name will hold. This value breaks \
+                   the promise on the same line you made it.",
+            fix: "Change the value to match the promise (e.g. start a count at `0`), or \
+                  change the label to what you meant (e.g. `: str` for text).",
+        },
+        "type.return-contradicts-signature" => Scaffold {
+            question: "The def line promises `-> ...`. What kind of thing does this `return` \
+                       actually hand back?",
+            hint: "str(...) and joining text make text; arithmetic makes numbers. The \
+                   promise and the return have to agree.",
+            fix: "Return the promised kind of thing, or change the `-> ...` to what you \
+                  really want to give back.",
+        },
+        "type.argument-contradicts-signature" => Scaffold {
+            question: "The def line says what each parameter should be. Is what you're \
+                       passing that kind of thing?",
+            hint: "The function is fine — it's this call that hands it the wrong kind of \
+                   thing. Quotes make text; plain digits make a number.",
+            fix: "Pass the kind the parameter asks for, e.g. `area(3, 4)` without the \
+                  quotes — or int(...) to convert text that holds a number.",
+        },
+        "type.comparing-text-with-number" => Scaffold {
+            question: "Is a word bigger than 5? What would that even mean?",
+            hint: "`<` and `>` order two numbers, or two pieces of text alphabetically — \
+                   there's no order between a word and a number.",
+            fix: "Compare two numbers (int(...) converts numeric text) or two pieces of \
+                  text.",
+        },
         "type.indexing-a-single-value" => Scaffold {
             question: "Square brackets pull one item out of a group. What group is this name?",
             hint: "The earlier line gave it a single value, not a list. A single value has \

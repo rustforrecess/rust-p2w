@@ -553,16 +553,18 @@ print(next_year)
             r.json
         );
         assert!(r.json.contains("Line 1"), "cause cited: {}", r.json);
-        // A rule still at the advisory tier: compiles (ok: true), reported
-        // under "types", never gates.
+        // Every confident shape is promoted now, so a gated program's
+        // advisory section is EMPTY — promoted codes never appear under
+        // "types" (they are the error above, not advice below).
         let r = check("n = 5\nw = 'b'\nprint(n < w)\n", false);
-        assert!(r.ok, "advisories never gate: {}", r.json);
-        assert!(r.json.contains("\"types\""), "{}", r.json);
+        assert!(!r.ok, "{}", r.json);
         assert!(
-            r.json.contains("type.comparing-text-with-number"),
+            r.json
+                .contains("\"code\": \"type.comparing-text-with-number\""),
             "{}",
             r.json
         );
+        assert!(r.json.contains("\"types\": []"), "{}", r.json);
         // Clean code: the section is present and empty.
         let r = check(
             "x = 5

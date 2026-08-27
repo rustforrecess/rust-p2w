@@ -350,15 +350,13 @@ fn type_annotations_compile_and_are_ignored() {
         "def add(a: int, b: int) -> int:\n    return a + b\nprint(add(2, 3))",
         "5\n",
     );
-    // A LYING scalar annotation traps at the boundary — the same contract
-    // the native backend has always had ("a lying annotation traps at the
-    // call, with or without us"), which this backend now matches instead
-    // of silently ignoring the annotation. The full type checker will move
-    // this to a compile error with a real message.
-    assert_raises(
-        "def label(x: str) -> int:\n    return x\nprint(label(\"hi\"))",
-        "TypeError",
-    );
+    // A LYING scalar annotation is a COMPILE error now (type checker, phase
+    // C rule 4) — it never reaches either backend's runtime. The message
+    // quotes the promise and names the line it was made on.
+    let err =
+        rust_p2w::compile_to_wat("def label(x: str) -> int:\n    return x\nprint(label(\"hi\"))")
+            .expect_err("a lying annotation must not compile");
+    assert!(err.contains("promises to give back"), "{err}");
     // A subscripted type annotation (list[int]) is accepted too.
     assert_output(
         "def total(xs: list[int]) -> int:\n    s = 0\n    for v in xs:\n        s += v\n    return s\nprint(total([1, 2, 3]))",

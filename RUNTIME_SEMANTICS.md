@@ -128,9 +128,9 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `n = 5; len(n)` | compile error | `line 2: `n` holds one value — a whole number (line 1) — and len() counts the items in a group — a single value isn't a group.` |
 | `n = 5; n.append(1)` | trap | `AttributeError: 'int' object has no attribute 'append'` |
 | `n = 5; for x in n` | compile error | `line 2: `n` holds one value — a whole number (line 1) — and a loop needs a group to step through — a list, some text, a dict or a set. range(n) counts, if…` |
-| `x: int = 'no'` | value | `no` |
-| `def f() -> int: return 'x'` | trap | `TypeError: expected a number, got 'str'` |
-| `def f(n: int) called with str` | trap | `TypeError: expected a number, got 'str'` |
+| `x: int = 'no'` | compile error | `line 1: you said `x` would be a whole number, but gave it text.` |
+| `def f() -> int: return 'x'` | compile error | `line 2: `f` promises to give back a whole number (line 1), but this returns text.` |
+| `def f(n: int) called with str` | compile error | `line 3: `f` wants a whole number for `n` (line 1), but this passes text.` |
 | `wrong arity` | compile error | `line 3: f() is missing a required argument 'b'` |
 | `call a number` | compile error | `line 2: `total` is a whole number (line 1), not something you can call.` |
 | `read before assignment` | compile error | `line 2: unknown name 'q' (define it with `q = ...` first)` |
@@ -196,7 +196,7 @@ Comparing unlike things is where Python's own rules are least obvious, so it is 
 | `bool('')` | value | `False` |
 | `bool([])` | value | `False` |
 | `1 == 'one'` | value | `False` |
-| `1 < 'one'` | compile error | `line 1: can't compare text with a number — there's no way to say whether a word is bigger than 5` |
+| `1 < 'one'` | compile error | `line 1: there is no way to say whether text is bigger than a number — compare two numbers (int(...) converts) or two pieces of text` |
 
 ## Unpacking
 

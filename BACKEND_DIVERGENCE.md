@@ -13,15 +13,9 @@ Error WORDING is not compared — the two have always phrased things differently
 
 ## Result
 
-**3 of 113 probes disagree.**
+**2 of 113 probes disagree.**
 
 A short list means converging the backends is cheap. A long one means we have been maintaining two languages, and which one is the real student-facing runtime is a decision rather than an accident.
-
-### Where a wrong type is caught TODAY
-
-| program | WASM-GC | linear memory |
-|---|---|---|
-| `x: int = 'no'` | value — `no` | trap — `expected an int [hung]` |
 
 ### Dicts and sets
 
