@@ -17,9 +17,10 @@ backend. One pass, four customers:
    ladder. `TYPE_ERROR_MESSAGES.md` is the wording spec; keys land in
    `src/messages.rs` like every other diagnostic.
 2. **The native entry** — the checker-first double-compile in
-   `compile_to_llvm_ir` exists because type-ish checks live inside the WASM
-   generator. Extracting them into this pass deletes that hack; both
-   backends get checks by architecture.
+   `compile_to_llvm_ir` is the enforcement mechanism that keeps both
+   targets rejecting the same programs. It stays (see phase B); this pass
+   is where every NEW check lives so nothing else ever accretes inside a
+   backend.
 3. **The backends' representation decisions** — `repr.rs` today proves
    Int/Float by local fixpoint; checker facts widen what it can prove
    (unboxing, packed lists, reuse — frontier task 3's continuation).
@@ -113,8 +114,8 @@ degrade — propose: ladder-first advisory for a full phase before gating.
   FAILS and names which must-reject cases moved — that failure is the
   checker's birth certificate. All 8 `ok/` still compile; all 8
   `must-reject/` caught with `TYPE_ERROR_MESSAGES.md` wording.
-- BACKEND_DIVERGENCE: 3 → 1 after Phase B (dict.get/unpack are separate
-  mechanical fixes), → 0 after Phase D.
+- BACKEND_DIVERGENCE: the annotation row leaves at Phase D (dict.get and
+  unpack are separate mechanical fixes) → 0.
 - `native_run.sh`, exec suite, Vm parity: green at every phase boundary.
 - Every new diagnostic: a key in `messages.rs`, a ladder in `scaffold()`,
   and a row in the before/after corpus schema (the research asset).
