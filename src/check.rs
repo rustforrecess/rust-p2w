@@ -75,8 +75,21 @@ struct Fact {
     ty: Ty,
     /// Where it became this type.
     line: usize,
-    /// A short phrase completing "line N …", e.g. "assigned it \"12\" (text)".
+    /// A short phrase completing "line N …", e.g. "put quotes around 12, and
+    /// quotes make text".
     why: String,
+    /// The name this fact is about (empty for anonymous facts).
+    name: String,
+}
+
+impl Fact {
+    fn name_or(&self, fallback: &str) -> String {
+        if self.name.is_empty() {
+            fallback.to_string()
+        } else {
+            format!("`{}`", self.name)
+        }
+    }
 }
 
 /// A function's declared surface, for call-site checking. Only ANNOTATED
@@ -89,6 +102,31 @@ struct FnSig {
     ret: Ty,
     n_required: usize,
     n_params: usize,
+}
+
+/// Phase C: the finding codes that are compile ERRORS now, not advice —
+/// promoted one rule at a time, each with its semantics-row diff read and
+/// blessed (docs/TYPE_CHECKER_DESIGN.md D4). Everything else stays advisory.
+pub const GATED: &[&str] = &["type.str-plus-number", "type.str-in-arithmetic"];
+
+pub fn is_gated(code: &str) -> bool {
+    GATED.contains(&code)
+}
+
+/// The shared front-end gate: the FIRST promoted finding becomes the compile
+/// error. Every entry point (Run, native, the Stepper) calls this after
+/// hoisting, so all surfaces refuse the same programs with the same words.
+pub fn gate(stmts: &[Stmt]) -> Result<(), crate::error::CompileError> {
+    match type_findings(stmts).into_iter().find(|f| is_gated(f.code)) {
+        Some(f) => {
+            let mut e = crate::error::CompileError::at(f.line, f.message)
+                .with_kind(crate::error::ErrorKind::Type)
+                .with_code(f.code);
+            e.span = Some(f.span);
+            Err(e)
+        }
+        None => Ok(()),
+    }
 }
 
 pub fn type_findings(stmts: &[Stmt]) -> Vec<TypeFinding> {
@@ -146,6 +184,7 @@ pub fn type_findings(stmts: &[Stmt]) -> Vec<TypeFinding> {
                 fenv.insert(
                     p.clone(),
                     Fact {
+                        name: p.clone(),
                         ty,
                         line: s.line,
                         why,
@@ -203,6 +242,7 @@ impl Checker {
                     env.insert(
                         name.clone(),
                         Fact {
+                            name: name.clone(),
                             ty,
                             line: s.line,
                             why,
@@ -231,6 +271,7 @@ impl Checker {
                     env.insert(
                         name.clone(),
                         Fact {
+                            name: name.clone(),
                             ty: declared,
                             line: s.line,
                             why,
@@ -287,6 +328,7 @@ impl Checker {
                     env.insert(
                         var.clone(),
                         Fact {
+                            name: var.clone(),
                             ty: Ty::Int,
                             line: s.line,
                             why: "made it count through range() (whole numbers)".into(),
@@ -324,6 +366,7 @@ impl Checker {
                     env.insert(
                         var.clone(),
                         Fact {
+                            name: var.clone(),
                             ty: vty,
                             line: s.line,
                             why: "the loop hands it each item in turn".into(),
@@ -377,6 +420,7 @@ impl Checker {
                             env.insert(
                                 n.clone(),
                                 Fact {
+                                    name: n.clone(),
                                     ty: Ty::Dyn,
                                     line: s.line,
                                     why: "unpacked it here".into(),
@@ -390,6 +434,7 @@ impl Checker {
                     env.insert(
                         name.clone(),
                         Fact {
+                            name: name.clone(),
                             ty: Ty::Func,
                             line: s.line,
                             why: format!("defined the function `{name}` here"),
@@ -400,6 +445,7 @@ impl Checker {
                     env.insert(
                         name.clone(),
                         Fact {
+                            name: name.clone(),
                             ty: Ty::Class,
                             line: s.line,
                             why: format!("defined the class `{name}` here"),
@@ -552,6 +598,7 @@ impl Checker {
                                 inner.insert(
                                     v.clone(),
                                     Fact {
+                                        name: v.clone(),
                                         ty: Ty::Dyn,
                                         line: e.line,
                                         why: "comprehension variable".into(),
@@ -588,6 +635,7 @@ impl Checker {
                                 inner.insert(
                                     v.clone(),
                                     Fact {
+                                        name: v.clone(),
                                         ty: Ty::Dyn,
                                         line: e.line,
                                         why: "comprehension variable".into(),
@@ -622,22 +670,12 @@ impl Checker {
             BinOp::Add => match (&ta, &tb) {
                 (Ty::Str, Ty::Str) => (Ty::Str, None),
                 (Ty::Str, t) | (t, Ty::Str) if t.numeric() => {
-                    let (sp, op_word) = if ta == Ty::Str {
-                        (&pa, "left")
-                    } else {
-                        (&pb, "right")
-                    };
-                    let _ = op_word;
+                    let sp = if ta == Ty::Str { &pa } else { &pb };
                     self.out.push(TypeFinding {
                         line: e.line,
                         span: e.span,
                         code: "type.str-plus-number",
-                        message: format!(
-                            "`+` can join two pieces of text, or add two numbers — this mixes \
-                             text{} with a number. int(...) turns text into a number; \
-                             str(...) goes the other way",
-                            prov_clause(sp),
-                        ),
+                        message: str_plus_number_message(sp),
                     });
                     (Ty::Dyn, None)
                 }
@@ -646,18 +684,13 @@ impl Checker {
                 _ => (Ty::Dyn, None),
             },
             BinOp::Sub | BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
-                for (t, p) in [(&ta, &pa), (&tb, &pb)] {
+                for (i, (t, p)) in [(&ta, &pa), (&tb, &pb)].into_iter().enumerate() {
                     if matches!(t, Ty::Str) {
                         self.out.push(TypeFinding {
                             line: e.line,
                             span: e.span,
                             code: "type.str-in-arithmetic",
-                            message: format!(
-                                "this arithmetic was handed text{} — `+` joins text, but \
-                                 there is no meaning for this operation on it. int(...) \
-                                 turns numeric text into a number first",
-                                prov_clause(p),
-                            ),
+                            message: str_in_arithmetic_message(op, p, i == 0),
                         });
                         return (Ty::Dyn, None);
                     }
@@ -845,16 +878,64 @@ fn prov_clause(p: &Option<Fact>) -> String {
     }
 }
 
+/// TYPE_ERROR_MESSAGES.md, "`age = \"12\"` then `age + 1`": at the `+`,
+/// ALSO pointing at the line that made it text.
+fn str_plus_number_message(p: &Option<Fact>) -> String {
+    match p {
+        Some(f) => format!(
+            "{} holds text, not a number, so a number can't be added to it. Line {} {}.",
+            f.name_or("this"),
+            f.line,
+            f.why
+        ),
+        None => "this adds a number to text, and there's no way to do that — quotes make \
+                 text. int(...) turns text that looks like a number into one"
+            .to_string(),
+    }
+}
+
+/// TYPE_ERROR_MESSAGES.md, "`\"hello world\" - \"world\"`": the expectation is
+/// reasonable (`+` joins text), so the message says why THIS one can't work.
+fn str_in_arithmetic_message(op: BinOp, p: &Option<Fact>, text_on_left: bool) -> String {
+    // `"..." % x` is Python's old formatting trick, not arithmetic — a
+    // student who wrote it meant formatting, and the subset's answer is
+    // f-strings. (The feature-probe doc pins this wording.)
+    if matches!(op, BinOp::Mod) && text_on_left {
+        return "`%` after text is Python's old way of filling in values, which this \
+                subset doesn't have — write an f-string instead: f\"...{value}...\""
+            .to_string();
+    }
+    let cannot = match op {
+        BinOp::Sub => "take one piece of text away from another",
+        BinOp::Div | BinOp::FloorDiv => "divide text",
+        BinOp::Mod => "take the remainder of text",
+        BinOp::Pow => "raise text to a power",
+        _ => "do this arithmetic on text",
+    };
+    match p {
+        Some(f) => format!(
+            "`+` joins text together, but there's no way to {cannot}. {} holds text — \
+             line {} {}.",
+            f.name_or("this"),
+            f.line,
+            f.why
+        ),
+        None => format!("`+` joins text together, but there's no way to {cannot}."),
+    }
+}
+
 /// A short phrase for WHY an assignment made a name its type — the ledger
 /// entry later messages cite.
 fn describe_value(value: &Expr, ty: &Ty) -> String {
     match &value.kind {
-        ExprKind::Str(s) if s.len() <= 12 => format!("assigned it \"{s}\" (text)"),
-        ExprKind::Str(_) => "assigned it text".into(),
-        ExprKind::Int(n) => format!("assigned it {n} (a whole number)"),
-        ExprKind::Float(_) => "assigned it a decimal number".into(),
+        ExprKind::Str(s) if s.len() <= 12 => {
+            format!("put quotes around `{s}`, and quotes make text")
+        }
+        ExprKind::Str(_) => "gave it text (quotes make text)".into(),
+        ExprKind::Int(n) => format!("gave it {n}, a whole number"),
+        ExprKind::Float(_) => "gave it a decimal number".into(),
         ExprKind::Call(n, _) if n == "input" => {
-            "assigned it input(), and everything typed in arrives as TEXT".into()
+            "gave it input(), and everything typed in arrives as text".into()
         }
         ExprKind::Call(n, _) => format!("assigned it {n}(...)"),
         ExprKind::List(_) => "assigned it a list".into(),
@@ -881,15 +962,15 @@ mod tests {
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].code, "type.str-plus-number");
         assert_eq!(f[0].line, 2);
-        assert!(f[0].message.contains("line 1"), "{}", f[0].message);
-        assert!(f[0].message.contains("\"12\""), "{}", f[0].message);
+        assert!(f[0].message.contains("Line 1"), "{}", f[0].message);
+        assert!(f[0].message.contains("`12`"), "{}", f[0].message);
     }
 
     #[test]
     fn input_is_the_classic_cause_and_the_ledger_says_so() {
         let f = findings("name = input()\nprint(name + 5)\n");
         assert_eq!(f.len(), 1, "{f:?}");
-        assert!(f[0].message.contains("arrives as TEXT"), "{}", f[0].message);
+        assert!(f[0].message.contains("arrives as text"), "{}", f[0].message);
     }
 
     #[test]

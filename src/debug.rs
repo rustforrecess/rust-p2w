@@ -322,6 +322,7 @@ impl Stepper {
         // their captures) behave identically here and under Run. The pass keeps
         // statement order, so stepping is unchanged for everything else.
         let program = crate::hoist::hoist_nested_functions(program)?;
+        crate::check::gate(&program)?; // Step refuses what Run refuses
         let mut s = Stepper {
             stack: vec![Cont::Seq {
                 block: Rc::new(program),
@@ -1915,6 +1916,7 @@ impl Vm {
         // Closure-convert like the compiler, so a nested function that captures
         // steps the same way it Runs (and a bad capture errors identically).
         let program = crate::hoist::hoist_nested_functions(program)?;
+        crate::check::gate(&program)?; // Step refuses what Run refuses
         let module = VmFrame {
             func: "<module>".to_string(),
             work: vec![Task::Next(Rc::new(program), 0)],

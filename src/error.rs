@@ -46,6 +46,10 @@ pub struct CompileError {
     /// The error's family (see [`ErrorKind`]); `Syntax` unless a site says
     /// otherwise via [`CompileError::with_kind`].
     pub kind: ErrorKind,
+    /// A stable key for THIS diagnostic (e.g. `type.str-plus-number`) when
+    /// it has one — what ladders, the corpus, and the IDE key on. Legacy
+    /// sites carry `None`; the type checker's promoted rules always set it.
+    pub code: Option<&'static str>,
 }
 
 impl CompileError {
@@ -55,6 +59,7 @@ impl CompileError {
             span: None,
             message: message.into(),
             kind: ErrorKind::Syntax,
+            code: None,
         }
     }
 
@@ -66,6 +71,7 @@ impl CompileError {
             span: Some(span),
             message: message.into(),
             kind: ErrorKind::Syntax,
+            code: None,
         }
     }
 
@@ -76,12 +82,19 @@ impl CompileError {
             span: None,
             message: message.into(),
             kind: ErrorKind::Syntax,
+            code: None,
         }
     }
 
     /// Classify this error (chainable): `CompileError::at(...).with_kind(Name)`.
     pub fn with_kind(mut self, kind: ErrorKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    /// Attach the diagnostic's stable key (see the `code` field).
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
         self
     }
 }

@@ -49,13 +49,14 @@ mod roles;
 pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
 pub use builtins::{BUILTINS, Builtin, builtins_json};
-pub use check::TypeFinding;
+pub use check::{GATED, TypeFinding, is_gated};
 pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{Status, Stepper, Value, Vm};
 pub use error::{CompileError, ErrorKind};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
 pub use floatfmt::py_float_repr;
 pub use lexer::Comment;
+pub use lint::error_scaffold;
 pub use math_wat::{MATH_DATA, MATH_FUNCS, MATH_GLOBALS, MATH_MEMORY};
 pub use roles::{
     Role, VarRole, classify_sort, classify_sort_by_passes, confirm_container_shrinks,
@@ -87,6 +88,9 @@ pub fn try_compile(source: &str) -> Result<String, CompileError> {
     let tokens = lexer::lex(source)?;
     let stmts = parser::parse(&tokens)?;
     let stmts = hoist::hoist_nested_functions(stmts)?;
+    // The type checker's promoted rules refuse here, in the shared front-end,
+    // before either backend — the same words on every surface.
+    check::gate(&stmts)?;
     codegen::generate(&stmts)
 }
 
@@ -169,6 +173,7 @@ pub fn compile_to_llvm_ir(source: &str) -> Result<String, String> {
     let tokens = lexer::lex(source).map_err(|e| e.to_string())?;
     let stmts = parser::parse(&tokens).map_err(|e| e.to_string())?;
     let stmts = hoist::hoist_nested_functions(stmts).map_err(|e| e.to_string())?;
+    check::gate(&stmts).map_err(|e| e.to_string())?;
     // Run the WASM generator as a CHECKER first, discarding its output. The
     // compile-time type checks (literal string arithmetic, annotation misuse,
     // arity…) live inside it, and running the SAME code is the only way the

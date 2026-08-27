@@ -196,7 +196,26 @@ fn check(source: &str, mojo: bool) -> Report {
     if let Err(e) = &compile {
         let mut it = String::from("{");
         push_field(&mut it, "severity", &json_str("error"), true);
-        push_field(&mut it, "code", &json_str(error_code(e.kind)), false);
+        // The specific key when the diagnostic has one (promoted type
+        // rules), else the family code — and the ladder that goes with it.
+        push_field(
+            &mut it,
+            "code",
+            &json_str(e.code.unwrap_or(error_code(e.kind))),
+            false,
+        );
+        match e.code.and_then(rust_p2w::error_scaffold) {
+            Some(s) => {
+                let ladder = format!(
+                    "{{\"question\": {}, \"hint\": {}, \"fix\": {}}}",
+                    json_str(s.question),
+                    json_str(s.hint),
+                    json_str(s.fix)
+                );
+                push_field(&mut it, "scaffold", &ladder, false);
+            }
+            None => push_field(&mut it, "scaffold", "null", false),
+        }
         push_field(&mut it, "headline", &json_str(e.kind.headline()), false);
         push_field(&mut it, "message", &json_str(&e.message), false);
         match e.line {
@@ -248,7 +267,11 @@ fn check(source: &str, mojo: bool) -> Report {
     // Flow-sensitive inference findings with provenance-ledger messages.
     // Advisory: they never gate, and an empty array is the normal case.
     let mut items: Vec<String> = Vec::new();
-    for f in rust_p2w::type_findings(source) {
+    // Promoted (gated) codes are compile errors above, not advice here.
+    for f in rust_p2w::type_findings(source)
+        .into_iter()
+        .filter(|f| !rust_p2w::is_gated(f.code))
+    {
         let mut it = String::from("{");
         push_field(&mut it, "severity", &json_str("advice"), true);
         push_field(&mut it, "code", &json_str(f.code), false);
@@ -508,8 +531,9 @@ mod tests {
 
     #[test]
     fn type_advisories_ride_the_report_and_never_gate() {
-        // The classic: compiles (ok: true), runs today, and the advisory
-        // names the CAUSE line — phase A in one report.
+        // A promoted rule (phase C): the classic is a compile ERROR now,
+        // carrying its stable code and its fading ladder, and it names the
+        // CAUSE line.
         let r = check(
             "age = '12'
 next_year = age + 1
@@ -517,10 +541,28 @@ print(next_year)
 ",
             false,
         );
+        assert!(!r.ok, "promoted rules gate: {}", r.json);
+        assert!(
+            r.json.contains("\"code\": \"type.str-plus-number\""),
+            "{}",
+            r.json
+        );
+        assert!(
+            r.json.contains("\"question\""),
+            "ladder expected: {}",
+            r.json
+        );
+        assert!(r.json.contains("Line 1"), "cause cited: {}", r.json);
+        // A rule still at the advisory tier: compiles (ok: true), reported
+        // under "types", never gates.
+        let r = check("score = 42\nprint(score[0])\n", false);
         assert!(r.ok, "advisories never gate: {}", r.json);
         assert!(r.json.contains("\"types\""), "{}", r.json);
-        assert!(r.json.contains("type.str-plus-number"), "{}", r.json);
-        assert!(r.json.contains("line 1"), "cause cited: {}", r.json);
+        assert!(
+            r.json.contains("type.indexing-a-single-value"),
+            "{}",
+            r.json
+        );
         // Clean code: the section is present and empty.
         let r = check(
             "x = 5

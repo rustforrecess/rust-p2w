@@ -2289,6 +2289,28 @@ fn for_each_subexpr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     }
 }
 
+/// The fading ladder for a promoted type ERROR, keyed by its stable code
+/// (`CompileError::code`). Tables from TYPE_ERROR_MESSAGES.md.
+pub fn error_scaffold(code: &str) -> Option<Scaffold> {
+    Some(match code {
+        "type.str-plus-number" => Scaffold {
+            question: "Is that value a number, or text that looks like a number?",
+            hint: "Quotes make text. Python can join text to text and add numbers to \
+                   numbers, but it can't add a number to text.",
+            fix: "int(...) turns the text into a number first — e.g. `int(age) + 1`.",
+        },
+        "type.str-in-arithmetic" => Scaffold {
+            question: "\"ab\" + \"cd\" gives \"abcd\". What would \"abcd\" - \"cd\" mean — \
+                       remove it from the end, from anywhere, or every copy?",
+            hint: "That's exactly why it isn't allowed: there's more than one sensible \
+                   answer, so Python makes you say which you want.",
+            fix: "`text.replace(\"world\", \"\")` removes it; `text[:5]` keeps the first \
+                  five letters. If the values were meant to be numbers, int(...) first.",
+        },
+        _ => return None,
+    })
+}
+
 /// Which diagnostic produced a lint — used to look up its fix scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintKind {

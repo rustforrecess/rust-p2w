@@ -112,10 +112,10 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `'café'[3]` | value | `é` |
 | `'a🦀b'[1]` | value | `🦀` |
 | `for c in 'héé'` | value | `h ⏎ é ⏎ é` |
-| `'ab' - 'b'` | compile error | `line 1: this operator needs numbers on both sides` |
-| `'ab' + 1` | compile error | `line 1: can't add text and a number together` |
-| `1 + 'ab'` | compile error | `line 1: can't add text and a number together` |
-| `'ab' / 2` | compile error | `line 1: this operator needs numbers on both sides` |
+| `'ab' - 'b'` | compile error | `line 1: `+` joins text together, but there's no way to take one piece of text away from another.` |
+| `'ab' + 1` | compile error | `line 1: this adds a number to text, and there's no way to do that — quotes make text. int(...) turns text that looks like a number into one` |
+| `1 + 'ab'` | compile error | `line 1: this adds a number to text, and there's no way to do that — quotes make text. int(...) turns text that looks like a number into one` |
+| `'ab' / 2` | compile error | `line 1: `+` joins text together, but there's no way to divide text.` |
 
 ## Where a wrong type is caught TODAY
 
@@ -123,7 +123,7 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 
 | program | where | result |
 |---|---|---|
-| `age = '12'; age + 1` | trap | `TypeError: expected a number, got 'str'` |
+| `age = '12'; age + 1` | compile error | `line 2: `age` holds text, not a number, so a number can't be added to it. Line 1 put quotes around `12`, and quotes make text.` |
 | `n = 5; n[0]` | trap | `TypeError: 'int' object is not subscriptable` |
 | `n = 5; len(n)` | trap | `TypeError: object of type 'int' has no len()` |
 | `n = 5; n.append(1)` | trap | `AttributeError: 'int' object has no attribute 'append'` |

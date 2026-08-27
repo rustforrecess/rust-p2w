@@ -68,7 +68,7 @@ fn every_finding_cites_its_ledger_when_a_name_is_involved() {
     assert_eq!(f.len(), 1);
     assert_eq!(f[0].line, 2, "symptom line");
     assert!(
-        f[0].message.contains("line 1"),
+        f[0].message.contains("Line 1"),
         "cause line: {}",
         f[0].message
     );

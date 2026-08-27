@@ -1043,8 +1043,11 @@ fn float_truthiness() {
 
 #[test]
 fn type_errors_name_the_offending_type() {
+    // Through a list element (Dyn to the checker) so the RUNTIME check is
+    // what's under test — the static shape `x = "a"; x - 1` is a compile
+    // error since phase C, rule 1.
     assert_raises(
-        "x = \"a\"\ny = 1\nprint(x - y)",
+        "xs = [\"a\", 1]\nprint(xs[0] - xs[1])",
         "TypeError: expected a number, got 'str'",
     );
     // `x * 2` is list repetition now; `-` keeps a list out of arithmetic.

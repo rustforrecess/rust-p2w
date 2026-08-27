@@ -37,7 +37,7 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `implicit string concatenation` | expected ')', but found a piece of text (a string) |
 | `bytes literal` | expected a new line, but found a piece of text (a string) |
 | `integer past 2^31` | the number 4000000000 is too big — whole numbers from -2147483648 to 2147483647 … |
-| `percent formatting` | this operator needs numbers on both sides |
+| `percent formatting` | `%` after text is Python's old way of filling in values, which this subset doesn… |
 | `divmod` | unknown function 'divmod' |
 | `type()` | unknown function 'type' |
 | `isinstance()` | unknown name 'int' (define it with `int = ...` first) |
