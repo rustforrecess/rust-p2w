@@ -74,9 +74,20 @@ and stays on the table for tier 2, decided ALONGSIDE the memory model
   as a new JSON section and the IDE's panel. ZERO behavior change:
   RUNTIME_SEMANTICS byte-identical, no gating. The corpus of real
   student programs tells us the false-positive rate before anything blocks.
-- **Phase B — extraction.** The literal checks move OUT of codegen's
-  `type_of` into the pass; `compile_to_llvm_ir` drops the double-compile.
-  Same rejections, same words, byte-for-byte — the suite is the oracle.
+- **Phase B — single home for checks (SCOPE CORRECTED 2026-08-23).** The
+  original premise — that `type_of` was the only front-end check inside
+  codegen — was wrong: `generate()` carries ~60 distinct compile-time
+  rejections (arity, keyword args, unknown names, format strings, range
+  rules, statement placement, super(), modules …); the type checks are
+  five of them. Deleting the double-compile after moving five would LOSE
+  the other fifty-five natively. And a byte-identical move of even those
+  five means replicating codegen's literal-only blindness, while using the
+  pass's real inference for errors IS phase C's gating decision. So: the
+  double-compile STAYS as the enforcement mechanism (correct by
+  construction; cost = one extra kid-sized compile offline). Phase B's
+  real content: the pass is the single home for every NEW check and for
+  every check phase C promotes; legacy checks migrate opportunistically as
+  phase C touches them, never as a relocation campaign.
 - **Phase C — the decided rules gate.** Type-changing rebinding,
   mixed-type branches, heterogeneous list use — compile errors with
   ladders. A LANGUAGE CHANGE: the semantics rows that move get read and
