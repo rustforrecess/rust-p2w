@@ -2076,7 +2076,7 @@ fn find_len_meaning(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
 // --- Variants missing an operation (the data-definition template) ----------
 //
 // A base class with subclasses is a data definition with variants
-// (`Shape = Circle | Square | Triangle`), and a method that several variants
+// (`Part = Motor | Servo | Buzzer`), and a method that several variants
 // define is an operation over that definition. The design-recipe template
 // for such an operation has one case per variant; in method-per-subclass
 // Python the cases are the sibling definitions. A variant with no case fails
@@ -2087,9 +2087,15 @@ fn find_len_meaning(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
 //
 // Fires when at least two siblings define the method and another sibling
 // neither defines nor inherits it. One sibling alone is a private method
-// (`Circle.radius`), not an operation over `Shape`. Dunders are not
+// (`Motor.reverse`), not an operation over `Part`. Dunders are not
 // operations over the data and are skipped. Advisory, like every lint: a
-// program that never asks a Triangle for `area()` is a correct program.
+// program that never tells a Buzzer to `stop()` is a correct program.
+//
+// The "one case per variant" obligation is the design-recipe idea (HtDP,
+// Sperber's DMdA — NOTICE, ideas only). The check, its wording, and its
+// examples are ours: the examples are drawn from the robot kit the programs
+// run on, not from the textbooks' shapes, so nothing here restates their
+// material.
 
 /// (line, span, message) per subclass that lacks a method two or more of
 /// its siblings define and that no ancestor provides. Anchored at the
@@ -2594,11 +2600,11 @@ pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
                   component's own id.",
         },
         LintKind::VariantMissingMethod => Scaffold {
-            question: "A class with subclasses is a list of kinds: a Shape is a Circle, a Square, \
-                       or a Triangle. When the program asks a Shape for area(), which of the \
-                       kinds can answer?",
+            question: "A class with subclasses is a list of kinds: a Part is a Motor, a Servo, \
+                       or a Buzzer. When the program tells a Part to stop(), which of the \
+                       kinds can do it?",
             hint: "Two of the kinds define the method and one does not. A missing method only \
-                   fails when that kind reaches the call — the Triangle in a list of shapes \
+                   fails when that kind reaches the call — the Buzzer in a list of parts \
                    stops the program with AttributeError after the others worked.",
             fix: "Either give the missing kind its own def of the method, or define the method \
                   once on the base class so every kind inherits it, overriding it only where \
@@ -3100,18 +3106,18 @@ mod tests {
 
     #[test]
     fn variant_missing_method_names_the_uncovered_kind() {
-        // Shape = Circle | Square | Triangle; area() has cases for two of them.
-        let src = "class Shape:\n    pass\n\nclass Circle(Shape):\n    def area(self):\n        return 3\n\n\
-                   class Square(Shape):\n    def area(self):\n        return 4\n\n\
-                   class Triangle(Shape):\n    def sides(self):\n        return 3\n";
+        // Part = Motor | Servo | Buzzer; stop() has cases for two of them.
+        let src = "class Part:\n    pass\n\nclass Motor(Part):\n    def stop(self):\n        return 3\n\n\
+                   class Servo(Part):\n    def stop(self):\n        return 4\n\n\
+                   class Buzzer(Part):\n    def beep(self):\n        return 3\n";
         let w = variants(src);
         assert_eq!(w.len(), 1, "{w:?}");
         // Anchored at the class that lacks the case, not at a call site.
         assert_eq!(w[0].0, 12);
         assert_eq!(
             w[0].1,
-            "Shape also has Triangle: Circle and Square define area(), and Triangle has no \
-             area() of its own or from Shape"
+            "Part also has Buzzer: Motor and Servo define stop(), and Buzzer has no \
+             stop() of its own or from Part"
         );
         // Three siblings with the method: the list reads naturally.
         let src = "class S:\n    pass\n\nclass A(S):\n    def f(self):\n        return 1\n\n\
@@ -3128,32 +3134,32 @@ mod tests {
         // The base provides it: every kind can answer.
         assert!(
             variants(
-                "class Shape:\n    def area(self):\n        return 0\n\n\
-             class Circle(Shape):\n    def area(self):\n        return 3\n\n\
-             class Square(Shape):\n    def area(self):\n        return 4\n\n\
-             class Triangle(Shape):\n    pass\n"
+                "class Part:\n    def stop(self):\n        return 0\n\n\
+             class Motor(Part):\n    def stop(self):\n        return 3\n\n\
+             class Servo(Part):\n    def stop(self):\n        return 4\n\n\
+             class Buzzer(Part):\n    pass\n"
             )
             .is_empty()
         );
         // One sibling's private method is not an operation over the base.
         assert!(variants(
-            "class Shape:\n    pass\n\nclass Circle(Shape):\n    def radius(self):\n        return 1\n\n\
-             class Square(Shape):\n    pass\n"
+            "class Part:\n    pass\n\nclass Motor(Part):\n    def reverse(self):\n        return 1\n\n\
+             class Servo(Part):\n    pass\n"
         )
         .is_empty());
-        // Provided by an intermediate ancestor: Triangle inherits Polygon.area.
+        // Provided by an intermediate ancestor: Buzzer inherits Mover.stop.
         assert!(variants(
-            "class Shape:\n    pass\n\nclass Polygon(Shape):\n    def area(self):\n        return 0\n\n\
-             class Circle(Shape):\n    def area(self):\n        return 3\n\n\
-             class Square(Polygon):\n    def area(self):\n        return 4\n\n\
-             class Triangle(Polygon):\n    pass\n"
+            "class Part:\n    pass\n\nclass Mover(Part):\n    def stop(self):\n        return 0\n\n\
+             class Motor(Part):\n    def stop(self):\n        return 3\n\n\
+             class Servo(Mover):\n    def stop(self):\n        return 4\n\n\
+             class Buzzer(Mover):\n    pass\n"
         )
         .is_empty());
         // Dunders are not operations over the data.
         assert!(variants(
-            "class Shape:\n    pass\n\nclass Circle(Shape):\n    def __init__(self):\n        self.r = 1\n\n\
-             class Square(Shape):\n    def __init__(self):\n        self.s = 1\n\n\
-             class Triangle(Shape):\n    pass\n"
+            "class Part:\n    pass\n\nclass Motor(Part):\n    def __init__(self):\n        self.r = 1\n\n\
+             class Servo(Part):\n    def __init__(self):\n        self.s = 1\n\n\
+             class Buzzer(Part):\n    pass\n"
         )
         .is_empty());
         // Unrelated classes with a shared method name are not variants of anything.

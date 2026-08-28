@@ -598,17 +598,17 @@ print(x + 3)
 
     #[test]
     fn a_kind_missing_its_siblings_method_is_named_before_it_runs() {
-        // Compiles fine and fails at run time on the Triangle; the report
+        // Compiles fine and fails at run time on the Buzzer; the report
         // says so up front, at the class, with the recipe's ladder attached.
         let r = check(
-            "class Shape:\n    pass\n\nclass Circle(Shape):\n    def area(self):\n        return 3\n\n\
-             class Square(Shape):\n    def area(self):\n        return 4\n\n\
-             class Triangle(Shape):\n    pass\n",
+            "class Part:\n    pass\n\nclass Motor(Part):\n    def stop(self):\n        return 3\n\n\
+             class Servo(Part):\n    def stop(self):\n        return 4\n\n\
+             class Buzzer(Part):\n    pass\n",
             false,
         );
         assert!(r.json.contains("\"ok\": true"), "{}", r.json);
         assert!(r.json.contains("\"variant_missing_method\""), "{}", r.json);
-        assert!(r.json.contains("Shape also has Triangle"), "{}", r.json);
+        assert!(r.json.contains("Part also has Buzzer"), "{}", r.json);
         assert!(r.json.contains("\"line\": 12"), "{}", r.json);
         assert!(r.json.contains("which of the"), "{}", r.json);
     }

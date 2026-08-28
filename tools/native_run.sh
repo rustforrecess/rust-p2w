@@ -437,7 +437,7 @@ run_case random_parity 'import random\nprint(random.randint(1, 100))\nprint(rand
 run_case dict_get "d = {'a': 1}\nprint(d.get('a', 0))\nprint(d.get('b', 0))\nprint(d.get('b'))\n" '1\n0\nNone' || fails=$((fails+1))
 run_case dict_get_heap "d = {'k': [1, 2]}\nxs = d.get('k', [])\nys = d.get('z', [9])\nprint(len(xs) + len(ys))\n" '3' || fails=$((fails+1))
 run_case unpack_exact "a, b = 1, 2\nc, d = [3, 4]\nprint(a + b + c + d)\n" '10' || fails=$((fails+1))
-run_case class_pass_variant 'class Shape:\n    def __init__(self, w: int):\n        self.w = w\nclass Circle(Shape):\n    def area(self) -> int:\n        return 3 * self.w * self.w\nclass Triangle(Shape):\n    pass\nt = Triangle(4)\nprint(t.w)\nprint(Circle(2).area())\n' '4\n12' || fails=$((fails+1))
+run_case class_pass_variant 'class Part:\n    def __init__(self, pin: int):\n        self.pin = pin\nclass Motor(Part):\n    def speed(self) -> int:\n        return 3 * self.pin * self.pin\nclass Buzzer(Part):\n    pass\nb = Buzzer(4)\nprint(b.pin)\nprint(Motor(2).speed())\n' '4\n12' || fails=$((fails+1))
 
 # --- Mojo-bridge cases (docs/MOJO_BRIDGE.md Lane 1) --------------------------
 # Every profile-ready bridge case must ALSO compile through the native

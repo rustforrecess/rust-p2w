@@ -93,6 +93,16 @@ nothing here depends on those licenses since no code is used.
      bit instructions, patterned on our own existing helpers ($py_neg,
      p2w_band). Behavior/spec is uncopyrightable; no MicroPython code is used.
 
+8. Program by Design / How to Design Programs (Felleisen et al.) and
+   DMdA / "Schreibe Dein Programm!" (Sperber, Klaeren) - textbooks and papers
+   - The design-recipe idea that a function over a data definition with
+     variants has one case per variant, and that a program's *form* (the
+     recipe step it diverges at) is what to report, informed
+     `lint::variant_missing_method_warnings` ("Part also has Buzzer"). The
+     check runs on class hierarchies, which the recipes never do; its wording
+     and its robot-kit examples are ours, and none of the books' examples or
+     text appear here. Bootstrap's materials (CC BY-NC-SA) were not used.
+
 7. Statically-compiled Python subsets, as a group — consulted for TYPE SYSTEM
    DESIGN DECISIONS ONLY, from public documentation. Written up in
    PRIOR-ART-TYPES.md; each decision is cited at the point it informed, in

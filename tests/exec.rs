@@ -228,13 +228,13 @@ fn assert_output(src: &str, expected: &str) {
 /// matching CPython's later-binding-wins.
 #[test]
 fn a_pass_body_class_is_a_variant_with_nothing_of_its_own() {
-    // `class Triangle(Shape): pass` — the leaf of a data definition. It
+    // `class Buzzer(Part): pass` — the leaf of a data definition. It
     // inherits construction and attributes and adds nothing.
     assert_output(
-        "class Shape:\n    def __init__(self, w: int):\n        self.w = w\n\
-         class Circle(Shape):\n    def area(self) -> int:\n        return 3 * self.w * self.w\n\
-         class Triangle(Shape):\n    pass\n\
-         t = Triangle(4)\nprint(t.w)\nprint(Circle(2).area())\n",
+        "class Part:\n    def __init__(self, pin: int):\n        self.pin = pin\n\
+         class Motor(Part):\n    def speed(self) -> int:\n        return 3 * self.pin * self.pin\n\
+         class Buzzer(Part):\n    pass\n\
+         b = Buzzer(4)\nprint(b.pin)\nprint(Motor(2).speed())\n",
         "4\n12\n",
     );
 }
