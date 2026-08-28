@@ -2073,6 +2073,131 @@ fn find_len_meaning(e: &Expr, out: &mut Vec<(usize, (usize, usize), String)>) {
     for_each_subexpr(e, &mut |sub| find_len_meaning(sub, out));
 }
 
+// --- Variants missing an operation (the data-definition template) ----------
+//
+// A base class with subclasses is a data definition with variants
+// (`Shape = Circle | Square | Triangle`), and a method that several variants
+// define is an operation over that definition. The design-recipe template
+// for such an operation has one case per variant; in method-per-subclass
+// Python the cases are the sibling definitions. A variant with no case fails
+// only when one reaches the call (`AttributeError` at run time, possibly on
+// the third item of a list that worked for the first two), so this names it
+// up front, at the class that lacks the method — the earliest recipe step
+// where the program diverges from what its data definition would derive.
+//
+// Fires when at least two siblings define the method and another sibling
+// neither defines nor inherits it. One sibling alone is a private method
+// (`Circle.radius`), not an operation over `Shape`. Dunders are not
+// operations over the data and are skipped. Advisory, like every lint: a
+// program that never asks a Triangle for `area()` is a correct program.
+
+/// (line, span, message) per subclass that lacks a method two or more of
+/// its siblings define and that no ancestor provides. Anchored at the
+/// lacking class, where the recipe says the fix goes.
+pub fn variant_missing_method_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
+    struct Class<'a> {
+        base: Option<&'a str>,
+        methods: Vec<&'a str>,
+        line: usize,
+        span: (usize, usize),
+    }
+    let mut classes: Vec<(&str, Class)> = Vec::new();
+    for s in stmts {
+        if let StmtKind::ClassDef {
+            name,
+            base,
+            methods,
+            ..
+        } = &s.kind
+        {
+            classes.push((
+                name.as_str(),
+                Class {
+                    base: base.as_deref(),
+                    methods: methods.iter().map(|m| m.name.as_str()).collect(),
+                    line: s.line,
+                    span: s.span,
+                },
+            ));
+        }
+    }
+    let find = |n: &str| classes.iter().find(|(c, _)| *c == n).map(|(_, c)| c);
+    // Does `name` or any ancestor define `method`? The walk is bounded: a
+    // cycle in `base` is rejected elsewhere, but never spin on one here.
+    let provides = |name: &str, method: &str| -> bool {
+        let mut cur = Some(name);
+        for _ in 0..=classes.len() {
+            let Some(c) = cur.and_then(find) else {
+                return false;
+            };
+            if c.methods.contains(&method) {
+                return true;
+            }
+            cur = c.base;
+        }
+        false
+    };
+    let mut out = Vec::new();
+    for (base_name, _) in &classes {
+        // The direct subclasses are the variants of this data definition.
+        let variants: Vec<&(&str, Class)> = classes
+            .iter()
+            .filter(|(_, c)| c.base == Some(*base_name))
+            .collect();
+        if variants.len() < 2 {
+            continue;
+        }
+        // Operations = methods two or more variants define that the base
+        // (or its ancestors) does not already provide.
+        let mut ops: Vec<&str> = Vec::new();
+        for (_, c) in &variants {
+            for m in &c.methods {
+                if m.starts_with("__") || ops.contains(m) || provides(base_name, m) {
+                    continue;
+                }
+                let defined_by = variants
+                    .iter()
+                    .filter(|(_, v)| v.methods.contains(m))
+                    .count();
+                if defined_by >= 2 {
+                    ops.push(m);
+                }
+            }
+        }
+        for (vname, v) in &variants {
+            for m in &ops {
+                if provides(vname, m) {
+                    continue;
+                }
+                let have: Vec<&str> = variants
+                    .iter()
+                    .filter(|(_, o)| o.methods.contains(m))
+                    .map(|(n, _)| *n)
+                    .collect();
+                out.push((
+                    v.line,
+                    v.span,
+                    format!(
+                        "{base_name} also has {vname}: {} define {m}(), and {vname} has \
+                         no {m}() of its own or from {base_name}",
+                        join_names(&have)
+                    ),
+                ));
+            }
+        }
+    }
+    out.sort_by_key(|(line, _, _)| *line);
+    out
+}
+
+fn join_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 // --- The Mojo-bridge profile -------------------------------------------------
 //
 // `p2w check --profile mojo`: findings for constructs OUTSIDE the Python∩Mojo
@@ -2397,6 +2522,10 @@ pub enum LintKind {
     /// A component API def reaching outside its component (step 5d) — the
     /// encapsulation teacher and the WIT/PXC conversion precondition.
     ComponentUnclean,
+    /// A subclass lacking a method its siblings share — the data-definition
+    /// template has one case per variant (see
+    /// `variant_missing_method_warnings`).
+    VariantMissingMethod,
 }
 
 /// A fading hint ladder for a concept-bearing lint. Rungs are least-help-first;
@@ -2463,6 +2592,17 @@ pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
             fix: "Add a parameter for the outside value and pass it in where the def is \
                   called — or, if it's an id or field key, rename it to start with the \
                   component's own id.",
+        },
+        LintKind::VariantMissingMethod => Scaffold {
+            question: "A class with subclasses is a list of kinds: a Shape is a Circle, a Square, \
+                       or a Triangle. When the program asks a Shape for area(), which of the \
+                       kinds can answer?",
+            hint: "Two of the kinds define the method and one does not. A missing method only \
+                   fails when that kind reaches the call — the Triangle in a list of shapes \
+                   stops the program with AttributeError after the others worked.",
+            fix: "Either give the missing kind its own def of the method, or define the method \
+                  once on the base class so every kind inherits it, overriding it only where \
+                  a kind differs.",
         },
         LintKind::Typo
         | LintKind::UndefinedName
@@ -2935,6 +3075,7 @@ mod tests {
             LintKind::ShadowedBuiltin,
             LintKind::UnusedLocal,
             LintKind::SelfComparison,
+            LintKind::VariantMissingMethod,
         ] {
             let s = scaffold(k).expect("concept lint should have a scaffold");
             assert!(!s.question.is_empty() && !s.hint.is_empty() && !s.fix.is_empty());
@@ -2948,6 +3089,79 @@ mod tests {
         ] {
             assert!(scaffold(k).is_none(), "{k:?} should have no scaffold");
         }
+    }
+
+    fn variants(src: &str) -> Vec<(usize, String)> {
+        variant_missing_method_warnings(&parse(src))
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
+    }
+
+    #[test]
+    fn variant_missing_method_names_the_uncovered_kind() {
+        // Shape = Circle | Square | Triangle; area() has cases for two of them.
+        let src = "class Shape:\n    pass\n\nclass Circle(Shape):\n    def area(self):\n        return 3\n\n\
+                   class Square(Shape):\n    def area(self):\n        return 4\n\n\
+                   class Triangle(Shape):\n    def sides(self):\n        return 3\n";
+        let w = variants(src);
+        assert_eq!(w.len(), 1, "{w:?}");
+        // Anchored at the class that lacks the case, not at a call site.
+        assert_eq!(w[0].0, 12);
+        assert_eq!(
+            w[0].1,
+            "Shape also has Triangle: Circle and Square define area(), and Triangle has no \
+             area() of its own or from Shape"
+        );
+        // Three siblings with the method: the list reads naturally.
+        let src = "class S:\n    pass\n\nclass A(S):\n    def f(self):\n        return 1\n\n\
+                   class B(S):\n    def f(self):\n        return 1\n\n\
+                   class C(S):\n    def f(self):\n        return 1\n\n\
+                   class D(S):\n    pass\n";
+        let w = variants(src);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].1.contains("A, B and C define f()"), "{}", w[0].1);
+    }
+
+    #[test]
+    fn variant_missing_method_does_not_cry_wolf() {
+        // The base provides it: every kind can answer.
+        assert!(
+            variants(
+                "class Shape:\n    def area(self):\n        return 0\n\n\
+             class Circle(Shape):\n    def area(self):\n        return 3\n\n\
+             class Square(Shape):\n    def area(self):\n        return 4\n\n\
+             class Triangle(Shape):\n    pass\n"
+            )
+            .is_empty()
+        );
+        // One sibling's private method is not an operation over the base.
+        assert!(variants(
+            "class Shape:\n    pass\n\nclass Circle(Shape):\n    def radius(self):\n        return 1\n\n\
+             class Square(Shape):\n    pass\n"
+        )
+        .is_empty());
+        // Provided by an intermediate ancestor: Triangle inherits Polygon.area.
+        assert!(variants(
+            "class Shape:\n    pass\n\nclass Polygon(Shape):\n    def area(self):\n        return 0\n\n\
+             class Circle(Shape):\n    def area(self):\n        return 3\n\n\
+             class Square(Polygon):\n    def area(self):\n        return 4\n\n\
+             class Triangle(Polygon):\n    pass\n"
+        )
+        .is_empty());
+        // Dunders are not operations over the data.
+        assert!(variants(
+            "class Shape:\n    pass\n\nclass Circle(Shape):\n    def __init__(self):\n        self.r = 1\n\n\
+             class Square(Shape):\n    def __init__(self):\n        self.s = 1\n\n\
+             class Triangle(Shape):\n    pass\n"
+        )
+        .is_empty());
+        // Unrelated classes with a shared method name are not variants of anything.
+        assert!(variants(
+            "class Dog:\n    def speak(self):\n        return 1\n\nclass Cat:\n    def speak(self):\n        return 2\n\n\
+             class Rock:\n    pass\n"
+        )
+        .is_empty());
     }
 
     #[test]

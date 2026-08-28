@@ -597,6 +597,23 @@ print(x + 3)
     }
 
     #[test]
+    fn a_kind_missing_its_siblings_method_is_named_before_it_runs() {
+        // Compiles fine and fails at run time on the Triangle; the report
+        // says so up front, at the class, with the recipe's ladder attached.
+        let r = check(
+            "class Shape:\n    pass\n\nclass Circle(Shape):\n    def area(self):\n        return 3\n\n\
+             class Square(Shape):\n    def area(self):\n        return 4\n\n\
+             class Triangle(Shape):\n    pass\n",
+            false,
+        );
+        assert!(r.json.contains("\"ok\": true"), "{}", r.json);
+        assert!(r.json.contains("\"variant_missing_method\""), "{}", r.json);
+        assert!(r.json.contains("Shape also has Triangle"), "{}", r.json);
+        assert!(r.json.contains("\"line\": 12"), "{}", r.json);
+        assert!(r.json.contains("which of the"), "{}", r.json);
+    }
+
+    #[test]
     fn the_report_states_what_the_program_can_reach() {
         let r = check("print(1)\n", false);
         assert!(r.json.contains("\"capabilities\""), "{}", r.json);

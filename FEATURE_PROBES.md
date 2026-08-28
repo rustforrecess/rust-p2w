@@ -6,7 +6,7 @@ Regenerate with `P2W_BLESS=1 cargo test --test upstream_gap`. **A row moving is 
 
 See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's designs are worth taking.
 
-## Rejected (31)
+## Rejected (30)
 
 | feature | message |
 |---|---|
@@ -24,7 +24,6 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `del name` | `del` removes an item like `del xs[0]` or `del d[key]` — deleting a whole variab… |
 | `for ... else` | expected a value, found Newline |
 | `while ... else` | expected a value, found Newline |
-| `pass in a class body` | a class body can only contain methods (def) and variable assignments |
 | `decorator` | unexpected character '@' |
 | `*args` | expected a parameter name, found Star |
 | `**kwargs` | expected a parameter name, found DoubleStar |
@@ -42,8 +41,9 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `type()` | unknown function 'type' |
 | `isinstance()` | unknown name 'int' (define it with `int = ...` first) |
 
-## Compiles (11)
+## Compiles (12)
 
+- `pass in a class body`
 - `from X import Y`
 - `inheritance`
 - `super()`

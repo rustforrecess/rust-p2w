@@ -14,7 +14,7 @@ progress.
 attempt grepped AST node names and was wrong twice: it missed features that are
 *desugared* (lambdas become `def`s, f-strings become concatenation, so neither
 has a node of its own), and it reported **inheritance as missing** because the
-probe was `class B(A): pass` — which fails on `pass` in a class body, not on
+probe was `class B(A): pass` — which failed on `pass` in a class body (accepted since 2026-08-28), not on
 inheritance.
 
 The probes now live in `tests/upstream_gap.rs` and regenerate

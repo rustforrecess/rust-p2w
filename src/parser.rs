@@ -954,10 +954,13 @@ impl<'a> Parser<'a> {
                     methods.push(Method { name, params, body })
                 }
                 StmtKind::Assign(n, v) => class_vars.push((n, v)),
+                // `class Triangle(Shape): pass` — a variant with nothing of
+                // its own, the shape a data definition's leaf usually takes.
+                StmtKind::Pass => {}
                 _ => {
                     return Err(CompileError::at(
                         stmt.line,
-                        "a class body can only contain methods (def) and variable assignments",
+                        "a class body can only contain methods (def), variable assignments, and pass",
                     ));
                 }
             }

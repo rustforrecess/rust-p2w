@@ -227,6 +227,19 @@ fn assert_output(src: &str, expected: &str) {
 /// `math.name(...)`, and a later `def` of the same name shadows the import,
 /// matching CPython's later-binding-wins.
 #[test]
+fn a_pass_body_class_is_a_variant_with_nothing_of_its_own() {
+    // `class Triangle(Shape): pass` — the leaf of a data definition. It
+    // inherits construction and attributes and adds nothing.
+    assert_output(
+        "class Shape:\n    def __init__(self, w: int):\n        self.w = w\n\
+         class Circle(Shape):\n    def area(self) -> int:\n        return 3 * self.w * self.w\n\
+         class Triangle(Shape):\n    pass\n\
+         t = Triangle(4)\nprint(t.w)\nprint(Circle(2).area())\n",
+        "4\n12\n",
+    );
+}
+
+#[test]
 fn from_import_binds_bare_math_names() {
     assert_output(
         "from math import sqrt, exp
