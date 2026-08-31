@@ -300,6 +300,59 @@ mechanized argument for the transfer model + reuse tokens would be a
 publishable result on its own. **Acceptance:** a machine-checked statement of
 the invariant the oracle currently samples (output ≡ CPython ∧ live == 0).
 
+### 9. Checked sums: per-class types, then exhaustiveness as a guarantee
+
+**Why it's cheap here:** the closed world already did the hard part. One
+program, no dynamic loading, no dynamic name resolution — so every base
+class's set of subclasses is completely known at compile time. That is the
+property nominal languages bolt on with `sealed`/`final`; here every
+class-hierarchy sum (`Part = Motor | Servo | Buzzer`) is sealed by
+construction. What's missing is only representation and checking:
+`check.rs` collapses every class to one coarse `Ty::Class`, so the checker
+cannot say "this is a Buzzer and Buzzer has no stop()". The
+`variant_missing_method` lint is exhaustiveness-as-advisory; per-class
+types graduate it to a guarantee for the method-per-variant form.
+**Interface:** `Ty::Class` → `Ty::Class(name)` (or an interned id) in the
+lattice; join of two classes = nearest common ancestor, else `Dyn`; the
+gate stays confined to the confident shapes per D6(b) — a method missing
+on the *inferred* class of a receiver joins the GATED list only once the
+oracle shows zero false positives on the must-accept corpus.
+**Elimination form later, not now:** `match`/`case` is Python 3.10 syntax,
+so adopting it is Tier-1-legal when wanted; until then method-per-variant
+dispatch IS the elimination form and the lint/gate covers it.
+**Acceptance:** the Buzzer program flips from advisory to compile error on
+every surface with a derivation message; oracle must-accept stays green;
+BACKEND_DIVERGENCE stays at zero.
+
+### 10. Zero-cost generics: PEP 695 monomorphization (after the unboxing rework)
+
+**Why it fits the language promise:** `def first[T](xs: list[T]) -> T` is
+real CPython 3.12 syntax — the spelling costs nothing against the
+every-p2w-program-is-valid-Python invariant (today it's a syntax error
+here; the lexer/parser work is the small half). And the closed world +
+no-dynamic-dispatch rules mean *full* whole-program monomorphization: every
+call site's `T` is known, each instantiation becomes a separate compiled
+function, nothing generic survives to runtime — no dict passing, no boxing
+fallback, no trait objects. That is the zero-cost half, and it is exactly
+the compile-time evaluation the blue-tier rule permits: terminating (bound
+instantiation depth to reject polymorphic recursion), effect-free,
+capability-neutral. See SUBSET_POLICY.md when this lands — the rule that a
+blue phase must stay non-Turing-complete gets written down there the day
+this task starts, because monomorphization is its first resident.
+**Sequencing:** after the typed-tier representation rework (unboxed
+container storage, i64, the marshalling batch). Before it, generics would
+be checked-but-boxed — the annotations would verify and buy nothing at
+runtime, which teaches the wrong lesson about what the types are for.
+**Interface:** instantiation pass between `check` and both backends — the
+front-end collects call-site type arguments, clones the AST per distinct
+tuple, renames (`first§int`), and hands both backends a monomorphic
+program; neither backend learns what a type parameter is.
+**Acceptance:** the generic identity/`first`/`swap` trio runs on all three
+surfaces with outputs matching CPython 3.12; emitted WAT/LLVM for
+`first[int]` is byte-identical to the hand-written monomorphic version
+(that IS the zero-cost claim, checked in IR text); a polymorphic-recursion
+probe is rejected with a written error message, not a hang.
+
 ## The verification frontier (added 2026-08-18) — TODO, each with why
 
 A 2026-08 research survey (searched, not recalled) found the field converging
