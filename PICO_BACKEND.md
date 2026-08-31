@@ -207,3 +207,58 @@ output). The seed arrives through `p2w_host_seed()`, the native analog of the
 WASM `env.seed` import: the host shims return a fixed 42 for determinism; a
 real host supplies a per-attempt value. On the device this becomes one more
 symbol the board support code provides, like `p2w_putc`.
+
+## The easy sibling: Raspberry Pi 4/5 (verified 2026-08-31)
+
+The Pi 4/5 are not Picos — they run Linux, and that makes them the *easy*
+device target, close to free with what exists today. Both halves of the
+claim were proven by running, not argued:
+
+```bash
+# 1. The runtime cross-compiles to the Pi's architecture unchanged (3.6 s):
+rustup target add aarch64-unknown-linux-gnu
+cargo rustc --manifest-path runtime/Cargo.toml --release \
+  --crate-type staticlib --target aarch64-unknown-linux-gnu -- -C panic=abort
+# -> .../aarch64-unknown-linux-gnu/release/libp2w_rt.a
+
+# 2. The emitted IR is target-neutral (no triple/datalayout pinned), so the
+#    same .ll the x86 oracle validates compiles for ARM:
+p2w-emit-ll program.py > program.ll        # cargo run --example emit_ll
+clang --target=aarch64-unknown-linux-gnu -Wno-override-module \
+  -c program.ll -o program.o               # -> ELF 64-bit ARM aarch64
+```
+
+The unproven remainder needs an aarch64 libc sysroot — which is exactly what
+the Pi itself is. On the device the chain closes as ordinary C linking:
+
+```bash
+cc program.o putc.c libp2w_rt.a -lm -o program && ./program
+```
+
+`putc.c` on Linux is the real thing (`putchar`, `getchar`, a clock), not a
+shim. And since `p2w` is plain Rust it also builds for aarch64, so a Pi can
+be a self-contained compile-and-run box with no cross toolchain anywhere:
+`apt install clang`, copy the repo, done.
+
+Why this earns a rung on the device ladder rather than a footnote:
+
+- **browser (WASM-GC) → Pi (native ELF, Linux) → Pico (bare metal).** Each
+  rung drops one layer of infrastructure. Classrooms that already own Pis
+  get the native backend *now*, with zero bring-up work, while the RP2350
+  boot/UF2 story is built.
+- **First honest test of the capability broker outside the browser.** The
+  Pi has an OS to mediate: files, GPIO (`/dev/gpiochip*`), network. The
+  WASI-preopens position in HOST_INTERFACE.md wants a target where the host
+  actually has authority to hand out; the Pico (no OS, all symbols trusted)
+  can't provide that and the browser sandboxes it away. The Pi is where
+  `capabilities()` meets a real operating system.
+- **Same divergence discipline.** Nothing Pi-specific may enter the
+  emitter: the Pi consumes the identical IR + runtime the host oracle
+  already pins to CPython. If a Pi-only behaviour ever appears it is a bug
+  in this section's premise, not a porting cost.
+
+Non-goals: no Pi-specific backend, no apt packaging yet, no promise about
+the Pi as a *deployment* target for the IDE (that is the browser's job).
+This section exists because the target costs almost nothing and answers a
+real classroom question ("we have a cart of Pi 400s — can we use them?").
+
