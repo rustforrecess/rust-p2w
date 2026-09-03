@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// One advisory finding: a stable key, a derivation-rendered message, and
 /// where to point.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeFinding {
     pub line: usize,
     pub span: (usize, usize),
