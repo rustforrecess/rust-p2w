@@ -125,8 +125,17 @@ an internal never/bottom, and the analysis is now named for what it asks:
 `falls_off_the_end` (Python folklore for reaching the implicit
 `return None`; a diverging statement means control never gets there). Only the literal
 `True` condition counts — computed truthiness stays conservative. A
-user-facing `NoReturn` annotation (real Python spelling) is deliberately
-NOT added until a lesson needs it (the robot main loop is the candidate). (b) heterogeneous
+user-facing annotation is deliberately NOT added until a lesson needs it
+(the robot main loop is the candidate) — and when it lands, SPELL IT
+`Never`, not `NoReturn`: verified against the real compilers 2026-08-31,
+`def f() -> Never:` with an infinite loop compiles in Mojo 1.0 (which
+also already counts divergence as totality — its diagnostic is "return
+expected at end of function with results") while `NoReturn` is an
+unknown declaration there; `Never` is also the modern typing spelling
+(3.11+). One spelling, valid in CPython, Mojo, and here. SPy has no
+language-level never: it raises "reached the end of the function
+without a `return`" at RUN time (their C backend aborts silently "for
+now") — on this axis we are ahead of SPy and aligned with Mojo. (b) heterogeneous
 lists / type-changing rebinding / disagreeing branches → advisory-first
 for a full phase; gate only after the false-positive rate on real student
 programs is known. Currently silent (`Dyn`) in the pass; the type-churn
