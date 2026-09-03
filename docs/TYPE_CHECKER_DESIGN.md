@@ -121,8 +121,9 @@ as totality — a `while True:` with no `break` of its own never falls
 through, so the retry loop (`while True:` with the `return` inside) and
 the early-return-plus-forever-loop shape are accepted (both were live
 false positives, found by probing; `must-accept` cases pin them). This is
-an internal never/bottom: `definitely_returns` really asks "can control
-fall off the end", and a diverging statement answers no. Only the literal
+an internal never/bottom, and the analysis is now named for what it asks:
+`falls_off_the_end` (Python folklore for reaching the implicit
+`return None`; a diverging statement means control never gets there). Only the literal
 `True` condition counts — computed truthiness stays conservative. A
 user-facing `NoReturn` annotation (real Python spelling) is deliberately
 NOT added until a lesson needs it (the robot main loop is the candidate). (b) heterogeneous

@@ -479,7 +479,7 @@ impl Checker {
             return; // a procedure: no value returned anywhere, nothing owed
         };
         let bare = first_bare_return(body);
-        if definitely_returns(body) && bare.is_none() {
+        if !falls_off_the_end(body) && bare.is_none() {
             return;
         }
         let gap = match bare {
@@ -917,19 +917,21 @@ fn first_bare_return(stmts: &[Stmt]) -> Option<usize> {
 /// Whether every path through `stmts` ends in a `return`: the last statement
 /// is a return, or an if/elif/else whose every arm definitely returns.
 /// Loops never count (they may run zero times) — conservative on purpose.
-/// "Control cannot fall off the end of these statements" — either the last
-/// one returns on every path, or some statement diverges (a `while True:`
-/// with no `break` of its own never finishes, so nothing after it runs and
-/// the function cannot finish without a value; the internal never/bottom).
-/// Only the literal-`True` spelling counts: a truthy-but-computed condition
-/// stays conservative, which can only keep the old behavior, never reject
-/// more.
-fn definitely_returns(stmts: &[Stmt]) -> bool {
+/// Can control "fall off the end" of these statements — Python folklore for
+/// reaching the implicit `return None` (mypy reports it as "Missing return
+/// statement"; the JLS calls the concept "completes normally"). False when
+/// the last statement returns on every path, or when some statement
+/// diverges (a `while True:` with no `break` of its own never finishes, so
+/// nothing after it runs; the internal never/bottom). Only the
+/// literal-`True` spelling counts as diverging: a truthy-but-computed
+/// condition stays conservative, which can only report falling-off where
+/// we always did, never accept less.
+fn falls_off_the_end(stmts: &[Stmt]) -> bool {
     if stmts.iter().any(diverges) {
-        return true;
+        return false;
     }
     match stmts.last().map(|s| &s.kind) {
-        Some(StmtKind::Return(_)) => true,
+        Some(StmtKind::Return(_)) => false,
         Some(StmtKind::If {
             body,
             elifs,
@@ -937,13 +939,13 @@ fn definitely_returns(stmts: &[Stmt]) -> bool {
             ..
         }) => {
             let Some(else_body) = else_body else {
-                return false;
+                return true;
             };
-            definitely_returns(body)
-                && elifs.iter().all(|(_, b)| definitely_returns(b))
-                && definitely_returns(else_body)
+            falls_off_the_end(body)
+                || elifs.iter().any(|(_, b)| falls_off_the_end(b))
+                || falls_off_the_end(else_body)
         }
-        _ => false,
+        _ => true,
     }
 }
 
