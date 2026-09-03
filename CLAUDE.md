@@ -98,7 +98,7 @@ bash tools/native_run.sh      # ~200 cases through clang + the real runtime; >10
 **`tools/native_run.sh` is the authority for the native backend.** Unit tests
 assert on emitted IR text and will happily pass while the program is wrong.
 
-## Two backends — 0 of 114 probes apart
+## Two backends — 0 of 115 probes apart
 
 `compile_to_wat` (WASM-GC, browser) and `compile_to_llvm_ir` + `runtime/`
 (linear memory, the board *and* the component/jco path). As of 2026-08-24

@@ -297,6 +297,10 @@ pub fn groups() -> Vec<Group> {
                     "return on some paths only",
                     "def f(n):\n    if n > 0:\n        return 1\nprint(f(0))\n",
                 ),
+                p(
+                    "retry loop: while True with the return inside",
+                    "def pick() -> int:\n    while True:\n        n = 3\n        if n > 2:\n            return n\nprint(pick())\n",
+                ),
                 p("call a number", "total = 5\nprint(total(3))\n"),
                 p(
                     "read before assignment",

@@ -13,7 +13,7 @@ Error WORDING is not compared — the two have always phrased things differently
 
 ## Result
 
-**0 of 114 probes disagree.**
+**0 of 115 probes disagree.**
 
 A short list means converging the backends is cheap. A long one means we have been maintaining two languages, and which one is the real student-facing runtime is a decision rather than an accident.
 

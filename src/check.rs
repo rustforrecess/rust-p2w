@@ -917,7 +917,17 @@ fn first_bare_return(stmts: &[Stmt]) -> Option<usize> {
 /// Whether every path through `stmts` ends in a `return`: the last statement
 /// is a return, or an if/elif/else whose every arm definitely returns.
 /// Loops never count (they may run zero times) — conservative on purpose.
+/// "Control cannot fall off the end of these statements" — either the last
+/// one returns on every path, or some statement diverges (a `while True:`
+/// with no `break` of its own never finishes, so nothing after it runs and
+/// the function cannot finish without a value; the internal never/bottom).
+/// Only the literal-`True` spelling counts: a truthy-but-computed condition
+/// stays conservative, which can only keep the old behavior, never reject
+/// more.
 fn definitely_returns(stmts: &[Stmt]) -> bool {
+    if stmts.iter().any(diverges) {
+        return true;
+    }
     match stmts.last().map(|s| &s.kind) {
         Some(StmtKind::Return(_)) => true,
         Some(StmtKind::If {
@@ -935,6 +945,37 @@ fn definitely_returns(stmts: &[Stmt]) -> bool {
         }
         _ => false,
     }
+}
+
+/// `while True:` whose body has no `break` bound to it. Any `return` inside
+/// is fine — that path returns a value; the point is only that control never
+/// reaches the statement after the loop.
+fn diverges(s: &Stmt) -> bool {
+    if let StmtKind::While { cond, body } = &s.kind
+        && matches!(cond.kind, ExprKind::Bool(true))
+    {
+        return !has_own_break(body);
+    }
+    false
+}
+
+/// A `break` that would exit THIS loop: don't descend into nested loops
+/// (their breaks bind to them), do descend into `if` arms.
+fn has_own_break(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        StmtKind::Break => true,
+        StmtKind::If {
+            body,
+            elifs,
+            else_body,
+            ..
+        } => {
+            has_own_break(body)
+                || elifs.iter().any(|(_, b)| has_own_break(b))
+                || else_body.as_deref().is_some_and(has_own_break)
+        }
+        _ => false,
+    })
 }
 
 fn num_join(a: &Ty, b: &Ty) -> Ty {

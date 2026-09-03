@@ -116,7 +116,16 @@ path returns a value, every path must ("what should it give back
 when..."). ✅ IMPLEMENTED as `type.missing-return` (gated): value returns
 on some paths with a fall-through or bare `return` elsewhere is a compile
 error at the `def`, naming the returning line; the oracle's open question
-moved to `must-reject/` as decided. (b) heterogeneous
+moved to `must-reject/` as decided. REFINED 2026-08-31: divergence counts
+as totality — a `while True:` with no `break` of its own never falls
+through, so the retry loop (`while True:` with the `return` inside) and
+the early-return-plus-forever-loop shape are accepted (both were live
+false positives, found by probing; `must-accept` cases pin them). This is
+an internal never/bottom: `definitely_returns` really asks "can control
+fall off the end", and a diverging statement answers no. Only the literal
+`True` condition counts — computed truthiness stays conservative. A
+user-facing `NoReturn` annotation (real Python spelling) is deliberately
+NOT added until a lesson needs it (the robot main loop is the candidate). (b) heterogeneous
 lists / type-changing rebinding / disagreeing branches → advisory-first
 for a full phase; gate only after the false-positive rate on real student
 programs is known. Currently silent (`Dyn`) in the pass; the type-churn

@@ -133,6 +133,7 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `def f(n: int) called with str` | compile error | `line 3: `f` wants a whole number for `n` (line 1), but this passes text.` |
 | `wrong arity` | compile error | `line 3: f() is missing a required argument 'b'` |
 | `return on some paths only` | compile error | `line 1: `f` gives back a value on some paths (line 3) but it can also finish without one — what should it give back in the other case?` |
+| `retry loop: while True with the return inside` | value | `3` |
 | `call a number` | compile error | `line 2: `total` is a whole number (line 1), not something you can call.` |
 | `read before assignment` | compile error | `line 2: unknown name 'q' (define it with `q = ...` first)` |
 
