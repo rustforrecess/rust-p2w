@@ -300,6 +300,35 @@ mechanized argument for the transfer model + reuse tokens would be a
 publishable result on its own. **Acceptance:** a machine-checked statement of
 the invariant the oracle currently samples (output ≡ CPython ∧ live == 0).
 
+**A concrete toolchain for this (checked against the real repos, 2026-09):**
+[AeneasVerif](https://aeneasverif.github.io/) translates *safe* Rust to a
+functional model in Lean, Coq, F\*, or HOL4 — Lean and HOL4 are its most
+mature backends, with partial-function support, extrinsic termination proofs,
+and tactics for monadic programs. That lines up with this task's shape
+exactly, and the fit is sharper than "verification tooling exists": **the
+target is `src/reuse.rs`, not `runtime/`.** `Liveness::analyze` and the
+`dead_after` token protocol that decides *where* retain/release/reuse calls
+go are plain safe Rust — zero `unsafe` in `src/reuse.rs` or `src/llvm.rs`
+(checked, 2026-09). The `unsafe` pointer arithmetic that *executes* those
+decisions lives entirely in `runtime/src/lib.rs` (197 occurrences, checked
+same date) and is already Miri's and Kani's job (see "Before pushing" in
+`CLAUDE.md`) — out of Aeneas's supported subset (safe Rust only; unsafe code
+and concurrency are explicitly unsupported) and out of scope here regardless.
+So this task is specifically: prove the *insertion logic* sound — that the
+tokens `reuse.rs` emits correctly imply the ownership discipline the runtime
+is trusted to execute — which is the layer neither Miri nor the oracle
+touches today. Lean is the natural pick over Coq/F\*/HOL4 both because its
+termination-proof support matches this task's shape and because it is
+already the family in use elsewhere in the stack (sequent's blueprint is an
+ITP-2025 Lean-Datalog checker). [Charon](https://github.com/AeneasVerif/charon)
+(the rustc driver Aeneas is built on) serializes a crate's MIR-derived IR to
+JSON — noted as existing, not adopted: it is an IR of *rust-p2w's own Rust
+implementation* for analyses written in another host language, which is not
+a problem this project has while the AST-sharing principle already keeps
+every analysis in-process. [Eurydice](https://github.com/AeneasVerif/eurydice)
+(Rust → C) has no target here: WASM-GC and the bare-metal LLVM backend cover
+the device story directly, and VEX's path is LLVM → jump table, not C.
+
 ### 9. Checked sums: per-class types, then exhaustiveness as a guarantee
 
 **Why it's cheap here:** the closed world already did the hard part. One
