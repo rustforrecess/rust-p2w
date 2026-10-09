@@ -262,3 +262,41 @@ the Pi as a *deployment* target for the IDE (that is the browser's job).
 This section exists because the target costs almost nothing and answers a
 real classroom question ("we have a cart of Pi 400s — can we use them?").
 
+### The Zero 2 W (verified 2026-10-09) — same rung, one real difference
+
+A Zero 2 W (BCM2710A1, quad-core Cortex-A53 — the Pi 3's SoC, not the
+original Zero W's much weaker single-core ARMv6) is still a Linux box, so
+everything above applies unchanged: same `-lm`/`putc.c`/ordinary-C-linking
+close, same "nothing device-specific may enter the emitter" rule. One
+thing is genuinely different and worth checking rather than assuming,
+which is why this is its own entry: **unlike the Pi 4/5, the Zero 2 W is
+commonly run on EITHER bit-width** — 64-bit Raspberry Pi OS is supported
+and recommended, but a lot of existing Zero 2 W setups still run the
+32-bit image (historically the Zero line's default, for peripheral/
+software compatibility). So both targets were proven, not just the one:
+
+```bash
+rustup target add armv7-unknown-linux-gnueabihf   # 32-bit OS path
+cargo rustc --manifest-path runtime/Cargo.toml --release \
+  --crate-type staticlib --target armv7-unknown-linux-gnueabihf -- -C panic=abort
+clang --target=armv7-unknown-linux-gnueabihf -Wno-override-module \
+  -c program.ll -o program.o            # -> ELF 32-bit ARM, EABI5
+```
+
+Same `program.ll`, same emitter, two valid object files (confirmed with
+`llvm-objdump -f`: `elf32-littlearm` / `aarch64`) — the "target-neutral
+IR" claim now checked on a second architecture, not just asserted by
+analogy to the Pi 4/5 aarch64 case.
+
+**What's proven vs. what isn't.** Proven: the runtime cross-compiles for
+both bit-widths, and the emitted IR for both is a valid object file —
+i.e., a cross-compiled p2w *program* runs on a Zero 2 W exactly like it
+runs on a Pi 4/5. **Not proven, and not casually assumed:** the Pi 4/5
+section's "self-contained compile-and-run box, no cross toolchain" claim.
+That means building the *whole* p2w compiler crate (~20k lines, not the
+kilobyte-scale runtime) on-device, and the Zero 2 W's 512MB RAM — a
+fraction of even a Pi 4's — is the kind of constraint that bites during
+linking specifically, not compiling. Until measured, treat the Zero 2 W
+as a proven *run* target (cross-compile elsewhere, copy the binary over)
+and an unverified *compile* target.
+
