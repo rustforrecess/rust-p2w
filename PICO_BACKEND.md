@@ -300,3 +300,30 @@ linking specifically, not compiling. Until measured, treat the Zero 2 W
 as a proven *run* target (cross-compile elsewhere, copy the binary over)
 and an unverified *compile* target.
 
+**Distro choice is a non-issue — the thing that matters is the libc, not
+the branding.** Jason's own box will run Ubuntu; a classroom full of
+these will likely run whatever each teacher's Pi Imager defaults to
+(Raspberry Pi OS, DietPi, Armbian, Ubuntu, …). A Rust target triple names
+(architecture, kernel, ABI) — `aarch64-unknown-linux-gnu` means "any
+aarch64 Linux with glibc," which is every distro listed above. None of
+them change which object file gets produced; the two already proven here
+cover all of them. The only distro family that *would* need a third
+target is a musl-based one (Alpine's ARM images exist but are rare on Pi
+hardware specifically) — not worth building for until someone actually
+runs one.
+
+**Checked specifically for Ubuntu, since that's the one someone here is
+actually running:** Canonical's own support matrix lists the Zero 2 W as
+server-supported from 22.04 through 26.04 LTS, but **only as a 64-bit
+image** — there is no 32-bit Ubuntu build for this board. So on Jason's
+box specifically, only `aarch64-unknown-linux-gnu` is in play; the
+armv7 path above is for Raspberry Pi OS users choosing the 32-bit image,
+not an Ubuntu concern at all. One more-basic fit question surfaced
+alongside this, independent of anything p2w does: a Raspberry Pi Forums
+thread reported Ubuntu Server 24.04 LTS 64-bit failing to boot on a
+Zero 2 W, with a poster attributing it to Ubuntu wanting closer to 1GB
+RAM than the board's 512MB gives — unconfirmed against Ubuntu's own
+docs, but consistent with the compile-side RAM caution above. Worth a
+quick boot test with whichever LTS release is current before assuming
+the OS itself is comfortable, let alone anything built on top of it.
+
