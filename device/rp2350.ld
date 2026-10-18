@@ -2,10 +2,11 @@
  *
  * Memory map: external QSPI flash is execute-in-place at 0x10000000 (the Pico 2
  * has 4 MB); SRAM is 520 KB at 0x20000000. This places the vector table at the
- * start of flash and the stack at the top of SRAM. NOTE: booting on real
- * hardware additionally needs the RP2350 bootrom IMAGE_DEF metadata block — see
- * PICO_BACKEND.md; this script is enough to link a complete Cortex-M image and
- * verify the toolchain, not yet to guarantee the bootrom runs it. */
+ * start of flash, the bootrom IMAGE_DEF block (device/boot.c's `image_def[]`)
+ * right after it, and the stack at the top of SRAM. Both .vectors and
+ * .image_def together are under 40 bytes, comfortably inside the "first 4 kB
+ * of flash" the bootrom actually scans (RP2350 datasheet 5.9.5), so no
+ * explicit placement address is needed beyond section ORDER. */
 
 ENTRY(Reset_Handler)
 
@@ -19,8 +20,9 @@ __stack_top = ORIGIN(RAM) + LENGTH(RAM);
 
 SECTIONS
 {
-    .vectors : { KEEP(*(.vectors)) } > FLASH
-    .text    : { *(.text*) *(.rodata*) } > FLASH
+    .vectors    : { KEEP(*(.vectors)) } > FLASH
+    .image_def  : { KEEP(*(.image_def)) } > FLASH
+    .text       : { *(.text*) *(.rodata*) } > FLASH
 
     /* Initialised data: stored in flash, copied to RAM by Reset_Handler. */
     .data : AT (ADDR(.text) + SIZEOF(.text))

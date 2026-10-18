@@ -6,10 +6,12 @@
  * host harness's putc.c.
  *
  * Hardware caveat: this links a complete Cortex-M image, but actually *running*
- * it on a Pico 2 still needs (a) the RP2350 bootrom IMAGE_DEF metadata block and
- * (b) clock/UART pin setup before UART0 will emit. Both are scoped in
- * PICO_BACKEND.md and require a board + picotool to validate. Until then UART0 is
- * poked directly (works once clocks are configured).
+ * it on a Pico 2 still needs clock/UART pin setup before UART0 will emit — that
+ * part is scoped in PICO_BACKEND.md and still requires a board to validate.
+ * Until then UART0 is poked directly (works once clocks are configured). The
+ * OTHER hardware requirement, the RP2350 bootrom IMAGE_DEF metadata block, is
+ * below (`image_def[]`) — the bootrom refuses to launch a flash image without
+ * one, so this is not optional.
  */
 
 #include <stdint.h>
@@ -63,4 +65,24 @@ void (*const vector_table[])(void) = {
     Reset_Handler,                  /* reset */
     Default_Handler,                /* NMI */
     Default_Handler,                /* HardFault */
+};
+
+/* The RP2350 bootrom scans the first 4 KB of flash for a block beginning with
+ * PICOBIN_BLOCK_MARKER_START; without one it treats the chip as unprogrammed
+ * and never launches this image (RP2350 datasheet, section 5.9.5.1, "Minimum
+ * Arm IMAGE_DEF" — verified against the primary source, not a secondhand
+ * writeup, since getting these bytes wrong just means "won't boot" but isn't
+ * worth guessing at). This exact 20-byte / 5-word sequence is the minimum
+ * valid block: a single ITEM_1BS_IMAGE_TYPE item (EXE, secure, Arm, RP2350)
+ * followed by the mandatory ITEM_2BS_LAST terminator, in a block loop that
+ * points to itself (the only block). It names no entry point, so the bootrom
+ * falls back to the Cortex-M vector table above — nothing about Reset_Handler
+ * or the vector table changes because of this. */
+__attribute__((section(".image_def"), used))
+const uint32_t image_def[] = {
+    0xffffded3, /* PICOBIN_BLOCK_MARKER_START */
+    0x10210142, /* ITEM_1BS_IMAGE_TYPE: EXE | SECURE | Arm | RP2350 chip */
+    0x000001ff, /* ITEM_2BS_LAST */
+    0x00000000, /* next block in the loop: 0 = link to self */
+    0xab123579, /* PICOBIN_BLOCK_MARKER_END */
 };

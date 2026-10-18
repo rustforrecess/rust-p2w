@@ -25,18 +25,30 @@ the host with no board:
 - Repeatable via **`tools/pico_build.sh`** (skips cleanly without clang/lld or the
   Rust target). The device-build counterpart of `tools/native_run.sh`.
 
-### Remaining hardware-gated work (needs a board + picotool to validate)
-The ELF is a valid Cortex-M33 image but not yet a *bootable* Pico 2 artifact:
-1. **RP2350 bootrom IMAGE_DEF block** — the bootrom scans flash for a metadata
-   block; without it the image won't be launched. (RP2350-specific; RP2040 didn't
-   need this.)
-2. **Clock + UART pin init** in `boot.c` before `p2w_putc` actually emits (today it
-   pokes UART0 directly, correct only once clocks/pins are set up).
-3. **`.uf2` packaging** (family ID + 256-byte blocks) for drag-to-Pico, and
-   on-device **flash + run** of a real program (LED blink / the on-chip temperature
-   sensor as the first demo).
-These can't be validated in CI/here (no board, no picotool/Renode/QEMU), so they're
-the next step once hardware is in hand.
+### Hardware-gated work — status now that a board exists (2026-10-17)
+1. ✅ **RP2350 bootrom IMAGE_DEF block — DONE, verified on real hardware.**
+   `device/boot.c` embeds the minimum valid 20-byte/5-word block from RP2350
+   datasheet section 5.9.5.1 (`PICOBIN_BLOCK_MARKER_START` /
+   `ITEM_1BS_IMAGE_TYPE` / `ITEM_2BS_LAST` / self-loop / `BLOCK_MARKER_END`),
+   placed via a new `.image_def` linker section right after `.vectors` in
+   `device/rp2350.ld`. `picotool info -a` confirms it decodes correctly
+   (`target chip: RP2350`, `image type: ARM Secure`, next-block address ==
+   its own address). **Flashed to a real Pico 2 W: the board booted —
+   the RPI-RP2 bootloader drive disappeared and did not reappear (no crash
+   loop).** This is the first p2w-compiled program to run on physical
+   hardware.
+2. **Clock + UART pin init** — still open. The board above booted silently;
+   nothing is visible yet because `p2w_putc` still pokes UART0 directly with
+   no clock/pin setup first. This is the next piece, same discipline as #1
+   (read the datasheet's actual register sequence, don't adapt an
+   unverified blog snippet).
+3. ✅ **`.uf2` packaging — DONE.** `picotool uf2 convert <elf> <uf2> --family
+   rp2350-arm-s` produces a real, flashable `.uf2` from the metadata-bearing
+   ELF. `picotool` itself builds clean with no `sudo`/system packages at all
+   — `-DPICOTOOL_NO_LIBUSB=1` (we only need offline file conversion, not
+   live USB device access) plus `cmake` via a user-local `pixi` install;
+   `PICO_SDK_PATH` only needs a plain `git clone` for its header-only
+   `add_subdirectory` targets, no build of the SDK itself.
 
 ## Why native, not MicroPython
 We own the AST, so we can emit real machine code with DWARF debug info — which is
