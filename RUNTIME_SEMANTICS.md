@@ -261,3 +261,13 @@ A function value may only ever come from directly naming a known top-level `def`
 |---|---|---|
 | `g = double; g(7)` | value | `14` |
 | `apply(double, 5)` | value | `10` |
+
+## sorted(xs, key=...)
+
+Decorate-sort-undecorate, built as ordinary synthesized Python AST (list literal, `.append`, `for`) run through the normal statement compiler on both backends — the sort-by-key step itself is the one new runtime primitive (`$py_sorted_by_key` / `p2w_sorted_by_key`), which mutates and returns the SAME pairs list, mirroring `sorted`'s own separation from its callers.
+
+| program | where | result |
+|---|---|---|
+| `sorted(xs, key=len)` | value | `['ox', 'fig', 'kiwi', 'banana']` |
+| `sorted(xs, key=len, reverse=True)` | value | `['banana', 'kiwi', 'fig', 'ox']` |
+| `sorted(xs, key=<user def>)` | value | `[5, 4, 3, 1, 1]` |

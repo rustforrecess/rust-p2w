@@ -92,10 +92,11 @@ return inner               still fails (a returned function cannot then be
                             called — deliberately out of scope for now)
 map(abs, xs)                still fails — map()/filter() don't exist as
                             builtins at all, unrelated to this landing
-sorted(xs, key=len)         still fails — the MECHANISM now resolves `len`
-                            fine, but sorted()'s own key= lowering
-                            (decorate-sort-undecorate, both backends) is a
-                            separate, not-yet-built follow-up
+sorted(xs, key=len)         NOW WORKS — decorate-sort-undecorate on both
+                            backends; `key=` may name a top-level `def`
+                            (one argument) or one of six arity-1 builtins
+                            shared by both backends (not `repr` — native
+                            doesn't have it yet)
 ```
 
 A binding that could hold more than one function, or sometimes a function

@@ -121,11 +121,16 @@ semantics and leak-freedom are oracle-gated). Differences:
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
 - **`sorted(seq, reverse=True)`** works everywhere — both compiled backends and
-  the step debugger (stable, both directions). `key=` still isn't supported —
-  first-class functions (the monomorphic case) landed, so `key=len` would
-  *resolve* fine now, but `sorted()`'s own lowering needs a
-  decorate-sort-undecorate rework on both backends' sort routines, which
-  hasn't happened yet; a bad keyword is a clean error.
+  the step debugger (stable, both directions). **`key=` now works on both
+  compiled backends** (decorate-sort-undecorate; `key=len` and a
+  user-defined one-argument function both work, combined with `reverse=`
+  too) — `key=` may name a top-level `def` or one of six arity-1 builtins
+  shared by both backends (`len`, `str`, `abs`, `int`, `bool`, `float`; not
+  `repr`, which doesn't exist natively yet). **The step debugger doesn't
+  support `key=` yet** — `sorted_values`/`sorted_reverse_args` in
+  `src/debug.rs` only know `reverse=`, so `key=` there falls through to the
+  stepper's generic "this expression isn't in the step debugger yet — use
+  Run for that" error (verified: it fails cleanly, not a crash).
 - **`list()` / `tuple()` / `dict()`** work: empty (`list()`, `dict()`) or from
   any iterable (`list("abc")`, `list(range(n))`, `tuple(a_set)`). `dict()` is
   empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or

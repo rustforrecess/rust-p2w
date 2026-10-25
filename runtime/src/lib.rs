@@ -2687,6 +2687,43 @@ pub extern "C" fn p2w_sorted(iterable: Value, reverse: Value) -> Value {
     out
 }
 
+/// Insertion sort in place over a list of already-built pairs (each pair
+/// itself a 2-element list `[key, original_elem]`), comparing by each
+/// pair's element 0 — the generic half of `sorted(xs, key=...)`'s
+/// decorate-sort-undecorate. It never calls the Python key function
+/// itself; the caller (`llvm.rs`'s call-site codegen, which alone knows
+/// the resolved function's exact signature) has already built every pair
+/// before calling this. `pairs` and `reverse` are internal plumbing, not
+/// user-supplied values, so unlike `p2w_sorted` this has no input to
+/// validate.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_sorted_by_key(pairs: Value, reverse: Value) -> Value {
+    let rev = p2w_truthy(reverse);
+    let o = pairs as usize;
+    let n = container_len(pairs);
+    for i in 1..n {
+        let pair = list_get(o, i);
+        let key = element_at(pair, 0);
+        let mut j = i;
+        while j > 0 {
+            let prev_pair = list_get(o, j - 1);
+            let prev_key = element_at(prev_pair, 0);
+            let shift = if rev {
+                value_lt(prev_key, key)
+            } else {
+                value_lt(key, prev_key)
+            };
+            if !shift {
+                break;
+            }
+            list_set_at(o, j, prev_pair);
+            j -= 1;
+        }
+        list_set_at(o, j, pair);
+    }
+    pairs
+}
+
 /// Add `v` (transferred); a duplicate is dropped (its ref released).
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_set_add(set: Value, v: Value) {

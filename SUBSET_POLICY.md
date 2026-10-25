@@ -182,10 +182,18 @@ doesn't ride in by accident (same discipline as generators below): returning a
 function value, storing one in a container, and first-class *bound methods*
 (`f = d.speak` — a separately deferred, harder feature; see
 `CLASSES_DESIGN.md`). `sorted(xs, key=...)` — the headline motivating case —
-still rejects `key=`: the mechanism above makes it resolvable, but the
-lowering itself (decorate-sort-undecorate, on both backends' own sort
-routines) turned out to be a separable, sequenced follow-up rather than a
-consequence of this landing.
+**SHIPPED** as the separable follow-up this section originally deferred it
+to: decorate-sort-undecorate on both backends, with `key=` restricted to a
+known top-level `def` (exactly one required argument) or one of the six
+builtins that exist, arity-1, on BOTH backends (`len`, `str`, `abs`, `int`,
+`bool`, `float` — `repr` stays out of the allowlist until it exists
+natively, per "both targets or neither"). The decorate/undecorate loops are
+synthesized Python AST (a list literal, `.append`, a `for` loop) run
+through each backend's ordinary statement compiler, so the only genuinely
+new runtime primitive is the sort-by-key step itself (`$py_sorted_by_key` /
+`p2w_sorted_by_key`), which mutates and returns the *same* pairs list — no
+new ownership bookkeeping needed around it on the native side, verified
+`live == 0`.
 
 ### Iterator protocol — passes; generators do not ride along
 

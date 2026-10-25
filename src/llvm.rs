@@ -167,6 +167,7 @@ declare i32 @p2w_sum(i32)
 declare i32 @p2w_min(i32)
 declare i32 @p2w_max(i32)
 declare i32 @p2w_sorted(i32, i32)
+declare i32 @p2w_sorted_by_key(i32, i32)
 declare i32 @p2w_float_of(i32)
 declare i32 @p2w_range_list(i32, i32, i32)
 declare i32 @p2w_enumerate(i32, i32)
@@ -2915,35 +2916,155 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }
-                // sorted(iterable[, reverse=<bool>]) — a new list; `key=`
-                // isn't supported yet. First-class functions (the monomorphic
-                // case) landed, but `key=` specifically needs its own
-                // decorate-sort-undecorate lowering on both backends — a
-                // separate, sequenced follow-up, not a consequence of this.
-                if name == "sorted" && (1..=2).contains(&args.len()) {
-                    let (v, o) = self.expr_borrow(&args[0])?;
-                    let rev = if args.len() == 2 {
-                        let ExprKind::Kwarg(k, ve) = &args[1].kind else {
+                // sorted(seq) / sorted(seq, reverse=<bool>) /
+                // sorted(seq, key=<name>) / both together, in either order.
+                // `key=` must name a known top-level `def` (exactly one
+                // required argument) or one of the few builtins that exist,
+                // arity-1, on BOTH backends — by the time this runs,
+                // fnval.rs has already ruled out any ambiguous binding, so
+                // the per-element call is always a direct call. The
+                // decorate/undecorate loops are synthesized Python AST
+                // (list literal, `.append`, `for`) run through the ordinary
+                // statement compiler, reusing its already-correct ownership
+                // bookkeeping; only the sort-by-key step itself is a raw
+                // runtime call (it mutates and returns the SAME list, so
+                // nothing needs releasing or re-binding around it).
+                if name == "sorted" && (1..=3).contains(&args.len()) {
+                    let mut rev_arg: Option<&Expr> = None;
+                    let mut key_arg: Option<&Expr> = None;
+                    for a in &args[1..] {
+                        let ExprKind::Kwarg(k, v) = &a.kind else {
                             return Err(format!(
-                                "line {}: sorted()'s second argument must be reverse=... (key= isn't supported yet)",
+                                "line {}: sorted()'s extra arguments must be reverse=... and/or key=...",
                                 e.line
                             ));
                         };
-                        if k != "reverse" {
+                        match k.as_str() {
+                            "reverse" if rev_arg.is_none() => rev_arg = Some(v),
+                            "key" if key_arg.is_none() => key_arg = Some(v),
+                            "reverse" | "key" => {
+                                return Err(format!(
+                                    "line {}: sorted() got multiple values for '{k}='",
+                                    e.line
+                                ));
+                            }
+                            other => {
+                                return Err(format!(
+                                    "line {}: sorted() doesn't take a '{other}=' argument — only reverse= and key=",
+                                    e.line
+                                ));
+                            }
+                        }
+                    }
+                    let Some(key_expr) = key_arg else {
+                        let (v, o) = self.expr_borrow(&args[0])?;
+                        let rev = match rev_arg {
+                            Some(ve) => self.expr_borrow(ve)?,
+                            None => (self.call_value("call i32 @p2w_none()"), true),
+                        };
+                        let r = self
+                            .call_value(&format!("call i32 @p2w_sorted(i32 {v}, i32 {})", rev.0));
+                        self.release_if_owned(&rev.0, rev.1);
+                        self.release_if_owned(&v, o);
+                        return Ok((r, Repr::Boxed));
+                    };
+                    let ExprKind::Name(key_name) = &key_expr.kind else {
+                        return Err(format!(
+                            "line {}: sorted()'s key= must be a plain function name, not an expression",
+                            e.line
+                        ));
+                    };
+                    if self.funcs.contains(key_name.as_str()) {
+                        let arity = self.func_params.get(key_name).map(|p| p.len()).unwrap_or(0);
+                        if arity != 1 {
                             return Err(format!(
-                                "line {}: sorted() doesn't take a '{k}=' argument — only reverse=",
+                                "line {}: the key function must take exactly one argument",
                                 e.line
                             ));
                         }
-                        self.expr_borrow(ve)?
-                    } else {
-                        (self.call_value("call i32 @p2w_none()"), true)
+                    } else if key_name == "repr" {
+                        return Err(format!(
+                            "line {}: sorted()'s key=repr isn't supported (repr() doesn't exist on the native backend yet)",
+                            e.line
+                        ));
+                    } else if !["len", "str", "abs", "int", "bool", "float"]
+                        .contains(&key_name.as_str())
+                    {
+                        return Err(format!(
+                            "line {}: unknown name '{key_name}' (define it with `{key_name} = ...` first)",
+                            e.line
+                        ));
+                    }
+                    let id = self.next_label;
+                    self.next_label += 1;
+                    let elem_var = format!(".sortelem{id}");
+                    let pair_var = format!(".sortpair{id}");
+                    let pairs_var = format!(".sortpairs{id}");
+                    let result_var = format!(".sortresult{id}");
+                    let line = e.line;
+                    let mk = |k: ExprKind| Expr {
+                        kind: k,
+                        line,
+                        span: (0, 0),
                     };
-                    let r =
-                        self.call_value(&format!("call i32 @p2w_sorted(i32 {v}, i32 {})", rev.0));
+                    let mk_s = |k: StmtKind| Stmt {
+                        kind: k,
+                        line,
+                        span: (0, 0),
+                    };
+                    let decorate = vec![
+                        mk_s(StmtKind::Assign(
+                            pairs_var.clone(),
+                            mk(ExprKind::List(vec![])),
+                        )),
+                        mk_s(StmtKind::ForEach {
+                            var: elem_var.clone(),
+                            iterable: args[0].clone(),
+                            body: vec![mk_s(StmtKind::Expr(mk(ExprKind::MethodCall(
+                                Box::new(mk(ExprKind::Name(pairs_var.clone()))),
+                                "append".to_string(),
+                                vec![mk(ExprKind::List(vec![
+                                    mk(ExprKind::Call(
+                                        key_name.clone(),
+                                        vec![mk(ExprKind::Name(elem_var.clone()))],
+                                    )),
+                                    mk(ExprKind::Name(elem_var.clone())),
+                                ]))],
+                            ))))],
+                        }),
+                    ];
+                    self.block(&decorate)?;
+                    let (pairs_v, _) = self.expr_borrow(&mk(ExprKind::Name(pairs_var.clone())))?;
+                    let rev = match rev_arg {
+                        Some(ve) => self.expr_borrow(ve)?,
+                        None => (self.call_value("call i32 @p2w_none()"), true),
+                    };
+                    self.line(&format!(
+                        "call i32 @p2w_sorted_by_key(i32 {pairs_v}, i32 {})",
+                        rev.0
+                    ));
                     self.release_if_owned(&rev.0, rev.1);
-                    self.release_if_owned(&v, o);
-                    return Ok((r, Repr::Boxed));
+                    let undecorate = vec![
+                        mk_s(StmtKind::Assign(
+                            result_var.clone(),
+                            mk(ExprKind::List(vec![])),
+                        )),
+                        mk_s(StmtKind::ForEach {
+                            var: pair_var.clone(),
+                            iterable: mk(ExprKind::Name(pairs_var.clone())),
+                            body: vec![mk_s(StmtKind::Expr(mk(ExprKind::MethodCall(
+                                Box::new(mk(ExprKind::Name(result_var.clone()))),
+                                "append".to_string(),
+                                vec![mk(ExprKind::Index(
+                                    Box::new(mk(ExprKind::Name(pair_var.clone()))),
+                                    Box::new(mk(ExprKind::Int(1))),
+                                ))],
+                            ))))],
+                        }),
+                    ];
+                    self.block(&undecorate)?;
+                    let (r, repr) = self.expr_typed(&mk(ExprKind::Name(result_var.clone())))?;
+                    return Ok((r, repr));
                 }
                 // min/max: one iterable, or several positional args (wrapped in a
                 // temp list). The winner comes back owned; the temp list is freed.

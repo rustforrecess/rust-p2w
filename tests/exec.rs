@@ -2709,6 +2709,25 @@ fn first_class_functions_monomorphic_case() {
 }
 
 #[test]
+fn sorted_key_decorate_sort_undecorate() {
+    // A builtin key (the headline motivating example): sort by string length.
+    assert_output(
+        "words = ['kiwi', 'fig', 'banana', 'ox']\nprint(sorted(words, key=len))\n",
+        "['ox', 'fig', 'kiwi', 'banana']\n",
+    );
+    // key= and reverse= together.
+    assert_output(
+        "words = ['kiwi', 'fig', 'banana', 'ox']\nprint(sorted(words, key=len, reverse=True))\n",
+        "['banana', 'kiwi', 'fig', 'ox']\n",
+    );
+    // A user-defined key function.
+    assert_output(
+        "def neg(x):\n    return 0 - x\nnums = [3, 1, 4, 1, 5]\nprint(sorted(nums, key=neg))\n",
+        "[5, 4, 3, 1, 1]\n",
+    );
+}
+
+#[test]
 fn non_ascii_text_survives_both_print_paths() {
     // The literal fast path (one write_str of the interned literal) and the
     // boxed-value path must both carry text beyond ASCII: é is two UTF-8

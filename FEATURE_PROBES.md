@@ -6,7 +6,7 @@ Regenerate with `P2W_BLESS=1 cargo test --test upstream_gap`. **A row moving is 
 
 See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's designs are worth taking.
 
-## Rejected (26)
+## Rejected (25)
 
 | feature | message |
 |---|---|
@@ -28,7 +28,6 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `multiple inheritance` | multiple inheritance isn't supported — one base class only |
 | `return a closure` | expected ',' or ')' in call, found LParen |
 | `map / filter` | unknown name 'abs' (define it with `abs = ...` first) |
-| `sorted(key=...)` | unknown name 'len' (define it with `len = ...` first) |
 | `implicit string concatenation` | expected ')', but found a piece of text (a string) |
 | `bytes literal` | expected a new line, but found a piece of text (a string) |
 | `integer past 2^31` | the number 4000000000 is too big — whole numbers from -2147483648 to 2147483647 … |
@@ -37,7 +36,7 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `type()` | unknown function 'type' |
 | `isinstance()` | unknown name 'int' (define it with `int = ...` first) |
 
-## Compiles (16)
+## Compiles (17)
 
 - `with / context manager`
 - `is / is not`
@@ -45,6 +44,7 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 - `from X import Y`
 - `bind a function to a name`
 - `pass a function as an argument`
+- `sorted(key=...)`
 - `inheritance`
 - `super()`
 - `lambda`

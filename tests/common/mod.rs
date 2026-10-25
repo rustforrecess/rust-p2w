@@ -508,6 +508,30 @@ pub fn groups() -> Vec<Group> {
                 ),
             ],
         },
+        Group {
+            title: "sorted(xs, key=...)",
+            note: "Decorate-sort-undecorate, built as ordinary synthesized \
+                   Python AST (list literal, `.append`, `for`) run through \
+                   the normal statement compiler on both backends — the \
+                   sort-by-key step itself is the one new runtime primitive \
+                   (`$py_sorted_by_key` / `p2w_sorted_by_key`), which \
+                   mutates and returns the SAME pairs list, mirroring \
+                   `sorted`'s own separation from its callers.",
+            probes: vec![
+                p(
+                    "sorted(xs, key=len)",
+                    "words = ['kiwi', 'fig', 'banana', 'ox']\nprint(sorted(words, key=len))\n",
+                ),
+                p(
+                    "sorted(xs, key=len, reverse=True)",
+                    "words = ['kiwi', 'fig', 'banana', 'ox']\nprint(sorted(words, key=len, reverse=True))\n",
+                ),
+                p(
+                    "sorted(xs, key=<user def>)",
+                    "def neg(x):\n    return 0 - x\nnums = [3, 1, 4, 1, 5]\nprint(sorted(nums, key=neg))\n",
+                ),
+            ],
+        },
     ]
 }
 

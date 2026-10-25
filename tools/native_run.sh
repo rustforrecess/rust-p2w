@@ -559,6 +559,14 @@ run_case dict_update_etc 'd = {"a": 1}\nd.update({"b": 2})\nprint(d)\nprint(d.ke
 run_case fnval_alias 'def double(x):\n    return x * 2\ng = double\nprint(g(7))\n' '14' || fails=$((fails+1))
 run_case fnval_callback 'def double(x):\n    return x * 2\ndef apply(f, x):\n    return f(x)\nprint(apply(double, 5))\n' '10' || fails=$((fails+1))
 
+# sorted(xs, key=...): decorate-sort-undecorate, synthesized as ordinary
+# Python AST (list/append/for) run through the normal statement compiler —
+# only the sort-by-key step itself is a raw runtime call. live==0 here is
+# the real test: it confirms the borrow around that call (and the reused
+# pairs-list slot) doesn't leak or double-free.
+run_case sortedkey_builtin "words = ['kiwi', 'fig', 'banana', 'ox']\nprint(sorted(words, key=len))\n" "['ox', 'fig', 'kiwi', 'banana']" || fails=$((fails+1))
+run_case sortedkey_userdef 'def neg(x):\n    return 0 - x\nnums = [3, 1, 4, 1, 5]\nprint(sorted(nums, key=neg))\n' '[5, 4, 3, 1, 1]' || fails=$((fails+1))
+
 # --- Mojo-bridge cases (docs/MOJO_BRIDGE.md Lane 1) --------------------------
 # Every profile-ready bridge case must ALSO compile through the native
 # backend and match CPython, so "valid Mojo too" and "runs on the board"

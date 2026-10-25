@@ -4637,6 +4637,66 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
 
+    // $py_sorted_by_key: insertion sort over an array of $TUPLE(key, elem)
+    // pairs, comparing by each pair's element 0 via $sort_lt and swapping
+    // whole pairs — the generic half of `sorted(xs, key=...)`'s
+    // decorate-sort-undecorate. It never knows what the key function was;
+    // the caller already computed every key before calling this, the same
+    // separation $py_sorted already has from its own callers.
+    let mut b = Body::new();
+    b.push("(local.set $n (array.len (local.get $pairs)))");
+    b.push("(local.set $i (i32.const 1))");
+    b.push("(block $od (loop $ol");
+    b.push_in(1, "(br_if $od (i32.ge_s (local.get $i) (local.get $n)))");
+    b.push_in(
+        1,
+        "(local.set $pair (array.get $ITEMS (local.get $pairs) (local.get $i)))",
+    );
+    b.push_in(
+        1,
+        "(local.set $key (array.get $ITEMS (struct.get $TUPLE 1 (ref.cast (ref $TUPLE) (local.get $pair))) (i32.const 0)))",
+    );
+    b.push_in(1, "(local.set $j (i32.sub (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(block $id (loop $il");
+    b.push_in(2, "(br_if $id (i32.lt_s (local.get $j) (i32.const 0)))");
+    b.push_in(
+        2,
+        "(local.set $jkey (array.get $ITEMS (struct.get $TUPLE 1 (ref.cast (ref $TUPLE) (array.get $ITEMS (local.get $pairs) (local.get $j)))) (i32.const 0)))",
+    );
+    b.push_in(
+        2,
+        "(local.set $cmp (if (result i32) (local.get $rev) (then (call $sort_lt (local.get $jkey) (local.get $key))) (else (call $sort_lt (local.get $key) (local.get $jkey)))))",
+    );
+    b.push_in(2, "(br_if $id (i32.eqz (local.get $cmp)))");
+    b.push_in(
+        2,
+        "(array.set $ITEMS (local.get $pairs) (i32.add (local.get $j) (i32.const 1)) (array.get $ITEMS (local.get $pairs) (local.get $j)))",
+    );
+    b.push_in(2, "(local.set $j (i32.sub (local.get $j) (i32.const 1)))");
+    b.push_in(2, "(br $il)))");
+    b.push_in(
+        1,
+        "(array.set $ITEMS (local.get $pairs) (i32.add (local.get $j) (i32.const 1)) (local.get $pair))",
+    );
+    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
+    b.push_in(1, "(br $ol)))");
+    b.push("(local.get $pairs)");
+    fs.push(Func {
+        signature:
+            "(func $py_sorted_by_key (param $pairs (ref null $ITEMS)) (param $rev i32) (result (ref null $ITEMS))"
+                .into(),
+        locals: vec![
+            "(local $n i32)".into(),
+            "(local $i i32)".into(),
+            "(local $j i32)".into(),
+            "(local $pair (ref null any))".into(),
+            "(local $key (ref null any))".into(),
+            "(local $jkey (ref null any))".into(),
+            "(local $cmp i32)".into(),
+        ],
+        body: b,
+    });
+
     // $list_sort: in-place insertion sort (matches sorted()'s comparison).
     let mut b = Body::new();
     b.push("(if (i32.eqz (ref.test (ref $LIST) (local.get $r))) (then (return (call $call_method (local.get $r) (local.get $name) (local.get $args)))))");
@@ -8390,7 +8450,7 @@ impl Gen {
                     ));
                 }
                 // Keyword arguments are bound only for user functions and the
-                // few builtins that take one (`sorted(reverse=…)`).
+                // few builtins that take one (`sorted(reverse=…, key=…)`).
                 if args.iter().any(|a| matches!(a.kind, ExprKind::Kwarg(..)))
                     && !self.funcs.contains_key(n.as_str())
                     && n != "sorted"
@@ -8455,34 +8515,138 @@ impl Gen {
                             let seq = self.value_expr(cx, &args[0])?;
                             return Ok(format!("(call $py_sum {seq})"));
                         }
-                        // sorted(seq) / sorted(seq, reverse=<bool>). `key=`
-                        // isn't supported yet. First-class functions (the
-                        // monomorphic case) landed, but `key=` specifically
-                        // needs its own decorate-sort-undecorate lowering on
-                        // both backends — a separate, sequenced follow-up.
-                        "sorted" if (1..=2).contains(&args.len()) => {
+                        // sorted(seq) / sorted(seq, reverse=<bool>) /
+                        // sorted(seq, key=<name>) / both together, in either
+                        // order. `key=` must name a known top-level `def`
+                        // (exactly one required argument) or one of the few
+                        // builtins that exist, arity-1, on BOTH backends —
+                        // by the time this runs, fnval.rs has already ruled
+                        // out any ambiguous binding, so the per-element call
+                        // is always a direct call, same shape as any other
+                        // resolved call.
+                        "sorted" if (1..=3).contains(&args.len()) => {
                             let seq = self.value_expr(cx, &args[0])?;
-                            let rev = if args.len() == 2 {
-                                let ExprKind::Kwarg(k, v) = &args[1].kind else {
+                            let mut rev_arg: Option<&Expr> = None;
+                            let mut key_arg: Option<&Expr> = None;
+                            for a in &args[1..] {
+                                let ExprKind::Kwarg(k, v) = &a.kind else {
                                     return Err(CompileError::at(
                                         e.line,
-                                        "sorted()'s second argument must be reverse=... (key= isn't supported yet)",
+                                        "sorted()'s extra arguments must be reverse=... and/or key=...",
                                     ));
                                 };
-                                if k != "reverse" {
-                                    return Err(CompileError::at(
-                                        e.line,
-                                        format!(
-                                            "sorted() doesn't take a '{k}=' argument — only reverse="
-                                        ),
-                                    ));
+                                match k.as_str() {
+                                    "reverse" if rev_arg.is_none() => rev_arg = Some(v),
+                                    "key" if key_arg.is_none() => key_arg = Some(v),
+                                    "reverse" | "key" => {
+                                        return Err(CompileError::at(
+                                            e.line,
+                                            format!("sorted() got multiple values for '{k}='"),
+                                        ));
+                                    }
+                                    other => {
+                                        return Err(CompileError::at(
+                                            e.line,
+                                            format!(
+                                                "sorted() doesn't take a '{other}=' argument — only reverse= and key="
+                                            ),
+                                        ));
+                                    }
                                 }
-                                let vv = self.value_expr(cx, v)?;
-                                format!("(call $truthy {vv})")
-                            } else {
-                                "(i32.const 0)".to_string()
+                            }
+                            let rev = match rev_arg {
+                                Some(v) => {
+                                    let vv = self.value_expr(cx, v)?;
+                                    format!("(call $truthy {vv})")
+                                }
+                                None => "(i32.const 0)".to_string(),
                             };
-                            return Ok(format!("(call $py_sorted {seq} {rev})"));
+                            let Some(key_expr) = key_arg else {
+                                return Ok(format!("(call $py_sorted {seq} {rev})"));
+                            };
+                            let ExprKind::Name(key_name) = &key_expr.kind else {
+                                return Err(CompileError::at(
+                                    e.line,
+                                    "sorted()'s key= must be a plain function name, not an expression",
+                                ));
+                            };
+                            let seq_local = cx.scratch_local(VAL);
+                            let n = cx.scratch_local("i32");
+                            let pairs = cx.scratch_local("(ref null $ITEMS)");
+                            let i = cx.scratch_local("i32");
+                            let elem = cx.scratch_local(VAL);
+                            let sorted_pairs = cx.scratch_local("(ref null $ITEMS)");
+                            let result_items = cx.scratch_local("(ref null $ITEMS)");
+                            let lbl1 = cx.fresh();
+                            let lbl2 = cx.fresh();
+                            let key_call = self.sorted_key_call(key_name, &elem, e.line)?;
+                            let mut b = Body::new();
+                            b.push(format!("(local.set ${seq_local} {seq})"));
+                            b.push(format!(
+                                "(local.set ${n} (call $py_len (local.get ${seq_local})))"
+                            ));
+                            b.push(format!(
+                                "(local.set ${pairs} (array.new_default $ITEMS (local.get ${n})))"
+                            ));
+                            b.push(format!("(local.set ${i} (i32.const 0))"));
+                            b.push(format!("(block $d{lbl1} (loop $l{lbl1}"));
+                            b.push_in(
+                                1,
+                                format!(
+                                    "(br_if $d{lbl1} (i32.ge_s (local.get ${i}) (local.get ${n})))"
+                                ),
+                            );
+                            b.push_in(
+                                1,
+                                format!(
+                                    "(local.set ${elem} (call $py_index (local.get ${seq_local}) (local.get ${i})))"
+                                ),
+                            );
+                            b.push_in(
+                                1,
+                                format!(
+                                    "(array.set $ITEMS (local.get ${pairs}) (local.get ${i}) (struct.new $TUPLE (i32.const 2) (array.new_fixed $ITEMS 2 {key_call} (local.get ${elem}))))"
+                                ),
+                            );
+                            b.push_in(
+                                1,
+                                format!(
+                                    "(local.set ${i} (i32.add (local.get ${i}) (i32.const 1)))"
+                                ),
+                            );
+                            b.push_in(1, format!("(br $l{lbl1})))"));
+                            b.push(format!(
+                                "(local.set ${sorted_pairs} (call $py_sorted_by_key (local.get ${pairs}) {rev}))"
+                            ));
+                            b.push(format!(
+                                "(local.set ${result_items} (array.new_default $ITEMS (local.get ${n})))"
+                            ));
+                            b.push(format!("(local.set ${i} (i32.const 0))"));
+                            b.push(format!("(block $d{lbl2} (loop $l{lbl2}"));
+                            b.push_in(
+                                1,
+                                format!(
+                                    "(br_if $d{lbl2} (i32.ge_s (local.get ${i}) (local.get ${n})))"
+                                ),
+                            );
+                            b.push_in(
+                                1,
+                                format!(
+                                    "(array.set $ITEMS (local.get ${result_items}) (local.get ${i}) (array.get $ITEMS (struct.get $TUPLE 1 (ref.cast (ref $TUPLE) (array.get $ITEMS (local.get ${sorted_pairs}) (local.get ${i})))) (i32.const 1)))"
+                                ),
+                            );
+                            b.push_in(
+                                1,
+                                format!(
+                                    "(local.set ${i} (i32.add (local.get ${i}) (i32.const 1)))"
+                                ),
+                            );
+                            b.push_in(1, format!("(br $l{lbl2})))"));
+                            let mut s = String::new();
+                            b.render(0, &mut s);
+                            return Ok(format!(
+                                "(block (result (ref null any))\n{s}(struct.new $LIST (local.get ${n}) (local.get ${result_items})))"
+                            ));
                         }
                         "any" if args.len() == 1 => {
                             let seq = self.value_expr(cx, &args[0])?;
@@ -8925,6 +9089,68 @@ impl Gen {
                 }
             }
         }
+    }
+
+    /// Resolve `key=<name>` to a direct call on `(local.get $<elem_local>)`
+    /// — either a user-defined top-level `def` taking exactly one argument,
+    /// or one of the few builtins that exist, arity-1, on BOTH backends
+    /// (`repr` doesn't exist natively yet, so it stays out of this list even
+    /// though it's in the general one-arg builtin table above — "both
+    /// targets or neither").
+    fn sorted_key_call(&self, key_name: &str, elem_local: &str, line: usize) -> Result<String> {
+        let elem = format!("(local.get ${elem_local})");
+        if let Some(&total) = self.funcs.get(key_name) {
+            if total != 1 {
+                return Err(CompileError::at(
+                    line,
+                    "the key function must take exactly one argument",
+                ));
+            }
+            let preprs = self
+                .func_param_reprs
+                .get(key_name)
+                .cloned()
+                .unwrap_or_else(|| vec![Repr::Boxed; 1]);
+            let arg = match preprs.first() {
+                Some(Repr::Int) => format!("(call $unbox {elem})"),
+                Some(Repr::Float) => format!("(call $unbox_f64 {elem})"),
+                _ => elem,
+            };
+            let call = format!("(call $f_{key_name} {arg})");
+            return Ok(match self.func_ret_reprs.get(key_name) {
+                Some(Repr::Int) => format!("(call $box {call})"),
+                Some(Repr::Float) => format!("(struct.new $FLOAT {call})"),
+                _ => call,
+            });
+        }
+        let builtin = match key_name {
+            "len" => Some(("$py_len", true)),
+            "str" => Some(("$to_str", false)),
+            "abs" => Some(("$py_abs", false)),
+            "int" => Some(("$py_int", false)),
+            "bool" => Some(("$py_bool", false)),
+            "float" => Some(("$py_float", false)),
+            _ => None,
+        };
+        if let Some((helper, boxed_i32)) = builtin {
+            let call = format!("(call {helper} {elem})");
+            return Ok(if boxed_i32 {
+                format!("(call $box {call})")
+            } else {
+                call
+            });
+        }
+        if key_name == "repr" {
+            return Err(CompileError::at(
+                line,
+                "sorted()'s key=repr isn't supported (repr() doesn't exist on the native backend yet)",
+            ));
+        }
+        Err(CompileError::at(
+            line,
+            format!("unknown name '{key_name}' (define it with `{key_name} = ...` first)"),
+        )
+        .with_kind(crate::error::ErrorKind::Name))
     }
 
     /// Generate WAT producing the raw i32 of `e` — a constant directly,
@@ -9866,8 +10092,17 @@ impl Gen {
                     .with_kind(crate::error::ErrorKind::Name))
                 }
             }
-            ExprKind::Call(_, args) => {
+            ExprKind::Call(name, args) => {
                 for a in args {
+                    // `sorted(..., key=name)`'s key is a name REFERENCE
+                    // resolved at the call site, not a value to type-check
+                    // here — skip it so a builtin key like `len` (never a
+                    // variable) doesn't get pre-rejected by the generic
+                    // `Name` case above before `sorted`'s own lowering
+                    // (which knows how to resolve it) ever runs.
+                    if name == "sorted" && matches!(&a.kind, ExprKind::Kwarg(k, _) if k == "key") {
+                        continue;
+                    }
                     self.type_of(cx, a)?;
                 }
                 Ok(Ty::Value)
