@@ -52,7 +52,18 @@ jobs:
   # calls READY must compile and run under the REAL Mojo compiler with the
   # shipped prelude, printing exactly what CPython prints — this job turns the
   # doc's "believed valid Mojo" into "verified". Cases: tests/mojo_bridge/.
+  #
+  # DISABLED 2026-10-19: Mojo 1.1 now requires `var` for every new local
+  # binding, annotated or not — and `var` is block-scoped where Python's
+  # implicit assignment is function-scoped, so there's no safe mechanical fix
+  # (injecting `var` at a name's first assignment changes behavior for any
+  # name first assigned inside a branch and read afterward — ordinary code,
+  # not an edge case). That breaks the bridge's actual claim: "this exact
+  # Python text, unchanged, is also valid Mojo." See docs/MOJO_BRIDGE.md for
+  # the full account; the Mojo side may relax this post-1.0 (Modular's own
+  # forum thread left that open), so this is parked, not deleted.
   mojo-bridge:
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

@@ -36,6 +36,7 @@ mod emit;
 mod error;
 mod evidence;
 mod floatfmt;
+mod fnval;
 mod hoist;
 mod lexer;
 mod lint;
@@ -87,7 +88,10 @@ pub fn compile_to_wat(source: &str) -> Result<String, String> {
 pub fn try_compile(source: &str) -> Result<String, CompileError> {
     let tokens = lexer::lex(source)?;
     let stmts = parser::parse(&tokens)?;
-    let stmts = hoist::hoist_nested_functions(stmts)?;
+    let mut stmts = hoist::hoist_nested_functions(stmts)?;
+    // First-class functions (monomorphic case): resolves and desugars away
+    // before either backend sees the AST, so neither needs to know it exists.
+    fnval::resolve(&mut stmts)?;
     // The type checker's promoted rules refuse here, in the shared front-end,
     // before either backend — the same words on every surface.
     check::gate(&stmts)?;
@@ -172,7 +176,8 @@ pub fn capabilities(wat: &str) -> Vec<String> {
 pub fn compile_to_llvm_ir(source: &str) -> Result<String, String> {
     let tokens = lexer::lex(source).map_err(|e| e.to_string())?;
     let stmts = parser::parse(&tokens).map_err(|e| e.to_string())?;
-    let stmts = hoist::hoist_nested_functions(stmts).map_err(|e| e.to_string())?;
+    let mut stmts = hoist::hoist_nested_functions(stmts).map_err(|e| e.to_string())?;
+    fnval::resolve(&mut stmts).map_err(|e| e.to_string())?;
     check::gate(&stmts).map_err(|e| e.to_string())?;
     // Run the WASM generator as a CHECKER first, discarding its output. The
     // compile-time type checks (literal string arithmetic, annotation misuse,
@@ -390,7 +395,7 @@ pub fn analyze(source: &str) -> (blockly::BlocksOutcome, Vec<Lint>) {
 /// The post-parse half of [`lints`] (see [`analyze`]).
 fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
     #[allow(clippy::type_complexity)] // a literal table; naming it adds nothing
-    let groups: [(LintKind, Vec<(usize, (usize, usize), String)>); 8] = [
+    let groups: [(LintKind, Vec<(usize, (usize, usize), String)>); 9] = [
         (
             LintKind::UndefinedName,
             lint::undefined_name_warnings(stmts),
@@ -419,6 +424,10 @@ fn lints_parsed(stmts: &[ast::Stmt]) -> Vec<Lint> {
         (
             LintKind::VariantMissingMethod,
             lint::variant_missing_method_warnings(stmts),
+        ),
+        (
+            LintKind::ImplicitDeclaration,
+            lint::implicit_declaration_warnings(stmts),
         ),
     ];
     let mut out: Vec<Lint> = Vec::new();

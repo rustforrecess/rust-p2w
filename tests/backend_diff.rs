@@ -215,8 +215,18 @@ fn backends_agree_or_the_differences_are_written_down() {
         eprintln!("SKIP: set P2W_DIFF=1 to run the two-backend comparison");
         return;
     }
-    if !have("clang") || !have("bash") {
-        eprintln!("SKIP: the native side needs clang and bash");
+    // Only `clang` is actually invoked anywhere in this file (via
+    // `Command::new`, no shell wrapping) — the old `bash` check was
+    // vestigial, presumably copied from `tools/native_run.sh`'s framing,
+    // where bash genuinely is needed. It also turned out to be actively
+    // wrong on at least one real setup: MSYS2's `bash.exe`, spawned
+    // directly as a Win32 child process (not forked from an existing MSYS
+    // session) via `Command::new("bash").arg("--version")`, exits 1 with
+    // no stderr for reasons unrelated to this project — a false SKIP that
+    // silently stopped blessing `BACKEND_DIVERGENCE.md` without comparing
+    // anything.
+    if !have("clang") {
+        eprintln!("SKIP: the native side needs clang");
         return;
     }
     let Some(target) = target_dir() else {
@@ -234,12 +244,28 @@ fn backends_agree_or_the_differences_are_written_down() {
     // Flush every byte. A native trap halts in a spin loop by design, so the
     // process never exits and a block-buffered stdout would take the trap's
     // message to the grave with it — the run would look silent when it was not.
+    // The runtime crate is one compilation unit, so any probe that pulls in
+    // p2w_print (i.e. every probe) also pulls in p2w_open/p2w_method0/1's
+    // undefined externs for these 5 symbols — they must be defined here
+    // even for probes that never call open(), or every native probe is a
+    // link error. name/mode/text cross as real (ptr, len) pairs sized for
+    // this host's pointer width (never p2w_str_ptr/p2w_str_len — those
+    // truncate to i32 and are for the wasm32 component target only). No
+    // probe stages a real file yet, so open() here always fails with -1.
     std::fs::write(
         dir.join("putc.c"),
         "#include <stdio.h>\n\
          void p2w_putc(unsigned char c) { putchar(c); fflush(stdout); }\n\
          int p2w_getc(void) { return getchar(); }\n\
-         int p2w_host_seed(void) { return 42; }\n",
+         int p2w_host_seed(void) { return 42; }\n\
+         int p2w_host_file_open(const char *np, int nl, const char *mp, int ml) {\n\
+         \x20 (void)np; (void)nl; (void)mp; (void)ml; return -1;\n\
+         }\n\
+         extern int p2w_str(const char *ptr, int len);\n\
+         int p2w_host_file_readline(int h) { (void)h; return p2w_str(\"\", 0); }\n\
+         int p2w_host_file_read(int h) { (void)h; return p2w_str(\"\", 0); }\n\
+         void p2w_host_file_write(int h, const char *tp, int tl) { (void)h; (void)tp; (void)tl; }\n\
+         void p2w_host_file_close(int h) { (void)h; }\n",
     )
     .expect("putc.c");
 

@@ -821,6 +821,8 @@ impl Builder {
             BinOp::Or => block("logic_operation", &field("OP", &jstr("OR")), &ab, "", ""),
             BinOp::In
             | BinOp::NotIn
+            | BinOp::Is
+            | BinOp::IsNot
             | BinOp::BitOr
             | BinOp::BitAnd
             | BinOp::BitXor

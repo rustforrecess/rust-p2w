@@ -212,6 +212,19 @@ pub fn groups() -> Vec<Group> {
                 p("math.pow(2, 10)", "import math\nprint(math.pow(2, 10))\n"),
                 e!("2.0 ** 2.0"),
                 e!("abs(-2.5)"),
+                // fabs/floor/ceil/trunc, closed on native 2026-10-23 — the
+                // first gap found in this session's parity audit (a
+                // compile-time "doesn't handle math.{method}() yet" error,
+                // not a trap — the mildest of the gaps closed this
+                // session). floor/ceil/trunc return an int, not a float
+                // (CPython's rule) — pinned on a negative input too, since
+                // floor/ceil round toward DIFFERENT infinities there.
+                p("math.fabs(-2.5)", "import math\nprint(math.fabs(-2.5))\n"),
+                p("math.floor(2.7)", "import math\nprint(math.floor(2.7))\n"),
+                p("math.floor(-2.7)", "import math\nprint(math.floor(-2.7))\n"),
+                p("math.ceil(2.1)", "import math\nprint(math.ceil(2.1))\n"),
+                p("math.ceil(-2.1)", "import math\nprint(math.ceil(-2.1))\n"),
+                p("math.trunc(-2.9)", "import math\nprint(math.trunc(-2.9))\n"),
             ],
         },
         Group {
@@ -270,6 +283,51 @@ pub fn groups() -> Vec<Group> {
                 e!("'ab' + 1"),
                 e!("1 + 'ab'"),
                 e!("'ab' / 2"),
+                // Case/strip methods, closed on native 2026-10-23 (previously
+                // native-only had no string methods at all — WASM compiled,
+                // native hit a hard "method not supported" trap). ASCII-only
+                // on every surface by design (ASCII case shift is a single
+                // in-range byte check; a non-ASCII UTF-8 byte is always
+                // >= 0x80 and never mistaken for one), which is why 'café'
+                // comes back with its accent untouched.
+                e!("'  Hello World  '.strip()"),
+                e!("'  Hello World  '.lstrip()"),
+                e!("'  Hello World  '.rstrip()"),
+                e!("'Hello World'.upper()"),
+                e!("'Hello World'.lower()"),
+                e!("'hELLO wORLD'.capitalize()"),
+                e!("'hELLO wORLD'.title()"),
+                e!("'café'.upper()"),
+                // split/join, closed on native 2026-10-23 — previously the
+                // one method that didn't just trap on native: it hung
+                // (spin-looped), the generic "unknown method" trap's own
+                // device-emulation behavior, with zero output to explain why.
+                e!("'  a  bb   c  '.split()"),
+                e!("'a,,b,'.split(',')"),
+                e!("'xy'.split('')"),
+                e!("', '.join(['a', 'bb', 'c'])"),
+                e!("'-'.join([])"),
+                // find/count/index/startswith/endswith/isdigit/isalpha/
+                // zfill/replace, closed on native 2026-10-23 — same shape
+                // as split/join: these hung rather than erroring. `count`/
+                // `index` are generic (list/tuple get them for free too,
+                // via the same `$py_count`/`$py_index_of` dispatch WASM
+                // already used — see the List methods group below).
+                e!("'abcabc'.find('bc')"),
+                e!("'abcabc'.find('zz')"),
+                e!("'abcabc'.count('bc')"),
+                e!("'abcabc'.index('ca')"),
+                e!("'hello'.startswith('he')"),
+                e!("'hello'.endswith('lo')"),
+                e!("'123'.isdigit()"),
+                e!("'abc'.isalpha()"),
+                e!("'42'.zfill(5)"),
+                e!("'-42'.zfill(5)"),
+                e!("'abcabc'.replace('a', 'XY')"),
+                p(
+                    "'abc'.index('zz') [ValueError]",
+                    "print('abc'.index('zz'))\n",
+                ),
             ],
         },
         Group {
@@ -328,6 +386,31 @@ pub fn groups() -> Vec<Group> {
                     "mixed list, element used",
                     "xs = [1, 'two']\nprint(xs[0] + 1)\n",
                 ),
+                // count/index, closed on native 2026-10-23 — the SAME
+                // py_count/py_index_of dispatch that closed str.count/
+                // str.index (see the Strings group above).
+                e!("[1, 2, 3, 2].count(2)"),
+                e!("[1, 2, 3, 2].index(2)"),
+                // sort/reverse/extend/insert, closed on native 2026-10-23 —
+                // same shape as the earlier string-method closures: these
+                // all mutate in place and return None, so the probe mutates
+                // then prints, rather than printing the call itself.
+                p(
+                    "xs = [3, 1, 2]; xs.sort(); xs",
+                    "xs = [3, 1, 2]\nxs.sort()\nprint(xs)\n",
+                ),
+                p(
+                    "xs = [1, 2, 3]; xs.reverse(); xs",
+                    "xs = [1, 2, 3]\nxs.reverse()\nprint(xs)\n",
+                ),
+                p(
+                    "xs = [1, 2]; xs.extend([3, 4]); xs",
+                    "xs = [1, 2]\nxs.extend([3, 4])\nprint(xs)\n",
+                ),
+                p(
+                    "xs = [1, 2, 3]; xs.insert(1, 9); xs",
+                    "xs = [1, 2, 3]\nxs.insert(1, 9)\nprint(xs)\n",
+                ),
             ],
         },
         Group {
@@ -343,6 +426,24 @@ pub fn groups() -> Vec<Group> {
                 e!("len({1, 2, 2})"),
                 e!("{1, 2} | {3}"),
                 e!("{1, 2} & {2, 3}"),
+                // update/clear/setdefault/keys/values/items, closed on
+                // native 2026-10-23 — same shape as the list/string method
+                // closures above: these used to hang on native, not error.
+                p(
+                    "d={'a':1}; d.update({'b':2}); d",
+                    "d = {'a': 1}\nd.update({'b': 2})\nprint(d)\n",
+                ),
+                p(
+                    "d={'a':1}; d.clear(); d",
+                    "d = {'a': 1}\nd.clear()\nprint(d)\n",
+                ),
+                p(
+                    "d={'a':1}; d.setdefault('b',2); d",
+                    "d = {'a': 1}\nd.setdefault('b', 2)\nprint(d)\n",
+                ),
+                e!("{'a': 1, 'b': 2}.keys()"),
+                e!("{'a': 1, 'b': 2}.values()"),
+                e!("{'a': 1, 'b': 2}.items()"),
             ],
         },
         Group {
@@ -387,6 +488,24 @@ pub fn groups() -> Vec<Group> {
                 p("a, b = 1, 2", "a, b = 1, 2\nprint(a + b)\n"),
                 p("a, b = 1, 2, 3", "a, b = 1, 2, 3\nprint(a)\n"),
                 p("a, b = [1, 2]", "a, b = [1, 2]\nprint(a + b)\n"),
+            ],
+        },
+        Group {
+            title: "First-class functions (monomorphic case)",
+            note: "A function value may only ever come from directly naming \
+                   a known top-level `def` (never computed), so `fnval.rs` \
+                   resolves every binding that provably holds exactly one \
+                   function to a direct call at compile time, before either \
+                   backend runs — neither sees anything but ordinary calls.",
+            probes: vec![
+                p(
+                    "g = double; g(7)",
+                    "def double(x):\n    return x * 2\ng = double\nprint(g(7))\n",
+                ),
+                p(
+                    "apply(double, 5)",
+                    "def double(x):\n    return x * 2\ndef apply(f, x):\n    return f(x)\nprint(apply(double, 5))\n",
+                ),
             ],
         },
     ]

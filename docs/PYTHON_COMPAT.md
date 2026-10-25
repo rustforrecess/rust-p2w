@@ -121,8 +121,11 @@ semantics and leak-freedom are oracle-gated). Differences:
   format spec" error.
 - **Tuples** are immutable by convention (lowered to lists internally).
 - **`sorted(seq, reverse=True)`** works everywhere — both compiled backends and
-  the step debugger (stable, both directions). `key=` needs first-class
-  functions and isn't supported yet; a bad keyword is a clean error.
+  the step debugger (stable, both directions). `key=` still isn't supported —
+  first-class functions (the monomorphic case) landed, so `key=len` would
+  *resolve* fine now, but `sorted()`'s own lowering needs a
+  decorate-sort-undecorate rework on both backends' sort routines, which
+  hasn't happened yet; a bad keyword is a clean error.
 - **`list()` / `tuple()` / `dict()`** work: empty (`list()`, `dict()`) or from
   any iterable (`list("abc")`, `list(range(n))`, `tuple(a_set)`). `dict()` is
   empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or
@@ -142,10 +145,19 @@ semantics and leak-freedom are oracle-gated). Differences:
   Provide enough elements — the common `a, *rest` / `*init, last` forms bind
   exactly like CPython.
 - **`lambda` works only as `name = lambda params: expr`** (all backends) — it
-  desugars to the equivalent `def`, so functions still aren't first-class
-  values. Any other lambda position is a friendly, specific error. Defaults
-  work (`lambda n, k=10: ...`); blocks/text round-trips canonicalize the
-  spelling to `def`.
+  desugars to the equivalent `def`. Any other lambda position (passed inline
+  as an argument, returned, stored in a container) is still a friendly,
+  specific error. Defaults work (`lambda n, k=10: ...`); blocks/text
+  round-trips canonicalize the spelling to `def`.
+- **First-class functions (the monomorphic case) work**, on all three
+  surfaces: `f = double` then `f(x)`, or passing a function directly as a
+  callback argument (`def apply(f, x): return f(x)`, called as
+  `apply(double, 5)`), compiles to a direct call — resolved at compile time,
+  since a function value may only ever come from directly naming a known
+  `def`. A binding that could hold more than one function, or sometimes a
+  function and sometimes something else, is a clean compile error, not
+  supported yet. Returning a function value, storing one in a container, and
+  first-class *bound methods* (`f = d.speak`, below) remain unsupported.
 - **Numeric builtins on native:** `abs`, `round` (1- and 2-arg), `sum`, `min`,
   `max`, `sorted` (incl. `reverse=`), `bool()`, and `float()` all work on the
   native backend now (matching the browser), with `min`/`max` over an iterable
@@ -164,10 +176,12 @@ semantics and leak-freedom are oracle-gated). Differences:
   and `list(range(n))` step cleanly. **Classes and functions** run in the
   step-into / call-stack mode (the mode the IDE uses). The simpler step-over
   interpreter still leaves classes to that mode.
-- **`import`** is `import math` only (the sole module): `math.pi`/`e`/`tau` and
-  `sqrt`/`fabs`/`floor`/`ceil`/`trunc`. Works on the browser backend and in the
-  debugger (which uses the host's `f64` ops); **native** doesn't have `math`
-  yet. A variable named `math` shadows the module, like CPython.
+- **`import`** is `math` and `random`: `math.pi`/`e`/`tau` and
+  `sqrt`/`fabs`/`floor`/`ceil`/`trunc`; `random.random`/`randint`/`choice`/
+  `shuffle`/`seed` (seeded, deterministic per attempt, bit-for-bit identical
+  across all three surfaces). Both work on the browser backend, native, and
+  the debugger. A variable named `math` or `random` shadows the module, like
+  CPython.
 - **Nested functions and closures** work on both backends and in the debugger.
   A nested `def` is **lifted to module level**, and any variable it captures
   from the enclosing function becomes a leading parameter passed at each call

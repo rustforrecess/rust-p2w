@@ -115,10 +115,25 @@ wants "the water-sample reading". `get_field`/`set_field` matches the task and
 grants less. A headless tool is a different question — and a headless tool is
 not the sandbox.
 
+This is also the answer to "should the file capability be backed by a
+database (Postgres) instead of a real filesystem?" — it shouldn't be backed
+by either, directly. `open`/`readline`/`read`/`write`/`close` is the same
+width as `get_field`: one bespoke capability, same shape on both the browser
+(host import) and native (host-provided `extern "C"` function, same
+signature on the board's eventual flash-backed store) targets. Per-filename
+capability checking (which names a program may open, and in which mode)
+lives entirely on the host side of this boundary, never in the compiler's
+own `capabilities()` manifest — same reason `get_field`'s key set isn't in
+there either. What backs a given name (a real file, a browser OPFS entry, a
+database row, a flash page) is the host's decision per deployment, invisible
+to the compiled program.
+
 ### Domain capabilities — bespoke by necessity
 
 `seed`, `set_field`/`get_field`, `report`, `evidence`, `on_frame`, the DOM and
-stage capabilities. No standard exists. Keep them shaped as WIT interfaces.
+stage capabilities, and the file capability
+(`open`/`readline`/`read`/`write`/`close`). No standard exists. Keep them
+shaped as WIT interfaces.
 
 ## Why the component chain targets `wasm32-unknown-unknown`
 
@@ -170,9 +185,9 @@ installed** here — `wasm-tools` is.
 
 ## Where that leaves each capability
 
-- **Domain caps** (`seed`, `get_field`, `report`, `on_frame`, DOM/stage) —
-  bespoke, because no standard exists. Keep them WIT-shaped. Unaffected by any
-  of the above.
+- **Domain caps** (`seed`, `get_field`, `report`, `on_frame`, DOM/stage,
+  `open`/`read`/`write`) — bespoke, because no standard exists. Keep them
+  WIT-shaped. Unaffected by any of the above.
 - **`wasi:clocks`** — flat functions, **no resources**, so it needs no
   `wit-bindgen` and no new machinery. **If time is ever wanted, this is the
   cheap standard to adopt, and it should be the first one.**

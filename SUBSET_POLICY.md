@@ -29,8 +29,10 @@ promise. Only one direction is dangerous, and it is a narrow one.
 
 ### Tier 1 — completing Python
 
-Features CPython has that we lack. Currently: exceptions, first-class
-functions, the iterator protocol.
+Features CPython has that we lack. Currently: exceptions, the iterator
+protocol. (First-class functions — the monomorphic case — shipped; see the
+worked example below. Multi-candidate dispatch, returning a function value,
+and storing one in a container remain open.)
 
 **No identity risk at all.** The only costs are implementation effort and the
 memory model. Extend freely, subject to the gates below.
@@ -108,8 +110,9 @@ rather than by teaching are how a subset stops being a subset.
 
 ## Worked examples
 
-These are the three known Tier 1 gaps, run through the gates. They are recorded
-here as much for the *method* as for the conclusions.
+These are recorded as much for the *method* as for the conclusions. Two of
+the three known Tier 1 gaps remain; first-class functions (the monomorphic
+case) shipped — see below.
 
 ### Exceptions — blocked at gate 1
 
@@ -141,20 +144,48 @@ Not decided — a `result` needs somewhere to put the error, and Python has no
 CPython shim. But it is the first proposal that gets past the gate that has
 been stopping this. See `PRIOR-ART-TYPES.md`.
 
-### First-class functions — passes, and is aligned
+### First-class functions — passes, and is aligned; the monomorphic case SHIPPED
 
-Passes all four gates. More usefully, it **pulls in the same direction as the
+Passed all four gates. More usefully, it **pulled in the same direction as the
 type work**: passing functions as values pushes toward monomorphising call
 sites, which is the same mechanism as the answer to `open-question/
 function-used-on-two-types.py`, which is the same mechanism as unboxed lists on
 the Pico.
 
 **Three separate goals wanting one piece of machinery is a strong signal about
-sequencing.** Lambda lifting already exists (`hoist.rs`).
+sequencing.** Lambda lifting already existed (`hoist.rs`) and turned out not to
+need any changes — see below.
 
-Gate 2 needs care but is satisfiable: functions as *values* keep the call graph
-decidable as long as they cannot be *constructed from names at runtime*, which
-the bright line already forbids.
+Gate 2 needed care and turned out satisfiable: functions as *values* keep the
+call graph decidable as long as they cannot be *constructed from names at
+runtime*, which the bright line already forbids. **Landed as a shared
+front-end desugaring pass (`src/fnval.rs`), run after `hoist` and before
+`check::gate`, so every surface (WASM, native, the debug interpreter) inherits
+it for free:** a function value may only ever come from directly naming a known
+top-level `def`; wherever a binding (a variable or a parameter) provably
+resolves to **exactly one** concrete function everywhere it is ever assigned
+or called — the monomorphic case — every call through it is rewritten to a
+direct call to that function before either backend ever sees the program.
+Nothing downstream learned a new concept: by the time codegen/llvm/debug run,
+the AST contains only ordinary direct calls, so there was **no new runtime
+dispatch mechanism to add on any surface** — the "same mechanism as
+monomorphising call sites" line above is not a metaphor, it is literally what
+shipped. A binding that resolves to more than one function, or sometimes a
+function and sometimes something else entirely (both are "can't pick just
+one," and either would silently diverge from CPython's per-call-site duck
+typing at a branch this analysis can't see), is a clean compile error, not a
+guess: *"can't tell which function '{name}' refers to here…"*. Multi-candidate
+closed sets are deliberately not built yet — tag + switch dispatch, mirroring
+the native backend's existing `dyn_<name>_<n>` class-dispatch pattern, is the
+explicitly sequenced follow-up. Also deliberately out of scope for now, so it
+doesn't ride in by accident (same discipline as generators below): returning a
+function value, storing one in a container, and first-class *bound methods*
+(`f = d.speak` — a separately deferred, harder feature; see
+`CLASSES_DESIGN.md`). `sorted(xs, key=...)` — the headline motivating case —
+still rejects `key=`: the mechanism above makes it resolvable, but the
+lowering itself (decorate-sort-undecorate, on both backends' own sort
+routines) turned out to be a separable, sequenced follow-up rather than a
+consequence of this landing.
 
 ### Iterator protocol — passes; generators do not ride along
 

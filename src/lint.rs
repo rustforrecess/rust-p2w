@@ -1656,6 +1656,102 @@ fn walk_shadow(
     }
 }
 
+// --- implicit declaration (unannotated first assignment) -------------------
+
+/// `total = 0` where this is the first time `total` is created in its scope
+/// — PEP 526 (Python 3.6) already gives Python a zero-cost way to say that
+/// explicitly: `total: int = 0`. Still ordinary, unmodified Python (no
+/// runtime change), but it marks a declaration as a declaration instead of
+/// looking identical to every later rebinding. Advisory, not a gate: fires
+/// once per name per scope, on the first bare `Assign`; a later rebinding of
+/// the same name is an ordinary update, not flagged again. Parameters and
+/// for-loop targets are already bindings. Suggests a concrete type only when
+/// the value is a literal the lint is CONFIDENT about (`lint_ty`'s coarser
+/// categories, e.g. "Number" for int/float/bool together, would sometimes
+/// suggest the wrong one here).
+pub fn implicit_declaration_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
+    let mut out = Vec::new();
+    decl_scope(stmts, &mut HashSet::new(), &mut out);
+    out.sort_by_key(|(line, _, _)| *line);
+    out
+}
+
+fn literal_type_name(e: &Expr) -> Option<&'static str> {
+    match &e.kind {
+        ExprKind::Int(_) => Some("int"),
+        ExprKind::Float(_) => Some("float"),
+        ExprKind::Bool(_) => Some("bool"),
+        ExprKind::Str(_) => Some("str"),
+        ExprKind::List(_) | ExprKind::ListComp { .. } => Some("list"),
+        ExprKind::Dict(_) | ExprKind::DictComp { .. } => Some("dict"),
+        ExprKind::Tuple(_) => Some("tuple"),
+        ExprKind::SetComp { .. } => Some("set"),
+        ExprKind::Call(name, _) if name == "set" => Some("set"),
+        _ => None,
+    }
+}
+
+fn decl_scope(
+    stmts: &[Stmt],
+    seen: &mut HashSet<String>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
+) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(name, value) => {
+                if seen.insert(name.clone()) {
+                    let msg = match literal_type_name(value) {
+                        Some(ty) => format!(
+                            "first time `{name}` is created in this scope — spelling it \
+                             `{name}: {ty} = ...` says so explicitly, still ordinary Python \
+                             (PEP 526), and reads differently from a later rebinding"
+                        ),
+                        None => format!(
+                            "first time `{name}` is created in this scope — spelling it \
+                             `{name}: <type> = ...` says so explicitly, still ordinary \
+                             Python (PEP 526), and reads differently from a later rebinding"
+                        ),
+                    };
+                    out.push((s.line, s.span, msg));
+                }
+            }
+            StmtKind::AnnAssign { name, .. } => {
+                seen.insert(name.clone());
+            }
+            StmtKind::Def { params, body, .. } => {
+                let mut inner: HashSet<String> = params.iter().cloned().collect();
+                decl_scope(body, &mut inner, out);
+            }
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    let mut inner: HashSet<String> = m.params.iter().cloned().collect();
+                    decl_scope(&m.body, &mut inner, out);
+                }
+            }
+            StmtKind::For { var, body, .. } | StmtKind::ForEach { var, body, .. } => {
+                seen.insert(var.clone());
+                decl_scope(body, seen, out);
+            }
+            StmtKind::If {
+                body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                decl_scope(body, seen, out);
+                for (_, b) in elifs {
+                    decl_scope(b, seen, out);
+                }
+                if let Some(b) = else_body {
+                    decl_scope(b, seen, out);
+                }
+            }
+            StmtKind::While { body, .. } => decl_scope(body, seen, out),
+            _ => {}
+        }
+    }
+}
+
 // --- self-comparison / no-op self-assignment -------------------------------
 
 /// Comparing something to itself (`if x == x:` — always the same answer) or
@@ -2532,6 +2628,10 @@ pub enum LintKind {
     /// template has one case per variant (see
     /// `variant_missing_method_warnings`).
     VariantMissingMethod,
+    /// A bare first assignment (`total = 0`) where an annotated one
+    /// (`total: int = 0`) would mark the declaration as a declaration — see
+    /// `implicit_declaration_warnings`.
+    ImplicitDeclaration,
 }
 
 /// A fading hint ladder for a concept-bearing lint. Rungs are least-help-first;
@@ -2609,6 +2709,14 @@ pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
             fix: "Either give the missing kind its own def of the method, or define the method \
                   once on the base class so every kind inherits it, overriding it only where \
                   a kind differs.",
+        },
+        LintKind::ImplicitDeclaration => Scaffold {
+            question: "This is the first time this name is used — is it being CREATED here, \
+                       or is this meant to update something that already exists?",
+            hint: "A name's first assignment is where it's created. Python lets you say that \
+                   out loud instead of leaving it to look the same as every later rebinding.",
+            fix: "Add a type after the name: `total = 0` becomes `total: int = 0`. Still \
+                  ordinary Python (PEP 526) — nothing about how the program runs changes.",
         },
         LintKind::Typo
         | LintKind::UndefinedName
@@ -3033,6 +3141,51 @@ mod tests {
         assert!(shadow("total = 0\nitems = []\n").is_empty());
     }
 
+    fn decl(src: &str) -> Vec<(usize, String)> {
+        let toks = crate::lexer::lex(src).unwrap();
+        let (stmts, _) = crate::parser::parse_recovering(&toks);
+        implicit_declaration_warnings(&stmts)
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
+    }
+
+    #[test]
+    fn implicit_declaration_flags_the_first_bare_assignment_only() {
+        // Each name's FIRST bare assignment is flagged, once; the rebind on
+        // line 2 is not — it's an update, not a declaration.
+        let w = decl("total = 0\ntotal = total + 1\n");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].0, 1);
+        assert!(w[0].1.contains("total: int"), "{}", w[0].1);
+        // A concrete type is suggested for each literal kind.
+        assert!(decl("name = \"hello\"\n")[0].1.contains("name: str"));
+        assert!(decl("pi = 3.14\n")[0].1.contains("pi: float"));
+        assert!(decl("flag = True\n")[0].1.contains("flag: bool"));
+        assert!(decl("items = [1, 2]\n")[0].1.contains("items: list"));
+        // No guessable type: a generic placeholder, not a wrong guess.
+        assert!(decl("x = f()\n")[0].1.contains("x: <type>"));
+        // Already annotated: nothing to flag.
+        assert!(decl("total: int = 0\n").is_empty());
+    }
+
+    #[test]
+    fn implicit_declaration_respects_scope_and_bindings() {
+        // A parameter and a for-loop target are already bindings.
+        assert!(decl("def f(n):\n    return n\n").is_empty());
+        assert!(decl("for i in range(5):\n    print(i)\n").is_empty());
+        // The SAME name in two different function scopes is "first" in each.
+        let w = decl(
+            "def f():\n    acc = 0\n    return acc\n\ndef g():\n    acc = 1\n    return acc\n",
+        );
+        assert_eq!(w.len(), 2, "{w:?}");
+        // A name first assigned inside an if/for is still flagged once,
+        // where it's first seen (this lint is advisory only — no scoping
+        // hazard the way auto-injecting Mojo's `var` would have had).
+        let w = decl("if True:\n    total = 0\nelse:\n    total = 1\nprint(total)\n");
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
     fn selfcmp(src: &str) -> Vec<(usize, String)> {
         let toks = crate::lexer::lex(src).unwrap();
         let (stmts, _) = crate::parser::parse_recovering(&toks);
@@ -3082,6 +3235,7 @@ mod tests {
             LintKind::UnusedLocal,
             LintKind::SelfComparison,
             LintKind::VariantMissingMethod,
+            LintKind::ImplicitDeclaration,
         ] {
             let s = scaffold(k).expect("concept lint should have a scaffold");
             assert!(!s.question.is_empty() && !s.hint.is_empty() && !s.fix.is_empty());

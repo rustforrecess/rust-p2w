@@ -37,11 +37,19 @@ the host with no board:
    the RPI-RP2 bootloader drive disappeared and did not reappear (no crash
    loop).** This is the first p2w-compiled program to run on physical
    hardware.
-2. **Clock + UART pin init** — still open. The board above booted silently;
-   nothing is visible yet because `p2w_putc` still pokes UART0 directly with
-   no clock/pin setup first. This is the next piece, same discipline as #1
-   (read the datasheet's actual register sequence, don't adapt an
-   unverified blog snippet).
+2. **Clock + UART pin init** — implemented, awaiting hardware confirmation.
+   `device/boot.c` now runs a `clocks_and_uart_init` before `main`: releases
+   reset on UART0/IO_BANK0/PADS_BANK0 (RESETS, datasheet 7.5 — these start
+   held in reset and don't respond at all otherwise), starts the 12 MHz
+   crystal and switches `clk_ref` onto it (ROSC, what the chip boots from, is
+   explicitly documented as too imprecise for "frequency sensitive interfaces
+   such as USB or UART" — datasheet 8.1), enables `clk_peri`, routes UART0
+   TX/RX onto GPIO0/GPIO1 via IO_BANK0 FUNCSEL + PADS_BANK0 pad config, and
+   programs 115200 8N1 off the resulting precise 12 MHz (no PLL needed for
+   this milestone — within UART tolerance). Links clean, `picotool info -a`
+   still confirms the IMAGE_DEF block, and a fresh `.uf2` converts. **Not yet
+   confirmed on the real board** — needs a flash + a USB-serial adapter (or
+   similar) on the other end to actually see output.
 3. ✅ **`.uf2` packaging — DONE.** `picotool uf2 convert <elf> <uf2> --family
    rp2350-arm-s` produces a real, flashable `.uf2` from the metadata-bearing
    ELF. `picotool` itself builds clean with no `sudo`/system packages at all

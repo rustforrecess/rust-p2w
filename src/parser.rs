@@ -346,6 +346,9 @@ impl<'a> Parser<'a> {
         if self.is_keyword("while") {
             return self.while_stmt();
         }
+        if self.is_keyword("with") {
+            return self.with_stmt();
+        }
         if self.is_keyword("def") {
             return self.def_stmt();
         }
@@ -991,6 +994,86 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `with EXPR as NAME: BODY` desugars to:
+    /// `.with0 = EXPR; NAME = .with0.__enter__(); BODY; .with0.__exit__(None, None, None)`
+    /// — real Python desugars through `try`/`finally` so `__exit__` still runs
+    /// if the body raises, but this subset has no `raise`/`try` yet (nothing
+    /// can trap and keep running afterward regardless), so the plain
+    /// sequential form is faithful to everything p2w can currently do; this
+    /// is worth revisiting the day exceptions land. `__enter__`/`__exit__`
+    /// are ordinary method calls here — whatever dispatches `.append()` to a
+    /// builtin list or a user class's own method handles these the same way,
+    /// so this works for any object implementing the protocol, not just a
+    /// compiler-special-cased one. `as NAME` is required for now (every
+    /// context manager this subset ships wants the bound value); bare
+    /// `with EXPR:` can be added if a real case needs it.
+    fn with_stmt(&mut self) -> Result<Stmt> {
+        let line = self.line();
+        self.eat_keyword("with")?;
+        let ctx_expr = self.expr(0)?;
+        self.eat_keyword("as")?;
+        let name = match self.peek().clone() {
+            Tok::Name(n) => {
+                self.advance();
+                n
+            }
+            other => {
+                return Err(self.err(format!("expected a name after 'as', found {other:?}")));
+            }
+        };
+        self.expect_colon()?;
+        self.expect(&Tok::Newline, "a new line")?;
+        let body = self.block()?;
+
+        let tmp = self.fresh_tmp();
+        let none = || Expr {
+            kind: ExprKind::NoneLit,
+            line,
+            span: (0, 0),
+        };
+        let tmp_ref = || Expr {
+            kind: ExprKind::Name(tmp.clone()),
+            line,
+            span: (0, 0),
+        };
+
+        let primary = Stmt {
+            kind: StmtKind::Assign(tmp.clone(), ctx_expr),
+            line,
+            span: (0, 0),
+        };
+
+        let enter_call = Expr {
+            kind: ExprKind::MethodCall(Box::new(tmp_ref()), "__enter__".into(), Vec::new()),
+            line,
+            span: (0, 0),
+        };
+        self.pending.push(Stmt {
+            kind: StmtKind::Assign(name, enter_call),
+            line,
+            span: (0, 0),
+        });
+
+        self.pending.extend(body);
+
+        let exit_call = Expr {
+            kind: ExprKind::MethodCall(
+                Box::new(tmp_ref()),
+                "__exit__".into(),
+                vec![none(), none(), none()],
+            ),
+            line,
+            span: (0, 0),
+        };
+        self.pending.push(Stmt {
+            kind: StmtKind::Expr(exit_call),
+            line,
+            span: (0, 0),
+        });
+
+        Ok(primary)
+    }
+
     fn for_stmt(&mut self) -> Result<Stmt> {
         let line = self.line();
         self.eat_keyword("for")?;
@@ -1295,7 +1378,20 @@ impl<'a> Parser<'a> {
             if op == BinOp::NotIn {
                 self.advance(); // the `in` of `not in`
             }
+            if op == BinOp::IsNot {
+                self.advance(); // the `not` of `is not`
+            }
             let rhs = self.expr(r_bp)?;
+            if matches!(op, BinOp::Is | BinOp::IsNot)
+                && !matches!(lhs.kind, ExprKind::NoneLit)
+                && !matches!(rhs.kind, ExprKind::NoneLit)
+            {
+                return Err(CompileError::at(
+                    op_line,
+                    "`is`/`is not` only compares to `None` here — use `==`/`!=` \
+                     to compare values",
+                ));
+            }
             if is_comparison(op) {
                 lhs = self.comparison_chain(lhs, op, rhs, op_line)?;
             } else {
@@ -1502,11 +1598,22 @@ impl<'a> Parser<'a> {
                     if matches!(self.peek(), Tok::LParen) {
                         self.advance();
                         let args = self.call_args()?;
-                        e = Expr {
-                            kind: ExprKind::MethodCall(Box::new(e), name, args),
-                            line,
-                            span: (0, 0),
-                        };
+                        // `"literal".format(...)` canonicalizes to the same
+                        // AST an equivalent f-string produces, when the
+                        // template can be resolved at parse time — see
+                        // `desugar_format_literal`.
+                        if name == "format"
+                            && let ExprKind::Str(template) = &e.kind
+                            && let Some(desugared) = desugar_format_literal(template, &args, line)
+                        {
+                            e = desugared;
+                        } else {
+                            e = Expr {
+                                kind: ExprKind::MethodCall(Box::new(e), name, args),
+                                line,
+                                span: (0, 0),
+                            };
+                        }
                     } else {
                         e = Expr {
                             kind: ExprKind::Attr(Box::new(e), name),
@@ -1951,6 +2058,12 @@ impl<'a> Parser<'a> {
             Tok::Name(n) if n == "not" && matches!(self.peek2(), Tok::Name(m) if m == "in") => {
                 (BinOp::NotIn, 7)
             }
+            // `is not` (two tokens; expr() eats the second), checked before
+            // bare `is` so it isn't swallowed by that arm first.
+            Tok::Name(n) if n == "is" && matches!(self.peek2(), Tok::Name(m) if m == "not") => {
+                (BinOp::IsNot, 7)
+            }
+            Tok::Name(n) if n == "is" => (BinOp::Is, 7),
             Tok::Lt => (BinOp::Lt, 7),
             Tok::Le => (BinOp::Le, 7),
             Tok::Gt => (BinOp::Gt, 7),
@@ -1991,6 +2104,119 @@ fn is_comparison(op: BinOp) -> bool {
         op,
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
     )
+}
+
+/// `"template".format(args...)` and an equivalent f-string compile to the
+/// same thing — this rewrites the literal-template, safely-resolvable case
+/// into the exact `str(...) + ...` chain the `Tok::FStr` arm above builds,
+/// so the AST only ever has one shape to carry through codegen/llvm/debug,
+/// the same move already made for `lambda` vs `def`. Returns `None` —
+/// leaving the original `.format()` method call in place, which still
+/// works via its own codegen path — for anything this can't safely resolve
+/// at parse time: a `!conversion` flag, a field with `.`/`[` in it
+/// (attribute/index access into an argument), mixed auto/explicit
+/// numbering (Python itself rejects that combination), or a field that
+/// doesn't resolve to one of the call's arguments.
+fn desugar_format_literal(template: &str, args: &[Expr], line: usize) -> Option<Expr> {
+    let positional: Vec<Expr> = args
+        .iter()
+        .filter(|a| !matches!(a.kind, ExprKind::Kwarg(_, _)))
+        .cloned()
+        .collect();
+
+    let piece = |kind| Expr {
+        kind,
+        line,
+        span: (0, 0),
+    };
+
+    let mut pieces: Vec<Expr> = Vec::new();
+    let mut text = String::new();
+    let mut auto_index = 0usize;
+    let mut used_auto = false;
+    let mut used_explicit = false;
+
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                text.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                text.push('}');
+            }
+            '}' => return None, // stray unmatched '}'
+            '{' => {
+                if !text.is_empty() {
+                    pieces.push(piece(ExprKind::Str(std::mem::take(&mut text))));
+                }
+                let mut field = String::new();
+                let mut spec = String::new();
+                let mut in_spec = false;
+                let mut closed = false;
+                for fc in chars.by_ref() {
+                    if fc == '}' {
+                        closed = true;
+                        break;
+                    } else if fc == '!' && !in_spec {
+                        return None; // conversion flag, not handled here
+                    } else if fc == ':' && !in_spec {
+                        in_spec = true;
+                    } else if in_spec {
+                        spec.push(fc);
+                    } else {
+                        field.push(fc);
+                    }
+                }
+                if !closed || field.contains('.') || field.contains('[') {
+                    return None;
+                }
+                let arg = if field.is_empty() {
+                    if used_explicit {
+                        return None;
+                    }
+                    used_auto = true;
+                    let a = positional.get(auto_index).cloned()?;
+                    auto_index += 1;
+                    a
+                } else if let Ok(idx) = field.parse::<usize>() {
+                    if used_auto {
+                        return None;
+                    }
+                    used_explicit = true;
+                    positional.get(idx).cloned()?
+                } else {
+                    args.iter().find_map(|a| match &a.kind {
+                        ExprKind::Kwarg(k, v) if k == &field => Some((**v).clone()),
+                        _ => None,
+                    })?
+                };
+                pieces.push(if spec.is_empty() {
+                    piece(ExprKind::Call("str".into(), vec![arg]))
+                } else {
+                    piece(ExprKind::Call(
+                        "format".into(),
+                        vec![arg, piece(ExprKind::Str(spec))],
+                    ))
+                });
+            }
+            other => text.push(other),
+        }
+    }
+    if !text.is_empty() {
+        pieces.push(piece(ExprKind::Str(text)));
+    }
+
+    let mut acc: Option<Expr> = None;
+    for p in pieces {
+        acc = Some(match acc {
+            None => p,
+            Some(prev) => piece(ExprKind::Bin(BinOp::Add, Box::new(prev), Box::new(p))),
+        });
+    }
+    Some(acc.unwrap_or_else(|| piece(ExprKind::Str(String::new()))))
 }
 
 /// Parse one f-string `{...}` fragment as an expression. Errors are
@@ -2267,6 +2493,86 @@ mod tests {
     }
 
     #[test]
+    fn is_and_is_not_only_accept_none() {
+        // `x is None` / `x is not None`, either operand order.
+        assert_eq!(
+            pe("x is None").kind,
+            ExprKind::Bin(
+                BinOp::Is,
+                Box::new(Expr {
+                    kind: ExprKind::Name("x".into()),
+                    line: 0,
+                    span: (0, 0)
+                }),
+                Box::new(Expr {
+                    kind: ExprKind::NoneLit,
+                    line: 0,
+                    span: (0, 0)
+                })
+            )
+        );
+        assert!(matches!(
+            pe("x is not None").kind,
+            ExprKind::Bin(BinOp::IsNot, _, _)
+        ));
+        assert!(matches!(
+            pe("None is x").kind,
+            ExprKind::Bin(BinOp::Is, _, _)
+        ));
+        assert!(matches!(
+            pe("None is not x").kind,
+            ExprKind::Bin(BinOp::IsNot, _, _)
+        ));
+        // Anything else is a clear error, not a silent miscompile — this
+        // subset doesn't implement general object identity (see the
+        // `id()` note in `BinOp::Is`'s doc comment).
+        let err = parse_expression(&lex("a is b\n").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("only compares to `None`"), "{err}");
+        let err = parse_expression(&lex("a is not b\n").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("only compares to `None`"), "{err}");
+    }
+
+    #[test]
+    fn literal_format_canonicalizes_to_the_fstring_shape() {
+        // `"...".format(...)` on a literal template desugars to the exact
+        // same AST an equivalent f-string produces — one shape downstream,
+        // same move as `lambda` -> `def`. `Expr`'s PartialEq is structural
+        // (ignores line/span), so this compares shape, not source position.
+        assert_eq!(
+            pe(r#""Hello {}, you have {} items".format(name, count)"#),
+            pe(r#"f"Hello {name}, you have {count} items""#)
+        );
+        // Explicit indices, out of order.
+        assert_eq!(
+            pe(r#""{1} then {0}".format(a, b)"#),
+            pe(r#"f"{b} then {a}""#)
+        );
+        // Keyword fields.
+        assert_eq!(
+            pe(r#""{x} and {y}".format(y=2, x=1)"#),
+            pe(r#"f"{1} and {2}""#)
+        );
+        // A format spec.
+        assert_eq!(
+            pe(r#""pi is {:.2f}".format(pi)"#),
+            pe(r#"f"pi is {pi:.2f}""#)
+        );
+        // No placeholders at all.
+        assert_eq!(pe(r#""plain text".format()"#), pe(r#""plain text""#));
+        // Escaped braces survive.
+        assert_eq!(pe(r#""{{brace}}".format()"#), pe(r#""{brace}""#));
+        // What this canonicalization deliberately leaves alone: a non-literal
+        // receiver still compiles as a real `.format()` method call.
+        let e = pe(r#"template.format(x)"#);
+        assert!(matches!(e.kind, ExprKind::MethodCall(_, ref m, _) if m == "format"));
+        // Mixed auto/explicit numbering is invalid Python — left as a method
+        // call rather than guessed at; codegen's own `.format()` path is
+        // what reports it.
+        let e = pe(r#""{} and {0}".format(a, b)"#);
+        assert!(matches!(e.kind, ExprKind::MethodCall(_, ref m, _) if m == "format"));
+    }
+
+    #[test]
     fn starred_unpack_desugars_and_is_position_checked() {
         // `a, *rest = xs` -> temp assign + a=t[0] + rest=t[1:].
         let stmts = parse_src("a, *rest = xs\n").unwrap();
@@ -2286,6 +2592,61 @@ mod tests {
         assert!(parse_src("a, *b, *c = xs\n").is_err());
         assert!(parse_src("*a = xs\n").is_err());
         assert!(parse_src("*a\n").is_err());
+    }
+
+    #[test]
+    fn with_statement_desugars_to_enter_body_exit() {
+        // `with ctx() as x: body` -> `.u0 = ctx(); x = .u0.__enter__(); body;
+        // .u0.__exit__(None, None, None)` — no try/finally (this subset has
+        // no raise/try yet, so nothing can trap and keep running afterward
+        // regardless; see the doc comment on `with_stmt`).
+        let stmts = parse_src("with ctx() as x:\n    use(x)\n").unwrap();
+        assert_eq!(stmts.len(), 4, "{stmts:?}");
+        // .u0 = ctx()
+        let StmtKind::Assign(tmp, ctx_call) = &stmts[0].kind else {
+            panic!("expected .u0 = ctx(), got {:?}", stmts[0].kind);
+        };
+        assert!(tmp.starts_with(".u"));
+        assert_eq!(ctx_call.kind, ExprKind::Call("ctx".into(), vec![]));
+        // x = .u0.__enter__()
+        let StmtKind::Assign(name, enter) = &stmts[1].kind else {
+            panic!("expected x = .u0.__enter__(), got {:?}", stmts[1].kind);
+        };
+        assert_eq!(name, "x");
+        let ExprKind::MethodCall(recv, m, args) = &enter.kind else {
+            panic!("expected a method call");
+        };
+        assert_eq!(m, "__enter__");
+        assert_eq!(recv.kind, ExprKind::Name(tmp.clone()));
+        assert!(args.is_empty());
+        // use(x) — the body, verbatim
+        let StmtKind::Expr(body_call) = &stmts[2].kind else {
+            panic!("expected the body statement");
+        };
+        assert_eq!(
+            body_call.kind,
+            ExprKind::Call(
+                "use".into(),
+                vec![Expr {
+                    kind: ExprKind::Name("x".into()),
+                    line: 0,
+                    span: (0, 0),
+                }]
+            )
+        );
+        // .u0.__exit__(None, None, None)
+        let StmtKind::Expr(exit) = &stmts[3].kind else {
+            panic!("expected the exit call");
+        };
+        let ExprKind::MethodCall(recv, m, args) = &exit.kind else {
+            panic!("expected a method call");
+        };
+        assert_eq!(m, "__exit__");
+        assert_eq!(recv.kind, ExprKind::Name(tmp.clone()));
+        assert_eq!(args.len(), 3);
+        assert!(args.iter().all(|a| a.kind == ExprKind::NoneLit));
+        // `as NAME` is required for now.
+        assert!(parse_src("with ctx():\n    pass\n").is_err());
     }
 
     #[test]

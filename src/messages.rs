@@ -175,6 +175,11 @@ pub const VALUE_RANDINT_ORDER: Msg = m(
 
 pub const ZERO_DIVISION: Msg = m("arith.zero-division", "ZeroDivisionError: division by zero");
 
+pub const FILE_NOT_FOUND: Msg = m(
+    "file.not-found",
+    "FileNotFoundError: can't open '{name}' — it isn't one of this program's available files",
+);
+
 pub const INT_OVERFLOW: Msg = m(
     "arith.int-overflow",
     "OverflowError: this calculation went outside the range of whole numbers we can store (-2147483648 to 2147483647)",

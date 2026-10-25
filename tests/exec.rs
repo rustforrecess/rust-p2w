@@ -2694,6 +2694,21 @@ fn sorted_reverse_keyword() {
 }
 
 #[test]
+fn first_class_functions_monomorphic_case() {
+    // A plain alias: calling through it is exactly calling the function.
+    assert_output(
+        "def double(x):\n    return x * 2\ng = double\nprint(g(7))\n",
+        "14\n",
+    );
+    // A callback parameter: every call to `apply` passes the same concrete
+    // function, so the call inside `apply` resolves to a direct call.
+    assert_output(
+        "def double(x):\n    return x * 2\ndef apply(f, x):\n    return f(x)\nprint(apply(double, 5))\n",
+        "10\n",
+    );
+}
+
+#[test]
 fn non_ascii_text_survives_both_print_paths() {
     // The literal fast path (one write_str of the interned literal) and the
     // boxed-value path must both carry text beyond ASCII: é is two UTF-8

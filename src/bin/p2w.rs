@@ -95,6 +95,8 @@ fn main() {
             let mut fuel = rust_p2w::harness::DEFAULT_FUEL;
             let mut stdin_text = String::new();
             let mut path: Option<String> = None;
+            let mut files: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -112,6 +114,27 @@ fn main() {
                             std::process::exit(2);
                         }
                     },
+                    "--file" => match it.next() {
+                        Some(spec) => match spec.split_once('=') {
+                            Some((name, disk_path)) => match std::fs::read_to_string(disk_path) {
+                                Ok(content) => {
+                                    files.insert(name.to_string(), content);
+                                }
+                                Err(e) => {
+                                    eprintln!("p2w: --file {disk_path}: {e}");
+                                    std::process::exit(2);
+                                }
+                            },
+                            None => {
+                                eprintln!("p2w: --file needs NAME=PATH, got {spec:?}");
+                                std::process::exit(2);
+                            }
+                        },
+                        None => {
+                            eprintln!("p2w: --file needs a value (NAME=PATH)");
+                            std::process::exit(2);
+                        }
+                    },
                     other => path = Some(other.to_string()),
                 }
             }
@@ -122,7 +145,7 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let r = rust_p2w::harness::run(&source, fuel, &stdin_text);
+            let r = rust_p2w::harness::run_with_files(&source, fuel, &stdin_text, &files);
             println!("{}", r.json);
             std::process::exit(r.exit);
         }
@@ -155,6 +178,8 @@ USAGE:
     p2w concepts [FILE]     concept evidence only, as JSON
     p2w run [FILE]          execute it under a fuel budget; JSON to stdout
                             --fuel N, --stdin TEXT  (needs --features run)
+                            --file NAME=PATH  stage a real file for open()
+                            (repeatable; the program sees NAME, not PATH)
 
 With no FILE, reads stdin. Lints never affect the exit code."
     );

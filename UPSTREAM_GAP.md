@@ -43,14 +43,14 @@ and gets its front end from the `ast` module for free.
 
 | | note |
 |---|---|
-| `with` / context managers | |
+| ~~`with` / context managers~~ | LANDED: `with EXPR as NAME:` desugars to `__enter__`/`__exit__` calls; sequential, not `try`/`finally`-backed, since this subset has no `try` yet — faithful to what can currently run at all |
 | `match` / `case` | |
 | walrus `:=` | |
 | `yield` / generators | generator *expressions* work; generator *functions* do not |
 | `try` / `except` / `finally`, `raise` | `SUBSET_POLICY.md` blocks these at gate 1 |
 | `assert` | |
 | `global` / `nonlocal` | |
-| `is` / `is not` | |
+| ~~`is` / `is not`~~ | LANDED |
 | decorators (`@`) | |
 | `*args` / `**kwargs` | at the definition site; keyword args at *call* sites work |
 | ~~`from X import Y`~~ | LANDED: `from math import sqrt, exp` binds bare names; `as` and `*` still rejected with clear messages |
@@ -65,34 +65,44 @@ and gets its front end from the `ast` module for free.
 still take a new attribute at runtime, so it is parsed as an ordinary class
 variable. Worse than absent: it looks supported.
 
-### ⭐ One root cause with many symptoms: functions are not values
+### ⭐ Functions are not values — the monomorphic case now SHIPPED, differently from upstream
 
-These all fail, and all for the same reason:
+Upstream's answer is a **calling convention**: every function has the
+signature `(args: PAIR chain, env: ENV) -> value` and lives in a **funcref
+table** reached by `call_indirect`. A closure is then an environment pointer
+plus a table index. We deliberately did NOT take this path — it touches gate
+2 (a funcref table makes the call graph harder to enumerate, and
+`capabilities()` depends on enumerating it; still decidable while indices
+can't be computed from data, but no longer free) and it changes how *every*
+function is called, not just the ones that need it.
+
+Landed instead (`src/fnval.rs`, a shared front-end desugaring pass, SHIPPED):
+a function value may only ever come from directly naming a known top-level
+`def`, so wherever a binding provably resolves to **exactly one** concrete
+function everywhere it is called, every call through it is rewritten to a
+direct call at compile time — no funcref table, no new calling convention,
+nothing downstream (not even `hoist.rs`'s existing lambda lifting) needed to
+change. Zero runtime cost for the common case, by construction.
 
 ```
-g = f                      'f' is a function — call it with f(...)
-apply(fn, v)               'd' is a function — call it with d(...)
-return inner               (a returned function cannot then be called)
-map(abs, xs)               unknown name 'abs'
-sorted(xs, key=len)        unknown name 'len'
+g = f                      NOW WORKS — g(x) compiles to a direct call to f
+apply(fn, v)                NOW WORKS, when every call to apply's own
+                            parameter resolves to one concrete function
+return inner               still fails (a returned function cannot then be
+                            called — deliberately out of scope for now)
+map(abs, xs)                still fails — map()/filter() don't exist as
+                            builtins at all, unrelated to this landing
+sorted(xs, key=len)         still fails — the MECHANISM now resolves `len`
+                            fine, but sorted()'s own key= lowering
+                            (decorate-sort-undecorate, both backends) is a
+                            separate, not-yet-built follow-up
 ```
 
-`hoist.rs` does **lambda lifting** — capture becomes extra parameters — which
-covers closures that are *called where they are defined* but cannot make a
-function a value, because there is nothing to hold.
-
-Upstream's answer is a **calling convention**: every function has the signature
-`(args: PAIR chain, env: ENV) -> value` and lives in a **funcref table** reached
-by `call_indirect`. A closure is then an environment pointer plus a table index.
-
-**So `map`, `filter`, `sorted(key=)` and every callback API are not separate
-gaps — they are downstream of one decision.** And that decision is bigger than
-`SUBSET_POLICY.md`'s Tier 1 entry implies: it changes how every function is
-called, and interacts with the reuse tier and the native backend.
-
-⚠ It also touches gate 2. A funcref table makes the call graph harder to
-enumerate, and `capabilities()` depends on enumerating it. Still decidable while
-table indices cannot be computed from data — but no longer free.
+A binding that could hold more than one function, or sometimes a function
+and sometimes something else, is a clean compile error (not a guess, not
+built yet) — multi-candidate tag+switch dispatch, mirroring the native
+backend's `dyn_<name>_<n>` class-dispatch pattern, is the sequenced next
+step. See `SUBSET_POLICY.md`'s worked example for the full account.
 
 ### Also absent, unrelated
 

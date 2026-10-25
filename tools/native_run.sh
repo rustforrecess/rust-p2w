@@ -31,11 +31,19 @@ LIB=$(cargo metadata --manifest-path runtime/Cargo.toml --format-version 1 --no-
 
 # Byte sink for p2w_print + a leak readout: at process exit, print the live
 # heap-object count to stderr so the harness can gate on RC correctness.
+#
+# Also the file-capability host shim (open/read/readline/write/close): the
+# runtime crate is one compilation unit, so ANY program that pulls in
+# p2w_print (i.e. every program) also pulls in p2w_open/p2w_method0/1's
+# undefined externs for these 5 symbols — they must be defined here even
+# for cases that never call open(), or every native case fails to link.
 cat > "$OUT/putc.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 extern int p2w_live(void);
 extern int p2w_allocs(void);
+extern int p2w_str(const char *ptr, int len);
 static void report(void) {
   fprintf(stderr, "P2W_LIVE=%d\n", p2w_live());
   fprintf(stderr, "P2W_ALLOCS=%d\n", p2w_allocs());
@@ -43,6 +51,49 @@ static void report(void) {
 void p2w_putc(unsigned char c) { putchar(c); }
 int p2w_host_seed(void) { return 42; }
 int p2w_getc(void) { return getchar(); }
+
+#define MAX_FILES 16
+static FILE *open_files[MAX_FILES];
+static int n_open_files = 0;
+
+/* name/mode/text cross as real (ptr, len) pairs sized for this host's
+ * pointer width — never via p2w_str_ptr/p2w_str_len (those truncate to
+ * i32 and are for the wasm32 component target only). */
+int p2w_host_file_open(const char *name_ptr, int name_len, const char *mode_ptr, int mode_len) {
+  char cname[1024];
+  char cmode[16];
+  if (name_len >= (int)sizeof(cname) || mode_len >= (int)sizeof(cmode)) return -1;
+  memcpy(cname, name_ptr, (size_t)name_len);
+  cname[name_len] = 0;
+  memcpy(cmode, mode_ptr, (size_t)mode_len);
+  cmode[mode_len] = 0;
+  FILE *f = fopen(cname, cmode);
+  if (!f) return -1;
+  if (n_open_files >= MAX_FILES) { fclose(f); return -1; }
+  open_files[n_open_files] = f;
+  return n_open_files++;
+}
+int p2w_host_file_readline(int handle) {
+  if (handle < 0 || handle >= n_open_files || !open_files[handle]) return p2w_str("", 0);
+  char line[4096];
+  if (!fgets(line, sizeof(line), open_files[handle])) return p2w_str("", 0);
+  return p2w_str(line, (int)strlen(line));
+}
+int p2w_host_file_read(int handle) {
+  if (handle < 0 || handle >= n_open_files || !open_files[handle]) return p2w_str("", 0);
+  static char buf[65536];
+  size_t n = fread(buf, 1, sizeof(buf), open_files[handle]);
+  return p2w_str(buf, (int)n);
+}
+void p2w_host_file_write(int handle, const char *text_ptr, int text_len) {
+  if (handle < 0 || handle >= n_open_files || !open_files[handle]) return;
+  fwrite(text_ptr, 1, (size_t)text_len, open_files[handle]);
+}
+void p2w_host_file_close(int handle) {
+  if (handle < 0 || handle >= n_open_files || !open_files[handle]) return;
+  fclose(open_files[handle]);
+  open_files[handle] = NULL;
+}
 __attribute__((constructor)) static void init(void) { atexit(report); }
 EOF
 
@@ -71,6 +122,31 @@ run_case() {
   if [ "$GATE_LEAKS" = "1" ] && [ "$live" != "0" ]; then
     echo "LEAK [$name]: output ok but live=$live (expected 0)"
     return 1
+  fi
+  echo "PASS [$name]  live=$live"
+  return 0
+}
+
+# Like run_case, but cd's into $OUT before running the exe, so a relative
+# open("name") resolves against $OUT — where fixture files for the file-
+# capability cases below are staged — rather than the crate root.
+run_case_file() {
+  local name="$1" src="$2" want="$3"
+  printf '%b' "$src" | cargo run -q --example emit_ll > "$OUT/$name.ll" 2>"$OUT/$name.err" || {
+    echo "FAIL [$name]: emit"; cat "$OUT/$name.err"; return 1; }
+  clang -Wno-override-module "$OUT/$name.ll" "$OUT/putc.c" "$LIB" -o "$OUT/$name.exe" \
+    2>"$OUT/$name.err" || { echo "FAIL [$name]: build"; cat "$OUT/$name.err"; return 1; }
+  local got; got=$(cd "$OUT" && timeout 10 "./$name.exe" 2>"$name.live" | tr -d '\r')
+  if [ $? -eq 124 ]; then
+    echo "FAIL [$name]: timed out (likely a runtime trap)"; return 1
+  fi
+  local live; live=$(sed -n 's/.*P2W_LIVE=\(-\?[0-9]*\).*/\1/p' "$OUT/$name.live")
+  : "${live:=?}"
+  if [ "$got" != "$(printf '%b' "$want")" ]; then
+    echo "FAIL [$name]: got [$got] want [$(printf '%b' "$want")]  live=$live"; return 1
+  fi
+  if [ "$GATE_LEAKS" = "1" ] && [ "$live" != "0" ]; then
+    echo "LEAK [$name]: output ok but live=$live (expected 0)"; return 1
   fi
   echo "PASS [$name]  live=$live"
   return 0
@@ -109,6 +185,11 @@ run_case floats    'print(7 / 2)\nprint(2 ** 10)\nprint(1.5 + 2)\n'            '
 run_case nativearith 'print(2 + 3 * 4)\nprint((10 - 3) * 2)\nprint(1 - 5)\n'    '14\n14\n-4'    || fails=$((fails+1))
 run_case floatmath 'print(1.5 * 2.0)\nprint(7 / 2)\nprint(1 + 2.5)\nprint(10.0 - 3)\n' '3.0\n3.5\n3.5\n7.0' || fails=$((fails+1))
 run_case floatcmp  'print(1.5 < 2.0)\nprint(2.5 > 3.0)\nprint(3.0 == 3.0)\n'     'True\nFalse\nTrue' || fails=$((fails+1))
+# `is None` / `is not None`: regression case for a real miscompile this
+# caught — `is not` lowered to `xor i1 %x, true` before the p2w_bool(i1)
+# call, which silently printed the UN-negated value on this target. Fixed
+# by using `icmp eq i1 %x, false` for the negation instead (src/llvm.rs).
+run_case isnone    'x = None\ny = 5\nprint(x is None)\nprint(x is not None)\nprint(y is None)\nprint(y is not None)\nprint("hi" is None)\nprint(None is None)\n' 'True\nFalse\nFalse\nTrue\nFalse\nTrue' || fails=$((fails+1))
 run_case floatparam 'def dbl(x: float) -> float:\n    return x * 2.0\nprint(dbl(2.5))\n' '5.0'   || fails=$((fails+1))
 run_case floatlocal 'total: float = 0.0\ntotal = total + 1.5\ntotal = total + 2.5\nprint(total)\n' '4.0' || fails=$((fails+1))
 run_case floatintarg 'def half(x: float) -> float:\n    return x / 2.0\nprint(half(7))\n' '3.5'   || fails=$((fails+1))
@@ -432,6 +513,9 @@ run_case_in input_loop 'a = input()\nb = input()\nprint(b + a)\n' 'ba' 'a\nb\n' 
 # math + random: expected strings are the WASM-GC backend's output for the
 # SAME programs (p2w run, seed 42) — cross-backend parity, bit for bit.
 run_case math_libm 'import math\nprint(math.exp(1.0))\nprint(math.log(10.0))\nprint(math.log2(8.0))\nprint(math.log10(1000.0))\nprint(math.pow(2, 10))\nprint(math.sqrt(2.0))\n' '2.7182818284590455\n2.302585092994046\n3.0\n3.0\n1024.0\n1.4142135623730951' || fails=$((fails+1))
+# fabs/floor/ceil/trunc used to be a compile-time "doesn't handle yet"
+# error on native — the first gap found in this session's parity audit.
+run_case math_fabs_etc 'import math\nprint(math.fabs(-2.5))\nprint(math.floor(-2.7))\nprint(math.ceil(-2.1))\nprint(math.trunc(-2.9))\n' '2.5\n-3\n-2\n-2' || fails=$((fails+1))
 run_case random_parity 'import random\nprint(random.randint(1, 100))\nprint(random.random())\nxs = [1, 2, 3, 4, 5]\nrandom.shuffle(xs)\nprint(xs)\nprint(random.choice([1]))\nrandom.seed(7)\nprint(random.randint(1, 100))\n' '70\n0.3458877553122256\n[1, 2, 3, 5, 4]\n1\n43' || fails=$((fails+1))
 
 run_case dict_get "d = {'a': 1}\nprint(d.get('a', 0))\nprint(d.get('b', 0))\nprint(d.get('b'))\n" '1\n0\nNone' || fails=$((fails+1))
@@ -439,19 +523,69 @@ run_case dict_get_heap "d = {'k': [1, 2]}\nxs = d.get('k', [])\nys = d.get('z', 
 run_case unpack_exact "a, b = 1, 2\nc, d = [3, 4]\nprint(a + b + c + d)\n" '10' || fails=$((fails+1))
 run_case class_pass_variant 'class Part:\n    def __init__(self, pin: int):\n        self.pin = pin\nclass Motor(Part):\n    def speed(self) -> int:\n        return 3 * self.pin * self.pin\nclass Buzzer(Part):\n    pass\nb = Buzzer(4)\nprint(b.pin)\nprint(Motor(2).speed())\n' '4\n12' || fails=$((fails+1))
 
+# --- file capability (open/read/readline/write/close, with) -----------------
+# The real host shim lives in putc.c above (real libc fopen/fread/fwrite);
+# this is the genuine end-to-end path, not a mock — same reason this file is
+# "the authority for the native backend" per CLAUDE.md. Fixture staged once.
+printf 'one\ntwo' > "$OUT/filetest_data.txt"
+run_case_file file_read 'f = open("filetest_data.txt")\nprint(f.readline())\nprint(f.read())\nf.close()\n' 'one\n\ntwo' || fails=$((fails+1))
+run_case_file file_write 'out = open("filetest_out.txt", "w")\nn = out.write("hi")\nprint(n)\nout.close()\nf2 = open("filetest_out.txt")\nprint(f2.read())\nf2.close()\n' '2\nhi' || fails=$((fails+1))
+run_case_file file_with 'with open("filetest_data.txt") as f:\n    print(f.readline())\nprint("done")\n' 'one\n\ndone' || fails=$((fails+1))
+# A missing file traps (FileNotFoundError), and every native trap spin-loops
+# by device-emulation design — this harness has no way to distinguish an
+# expected trap from a hang, so that path is covered at the Rust unit-test
+# level instead (runtime/src/lib.rs's file_open_rejects_an_unstaged_name).
+
+# --- string case/strip methods (ASCII-only on every backend, by design —
+# non-ASCII bytes pass through untouched; see runtime/src/lib.rs's
+# str_case_shift) ---
+run_case str_case_strip 's = "  Hello World  "\nprint(s.strip())\nprint(s.lstrip())\nprint(s.rstrip())\nprint("Hello World".upper())\nprint("Hello World".lower())\nprint("hELLO wORLD".capitalize())\nprint("hELLO wORLD".title())\n' 'Hello World\nHello World  \n  Hello World\nHELLO WORLD\nhello world\nHello world\nHello World' || fails=$((fails+1))
+# split()/join() used to hang on native (the generic "unknown method" trap
+# spin-loops, with zero output) — this is the regression guard.
+run_case str_split_join 'print("  a  bb   c  ".split())\nprint("a,,b,".split(","))\nprint(", ".join(["a", "bb", "c"]))\n' "['a', 'bb', 'c']\n['a', '', 'b', '']\na, bb, c" || fails=$((fails+1))
+# find/count/index/startswith/endswith/isdigit/isalpha/zfill/replace — same
+# shape as split/join: used to hang on native (zero output), not error.
+run_case str_find_etc 'print("abcabc".find("bc"))\nprint("abcabc".count("bc"))\nprint("abcabc".index("ca"))\nprint([1, 2, 3, 2].index(2))\nprint("hello".startswith("he"))\nprint("123".isdigit())\nprint("42".zfill(5))\nprint("abcabc".replace("a", "XY"))\n' '1\n2\n2\n1\nTrue\nTrue\n00042\nXYbcXYbc' || fails=$((fails+1))
+# sort/reverse/extend/insert — same shape as the string methods above: used
+# to hang on native (zero output), not error.
+run_case list_sort_etc 'xs = [3, 1, 2]\nxs.sort()\nprint(xs)\nxs.reverse()\nprint(xs)\nxs.extend([9, 8])\nprint(xs)\nxs.insert(0, 99)\nprint(xs)\n' '[1, 2, 3]\n[3, 2, 1]\n[3, 2, 1, 9, 8]\n[99, 3, 2, 1, 9, 8]' || fails=$((fails+1))
+# update/clear/setdefault/keys/values/items — same shape as the earlier
+# method closures: these used to hang on native (zero output), not error.
+run_case dict_update_etc 'd = {"a": 1}\nd.update({"b": 2})\nprint(d)\nprint(d.keys())\nprint(d.values())\nprint(d.items())\nprint(d.setdefault("c", 3))\nd.clear()\nprint(d)\n' "{'a': 1, 'b': 2}\n['a', 'b']\n[1, 2]\n[('a', 1), ('b', 2)]\n3\n{}" || fails=$((fails+1))
+
+# First-class functions (monomorphic case): fnval.rs resolves each of these
+# at compile time to a direct call, so nothing here exercises new runtime
+# machinery — the case is that the REWRITE is correct on this backend too.
+run_case fnval_alias 'def double(x):\n    return x * 2\ng = double\nprint(g(7))\n' '14' || fails=$((fails+1))
+run_case fnval_callback 'def double(x):\n    return x * 2\ndef apply(f, x):\n    return f(x)\nprint(apply(double, 5))\n' '10' || fails=$((fails+1))
+
 # --- Mojo-bridge cases (docs/MOJO_BRIDGE.md Lane 1) --------------------------
 # Every profile-ready bridge case must ALSO compile through the native
 # backend and match CPython, so "valid Mojo too" and "runs on the board"
 # stay the same set of programs. Expected output comes from CPython itself.
-PY=python3
-command -v python3 >/dev/null 2>&1 || PY=python
-for bcase in tests/mojo_bridge/*.py; do
-  bname="mojo_$(basename "$bcase" .py)"
-  [[ "$bname" == mojo_not_* ]] && continue
-  bwant=$(PYTHONIOENCODING=utf-8 "$PY" "$bcase" | tr -d '\r')
-  bsrc=$(cat "$bcase")
-  run_case "$bname" "$bsrc" "$bwant" || fails=$((fails+1))
+# `command -v` alone isn't enough: on Windows, `python3`/`python` can exist
+# as the Microsoft Store's placeholder stub (a real file on PATH that prints
+# an install nag and exits nonzero instead of running anything), so a
+# present-but-dead candidate must be skipped, not trusted.
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" --version >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
 done
+if [ -z "$PY" ]; then
+  echo "SKIP: no working Python found — the Mojo-bridge oracle cases need a real interpreter."
+fi
+if [ -n "$PY" ]; then
+  for bcase in tests/mojo_bridge/*.py; do
+    bname="mojo_$(basename "$bcase" .py)"
+    [[ "$bname" == mojo_not_* ]] && continue
+    bwant=$(PYTHONIOENCODING=utf-8 "$PY" "$bcase" | tr -d '\r')
+    bsrc=$(cat "$bcase")
+    run_case "$bname" "$bsrc" "$bwant" || fails=$((fails+1))
+  done
+fi
 
 echo "---"
 if [ "$fails" -eq 0 ]; then

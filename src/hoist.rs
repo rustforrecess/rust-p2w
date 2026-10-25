@@ -218,8 +218,9 @@ fn rewrite_clauses(clauses: &mut [CompClause], caps: &BTreeMap<String, Vec<Strin
 }
 
 /// Mutable twin of `lint::stmt_exprs` (expressions a statement evaluates in
-/// place, not descending into child blocks).
-fn stmt_exprs_mut(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
+/// place, not descending into child blocks). `pub(crate)`: also reused by
+/// `fnval.rs`'s call-rewriting pass.
+pub(crate) fn stmt_exprs_mut(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
     match &mut s.kind {
         StmtKind::Expr(e)
         | StmtKind::Assign(_, e)
@@ -277,7 +278,10 @@ fn stmt_exprs_mut(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
     }
 }
 
-/// Mutable twin of `lint::for_each_child_block` (every nested statement block).
+/// Mutable twin of `lint::for_each_child_block` (every nested statement
+/// block) — unconditionally descends into a nested `Def`'s body too (unlike
+/// the `BlockScope`-aware original), which is exactly what lifting wants and
+/// exactly what a scope-sensitive caller must NOT reuse as-is.
 fn child_blocks_mut(s: &mut Stmt, f: &mut impl FnMut(&mut Vec<Stmt>)) {
     match &mut s.kind {
         StmtKind::If {

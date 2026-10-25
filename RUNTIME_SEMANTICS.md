@@ -66,6 +66,12 @@ Full fractional `**` and math.exp/log/log2/log10/pow, via libm compiled to WAT (
 | `math.pow(2, 10)` | value | `1024.0` |
 | `2.0 ** 2.0` | value | `4.0` |
 | `abs(-2.5)` | value | `2.5` |
+| `math.fabs(-2.5)` | value | `2.5` |
+| `math.floor(2.7)` | value | `2` |
+| `math.floor(-2.7)` | value | `-3` |
+| `math.ceil(2.1)` | value | `3` |
+| `math.ceil(-2.1)` | value | `-2` |
+| `math.trunc(-2.9)` | value | `-2` |
 
 ## Division by zero
 
@@ -116,6 +122,31 @@ CPython's rule, and it means a type system cannot treat `bool` as unrelated to `
 | `'ab' + 1` | compile error | `line 1: this adds a number to text, and there's no way to do that — quotes make text. int(...) turns text that looks like a number into one` |
 | `1 + 'ab'` | compile error | `line 1: this adds a number to text, and there's no way to do that — quotes make text. int(...) turns text that looks like a number into one` |
 | `'ab' / 2` | compile error | `line 1: `+` joins text together, but there's no way to divide text.` |
+| `'  Hello World  '.strip()` | value | `Hello World` |
+| `'  Hello World  '.lstrip()` | value | `Hello World` |
+| `'  Hello World  '.rstrip()` | value | `  Hello World` |
+| `'Hello World'.upper()` | value | `HELLO WORLD` |
+| `'Hello World'.lower()` | value | `hello world` |
+| `'hELLO wORLD'.capitalize()` | value | `Hello world` |
+| `'hELLO wORLD'.title()` | value | `Hello World` |
+| `'café'.upper()` | value | `CAFé` |
+| `'  a  bb   c  '.split()` | value | `['a', 'bb', 'c']` |
+| `'a,,b,'.split(',')` | value | `['a', '', 'b', '']` |
+| `'xy'.split('')` | value | `['xy']` |
+| `', '.join(['a', 'bb', 'c'])` | value | `a, bb, c` |
+| `'-'.join([])` | value | (no output) |
+| `'abcabc'.find('bc')` | value | `1` |
+| `'abcabc'.find('zz')` | value | `-1` |
+| `'abcabc'.count('bc')` | value | `2` |
+| `'abcabc'.index('ca')` | value | `2` |
+| `'hello'.startswith('he')` | value | `True` |
+| `'hello'.endswith('lo')` | value | `True` |
+| `'123'.isdigit()` | value | `True` |
+| `'abc'.isalpha()` | value | `True` |
+| `'42'.zfill(5)` | value | `00042` |
+| `'-42'.zfill(5)` | value | `-0042` |
+| `'abcabc'.replace('a', 'XY')` | value | `XYbcXYbc` |
+| `'abc'.index('zz') [ValueError]` | trap | `ValueError: value is not in the sequence` |
 
 ## Where a wrong type is caught TODAY
 
@@ -154,6 +185,12 @@ Index errors are the classic runtime failure. `for i in range(len(xs))` is the s
 | `[1, 2, 3][::0]` | trap | `ValueError: slice step cannot be zero` |
 | `[1, 'two', 3.0]` | value | `[1, 'two', 3.0]` |
 | `mixed list, element used` | value | `2` |
+| `[1, 2, 3, 2].count(2)` | value | `2` |
+| `[1, 2, 3, 2].index(2)` | value | `1` |
+| `xs = [3, 1, 2]; xs.sort(); xs` | value | `[1, 2, 3]` |
+| `xs = [1, 2, 3]; xs.reverse(); xs` | value | `[3, 2, 1]` |
+| `xs = [1, 2]; xs.extend([3, 4]); xs` | value | `[1, 2, 3, 4]` |
+| `xs = [1, 2, 3]; xs.insert(1, 9); xs` | value | `[1, 9, 2, 3]` |
 
 ## Dicts and sets
 
@@ -168,6 +205,12 @@ Index errors are the classic runtime failure. `for i in range(len(xs))` is the s
 | `len({1, 2, 2})` | value | `2` |
 | `{1, 2} \| {3}` | value | `{1, 2, 3}` |
 | `{1, 2} & {2, 3}` | value | `{2}` |
+| `d={'a':1}; d.update({'b':2}); d` | value | `{'a': 1, 'b': 2}` |
+| `d={'a':1}; d.clear(); d` | value | `{}` |
+| `d={'a':1}; d.setdefault('b',2); d` | value | `{'a': 1, 'b': 2}` |
+| `{'a': 1, 'b': 2}.keys()` | value | `['a', 'b']` |
+| `{'a': 1, 'b': 2}.values()` | value | `[1, 2]` |
+| `{'a': 1, 'b': 2}.items()` | value | `[('a', 1), ('b', 2)]` |
 
 ## Conversions
 
@@ -209,3 +252,12 @@ A length mismatch is checkable statically whenever both sides are literals.
 | `a, b = 1, 2` | value | `3` |
 | `a, b = 1, 2, 3` | trap | `ValueError: wrong number of values to unpack` |
 | `a, b = [1, 2]` | value | `3` |
+
+## First-class functions (monomorphic case)
+
+A function value may only ever come from directly naming a known top-level `def` (never computed), so `fnval.rs` resolves every binding that provably holds exactly one function to a direct call at compile time, before either backend runs — neither sees anything but ordinary calls.
+
+| program | where | result |
+|---|---|---|
+| `g = double; g(7)` | value | `14` |
+| `apply(double, 5)` | value | `10` |

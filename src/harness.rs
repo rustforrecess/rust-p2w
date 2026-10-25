@@ -35,7 +35,7 @@
 //! that drift are how a flush bug faked an entire harness run.
 
 use std::io::Read;
-use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
+use wasmtime::{Caller, Config, Engine, ExternRef, Linker, Module, Rooted, Store};
 
 /// Enough for any classroom program; small enough that a runaway loop stops
 /// while a person is still looking at the screen.
@@ -66,14 +66,60 @@ pub struct Report {
     pub exit: i32,
 }
 
-/// Host state: what the program printed, plus the stdin it may read.
+/// Host state: what the program printed, the stdin it may read, and file
+/// capability state (pre-staged read content, plus handles opened so far).
 struct Io {
     out: Vec<u8>,
     input: Vec<u8>,
     pos: usize,
+    files: std::collections::HashMap<String, String>,
+    open_files: Vec<HostFile>,
+}
+
+/// One open file's state (mirrors `debug::VmFile` — same reason: `write()`
+/// accumulates rather than touching anything real, since this harness has
+/// no filesystem any more than the debugger does, only what's staged).
+struct HostFile {
+    lines: Vec<String>,
+    cursor: usize,
+    mode: HostFileMode,
+    writes: String,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum HostFileMode {
+    Read,
+    Write,
+}
+
+fn split_lines(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = content;
+    while let Some(i) = rest.find('\n') {
+        lines.push(rest[..=i].to_string());
+        rest = &rest[i + 1..];
+    }
+    if !rest.is_empty() {
+        lines.push(rest.to_string());
+    }
+    lines
 }
 
 pub fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
+    run_with_files(source, fuel, stdin_text, &std::collections::HashMap::new())
+}
+
+/// Like [`run`], but with file content staged for `open()` to read — the
+/// same shape as `stdin_text` for `input()`. Files opened in write mode
+/// don't need to be staged; what they accumulate isn't surfaced here (this
+/// harness is for checking program behavior, not file output) the same way
+/// stdout written mid-run is only visible in the final report, not live.
+pub fn run_with_files(
+    source: &str,
+    fuel: u64,
+    stdin_text: &str,
+    files: &std::collections::HashMap<String, String>,
+) -> Report {
     let wat = match crate::try_compile(source) {
         Ok(w) => w,
         Err(e) => {
@@ -115,6 +161,8 @@ pub fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
             out: Vec::new(),
             input: stdin_text.as_bytes().to_vec(),
             pos: 0,
+            files: files.clone(),
+            open_files: Vec::new(),
         },
     );
     if let Err(e) = store.set_fuel(fuel) {
@@ -188,6 +236,101 @@ pub fn run(source: &str, fuel: u64, stdin_text: &str) -> Report {
     // make the same program give different results on two invocations.
     linker
         .func_wrap("env", "seed", |_: Caller<'_, Io>| -> i32 { 42 })
+        .unwrap();
+    // File capability: `files` staged content is what `open()` in read mode
+    // may answer (the per-filename capability check — see HOST_INTERFACE.md,
+    // "not for student code" on raw `wasi:filesystem` — lives entirely here,
+    // host-side, same width as `get_field`). Write mode always succeeds and
+    // starts empty; what it accumulates isn't surfaced by this harness (see
+    // `run_with_files`'s doc comment).
+    linker
+        .func_wrap(
+            "env",
+            "file_open",
+            |mut c: Caller<'_, Io>,
+             name: Option<Rooted<ExternRef>>,
+             mode: Option<Rooted<ExternRef>>|
+             -> i32 {
+                let name = crate::js_string_host::js_str(&mut c, &name);
+                let mode = crate::js_string_host::js_str(&mut c, &mode);
+                let d = c.data_mut();
+                match mode.as_str() {
+                    "r" => match d.files.get(&name) {
+                        Some(content) => {
+                            d.open_files.push(HostFile {
+                                lines: split_lines(content),
+                                cursor: 0,
+                                mode: HostFileMode::Read,
+                                writes: String::new(),
+                            });
+                            (d.open_files.len() - 1) as i32
+                        }
+                        None => -1,
+                    },
+                    "w" => {
+                        d.open_files.push(HostFile {
+                            lines: Vec::new(),
+                            cursor: 0,
+                            mode: HostFileMode::Write,
+                            writes: String::new(),
+                        });
+                        (d.open_files.len() - 1) as i32
+                    }
+                    _ => -1,
+                }
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "file_readline",
+            |mut c: Caller<'_, Io>, handle: i32| -> Option<Rooted<ExternRef>> {
+                let line = match c.data_mut().open_files.get_mut(handle as usize) {
+                    Some(f) if f.cursor < f.lines.len() => {
+                        let line = f.lines[f.cursor].clone();
+                        f.cursor += 1;
+                        line
+                    }
+                    _ => String::new(),
+                };
+                Some(crate::js_string_host::js_new(&mut c, line))
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "file_read",
+            |mut c: Caller<'_, Io>, handle: i32| -> Option<Rooted<ExternRef>> {
+                let rest = match c.data_mut().open_files.get_mut(handle as usize) {
+                    Some(f) => {
+                        let rest = f.lines[f.cursor..].concat();
+                        f.cursor = f.lines.len();
+                        rest
+                    }
+                    None => String::new(),
+                };
+                Some(crate::js_string_host::js_new(&mut c, rest))
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "file_write",
+            |mut c: Caller<'_, Io>, handle: i32, text: Option<Rooted<ExternRef>>| {
+                let text = crate::js_string_host::js_str(&mut c, &text);
+                if let Some(f) = c.data_mut().open_files.get_mut(handle as usize)
+                    && f.mode == HostFileMode::Write
+                {
+                    f.writes.push_str(&text);
+                }
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap("env", "file_close", |_: Caller<'_, Io>, _handle: i32| {})
         .unwrap();
 
     crate::js_string_host::add_js_string_builtins(&mut linker);
@@ -327,5 +470,53 @@ mod tests {
         let r = run("x = input()\nprint('hi ' + x)\n", DEFAULT_FUEL, "ada\n");
         assert_eq!(r.exit, 0, "{}", r.json);
         assert!(r.json.contains("hi ada"), "{}", r.json);
+    }
+
+    #[test]
+    fn open_read_write_close_round_trip_on_wasm() {
+        let files =
+            std::collections::HashMap::from([("data.txt".to_string(), "one\ntwo".to_string())]);
+        let r = run_with_files(
+            "f = open(\"data.txt\")\n\
+             print(f.readline())\n\
+             print(f.read())\n\
+             f.close()\n\
+             out = open(\"out.txt\", \"w\")\n\
+             n = out.write(\"hi\")\n\
+             print(n)\n\
+             out.close()\n",
+            DEFAULT_FUEL,
+            "",
+            &files,
+        );
+        assert_eq!(r.exit, 0, "{}", r.json);
+        // readline() took "one\n"; read() takes the rest ("two"); write()
+        // returns the character count, matching CPython (and debug.rs).
+        assert!(r.json.contains("one\\n\\ntwo\\n2\\n"), "{}", r.json);
+    }
+
+    #[test]
+    fn opening_an_unstaged_file_traps_with_a_clear_message() {
+        let r = run("open(\"missing.txt\")\n", DEFAULT_FUEL, "");
+        assert_eq!(r.exit, 1, "{}", r.json);
+        assert!(r.json.contains("FileNotFoundError"), "{}", r.json);
+        assert!(r.json.contains("missing.txt"), "{}", r.json);
+    }
+
+    #[test]
+    fn with_on_a_plain_class_needs_no_file_import_still() {
+        // The regression this guards: `__enter__`/`__exit__` dispatch must
+        // stay gated on the program actually calling `open()` somewhere, or
+        // this would fail to instantiate (missing env.file_open) despite
+        // never touching a file.
+        let r = run(
+            "class Guard:\n    def __enter__(self):\n        return self\n    \
+             def __exit__(self, a, b, c):\n        pass\n\n\
+             with Guard() as g:\n    print(\"ok\")\n",
+            DEFAULT_FUEL,
+            "",
+        );
+        assert_eq!(r.exit, 0, "{}", r.json);
+        assert!(r.json.contains("\"output\": \"ok\\n\""), "{}", r.json);
     }
 }

@@ -48,7 +48,56 @@ pub enum Value {
     /// A class instance. `Rc`-shared so aliases see each other's attribute
     /// writes (true reference semantics, like the compiled backends).
     Object(Rc<VmObj>),
+    /// An open file: an index into `Vm::open_files`, not the file's state
+    /// itself — mutation (reading advances a cursor) happens on that side
+    /// table, the same reason `Value::Object` is `Rc`-shared, just simpler
+    /// since nothing else can alias a given open handle.
+    File(usize),
     None,
+}
+
+/// One open file's state. Lines keep their trailing `\n` (matching real
+/// Python's `readline()`/file iteration), except possibly the last one, the
+/// same way a real text file may or may not end in a newline.
+struct VmFile {
+    name: String,
+    lines: Vec<String>,
+    cursor: usize,
+    closed: bool,
+    mode: FileMode,
+    /// Accumulated `.write()` calls, in write mode — read back via
+    /// `Vm::file_writes` after the run. The debugger has no real filesystem
+    /// to commit this to; whatever embeds it (the IDE, a test) decides where
+    /// it actually lands.
+    writes: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FileMode {
+    Read,
+    Write,
+}
+
+impl VmFile {
+    fn new(name: String, content: &str, mode: FileMode) -> Self {
+        let mut lines: Vec<String> = Vec::new();
+        let mut rest = content;
+        while let Some(i) = rest.find('\n') {
+            lines.push(rest[..=i].to_string());
+            rest = &rest[i + 1..];
+        }
+        if !rest.is_empty() {
+            lines.push(rest.to_string());
+        }
+        VmFile {
+            name,
+            lines,
+            cursor: 0,
+            closed: false,
+            mode,
+            writes: String::new(),
+        }
+    }
 }
 
 /// A class instance's storage. Equality is IDENTITY (same allocation) — the
@@ -80,6 +129,7 @@ impl Value {
             Value::Set(v) => !v.is_empty(),
             Value::Dict(d) => !d.is_empty(),
             Value::Object(_) => true, // instances are truthy (CPython default)
+            Value::File(_) => true,
             Value::None => false,
         }
     }
@@ -99,6 +149,7 @@ impl Value {
             // top-level print/str sites (values nested in containers show
             // this default — a documented debugger-only narrowing).
             Value::Object(o) => format!("<{} object>", o.class),
+            Value::File(_) => "<file object>".to_string(),
             Value::Int(n) => n.to_string(),
             // CPython-exact float repr (shortest round-trip + sci-notation
             // thresholds); Rust's own `{:?}` disagrees on 16-digit ties and
@@ -321,7 +372,8 @@ impl Stepper {
         // Same closure conversion the compiler runs, so nested functions (and
         // their captures) behave identically here and under Run. The pass keeps
         // statement order, so stepping is unchanged for everything else.
-        let program = crate::hoist::hoist_nested_functions(program)?;
+        let mut program = crate::hoist::hoist_nested_functions(program)?;
+        crate::fnval::resolve(&mut program)?; // same first-class-function desugar Run gets
         crate::check::gate(&program)?; // Step refuses what Run refuses
         let mut s = Stepper {
             stack: vec![Cont::Seq {
@@ -980,6 +1032,12 @@ impl Stepper {
         match op {
             BinOp::Eq => Ok(Value::Bool(py_eq(&l, &r))),
             BinOp::Ne => Ok(Value::Bool(!py_eq(&l, &r))),
+            BinOp::Is => Ok(Value::Bool(
+                matches!(l, Value::None) && matches!(r, Value::None),
+            )),
+            BinOp::IsNot => Ok(Value::Bool(
+                !(matches!(l, Value::None) && matches!(r, Value::None)),
+            )),
             BinOp::In => Ok(Value::Bool(contains(&r, &l)?)),
             BinOp::NotIn => Ok(Value::Bool(!contains(&r, &l)?)),
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => compare(op, &l, &r),
@@ -1099,62 +1157,25 @@ impl Stepper {
         {
             return math_call(method, vals.as_slice());
         }
-        // Mutating list/set methods need the variable itself, so require a Name.
-        if let ExprKind::Name(name) = &obj.kind {
-            match scope.get_mut(name) {
-                Some(Value::List(items)) => match (method, vals.as_slice()) {
-                    ("append", [v]) => {
-                        items.push(v.clone());
-                        return Ok(Value::None);
-                    }
-                    ("pop", []) => {
-                        return items.pop().ok_or_else(|| {
-                            fill_msg(&crate::messages::INDEX_OUT_OF_RANGE, &[("seq", "list")])
-                        });
-                    }
-                    ("pop", [i]) => {
-                        let i = as_int(i).ok_or_else(|| expected_number(i))?;
-                        let n = items.len() as i64;
-                        let real = if i < 0 { i + n } else { i };
-                        if real < 0 || real >= n {
-                            return Err(fill_msg(
-                                &crate::messages::INDEX_OUT_OF_RANGE,
-                                &[("seq", "list")],
-                            ));
-                        }
-                        return Ok(items.remove(real as usize));
-                    }
-                    _ => {}
-                },
-                Some(Value::Set(items)) => {
-                    if let Some(res) = set_method_mut(items, method, &vals) {
-                        return res;
-                    }
-                }
-                Some(Value::Dict(pairs)) => {
-                    if let ("pop", [k]) = (method, vals.as_slice()) {
-                        match pairs.iter().position(|(dk, _)| py_eq(dk, k)) {
-                            Some(i) => return Ok(pairs.remove(i).1),
-                            None => {
-                                return Err(fill_msg(
-                                    &crate::messages::KEY_MISSING,
-                                    &[("key", &k.py_repr())],
-                                ));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+        // Mutating list/set/dict/string methods need the variable itself (for
+        // the mutating ones to write back), so require a Name — delegates to
+        // the same dispatcher the step machine's Task::MethodOnName uses, so
+        // a method behaves identically whether it's stepped or run inside a
+        // called function's atomic body.
+        if let ExprKind::Name(name) = &obj.kind
+            && let Some(v) = scope.get_mut(name)
+            && matches!(
+                v,
+                Value::List(_) | Value::Tuple(_) | Value::Set(_) | Value::Dict(_) | Value::Str(_)
+            )
+        {
+            return container_method(v, method, vals);
         }
-        // Non-mutating set methods (union/intersection/issubset/copy/…).
-        let recv = Self::eval_in(funcs, scope, out, obj)?;
-        if let Some(res) = set_method_val(&recv, method, &vals) {
-            return res;
-        }
-        Err(format!(
-            ".{method}() isn't in the step debugger yet — use Run for that"
-        ))
+        // General receiver (a literal, or a non-container/non-Name
+        // expression): evaluate it and dispatch by value. Mutation is
+        // harmless since the value is a temporary.
+        let mut recv = Self::eval_in(funcs, scope, out, obj)?;
+        container_method(&mut recv, method, vals)
     }
 
     /// Run a user function to completion (step-over): bind args (and defaults)
@@ -1690,6 +1711,7 @@ fn expected_number_bin(op: BinOp, l: &Value, r: &Value) -> String {
 fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Object(_) => "object",
+        Value::File(_) => "file",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
         Value::Bool(_) => "bool",
@@ -1903,6 +1925,13 @@ pub struct Vm {
     /// Pre-supplied input lines served to `input()` during stepping (the VM has
     /// no real stdin; the IDE fills this from its input box via `set_stdin`).
     stdin: std::collections::VecDeque<String>,
+    /// Pre-staged file content, keyed by the name a program's `open(name)`
+    /// call uses — the debugger has no real filesystem underneath any more
+    /// than it has real stdin; the embedder supplies what's answerable via
+    /// `set_files` (a lesson's bundled example files, say) before running.
+    file_sources: HashMap<String, String>,
+    /// Handles created by `open()` so far, indexed by `Value::File`.
+    open_files: Vec<VmFile>,
     /// xorshift64* state — the bit-exact mirror of the compiled backend's
     /// $rnd helpers. Seeded 42 like the test hosts' env.seed, so the Vm and
     /// the compiled module produce the SAME sequence under test.
@@ -1915,7 +1944,8 @@ impl Vm {
         let program = crate::parser::parse(&tokens)?;
         // Closure-convert like the compiler, so a nested function that captures
         // steps the same way it Runs (and a bad capture errors identically).
-        let program = crate::hoist::hoist_nested_functions(program)?;
+        let mut program = crate::hoist::hoist_nested_functions(program)?;
+        crate::fnval::resolve(&mut program)?; // same first-class-function desugar Run gets
         crate::check::gate(&program)?; // Step refuses what Run refuses
         let module = VmFrame {
             func: "<module>".to_string(),
@@ -1935,6 +1965,8 @@ impl Vm {
             watch_hit: None,
             last_return: None,
             stdin: std::collections::VecDeque::new(),
+            file_sources: HashMap::new(),
+            open_files: Vec::new(),
             rnd: rnd_seed(42),
         };
         vm.settle();
@@ -1946,6 +1978,14 @@ impl Vm {
     /// with its input box.
     pub fn set_stdin(&mut self, s: &str) {
         self.stdin = s.lines().map(|l| l.to_string()).collect();
+    }
+
+    /// Provide file content a program's `open(name)` may read, keyed by the
+    /// name it opens — a lesson's bundled example files, say. Files not
+    /// listed here are not openable (same shape as `set_stdin`: the debugger
+    /// has no real filesystem, only what's staged before running).
+    pub fn set_files(&mut self, files: HashMap<String, String>) {
+        self.file_sources = files;
     }
 
     pub fn output(&self) -> &str {
@@ -2296,6 +2336,11 @@ impl Vm {
                             | "__ge__"
                             | "__len__"
                             | "__getitem__"
+                            // Called via ordinary `.method()` syntax (the `with`
+                            // statement desugars to plain MethodCall nodes), so
+                            // no special operator-dunder wiring is needed here.
+                            | "__enter__"
+                            | "__exit__"
                     );
                     if m.name.starts_with("__") && m.name.ends_with("__") && !allowed {
                         return Err(format!(
@@ -2407,7 +2452,18 @@ impl Vm {
             Task::Bin(op) => {
                 let r = self.pop_op()?;
                 let l = self.pop_op()?;
-                if matches!(l, Value::Object(_)) || matches!(r, Value::Object(_)) {
+                if matches!(op, BinOp::Is | BinOp::IsNot) {
+                    // Never dunder-dispatched (the parser only allows this
+                    // against `None`, and identity against the singleton
+                    // doesn't go through `__eq__`): a raw value-shape check.
+                    let both_none = matches!(l, Value::None) && matches!(r, Value::None);
+                    let is = if op == BinOp::Is {
+                        both_none
+                    } else {
+                        !both_none
+                    };
+                    self.push_op(Value::Bool(is));
+                } else if matches!(l, Value::Object(_)) || matches!(r, Value::Object(_)) {
                     self.bin_dunder(op, l, r)?;
                 } else {
                     self.push_op(apply_bin(op, &l, &r)?);
@@ -2639,10 +2695,12 @@ impl Vm {
                     args.push(self.pop_op()?);
                 }
                 args.reverse();
-                // An instance dispatches through its class chain (the Rc is
-                // shared, so the method mutates the same object the variable
-                // holds); containers keep the name-based mutation path.
-                if let Some(recv @ Value::Object(_)) = self.lookup(&name) {
+                // A file's mutable state (the read cursor) lives on the Vm's
+                // own side table, not inside the `Value` — see `Value::File`.
+                if let Some(Value::File(idx)) = self.lookup(&name) {
+                    let result = self.file_method(idx, &method, &args)?;
+                    self.push_op(result);
+                } else if let Some(recv @ Value::Object(_)) = self.lookup(&name) {
                     let owner = match &recv {
                         Value::Object(o) => self
                             .resolve_method(&o.class, &method)
@@ -2784,12 +2842,14 @@ impl Vm {
                     args.push(self.pop_op()?);
                 }
                 args.reverse();
-                let recv = self.pop_op()?;
+                let mut recv = self.pop_op()?;
                 let Value::Object(o) = &recv else {
-                    return Err(
-                        "method calls need a simple variable (e.g. xs.append(..)) here yet"
-                            .to_string(),
-                    );
+                    // Not an instance: a literal/temporary receiver (e.g.
+                    // `"abc".upper()`, `[3, 1].sort()`) — mutation is
+                    // harmless since the value is discarded after.
+                    let out = container_method(&mut recv, &method, args)?;
+                    self.push_op(out);
+                    return Ok(());
                 };
                 let (owner, _) = self.resolve_method(&o.class, &method).ok_or_else(|| {
                     format!("this object has no method '{method}' (or wrong arguments)")
@@ -3219,11 +3279,124 @@ impl Vm {
             let line = self.stdin.pop_front().unwrap_or_default();
             self.push_op(Value::Str(line));
             Ok(())
+        } else if name == "open" {
+            // `open(name[, mode])` — the debugger has no real filesystem, only
+            // what `set_files` staged (same shape as `input`'s `set_stdin`).
+            // Read mode ("r", the default) needs the name pre-staged; write
+            // mode ("w") always succeeds and starts from an empty buffer —
+            // what's written is read back via `Vm::file_writes` after the
+            // run, not committed anywhere real here.
+            let filename = match args.first() {
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Err("open() needs a text filename".to_string()),
+            };
+            let mode_str = match args.get(1) {
+                Some(Value::Str(m)) => m.as_str(),
+                None => "r",
+                Some(_) => return Err("open()'s mode must be text".to_string()),
+            };
+            let (mode, content) = match mode_str {
+                "r" => {
+                    let Some(content) = self.file_sources.get(&filename) else {
+                        return Err(format!(
+                            "can't open '{filename}' — it isn't one of this program's \
+                             available files"
+                        ));
+                    };
+                    (FileMode::Read, content.clone())
+                }
+                "w" => (FileMode::Write, String::new()),
+                other => {
+                    return Err(format!(
+                        "open() mode '{other}' isn't supported yet — use 'r' or 'w'"
+                    ));
+                }
+            };
+            self.open_files.push(VmFile::new(filename, &content, mode));
+            self.push_op(Value::File(self.open_files.len() - 1));
+            Ok(())
         } else {
             let v = call_builtin(name, &args)?;
             self.push_op(v);
             Ok(())
         }
+    }
+
+    /// `.readline()` / `.read()` / `.write()` / `.close()` / `__enter__` /
+    /// `__exit__` on an open file (`Value::File` indexes here, not into the
+    /// value itself — see its doc comment).
+    fn file_method(&mut self, idx: usize, method: &str, args: &[Value]) -> Result<Value, String> {
+        // `__enter__` returns the same handle — not touched through `f`.
+        if method == "__enter__" && args.is_empty() {
+            return Ok(Value::File(idx));
+        }
+        let f = self
+            .open_files
+            .get_mut(idx)
+            .ok_or("this file handle doesn't exist")?;
+        match (method, args) {
+            ("readline", []) => {
+                if f.closed {
+                    return Err("this file is already closed".to_string());
+                }
+                if f.mode != FileMode::Read {
+                    return Err("this file isn't open for reading".to_string());
+                }
+                if f.cursor < f.lines.len() {
+                    let line = f.lines[f.cursor].clone();
+                    f.cursor += 1;
+                    Ok(Value::Str(line))
+                } else {
+                    Ok(Value::Str(String::new()))
+                }
+            }
+            ("read", []) => {
+                if f.closed {
+                    return Err("this file is already closed".to_string());
+                }
+                if f.mode != FileMode::Read {
+                    return Err("this file isn't open for reading".to_string());
+                }
+                let rest = f.lines[f.cursor..].concat();
+                f.cursor = f.lines.len();
+                Ok(Value::Str(rest))
+            }
+            ("write", [Value::Str(text)]) => {
+                if f.closed {
+                    return Err("this file is already closed".to_string());
+                }
+                if f.mode != FileMode::Write {
+                    return Err("this file isn't open for writing".to_string());
+                }
+                f.writes.push_str(text);
+                Ok(Value::Int(text.chars().count() as i64))
+            }
+            ("write", [_]) => Err("write() needs text".to_string()),
+            ("close", []) => {
+                f.closed = true;
+                Ok(Value::None)
+            }
+            ("__exit__", [_, _, _]) => {
+                f.closed = true;
+                Ok(Value::None)
+            }
+            (m, _) => Err(format!("a file object has no method '{m}' yet")),
+        }
+    }
+
+    /// What every file opened in write mode accumulated, keyed by name —
+    /// read back after the run. The debugger never commits this anywhere
+    /// real; whatever embeds it (the IDE, a test) decides where it lands.
+    pub fn file_writes(&self) -> HashMap<String, String> {
+        // Multiple opens of the same name in write mode overwrite — later
+        // open wins, matching real Python's truncate-on-open "w" semantics.
+        let mut out = HashMap::new();
+        for f in &self.open_files {
+            if f.mode == FileMode::Write {
+                out.insert(f.name.clone(), f.writes.clone());
+            }
+        }
+        out
     }
 
     /// Pop the current frame, delivering `v` to the caller (or finishing the
@@ -3900,6 +4073,245 @@ fn set_subset(a: &Value, b: &Value) -> Result<bool, String> {
     }
 }
 
+/// ASCII whitespace, matching the compiled backends' `$is_space` (not Rust's
+/// fuller `is_ascii_whitespace`, which also treats form-feed/vertical-tab as
+/// space).
+fn is_ascii_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Does `sub` occur in `s` at byte offset `pos`? Shared by find/count/replace/
+/// starts/ends, mirroring the runtime's `str_match_at`.
+fn str_match_at(s: &[u8], pos: usize, sub: &[u8]) -> bool {
+    pos + sub.len() <= s.len() && s[pos..pos + sub.len()] == *sub
+}
+
+/// Byte index of the first occurrence of `sub` in `s`, or -1. An empty `sub`
+/// matches at 0 (CPython's rule).
+fn str_find_idx(s: &str, sub: &str) -> i64 {
+    let (b, sb) = (s.as_bytes(), sub.as_bytes());
+    let (n, sl) = (b.len(), sb.len());
+    let mut i = 0;
+    while i + sl <= n {
+        if str_match_at(b, i, sb) {
+            return i as i64;
+        }
+        i += 1;
+    }
+    -1
+}
+
+/// Non-overlapping occurrences of `sub` in `s`. An empty `sub` counts every
+/// gap between bytes plus the two ends (CPython's `"abc".count("") == 4`).
+/// A string method's argument, type-checked. `method` is only used for the
+/// error text.
+fn arg_str<'a>(v: &'a Value, method: &str) -> Result<&'a str, String> {
+    match v {
+        Value::Str(s) => Ok(s.as_str()),
+        _ => Err(format!(
+            ".{method}() needs a string argument, not {}",
+            type_name(v)
+        )),
+    }
+}
+
+fn str_count_sub(s: &str, sub: &str) -> i64 {
+    let (b, sb) = (s.as_bytes(), sub.as_bytes());
+    let (n, sl) = (b.len(), sb.len());
+    if sl == 0 {
+        return (n + 1) as i64;
+    }
+    let mut i = 0;
+    let mut cnt = 0i64;
+    while i + sl <= n {
+        if str_match_at(b, i, sb) {
+            cnt += 1;
+            i += sl;
+        } else {
+            i += 1;
+        }
+    }
+    cnt
+}
+
+/// Non-mutating string methods — strings are immutable, so there is no
+/// separate mutating variant. Transforms are byte-wise and ASCII-only
+/// (upper/lower/strip/capitalize/title), matching the compiled backends'
+/// deliberate simplification exactly: a UTF-8 continuation/lead byte is
+/// always >= 0x80 and never equals an ASCII letter, so this generalizes
+/// correctly to non-ASCII text too, same as `runtime/src/lib.rs`'s
+/// `str_case_shift` et al. Returns `None` if `method` isn't a string method.
+fn str_method_val(s: &str, method: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    let r: Result<Value, String> = match (method, args) {
+        ("upper", []) | ("lower", []) => {
+            let upper = method == "upper";
+            let bytes: Vec<u8> = s
+                .bytes()
+                .map(|c| {
+                    if upper && (97..=122).contains(&c) {
+                        c - 32
+                    } else if !upper && (65..=90).contains(&c) {
+                        c + 32
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            Ok(Value::Str(String::from_utf8(bytes).unwrap()))
+        }
+        ("strip", []) | ("lstrip", []) | ("rstrip", []) => {
+            let (left, right) = (method != "rstrip", method != "lstrip");
+            let b = s.as_bytes();
+            let (mut start, mut end) = (0usize, b.len());
+            if left {
+                while start < end && is_ascii_space(b[start]) {
+                    start += 1;
+                }
+            }
+            if right {
+                while end > start && is_ascii_space(b[end - 1]) {
+                    end -= 1;
+                }
+            }
+            Ok(Value::Str(
+                String::from_utf8(b[start..end].to_vec()).unwrap(),
+            ))
+        }
+        ("capitalize", []) => {
+            let bytes: Vec<u8> = s
+                .bytes()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == 0 {
+                        if (97..=122).contains(&c) { c - 32 } else { c }
+                    } else if (65..=90).contains(&c) {
+                        c + 32
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            Ok(Value::Str(String::from_utf8(bytes).unwrap()))
+        }
+        ("title", []) => {
+            let mut prev_alpha = false;
+            let bytes: Vec<u8> = s
+                .bytes()
+                .map(|c| {
+                    let is_alpha = (65..=90).contains(&c) || (97..=122).contains(&c);
+                    let out = if !is_alpha {
+                        c
+                    } else if prev_alpha {
+                        if (65..=90).contains(&c) { c + 32 } else { c }
+                    } else if (97..=122).contains(&c) {
+                        c - 32
+                    } else {
+                        c
+                    };
+                    prev_alpha = is_alpha;
+                    out
+                })
+                .collect();
+            Ok(Value::Str(String::from_utf8(bytes).unwrap()))
+        }
+        ("split", []) => Ok(Value::List(
+            s.split_ascii_whitespace()
+                .map(|w| Value::Str(w.to_string()))
+                .collect(),
+        )),
+        ("split", [sepv]) => match arg_str(sepv, method) {
+            Err(e) => Err(e),
+            Ok("") => Ok(Value::List(vec![Value::Str(s.to_string())])),
+            Ok(sep) => Ok(Value::List(
+                s.split(sep).map(|w| Value::Str(w.to_string())).collect(),
+            )),
+        },
+        ("join", [it]) => match to_elements(it) {
+            Err(e) => Err(e),
+            Ok(elems) => {
+                let mut parts = Vec::with_capacity(elems.len());
+                for e in &elems {
+                    match e {
+                        Value::Str(w) => parts.push(w.as_str()),
+                        _ => return Some(Err("join() needs an iterable of strings".to_string())),
+                    }
+                }
+                Ok(Value::Str(parts.join(s)))
+            }
+        },
+        ("find", [subv]) => arg_str(subv, method).map(|sub| Value::Int(str_find_idx(s, sub))),
+        ("count", [subv]) => arg_str(subv, method).map(|sub| Value::Int(str_count_sub(s, sub))),
+        ("index", [subv]) => arg_str(subv, method).and_then(|sub| {
+            let idx = str_find_idx(s, sub);
+            if idx < 0 {
+                Err(crate::messages::VALUE_NOT_IN_SEQUENCE.text.to_string())
+            } else {
+                Ok(Value::Int(idx))
+            }
+        }),
+        ("startswith", [p]) => arg_str(p, method).map(|p| {
+            Value::Bool(p.len() <= s.len() && str_match_at(s.as_bytes(), 0, p.as_bytes()))
+        }),
+        ("endswith", [p]) => arg_str(p, method).map(|p| {
+            let (n, pl) = (s.len(), p.len());
+            Value::Bool(pl <= n && str_match_at(s.as_bytes(), n - pl, p.as_bytes()))
+        }),
+        ("isdigit", []) => Ok(Value::Bool(
+            !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()),
+        )),
+        ("isalpha", []) => Ok(Value::Bool(
+            !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphabetic()),
+        )),
+        ("zfill", [w]) => match as_int(w) {
+            None => Err(expected_number(w)),
+            Some(w) => {
+                let w = w.max(0) as usize;
+                let n = s.len();
+                if n >= w {
+                    Ok(Value::Str(s.to_string()))
+                } else {
+                    let pad = w - n;
+                    let b = s.as_bytes();
+                    let first = if n > 0 { b[0] } else { 0 };
+                    let has_sign = first == b'+' || first == b'-';
+                    let mut out = Vec::with_capacity(w);
+                    if has_sign {
+                        out.push(first);
+                        out.extend(std::iter::repeat_n(b'0', pad));
+                        out.extend_from_slice(&b[1..]);
+                    } else {
+                        out.extend(std::iter::repeat_n(b'0', pad));
+                        out.extend_from_slice(b);
+                    }
+                    Ok(Value::Str(String::from_utf8(out).unwrap()))
+                }
+            }
+        },
+        ("replace", [oldv, newv]) => match (arg_str(oldv, method), arg_str(newv, method)) {
+            (Ok(""), Ok(_)) => Ok(Value::Str(s.to_string())),
+            (Ok(old), Ok(new)) => {
+                let (b, ob) = (s.as_bytes(), old.as_bytes());
+                let (n, ol) = (b.len(), ob.len());
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < n {
+                    if i + ol <= n && str_match_at(b, i, ob) {
+                        out.extend_from_slice(new.as_bytes());
+                        i += ol;
+                    } else {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+                Ok(Value::Str(String::from_utf8(out).unwrap()))
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        _ => return None,
+    };
+    Some(r)
+}
+
 /// Mutating set methods on the set's elements (the receiver is a set variable).
 /// Returns `None` if `method` isn't a mutating set method.
 fn set_method_mut(
@@ -3966,6 +4378,15 @@ fn apply_bin(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     match op {
         BinOp::Eq => Ok(Value::Bool(py_eq(l, r))),
         BinOp::Ne => Ok(Value::Bool(!py_eq(l, r))),
+        // Restricted to `None` by the parser; never dunder-dispatched, so
+        // this is correct even when called directly (bypassing Task::Bin's
+        // own identity shortcut, e.g. from `watch_eval`).
+        BinOp::Is => Ok(Value::Bool(
+            matches!(l, Value::None) && matches!(r, Value::None),
+        )),
+        BinOp::IsNot => Ok(Value::Bool(
+            !(matches!(l, Value::None) && matches!(r, Value::None)),
+        )),
         BinOp::In => Ok(Value::Bool(contains(r, l)?)),
         BinOp::NotIn => Ok(Value::Bool(!contains(r, l)?)),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => compare(op, l, r),
@@ -4123,6 +4544,52 @@ fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<
                 }
                 Ok(items.remove(real as usize))
             }
+            // Stable insertion sort via `py_lt` — same shape as `sorted()`.
+            ("sort", []) => {
+                for i in 1..items.len() {
+                    let mut j = i;
+                    while j > 0 && py_lt(&items[j], &items[j - 1])? {
+                        items.swap(j, j - 1);
+                        j -= 1;
+                    }
+                }
+                Ok(Value::None)
+            }
+            ("reverse", []) => {
+                items.reverse();
+                Ok(Value::None)
+            }
+            ("extend", [it]) => {
+                items.extend(to_elements(it)?);
+                Ok(Value::None)
+            }
+            ("insert", [idx, v]) => {
+                let i = as_int(idx).ok_or_else(|| expected_number(idx))?;
+                let n = items.len() as i64;
+                let real = i.clamp(0, n);
+                items.insert(real as usize, v.clone());
+                Ok(Value::None)
+            }
+            ("count", [v]) => Ok(Value::Int(
+                items.iter().filter(|x| py_eq(x, v)).count() as i64
+            )),
+            ("index", [v]) => items
+                .iter()
+                .position(|x| py_eq(x, v))
+                .map(|i| Value::Int(i as i64))
+                .ok_or_else(|| crate::messages::VALUE_NOT_IN_SEQUENCE.text.to_string()),
+            _ => Err(unsupported()),
+        },
+        // Tuples are immutable, so only the non-mutating element queries apply.
+        Value::Tuple(items) => match (method, args.as_slice()) {
+            ("count", [v]) => Ok(Value::Int(
+                items.iter().filter(|x| py_eq(x, v)).count() as i64
+            )),
+            ("index", [v]) => items
+                .iter()
+                .position(|x| py_eq(x, v))
+                .map(|i| Value::Int(i as i64))
+                .ok_or_else(|| crate::messages::VALUE_NOT_IN_SEQUENCE.text.to_string()),
             _ => Err(unsupported()),
         },
         Value::Set(items) => {
@@ -4141,8 +4608,42 @@ fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<
                     &[("key", &k.py_repr())],
                 )),
             },
+            ("update", [other]) => {
+                let Value::Dict(extra) = other else {
+                    return Err(".update() needs a dict argument".to_string());
+                };
+                for (k, v) in extra {
+                    match pairs.iter_mut().find(|(dk, _)| py_eq(dk, k)) {
+                        Some(slot) => slot.1 = v.clone(),
+                        None => pairs.push((k.clone(), v.clone())),
+                    }
+                }
+                Ok(Value::None)
+            }
+            ("clear", []) => {
+                pairs.clear();
+                Ok(Value::None)
+            }
+            ("setdefault", [k, default]) => match pairs.iter().find(|(dk, _)| py_eq(dk, k)) {
+                Some((_, v)) => Ok(v.clone()),
+                None => {
+                    pairs.push((k.clone(), default.clone()));
+                    Ok(default.clone())
+                }
+            },
+            ("keys", []) => Ok(Value::List(pairs.iter().map(|(k, _)| k.clone()).collect())),
+            ("values", []) => Ok(Value::List(pairs.iter().map(|(_, v)| v.clone()).collect())),
+            ("items", []) => Ok(Value::List(
+                pairs
+                    .iter()
+                    .map(|(k, v)| Value::Tuple(vec![k.clone(), v.clone()]))
+                    .collect(),
+            )),
             _ => Err(unsupported()),
         },
+        Value::Str(s) => {
+            str_method_val(s.as_str(), method, &args).unwrap_or_else(|| Err(unsupported()))
+        }
         _ => Err(unsupported()),
     }
 }
@@ -4168,6 +4669,24 @@ mod tests {
     #[test]
     fn steps_assignment_and_print() {
         assert_eq!(run_to_end("x = 5\nprint(x)\n"), "5\n");
+    }
+
+    #[test]
+    fn a_plain_function_alias_steps_like_calling_it_directly() {
+        assert_eq!(
+            run_to_end("def double(x):\n    return x * 2\ng = double\nprint(g(7))\n"),
+            "14\n"
+        );
+    }
+
+    #[test]
+    fn a_callback_parameter_steps_like_calling_it_directly() {
+        assert_eq!(
+            run_to_end(
+                "def double(x):\n    return x * 2\ndef apply(f, x):\n    return f(x)\nprint(apply(double, 5))\n"
+            ),
+            "10\n"
+        );
     }
 
     #[test]
@@ -4380,6 +4899,117 @@ mod tests {
             "2\n"
         );
         assert_eq!(run_to_end("print(\"cat\" in \"category\")\n"), "True\n");
+    }
+
+    #[test]
+    fn string_methods_in_the_step_debugger() {
+        // Closes the step debugger's string-method gap (this session's
+        // native closure for the same gap): every method here must agree
+        // byte-for-byte with the compiled backends (see BACKEND_DIVERGENCE.md).
+        assert_eq!(run_to_end("print('Hello'.upper())\n"), "HELLO\n");
+        assert_eq!(run_to_end("print('Hello'.lower())\n"), "hello\n");
+        assert_eq!(run_to_end("print('  hi  '.strip())\n"), "hi\n");
+        assert_eq!(run_to_end("print('  hi  '.lstrip())\n"), "hi  \n");
+        assert_eq!(run_to_end("print('  hi  '.rstrip())\n"), "  hi\n");
+        assert_eq!(
+            run_to_end("print('hello world'.capitalize())\n"),
+            "Hello world\n"
+        );
+        assert_eq!(
+            run_to_end("print('hello world'.title())\n"),
+            "Hello World\n"
+        );
+        assert_eq!(run_to_end("print('a b  c'.split())\n"), "['a', 'b', 'c']\n");
+        assert_eq!(
+            run_to_end("print('a,b,,c'.split(','))\n"),
+            "['a', 'b', '', 'c']\n"
+        );
+        assert_eq!(run_to_end("print(','.join(['a', 'b', 'c']))\n"), "a,b,c\n");
+        assert_eq!(run_to_end("print('abcabc'.find('bc'))\n"), "1\n");
+        assert_eq!(run_to_end("print('abcabc'.find('zz'))\n"), "-1\n");
+        assert_eq!(run_to_end("print('abcabc'.count('bc'))\n"), "2\n");
+        assert_eq!(run_to_end("print('abcabc'.index('bc'))\n"), "1\n");
+        assert_eq!(run_to_end("print('abc'.startswith('ab'))\n"), "True\n");
+        assert_eq!(run_to_end("print('abc'.endswith('bc'))\n"), "True\n");
+        assert_eq!(run_to_end("print('123'.isdigit())\n"), "True\n");
+        assert_eq!(run_to_end("print('abc'.isalpha())\n"), "True\n");
+        assert_eq!(run_to_end("print('42'.zfill(5))\n"), "00042\n");
+        assert_eq!(run_to_end("print('-42'.zfill(5))\n"), "-0042\n");
+        assert_eq!(
+            run_to_end("print('abcabc'.replace('a', 'X'))\n"),
+            "XbcXbc\n"
+        );
+        // A literal receiver (not a variable) — exercises the general
+        // (non-Name) dispatch path, not the name-bound one.
+        assert_eq!(run_to_end("print('ABC'.lower())\n"), "abc\n");
+    }
+
+    #[test]
+    fn string_index_of_a_missing_substring_errors_in_the_step_debugger() {
+        let mut s = Stepper::new("'abc'.index('zz')\n").unwrap();
+        while s.is_paused() {
+            s.step();
+        }
+        assert!(matches!(s.status(), Status::Error { message, .. } if message.contains("not in")));
+    }
+
+    #[test]
+    fn list_methods_in_the_step_debugger() {
+        assert_eq!(
+            run_to_end("xs = [3, 1, 2]\nxs.sort()\nprint(xs)\n"),
+            "[1, 2, 3]\n"
+        );
+        assert_eq!(
+            run_to_end("xs = [1, 2, 3]\nxs.reverse()\nprint(xs)\n"),
+            "[3, 2, 1]\n"
+        );
+        assert_eq!(
+            run_to_end("xs = [1, 2]\nxs.extend([3, 4])\nprint(xs)\n"),
+            "[1, 2, 3, 4]\n"
+        );
+        assert_eq!(
+            run_to_end("xs = [1, 2, 3]\nxs.insert(1, 9)\nprint(xs)\n"),
+            "[1, 9, 2, 3]\n"
+        );
+        assert_eq!(run_to_end("xs = [1, 2, 1, 3]\nprint(xs.count(1))\n"), "2\n");
+        assert_eq!(run_to_end("xs = [1, 2, 3]\nprint(xs.index(2))\n"), "1\n");
+    }
+
+    #[test]
+    fn dict_methods_in_the_step_debugger() {
+        assert_eq!(
+            run_to_end("d = {\"a\": 1}\nd.update({\"b\": 2})\nprint(d)\n"),
+            "{'a': 1, 'b': 2}\n"
+        );
+        assert_eq!(run_to_end("d = {\"a\": 1}\nd.clear()\nprint(d)\n"), "{}\n");
+        assert_eq!(
+            run_to_end(
+                "d = {\"a\": 1}\nprint(d.setdefault(\"a\", 9))\nprint(d.setdefault(\"b\", 9))\nprint(d)\n"
+            ),
+            "1\n9\n{'a': 1, 'b': 9}\n"
+        );
+        assert_eq!(
+            run_to_end("d = {\"a\": 1, \"b\": 2}\nprint(d.keys())\n"),
+            "['a', 'b']\n"
+        );
+        assert_eq!(
+            run_to_end("d = {\"a\": 1, \"b\": 2}\nprint(d.values())\n"),
+            "[1, 2]\n"
+        );
+        assert_eq!(
+            run_to_end("d = {\"a\": 1, \"b\": 2}\nprint(d.items())\n"),
+            "[('a', 1), ('b', 2)]\n"
+        );
+    }
+
+    #[test]
+    fn container_methods_also_work_inside_a_called_function() {
+        // The atomic step-over executor (`eval_method`) is a SEPARATE, smaller
+        // interpreter from the step machine above — it must support the same
+        // methods or a call inside a user function would silently diverge.
+        let src = "def f(xs):\n    xs.sort()\n    return xs\nprint(f([3, 1, 2]))\n\
+                   def g(s):\n    return s.upper()\nprint(g('ok'))\n";
+        assert_eq!(run_to_end(src), "[1, 2, 3]\nOK\n");
     }
 
     #[test]
@@ -4636,6 +5266,126 @@ mod tests {
             "{:?}",
             vm.status()
         );
+    }
+
+    #[test]
+    fn vm_opens_a_staged_file_and_reads_it_line_by_line() {
+        // readline() returns each line WITH its trailing newline (matching
+        // real Python), then "" forever after EOF — never an error, the same
+        // way a real file object behaves at end of file.
+        let mut vm = Vm::new(
+            "f = open(\"data.txt\")\n\
+             print(f.readline())\n\
+             print(f.readline())\n\
+             print(f.readline())\n\
+             f.close()\n",
+        )
+        .unwrap();
+        vm.set_files(HashMap::from([(
+            "data.txt".to_string(),
+            "one\ntwo".to_string(),
+        )]));
+        let mut guard = 0;
+        while vm.is_paused() {
+            vm.step();
+            guard += 1;
+            assert!(guard < 100_000, "ran away");
+        }
+        assert_eq!(*vm.status(), Status::Finished, "{:?}", vm.status());
+        // print() adds its own newline, so "one\n" shows as a blank line after it.
+        assert_eq!(vm.output(), "one\n\ntwo\n\n");
+    }
+
+    #[test]
+    fn vm_reads_the_whole_remaining_content_at_once() {
+        let mut vm = Vm::new(
+            "f = open(\"data.txt\")\n\
+             print(f.readline())\n\
+             print(f.read())\n\
+             f.close()\n",
+        )
+        .unwrap();
+        vm.set_files(HashMap::from([(
+            "data.txt".to_string(),
+            "one\ntwo\nthree".to_string(),
+        )]));
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(*vm.status(), Status::Finished, "{:?}", vm.status());
+        // readline() took "one\n"; read() takes everything left ("two\nthree").
+        assert_eq!(vm.output(), "one\n\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn vm_writes_are_readable_back_after_the_run_not_during() {
+        let mut vm = Vm::new(
+            "f = open(\"out.txt\", \"w\")\n\
+             n = f.write(\"hi\")\n\
+             print(n)\n\
+             f.close()\n",
+        )
+        .unwrap();
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(*vm.status(), Status::Finished, "{:?}", vm.status());
+        assert_eq!(vm.output(), "2\n"); // write() returns the character count
+        assert_eq!(
+            vm.file_writes().get("out.txt").map(String::as_str),
+            Some("hi")
+        );
+        // A read-mode file's writes never appear (nothing was opened "w").
+        assert!(!vm.file_writes().contains_key("missing.txt"));
+    }
+
+    #[test]
+    fn vm_runs_with_statement_on_a_real_file_object() {
+        // The with-statement test elsewhere uses a user-defined class; this
+        // confirms the SAME desugaring also works against the compiler's own
+        // File object, closing the loop `with open(...) as f:` promises.
+        let mut vm =
+            Vm::new("with open(\"data.txt\") as f:\n    print(f.readline())\nprint(\"done\")\n")
+                .unwrap();
+        vm.set_files(HashMap::from([(
+            "data.txt".to_string(),
+            "hello".to_string(),
+        )]));
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert_eq!(*vm.status(), Status::Finished, "{:?}", vm.status());
+        assert_eq!(vm.output(), "hello\ndone\n");
+    }
+
+    #[test]
+    fn vm_rejects_opening_a_file_that_was_never_staged() {
+        let mut vm = Vm::new("f = open(\"missing.txt\")\n").unwrap();
+        while vm.is_paused() {
+            vm.step();
+        }
+        assert!(
+            matches!(vm.status(), Status::Error { message, .. } if message.contains("missing.txt")),
+            "{:?}",
+            vm.status()
+        );
+    }
+
+    #[test]
+    fn vm_runs_with_statement_via_enter_exit() {
+        // `with` desugars (parser.rs) to plain `.method()` calls, so any
+        // class implementing the protocol works, not just a compiler-special
+        // one — this is the debugger-engine half of that claim; codegen.rs
+        // (WASM) and llvm.rs (native) are the other two.
+        let out = vm_run(
+            "class Guard:\n    def __init__(self, label):\n        self.label = label\n    \
+             def __enter__(self):\n        print(\"enter \" + self.label)\n        return self\n    \
+             def __exit__(self, a, b, c):\n        print(\"exit \" + self.label)\n    \
+             def ping(self):\n        print(\"ping \" + self.label)\n\n\
+             with Guard(\"outer\") as g:\n    g.ping()\n    print(\"inside\")\n\
+             print(\"after\")\n",
+        );
+        assert_eq!(out, "enter outer\nping outer\ninside\nexit outer\nafter\n");
     }
 
     #[test]

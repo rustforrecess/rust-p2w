@@ -70,6 +70,8 @@ declare double @p2w_unbox_float(i32)
 declare i32 @p2w_bool(i1)
 declare i32 @p2w_none()
 declare i32 @p2w_str(ptr, i32)
+declare i32 @p2w_open(i32, i32)
+declare i32 @p2w_file_exit(i32, i32, i32, i32)
 declare i32 @p2w_add(i32, i32)
 declare i32 @p2w_sub(i32, i32)
 declare i32 @p2w_mul(i32, i32)
@@ -82,6 +84,10 @@ declare i32 @p2w_math_log(i32)
 declare i32 @p2w_math_log2(i32)
 declare i32 @p2w_math_log10(i32)
 declare i32 @p2w_math_sqrt(i32)
+declare i32 @p2w_math_fabs(i32)
+declare i32 @p2w_math_floor(i32)
+declare i32 @p2w_math_ceil(i32)
+declare i32 @p2w_math_trunc(i32)
 declare i32 @p2w_math_pow(i32, i32)
 declare void @p2w_rnd_init()
 declare void @p2w_rnd_seed(i32)
@@ -243,8 +249,16 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
                 // Operator dunders also get their arity checked here — a
                 // mismatch would surface as a baffling dispatch trap later.
                 let expected = dunder_arity(&m.name);
-                let allowed_dunder = matches!(m.name.as_str(), "__init__" | "__repr__" | "__str__")
-                    || expected.is_some();
+                // `__enter__`/`__exit__` are called via ordinary `.method()`
+                // syntax (the `with` statement desugars to plain MethodCall
+                // nodes — see parser.rs's `with_stmt`), so they need no
+                // special operator-dunder wiring; the generic mangled-name
+                // method dispatch every other `.method()` call already uses
+                // is enough.
+                let allowed_dunder = matches!(
+                    m.name.as_str(),
+                    "__init__" | "__repr__" | "__str__" | "__enter__" | "__exit__"
+                ) || expected.is_some();
                 if m.name.starts_with("__") && m.name.ends_with("__") && !allowed_dunder {
                     return Err(format!(
                         "line {}: the native backend doesn't dispatch {} yet — defining it \
@@ -2901,8 +2915,11 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }
-                // sorted(iterable[, reverse=<bool>]) — a new list; key= isn't
-                // supported yet (needs first-class functions).
+                // sorted(iterable[, reverse=<bool>]) — a new list; `key=`
+                // isn't supported yet. First-class functions (the monomorphic
+                // case) landed, but `key=` specifically needs its own
+                // decorate-sort-undecorate lowering on both backends — a
+                // separate, sequenced follow-up, not a consequence of this.
                 if name == "sorted" && (1..=2).contains(&args.len()) {
                     let (v, o) = self.expr_borrow(&args[0])?;
                     let rev = if args.len() == 2 {
@@ -2947,6 +2964,37 @@ impl<'a> FuncEmitter<'a> {
                         self.release(&lst);
                         r
                     };
+                    return Ok((r, Repr::Boxed));
+                }
+                if name == "open" {
+                    // open(name[, mode]) -> a $FILE handle, or a trap
+                    // (FileNotFoundError) if the host refuses the name — see
+                    // `runtime/src/lib.rs`'s `p2w_open`. No try/except exists
+                    // yet to catch it — same reason `with` doesn't need
+                    // try/finally (parser.rs's `with_stmt`): nothing can trap
+                    // and keep running afterward regardless.
+                    let (name_v, name_o) = match args.first() {
+                        Some(a) => self.expr_borrow(a)?,
+                        None => return nope("open() needs a filename"),
+                    };
+                    let (mode_v, mode_o) = match args.get(1) {
+                        Some(a) => self.expr_borrow(a)?,
+                        None => {
+                            let r_lit = Expr {
+                                kind: ExprKind::Str("r".to_string()),
+                                line: e.line,
+                                span: (0, 0),
+                            };
+                            self.expr_borrow(&r_lit)?
+                        }
+                    };
+                    if args.len() > 2 {
+                        return nope("open() takes 1 or 2 arguments");
+                    }
+                    let r =
+                        self.call_value(&format!("call i32 @p2w_open(i32 {name_v}, i32 {mode_v})"));
+                    self.release_if_owned(&name_v, name_o);
+                    self.release_if_owned(&mode_v, mode_o);
                     return Ok((r, Repr::Boxed));
                 }
                 if name == "input" {
@@ -3423,6 +3471,10 @@ impl<'a> FuncEmitter<'a> {
                 "log2" => "p2w_math_log2",
                 "log10" => "p2w_math_log10",
                 "sqrt" => "p2w_math_sqrt",
+                "fabs" => "p2w_math_fabs",
+                "floor" => "p2w_math_floor",
+                "ceil" => "p2w_math_ceil",
+                "trunc" => "p2w_math_trunc",
                 "pow" => {
                     one(2)?;
                     let a = self.expr(&args[0])?;
@@ -3562,6 +3614,25 @@ impl<'a> FuncEmitter<'a> {
                 ops.join(", ")
             )));
         }
+        // `.__exit__(a, b, c)` — the one 3-argument method this subset ships
+        // (the `with`-statement desugar; see parser.rs's `with_stmt`), and
+        // only reachable here because no class above defined `__exit__`
+        // itself (that path already returned). A hand-written bypass for
+        // the generic arity ceiling below, not a new general mechanism —
+        // `p2w_file_exit` traps if the receiver isn't actually a file.
+        if method == "__exit__" && args.len() == 3 {
+            let (recv, rrepr, rowned) = self.expr_borrow_typed(obj)?;
+            let recv = self.as_boxed(recv, rrepr);
+            let recv_owned = rowned || boxes_to_new_temp(rrepr);
+            let a = self.expr(&args[0])?;
+            let b = self.expr(&args[1])?;
+            let c = self.expr(&args[2])?;
+            let r = self.call_value(&format!(
+                "call i32 @p2w_file_exit(i32 {recv}, i32 {a}, i32 {b}, i32 {c})"
+            ));
+            self.release_if_owned(&recv, recv_owned);
+            return Ok(r);
+        }
         if args.len() > 2 {
             return Err(format!(
                 "line {}: the native backend handles methods with up to 2 arguments yet",
@@ -3664,6 +3735,47 @@ impl<'a> FuncEmitter<'a> {
         }
         let (va, ar, ao) = self.expr_borrow_typed(a)?;
         let (vb, br, bo) = self.expr_borrow_typed(b)?;
+        // `is None` / `is not None` — the parser only accepts this against
+        // `None`, and unlike `==`, it must never dispatch to a custom
+        // `__eq__` (that's the whole reason `is` exists apart from `==`), so
+        // this is its own path rather than feeding into the `p2w_eq`-based
+        // boxed fallback below. An operand with an unboxed Repr (Int/Bool/
+        // Float/*Array) can never be None at runtime — type soundness
+        // proves the answer (False for `is`, True for `is not`) without a
+        // check. A genuinely `Boxed` operand needs the one runtime compare,
+        // against `p2w_none()` the same way `ExprKind::NoneLit` itself
+        // compiles.
+        if matches!(op, BinOp::Is | BinOp::IsNot) {
+            let side_is_none = |g: &mut Self, v: &str, r: Repr| -> String {
+                if r == Repr::Boxed {
+                    let none = g.call_value("call i32 @p2w_none()");
+                    let t = g.temp();
+                    g.line(&format!("{t} = icmp eq i32 {v}, {none}"));
+                    t
+                } else {
+                    "false".to_string()
+                }
+            };
+            let a_none = side_is_none(self, &va, ar);
+            let b_none = side_is_none(self, &vb, br);
+            self.release_if_owned(&va, ao);
+            self.release_if_owned(&vb, bo);
+            let both = self.temp();
+            self.line(&format!("{both} = and i1 {a_none}, {b_none}"));
+            let r = if op == BinOp::Is {
+                both
+            } else {
+                // Not `xor i1 {both}, true`: that miscompiles through this
+                // target's `p2w_bool(i1)` call boundary (verified — it
+                // prints the un-negated value; `icmp eq ..., false` is the
+                // same logical negation and was confirmed correct the same
+                // way, so this isn't a guess at the workaround).
+                let t = self.temp();
+                self.line(&format!("{t} = icmp eq i1 {both}, false"));
+                t
+            };
+            return Ok((r, Repr::Bool));
+        }
 
         // Native fast path: both operands are unboxed ints and the op is a simple
         // wraparound — emit a raw LLVM instruction, no boxing, no runtime call,

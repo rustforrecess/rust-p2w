@@ -252,6 +252,15 @@ pub enum BinOp {
     Ge,
     Eq,
     Ne,
+    /// `x is None` / `x is not None` — identity against the `None` singleton
+    /// specifically, not general object identity (parser rejects any other
+    /// right-hand side; see the `is`/`is not` arms in `peek_infix`). Kept
+    /// distinct from `Eq`/`Ne` because unlike those, this never dispatches to
+    /// a class's `__eq__` override — it's a raw representation-level check
+    /// (`ref.eq` against the `$NONE` global on WASM, a sentinel-value compare
+    /// on native), the same reason real Python's `is` exists apart from `==`.
+    Is,
+    IsNot,
     // Logical (Python value semantics: the result is the deciding operand,
     // e.g. `2 and 1` is 1, `4 or 2` is 4; the right side is short-circuited)
     And,

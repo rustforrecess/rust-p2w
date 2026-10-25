@@ -22,7 +22,7 @@ pub fn js_str(store: &mut impl AsContextMut, r: &Option<Rooted<ExternRef>>) -> S
         .clone()
 }
 
-fn js_new(store: &mut impl AsContextMut, s: String) -> Rooted<ExternRef> {
+pub fn js_new(store: &mut impl AsContextMut, s: String) -> Rooted<ExternRef> {
     ExternRef::new(&mut *store, s).expect("alloc externref")
 }
 

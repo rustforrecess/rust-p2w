@@ -236,9 +236,14 @@ impl Counter {
                     | BinOp::FloorDiv
                     | BinOp::Mod
                     | BinOp::Pow => self.bump("arithmetic"),
-                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
-                        self.bump("comparison")
-                    }
+                    BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Is
+                    | BinOp::IsNot => self.bump("comparison"),
                     BinOp::And | BinOp::Or => self.bump("boolean_logic"),
                     BinOp::In | BinOp::NotIn => self.bump("membership"),
                     // Bitwise / set / shift operators — not in the core concept vocab.

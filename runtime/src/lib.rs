@@ -619,6 +619,531 @@ fn str_alloc(bytes: &[u8]) -> Value {
     p as Value
 }
 
+/// ASCII-only whitespace test (space, tab, LF, CR) — same four bytes as the
+/// WASM backend's `$is_space`, not Rust's fuller `u8::is_ascii_whitespace`
+/// (which also treats form-feed/vertical-tab as space), to keep both
+/// backends agreeing on where a string gets cut.
+fn is_ascii_space(c: u8) -> bool {
+    c == 32 || c == 9 || c == 10 || c == 13
+}
+
+/// Allocate a string of `n` bytes, each produced by `f(i)` in ascending
+/// order — `str_alloc`'s write loop, generalized to a transform instead of
+/// a source slice, since `no_std` (device builds) has no `Vec` to stage one
+/// in first.
+fn str_alloc_sized(n: usize, mut f: impl FnMut(usize) -> u8) -> Value {
+    let p = alloc(12 + n);
+    wr(p, T_STR);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, n as u32);
+    for i in 0..n {
+        wr_byte(p + 12 + i, f(i));
+    }
+    p as Value
+}
+
+/// `str.upper()`/`str.lower()` — ASCII-only case shift, byte-for-byte (a
+/// non-ASCII UTF-8 byte is always >= 0x80 and never equals an ASCII
+/// upper/lower-case letter, so no decoding is needed). BORROWS `v`; returns
+/// a fresh owned string of the same byte length.
+fn str_case_shift(v: Value, upper: bool) -> Value {
+    str_alloc_sized(str_len(v), |i| {
+        let c = str_byte(v, i);
+        if upper && (97..=122).contains(&c) {
+            c - 32
+        } else if !upper && (65..=90).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    })
+}
+
+/// `str.strip()`/`.lstrip()`/`.rstrip()` — drop leading/trailing ASCII
+/// whitespace. BORROWS `v`; returns a fresh owned string.
+fn str_strip(v: Value, left: bool, right: bool) -> Value {
+    let n = str_len(v);
+    let mut start = 0usize;
+    let mut end = n;
+    if left {
+        while start < end && is_ascii_space(str_byte(v, start)) {
+            start += 1;
+        }
+    }
+    if right {
+        while end > start && is_ascii_space(str_byte(v, end - 1)) {
+            end -= 1;
+        }
+    }
+    str_alloc_sized(end - start, |i| str_byte(v, start + i))
+}
+
+/// `str.capitalize()` — first byte upper, the rest lower. BORROWS `v`.
+fn str_capitalize(v: Value) -> Value {
+    str_alloc_sized(str_len(v), |i| {
+        let c = str_byte(v, i);
+        if i == 0 {
+            if (97..=122).contains(&c) { c - 32 } else { c }
+        } else if (65..=90).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    })
+}
+
+/// `str.title()` — first letter of each ASCII-alpha run upper, the rest
+/// lower. BORROWS `v`. `str_alloc_sized` calls its closure with `i` in
+/// strictly ascending order, so the captured `prev_alpha` sees each byte
+/// exactly once, in order — the same sequential pass `$str_title` runs.
+fn str_title(v: Value) -> Value {
+    let mut prev_alpha = false;
+    str_alloc_sized(str_len(v), |i| {
+        let c = str_byte(v, i);
+        let is_alpha = (65..=90).contains(&c) || (97..=122).contains(&c);
+        let out = if !is_alpha {
+            c
+        } else if prev_alpha {
+            if (65..=90).contains(&c) { c + 32 } else { c }
+        } else if (97..=122).contains(&c) {
+            c - 32
+        } else {
+            c
+        };
+        prev_alpha = is_alpha;
+        out
+    })
+}
+
+/// `str.split([sep])` — `sep` absent/`None`: split on ASCII-whitespace runs,
+/// no empty tokens. `sep` given: split on each literal occurrence, empty
+/// tokens KEPT (Python's rule); an empty `sep` returns the whole string as
+/// a one-element list — this project's own simplification (not CPython's
+/// `ValueError`), matching the WASM backend's `$str_split` exactly. BORROWS
+/// `v`/`sep`; returns an owned list of owned strings.
+fn str_split(v: Value, sep: Option<Value>) -> Value {
+    let lst = coll_new(T_LIST);
+    let n = str_len(v);
+    match sep {
+        None => {
+            let mut i = 0usize;
+            while i < n {
+                while i < n && is_ascii_space(str_byte(v, i)) {
+                    i += 1;
+                }
+                if i >= n {
+                    break;
+                }
+                let start = i;
+                while i < n && !is_ascii_space(str_byte(v, i)) {
+                    i += 1;
+                }
+                list_push(
+                    lst as usize,
+                    str_alloc_sized(i - start, |k| str_byte(v, start + k)),
+                );
+            }
+        }
+        Some(sepv) => {
+            let sl = str_len(sepv);
+            if sl == 0 {
+                list_push(lst as usize, owned(v));
+            } else {
+                let mut start = 0usize;
+                let mut i = 0usize;
+                while i + sl <= n {
+                    let matched = (0..sl).all(|k| str_byte(v, i + k) == str_byte(sepv, k));
+                    if matched {
+                        list_push(
+                            lst as usize,
+                            str_alloc_sized(i - start, |k| str_byte(v, start + k)),
+                        );
+                        i += sl;
+                        start = i;
+                    } else {
+                        i += 1;
+                    }
+                }
+                list_push(
+                    lst as usize,
+                    str_alloc_sized(n - start, |k| str_byte(v, start + k)),
+                );
+            }
+        }
+    }
+    lst
+}
+
+/// `sep.join(iterable)` — join the string elements of any Python-indexable
+/// iterable with `sep` between them, via the same generic `p2w_len`/
+/// `p2w_index` a `for`-loop already uses (matching `$str_join`, which uses
+/// `$py_len`/`$py_index` the same way). Traps if any element isn't a
+/// string. BORROWS `sep`/`it`; returns a fresh owned string. Two passes
+/// (size, then fill) since `no_std` has no `Vec` to stage the pieces in.
+fn str_join(sep: Value, it: Value) -> Value {
+    let cnt = as_int(p2w_len(it)) as usize;
+    let sl = str_len(sep);
+    let mut total = 0usize;
+    for i in 0..cnt {
+        let e = p2w_index(it, p2w_int(i as i32));
+        if !(is_heap(e) && obj_tag(e) == T_STR) {
+            trap("join() needs an iterable of strings");
+        }
+        total += str_len(e);
+        p2w_release(e);
+    }
+    if cnt > 1 {
+        total += sl * (cnt - 1);
+    }
+    let p = alloc(12 + total);
+    wr(p, T_STR);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, total as u32);
+    let mut pos = 0usize;
+    for i in 0..cnt {
+        if i > 0 {
+            for k in 0..sl {
+                wr_byte(p + 12 + pos, str_byte(sep, k));
+                pos += 1;
+            }
+        }
+        let e = p2w_index(it, p2w_int(i as i32));
+        let elen = str_len(e);
+        for k in 0..elen {
+            wr_byte(p + 12 + pos, str_byte(e, k));
+            pos += 1;
+        }
+        p2w_release(e);
+    }
+    p as Value
+}
+
+/// Does `sub` (length `sl`) occur in `v` starting at byte offset `pos`?
+/// Shared by find/count/replace/starts/ends, mirroring `$str_match_at`.
+fn str_match_at(v: Value, pos: usize, sub: Value, sl: usize) -> bool {
+    (0..sl).all(|k| str_byte(v, pos + k) == str_byte(sub, k))
+}
+
+/// Byte index of the first occurrence of `sub` in `v`, or -1. An empty
+/// `sub` matches at 0 (CPython's rule: `"abc".find("") == 0`).
+fn str_find_idx(v: Value, sub: Value) -> i64 {
+    let n = str_len(v);
+    let sl = str_len(sub);
+    let mut i = 0usize;
+    while i + sl <= n {
+        if str_match_at(v, i, sub, sl) {
+            return i as i64;
+        }
+        i += 1;
+    }
+    -1
+}
+
+/// Non-overlapping occurrences of `sub` in `v`. An empty `sub` counts every
+/// gap between bytes plus the two ends — CPython's `"abc".count("") == 4`.
+fn str_count_sub(v: Value, sub: Value) -> i64 {
+    let n = str_len(v);
+    let sl = str_len(sub);
+    if sl == 0 {
+        return (n + 1) as i64;
+    }
+    let mut i = 0usize;
+    let mut cnt = 0i64;
+    while i + sl <= n {
+        if str_match_at(v, i, sub, sl) {
+            cnt += 1;
+            i += sl;
+        } else {
+            i += 1;
+        }
+    }
+    cnt
+}
+
+/// `str.startswith(p)`/`.endswith(p)`. BORROWS both; returns a bool Value.
+fn str_starts_ends(v: Value, p: Value, at_start: bool) -> Value {
+    let n = str_len(v);
+    let pl = str_len(p);
+    if pl > n {
+        return V_FALSE;
+    }
+    let at = if at_start { 0 } else { n - pl };
+    if str_match_at(v, at, p, pl) {
+        V_TRUE
+    } else {
+        V_FALSE
+    }
+}
+
+/// `str.isdigit()`/`.isalpha()` — non-empty and every byte in the class.
+/// BORROWS `v`; returns a bool Value.
+fn str_is_class(v: Value, in_class: impl Fn(u8) -> bool) -> Value {
+    let n = str_len(v);
+    if n == 0 {
+        return V_FALSE;
+    }
+    for i in 0..n {
+        if !in_class(str_byte(v, i)) {
+            return V_FALSE;
+        }
+    }
+    V_TRUE
+}
+
+/// `str.replace(old, new)` — every non-overlapping occurrence of `old`
+/// swapped for `new`. An empty `old` is lenient: returns the original
+/// unchanged (not CPython's "insert `new` between every char" rule — this
+/// project's own simplification, matching `$str_replace` exactly). BORROWS
+/// all three; returns a fresh owned string (or the same object, retained,
+/// for the empty-`old` case).
+fn str_replace(v: Value, old: Value, new: Value) -> Value {
+    let n = str_len(v);
+    let ol = str_len(old);
+    let nl = str_len(new);
+    if ol == 0 {
+        return owned(v);
+    }
+    let mut cnt = 0usize;
+    let mut i = 0usize;
+    while i + ol <= n {
+        if str_match_at(v, i, old, ol) {
+            cnt += 1;
+            i += ol;
+        } else {
+            i += 1;
+        }
+    }
+    // cnt matches, each consuming `ol` non-overlapping bytes of `v` (so
+    // cnt*ol <= n), replaced by `nl` bytes each.
+    let total = (n - cnt * ol) + cnt * nl;
+    let p = alloc(12 + total);
+    wr(p, T_STR);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, total as u32);
+    let mut src = 0usize;
+    let mut pos = 0usize;
+    while src < n {
+        if src + ol <= n && str_match_at(v, src, old, ol) {
+            for k in 0..nl {
+                wr_byte(p + 12 + pos, str_byte(new, k));
+                pos += 1;
+            }
+            src += ol;
+        } else {
+            wr_byte(p + 12 + pos, str_byte(v, src));
+            pos += 1;
+            src += 1;
+        }
+    }
+    p as Value
+}
+
+/// `str.zfill(w)` — pad with leading zeros to `w`, keeping a leading `+`/`-`
+/// sign in front of the zeros rather than after. BORROWS `v`.
+fn str_zfill(v: Value, w: usize) -> Value {
+    let n = str_len(v);
+    if n >= w {
+        return owned(v);
+    }
+    let pad = w - n;
+    let first = if n > 0 { str_byte(v, 0) } else { 0 };
+    let has_sign = first == b'+' || first == b'-';
+    str_alloc_sized(w, |i| {
+        if has_sign {
+            if i == 0 {
+                first
+            } else if i < 1 + pad {
+                b'0'
+            } else {
+                str_byte(v, i - pad)
+            }
+        } else if i < pad {
+            b'0'
+        } else {
+            str_byte(v, i - pad)
+        }
+    })
+}
+
+/// `x.count(v)` — structural-equality count on a list/tuple, or the
+/// substring count on a string, matching `$py_count`'s dispatch. BORROWS
+/// both.
+fn py_count(recv: Value, v: Value) -> Value {
+    if is_heap(recv) && matches!(obj_tag(recv), T_LIST | T_TUPLE) {
+        let o = recv as usize;
+        let n = coll_len(o);
+        let mut cnt = 0i64;
+        for i in 0..n {
+            if p2w_eq(list_get(o, i), v) == V_TRUE {
+                cnt += 1;
+            }
+        }
+        return make_int(cnt);
+    }
+    make_int(str_count_sub(recv, v))
+}
+
+/// `x.index(v)` — first index of an element (list/tuple) or substring
+/// (str); `ValueError` if absent, matching `$py_index_of`'s dispatch.
+/// BORROWS both.
+fn py_index_of(recv: Value, v: Value) -> Value {
+    if is_heap(recv) && matches!(obj_tag(recv), T_LIST | T_TUPLE) {
+        let o = recv as usize;
+        let n = coll_len(o);
+        for i in 0..n {
+            if p2w_eq(list_get(o, i), v) == V_TRUE {
+                return make_int(i as i64);
+            }
+        }
+        trap(messages::VALUE_NOT_IN_SEQUENCE.text);
+    }
+    let idx = str_find_idx(recv, v);
+    if idx < 0 {
+        trap(messages::VALUE_NOT_IN_SEQUENCE.text);
+    }
+    make_int(idx)
+}
+
+/// `list.sort()` — in-place insertion sort, reusing the same `value_lt`
+/// comparator `sorted()`/`min`/`max` already use (lexicographic for two
+/// strings, else numeric; mixed-type traps there too).
+fn list_sort_inplace(o: usize) {
+    let n = coll_len(o);
+    for i in 1..n {
+        let key = list_get(o, i);
+        let mut j = i;
+        while j > 0 && value_lt(key, list_get(o, j - 1)) {
+            list_set_at(o, j, list_get(o, j - 1));
+            j -= 1;
+        }
+        list_set_at(o, j, key);
+    }
+}
+
+/// `list.reverse()` — in-place swap from both ends inward.
+fn list_reverse_inplace(o: usize) {
+    let n = coll_len(o);
+    if n == 0 {
+        return;
+    }
+    let mut lo = 0usize;
+    let mut hi = n - 1;
+    while lo < hi {
+        let tmp = list_get(o, lo);
+        list_set_at(o, lo, list_get(o, hi));
+        list_set_at(o, hi, tmp);
+        lo += 1;
+        hi -= 1;
+    }
+}
+
+/// `list.extend(it)` — append every element of any Python-indexable
+/// iterable, via the same generic `p2w_len`/`p2w_index` `join`/`for` use.
+/// Does NOT release `it` itself (the caller does, same as any other
+/// transferred argument) — only consumes its elements.
+fn list_extend_impl(recv: Value, it: Value) {
+    let n = as_int(p2w_len(it)) as usize;
+    for i in 0..n {
+        let e = p2w_index(it, p2w_int(i as i32));
+        list_push(recv as usize, e);
+    }
+}
+
+/// `list.insert(idx, x)` — insert before `idx`, clamped like Python
+/// (negative counts from the end, floored at 0; past the end clamps to a
+/// trailing append). `x` is stored directly (ownership transfers in).
+fn list_insert_impl(recv: usize, idx: i64, x: Value) {
+    let n = coll_len(recv) as i64;
+    let mut idx = idx;
+    if idx < 0 {
+        idx += n;
+        if idx < 0 {
+            idx = 0;
+        }
+    }
+    if idx > n {
+        idx = n;
+    }
+    let idx = idx as usize;
+    let n = n as usize;
+    ensure_cap(recv, n + 1, n, 4);
+    let mut j = n;
+    while j > idx {
+        list_set_at(recv, j, list_get(recv, j - 1));
+        j -= 1;
+    }
+    list_set_at(recv, idx, x);
+    set_len(recv, n + 1);
+}
+
+/// `dict.update(other)` — merge another dict's pairs in, overwriting on a
+/// shared key (via `dict_set`'s own merge rule). `other`'s own pairs are
+/// retained copies (it keeps its originals), matching `$dict_update`
+/// sharing references under GC. BORROWS `other` (the caller releases it).
+fn dict_update_impl(recv: Value, other: Value) {
+    if !(is_heap(other) && obj_tag(other) == T_DICT) {
+        trap("update() needs a dict");
+    }
+    let oo = other as usize;
+    for i in 0..coll_len(oo) {
+        let k = owned(dict_key(oo, i));
+        let v = owned(dict_val(oo, i));
+        dict_set(recv as usize, k, v);
+    }
+}
+
+/// `dict.clear()` — release every key/value, then empty in place.
+fn dict_clear_impl(o: usize) {
+    for i in 0..coll_len(o) {
+        p2w_release(dict_key(o, i));
+        p2w_release(dict_val(o, i));
+    }
+    set_len(o, 0);
+}
+
+/// `dict.setdefault(key[, default])` — `d[key]` if present (releasing the
+/// now-redundant `key`/`default`, returning a fresh owned reference to the
+/// existing value); else inserts `key: default` and returns `default`
+/// (retained once more — the dict keeps one reference, the caller gets
+/// another). `default` is `V_NONE` when the 1-arg form omits it (matching
+/// `dict.get`'s own split between `p2w_method1`/`p2w_method2`).
+fn dict_setdefault_impl(recv: Value, key: Value, default: Value) -> Value {
+    let o = recv as usize;
+    if let Some(i) = dict_find(o, key) {
+        p2w_release(key);
+        p2w_release(default);
+        return owned(dict_val(o, i));
+    }
+    let ret = owned(default);
+    dict_set(o, key, default);
+    ret
+}
+
+/// `dict.keys()`/`.values()`/`.items()` — a fresh list of (retained) keys,
+/// values, or `(key, value)` tuples, matching `$dict_view`'s three modes
+/// (`which` 0/1/2).
+fn dict_view_impl(d: Value, which: u32) -> Value {
+    let o = d as usize;
+    let r = coll_new(T_LIST);
+    for i in 0..coll_len(o) {
+        let elem = match which {
+            0 => owned(dict_key(o, i)),
+            1 => owned(dict_val(o, i)),
+            _ => {
+                let tup = coll_new(T_TUPLE);
+                list_push(tup as usize, owned(dict_key(o, i)));
+                list_push(tup as usize, owned(dict_val(o, i)));
+                tup
+            }
+        };
+        list_push(r as usize, elem);
+    }
+    r
+}
+
 /// `int(x)` — identity for ints, truncates floats toward zero, True/False →
 /// 1/0, and parses strings (optional surrounding whitespace, optional sign,
 /// decimal digits — CPython's accepted shape). BORROWS `v`; returns owned.
@@ -710,6 +1235,74 @@ fn float_alloc(x: f64) -> Value {
     live_inc();
     unsafe { core::ptr::write_unaligned(heap_base().add(p + 8) as *mut f64, x) };
     p as Value
+}
+
+fn as_handle(v: Value) -> i32 {
+    rd(v as usize + 8) as i32
+}
+
+/// Box a file handle on the heap (refcount starts at 1).
+fn file_alloc(handle: i32) -> Value {
+    let p = alloc(8 + 4); // [tag][rc][handle]
+    wr(p, T_FILE);
+    wr(p + 4, 1);
+    live_inc();
+    wr(p + 8, handle as u32);
+    p as Value
+}
+
+/// `open(name[, mode])` — a handle wrapped as a `T_FILE` value, or a trap
+/// (`FileNotFoundError`, naming the file) when the host refuses `name`. No
+/// `try`/`except` exists yet to catch it — same reason `with` doesn't need
+/// `try`/`finally` (see `parser.rs`'s `with_stmt`): nothing can trap and
+/// keep running afterward regardless. BORROWS `name`/`mode`.
+///
+/// Split from the `extern "C"` wrapper below so a trap here can be tested
+/// with `#[should_panic]` — a panic can't unwind out of an `extern "C"` fn
+/// (it aborts the process instead), the same reason this file's arithmetic
+/// traps are pinned by calling `numeric` directly rather than `p2w_mul`.
+fn open_impl(name: Value, mode: Value) -> Value {
+    if !(is_heap(name) && obj_tag(name) == T_STR) {
+        trap("open() needs a text filename");
+    }
+    if !(is_heap(mode) && obj_tag(mode) == T_STR) {
+        trap("open()'s mode must be text");
+    }
+    let n = str_as_str(name);
+    let m = str_as_str(mode);
+    let handle =
+        unsafe { p2w_host_file_open(n.as_ptr(), n.len() as i32, m.as_ptr(), m.len() as i32) };
+    if handle < 0 {
+        trap_msg(&messages::FILE_NOT_FOUND, n);
+    }
+    file_alloc(handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_open(name: Value, mode: Value) -> Value {
+    open_impl(name, mode)
+}
+
+/// `recv.__exit__(a, b, c)` on a file — the hand-written bypass for method
+/// calls past 2 arguments, which native doesn't generically support
+/// (`p2w_method3` doesn't exist). Reached only when no class in the program
+/// defines `__exit__` itself (llvm.rs's own compile-time check — the only
+/// way the compiler ever emits a call here; see `method_call`), so a
+/// non-file receiver here means a stray same-named call with no class
+/// behind it: trap cleanly rather than guess. BORROWS `recv`; `a`/`b`/`c`
+/// are transferred (released here like any other method's owned
+/// arguments) — always `None` in practice (the `with`-statement desugar's
+/// own exc info), but released generically regardless of what's passed.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_file_exit(recv: Value, a: Value, b: Value, c: Value) -> Value {
+    if !(is_heap(recv) && obj_tag(recv) == T_FILE) {
+        trap("__exit__ needs a file object here (no class in this program defines __exit__)");
+    }
+    unsafe { p2w_host_file_close(as_handle(recv)) };
+    p2w_release(a);
+    p2w_release(b);
+    p2w_release(c);
+    V_NONE
 }
 
 /// Numeric-as-float view: int/bool widen to `f64`, a float yields its value,
@@ -1229,6 +1822,13 @@ fn free_object(o: usize) {
                 dealloc(d);
             }
         }
+        T_FILE => {
+            // Mirrors CPython: a file object's refcount hitting zero closes
+            // it, same as relying on `__del__` as a safety net — `.close()`
+            // or `with` is still the real idiom, this just means a forgotten
+            // one doesn't leak the host-side handle forever.
+            unsafe { p2w_host_file_close(as_handle(o as Value)) };
+        }
         _ => {}
     }
     dealloc(o);
@@ -1285,6 +1885,10 @@ const T_TUPLE: u32 = 10;
 /// attributes, release, and ask the module for a display string
 /// (`p2w_obj_repr`, generated per module).
 const T_OBJECT: u32 = 11;
+/// An open file: `[tag][rc][handle]` — just the host-side handle `open()`
+/// got back, the same minimal shape as `T_FLOAT`'s boxed `f64`. Everything
+/// else (cursor, mode, buffered writes) lives host-side — see `p2w_open`.
+const T_FILE: u32 = 12;
 
 fn coll_len(o: usize) -> usize {
     rd(o + 8) as usize
@@ -1629,6 +2233,15 @@ pub unsafe extern "C" fn p2w_str_eq_lit(v: Value, p: *const u8, len: i32) -> boo
 /// shim's unmarshalling seam (canonical-ABI strings are `(ptr, len)` pairs;
 /// see LESSON_PLAYER.md step 5e). Borrows `v`; traps on a non-string, since
 /// the compiler only routes string-typed values here.
+///
+/// **wasm32-component only.** This truncates `heap_base() + offset` to
+/// `i32`, which is lossless only because wasm32 linear memory is natively
+/// ≤4GB. On a real native process (the board, or a test host) `heap_base()`
+/// is an ordinary pointer-width address; truncating it here and casting
+/// back to a pointer on the C side reconstructs garbage and segfaults on
+/// first use. A native host capability (see `p2w_host_file_open` above)
+/// must get its `(ptr, len)` from `str_as_str(v).as_ptr()`/`.len()`
+/// instead — never from this function.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_str_ptr(v: Value) -> i32 {
     if !(is_heap(v) && obj_tag(v) == T_STR) {
@@ -2398,15 +3011,41 @@ unsafe fn name_eq(ptr: *const u8, len: i32, expected: &[u8]) -> bool {
 /// `name` must point to `name_len` valid bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn p2w_method0(recv: Value, name: *const u8, name_len: i32) -> Value {
-    if is_heap(recv) && obj_tag(recv) == T_LIST && unsafe { name_eq(name, name_len, b"pop") } {
+    if is_heap(recv) && obj_tag(recv) == T_LIST {
         let o = recv as usize;
-        let len = coll_len(o);
-        if len == 0 {
-            trap_msg(&messages::INDEX_OUT_OF_RANGE, "list");
+        if unsafe { name_eq(name, name_len, b"pop") } {
+            let len = coll_len(o);
+            if len == 0 {
+                trap_msg(&messages::INDEX_OUT_OF_RANGE, "list");
+            }
+            let v = list_get(o, len - 1);
+            set_len(o, len - 1);
+            return v;
         }
-        let v = list_get(o, len - 1);
-        set_len(o, len - 1);
-        return v;
+        if unsafe { name_eq(name, name_len, b"sort") } {
+            list_sort_inplace(o);
+            return V_NONE;
+        }
+        if unsafe { name_eq(name, name_len, b"reverse") } {
+            list_reverse_inplace(o);
+            return V_NONE;
+        }
+    }
+    if is_heap(recv) && obj_tag(recv) == T_DICT {
+        let o = recv as usize;
+        if unsafe { name_eq(name, name_len, b"clear") } {
+            dict_clear_impl(o);
+            return V_NONE;
+        }
+        if unsafe { name_eq(name, name_len, b"keys") } {
+            return dict_view_impl(recv, 0);
+        }
+        if unsafe { name_eq(name, name_len, b"values") } {
+            return dict_view_impl(recv, 1);
+        }
+        if unsafe { name_eq(name, name_len, b"items") } {
+            return dict_view_impl(recv, 2);
+        }
     }
     if is_heap(recv) && obj_tag(recv) == T_SET {
         let o = recv as usize;
@@ -2430,6 +3069,54 @@ pub unsafe extern "C" fn p2w_method0(recv: Value, name: *const u8, name_len: i32
             return v;
         }
     }
+    if is_heap(recv) && obj_tag(recv) == T_STR {
+        if unsafe { name_eq(name, name_len, b"upper") } {
+            return str_case_shift(recv, true);
+        }
+        if unsafe { name_eq(name, name_len, b"lower") } {
+            return str_case_shift(recv, false);
+        }
+        if unsafe { name_eq(name, name_len, b"strip") } {
+            return str_strip(recv, true, true);
+        }
+        if unsafe { name_eq(name, name_len, b"lstrip") } {
+            return str_strip(recv, true, false);
+        }
+        if unsafe { name_eq(name, name_len, b"rstrip") } {
+            return str_strip(recv, false, true);
+        }
+        if unsafe { name_eq(name, name_len, b"capitalize") } {
+            return str_capitalize(recv);
+        }
+        if unsafe { name_eq(name, name_len, b"title") } {
+            return str_title(recv);
+        }
+        if unsafe { name_eq(name, name_len, b"split") } {
+            return str_split(recv, None);
+        }
+        if unsafe { name_eq(name, name_len, b"isdigit") } {
+            return str_is_class(recv, |c| (48..=57).contains(&c));
+        }
+        if unsafe { name_eq(name, name_len, b"isalpha") } {
+            return str_is_class(recv, |c| (65..=90).contains(&c) || (97..=122).contains(&c));
+        }
+    }
+    if is_heap(recv) && obj_tag(recv) == T_FILE {
+        let handle = as_handle(recv);
+        if unsafe { name_eq(name, name_len, b"readline") } {
+            return unsafe { p2w_host_file_readline(handle) };
+        }
+        if unsafe { name_eq(name, name_len, b"read") } {
+            return unsafe { p2w_host_file_read(handle) };
+        }
+        if unsafe { name_eq(name, name_len, b"close") } {
+            unsafe { p2w_host_file_close(handle) };
+            return V_NONE;
+        }
+        if unsafe { name_eq(name, name_len, b"__enter__") } {
+            return owned(recv); // the SAME file object, same reason `with` works on any class
+        }
+    }
     trap("method not supported in the native backend yet")
 }
 
@@ -2444,6 +3131,72 @@ pub unsafe extern "C" fn p2w_method1(
     name_len: i32,
     a: Value,
 ) -> Value {
+    if is_heap(recv) && obj_tag(recv) == T_FILE && unsafe { name_eq(name, name_len, b"write") } {
+        if !(is_heap(a) && obj_tag(a) == T_STR) {
+            trap("file.write() needs text");
+        }
+        let handle = as_handle(recv);
+        let text = str_as_str(a);
+        unsafe { p2w_host_file_write(handle, text.as_ptr(), text.len() as i32) };
+        // write() returns the character count, matching CPython (and this
+        // project's own debug interpreter) — CODE POINTS, not bytes, same
+        // as `len()`.
+        let n = str_cp_len(a) as i64;
+        p2w_release(a);
+        return make_int(n);
+    }
+    if is_heap(recv) && obj_tag(recv) == T_STR {
+        if unsafe { name_eq(name, name_len, b"split") } {
+            // `a` may be `None` (an explicit `s.split(None)`, same shape as
+            // omitting it) or a string separator.
+            let r = if a == V_NONE {
+                str_split(recv, None)
+            } else {
+                str_split(recv, Some(a))
+            };
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"join") } {
+            let r = str_join(recv, a);
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"find") } {
+            let r = make_int(str_find_idx(recv, a));
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"startswith") } {
+            let r = str_starts_ends(recv, a, true);
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"endswith") } {
+            let r = str_starts_ends(recv, a, false);
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"zfill") } {
+            let w = as_int(a).max(0) as usize;
+            p2w_release(a);
+            return str_zfill(recv, w);
+        }
+    }
+    // `count`/`index` apply to strings AND list/tuple (structural-equality
+    // search), matching `$py_count`/`$py_index_of`'s shared dispatch.
+    if is_heap(recv) && matches!(obj_tag(recv), T_STR | T_LIST | T_TUPLE) {
+        if unsafe { name_eq(name, name_len, b"count") } {
+            let r = py_count(recv, a);
+            p2w_release(a);
+            return r;
+        }
+        if unsafe { name_eq(name, name_len, b"index") } {
+            let r = py_index_of(recv, a);
+            p2w_release(a);
+            return r;
+        }
+    }
     if is_heap(recv) && obj_tag(recv) == T_LIST {
         if unsafe { name_eq(name, name_len, b"append") } {
             list_push(recv as usize, a);
@@ -2461,6 +3214,11 @@ pub unsafe extern "C" fn p2w_method1(
             set_len(o, coll_len(o) - 1);
             return v;
         }
+        if unsafe { name_eq(name, name_len, b"extend") } {
+            list_extend_impl(recv, a);
+            p2w_release(a);
+            return V_NONE;
+        }
     }
     // `d.pop(key)` — remove the pair and hand its value out (owned). Backs
     // `del d[key]`, which desugars to a discarded pop. Missing key traps, like
@@ -2475,6 +3233,17 @@ pub unsafe extern "C" fn p2w_method1(
         };
         p2w_release(a);
         return r;
+    }
+    if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"update") } {
+        dict_update_impl(recv, a);
+        p2w_release(a);
+        return V_NONE;
+    }
+    // `d.setdefault(key)` — the 1-arg form; default is implicitly `None`,
+    // the same split `dict.get` uses between `p2w_method1`/`p2w_method2`.
+    if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"setdefault") }
+    {
+        return dict_setdefault_impl(recv, a, V_NONE);
     }
     if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"pop") } {
         let o = recv as usize;
@@ -2553,7 +3322,8 @@ pub unsafe extern "C" fn p2w_method1(
     trap("method not supported in the native backend yet")
 }
 
-/// `recv.method(a, b)` — 2-argument methods (none yet; reserved).
+/// `recv.method(a, b)` — 2-argument methods (`dict.get`'s default form,
+/// `str.replace`).
 ///
 /// # Safety
 /// `name` must point to `name_len` valid bytes.
@@ -2565,6 +3335,18 @@ pub unsafe extern "C" fn p2w_method2(
     a: Value,
     b: Value,
 ) -> Value {
+    if is_heap(recv) && obj_tag(recv) == T_STR && unsafe { name_eq(name, name_len, b"replace") } {
+        let r = str_replace(recv, a, b);
+        p2w_release(a);
+        p2w_release(b);
+        return r;
+    }
+    if is_heap(recv) && obj_tag(recv) == T_LIST && unsafe { name_eq(name, name_len, b"insert") } {
+        let idx = as_int(a);
+        p2w_release(a);
+        list_insert_impl(recv as usize, idx, b); // `b` is stored, not released
+        return V_NONE;
+    }
     // `d.get(key, default)` — CPython's idiom for a lookup that can't raise
     // (the thing to teach before exceptions). Both args were transferred:
     // the key is released after the lookup; the default is handed back
@@ -2580,6 +3362,10 @@ pub unsafe extern "C" fn p2w_method2(
         };
         p2w_release(a);
         return r;
+    }
+    if is_heap(recv) && obj_tag(recv) == T_DICT && unsafe { name_eq(name, name_len, b"setdefault") }
+    {
+        return dict_setdefault_impl(recv, a, b);
     }
     trap("method not supported in the native backend yet")
 }
@@ -2907,6 +3693,36 @@ unsafe extern "C" {
     /// (instance -> class-namespace chain; methods and true misses trap).
     /// BORROWS both; returns an owned value.
     fn p2w_classvar(obj: Value, name: Value) -> Value;
+
+    /// File capability, host-provided (like `p2w_putc`/`p2w_getc` — not
+    /// generated per module). Per-filename capability checking lives
+    /// entirely on the host side of this boundary (same width as the WASM
+    /// backend's `get_field` — see HOST_INTERFACE.md, "not for student code"
+    /// on raw `wasi:filesystem`); this crate only forwards and traps on -1.
+    ///
+    /// `name`/`mode`/`text` cross as a raw `(ptr, len)` pair with a
+    /// genuinely pointer-width `ptr` — NOT via `p2w_str_ptr`/`p2w_str_len`.
+    /// Those two return the string's address truncated to `i32`, which is
+    /// correct only for the wasm32 *component* target (`src/component.rs`),
+    /// where linear-memory addresses are natively 32-bit; on a real native
+    /// process (the board, or this crate's own test host) `heap_base()` is
+    /// an ordinary 64-bit pointer, and truncating it to `i32` and casting
+    /// back on the C side produces a garbage address — segfaults on first
+    /// use. This boundary extracts the pointer and length itself (via
+    /// `str_as_str`, pointer-width-correct on every target) and passes the
+    /// real pointer across, so the host shim does no unpacking at all.
+    /// `readline`/`read` return an OWNED Value the host built via `p2w_str`
+    /// (which already takes a `ptr`-typed, not `i32`-typed, pointer).
+    fn p2w_host_file_open(
+        name_ptr: *const u8,
+        name_len: i32,
+        mode_ptr: *const u8,
+        mode_len: i32,
+    ) -> i32;
+    fn p2w_host_file_readline(handle: i32) -> Value;
+    fn p2w_host_file_read(handle: i32) -> Value;
+    fn p2w_host_file_write(handle: i32, text_ptr: *const u8, text_len: i32);
+    fn p2w_host_file_close(handle: i32);
 }
 
 #[unsafe(no_mangle)]
@@ -3137,6 +3953,37 @@ pub extern "C" fn p2w_math_log10(v: Value) -> Value {
 pub extern "C" fn p2w_math_sqrt(v: Value) -> Value {
     math1(v, libm::sqrt)
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_fabs(v: Value) -> Value {
+    math1(v, libm::fabs)
+}
+
+/// `math.floor`/`.ceil`/`.trunc` — CPython returns an `int`, not a float
+/// (unlike `fabs`/`sqrt`/etc). `f(x) as i32` is a direct, SATURATING f64->i32
+/// cast (Rust's defined `as` semantics: out-of-range clamps to i32::MIN/MAX,
+/// NaN -> 0) — the same thing WASM's `i32.trunc_sat_f64_s` does, applied to
+/// the SAME width; widening through `i64` first (as `make_int` expects)
+/// without this would wrap instead of saturate on an extreme input and
+/// disagree with the WASM backend.
+fn math1_to_int(v: Value, f: fn(f64) -> f64) -> Value {
+    match fnum(v) {
+        Some(x) => make_int(f(x) as i32 as i64),
+        None => trap_msg(&messages::TYPE_EXPECTED_NUMBER, type_label(v)),
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_floor(v: Value) -> Value {
+    math1_to_int(v, libm::floor)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_ceil(v: Value) -> Value {
+    math1_to_int(v, libm::ceil)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_math_trunc(v: Value) -> Value {
+    math1_to_int(v, libm::trunc)
+}
+
 /// `math.pow` is ALWAYS float (CPython), unlike the `**` operator.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_math_pow(a: Value, b: Value) -> Value {
@@ -3449,6 +4296,79 @@ mod tests {
     extern "C" fn p2w_classvar(_obj: Value, _name: Value) -> Value {
         trap("this object has no attribute with that name");
     }
+
+    // File capability stubs: one fixed fake read-mode file ("data.txt",
+    // handle 0, content "one\ntwo") and one fake write-mode handle (1,
+    // whatever name/mode — its writes land in FILE_WRITE_BUF, inspectable
+    // after the call). Real enough to test p2w_open/p2w_method0/1's file
+    // branches directly, not just satisfy the linker.
+    static FILE_CURSOR: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+    static FILE_WRITE_BUF: std::sync::Mutex<std::vec::Vec<u8>> =
+        std::sync::Mutex::new(std::vec::Vec::new());
+    const FILE_LINES: [&[u8]; 2] = [b"one\n", b"two"];
+
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_host_file_open(
+        name_ptr: *const u8,
+        name_len: i32,
+        mode_ptr: *const u8,
+        mode_len: i32,
+    ) -> i32 {
+        let name = unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(name_ptr, name_len as usize))
+        };
+        let mode = unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(mode_ptr, mode_len as usize))
+        };
+        match (name, mode) {
+            ("data.txt", "r") => {
+                *FILE_CURSOR.lock().unwrap() = 0;
+                0
+            }
+            (_, "w") => {
+                FILE_WRITE_BUF.lock().unwrap().clear();
+                1
+            }
+            _ => -1,
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_host_file_readline(handle: i32) -> Value {
+        let mut cursor = FILE_CURSOR.lock().unwrap();
+        if handle == 0 && *cursor < FILE_LINES.len() {
+            let line = FILE_LINES[*cursor];
+            *cursor += 1;
+            str_alloc(line)
+        } else {
+            str_alloc(b"")
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_host_file_read(handle: i32) -> Value {
+        if handle != 0 {
+            return str_alloc(b"");
+        }
+        let mut cursor = FILE_CURSOR.lock().unwrap();
+        let mut rest = std::vec::Vec::new();
+        for l in &FILE_LINES[(*cursor).min(FILE_LINES.len())..] {
+            rest.extend_from_slice(l);
+        }
+        *cursor = FILE_LINES.len();
+        str_alloc(&rest)
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_host_file_write(handle: i32, text_ptr: *const u8, text_len: i32) {
+        if handle == 1 {
+            let bytes = unsafe { core::slice::from_raw_parts(text_ptr, text_len as usize) };
+            FILE_WRITE_BUF.lock().unwrap().extend_from_slice(bytes);
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_host_file_close(_handle: i32) {}
 
     // The heap is one shared `static mut`, but `cargo test` runs tests in
     // parallel — so heap-touching tests serialize on this lock (and reset the
@@ -4031,6 +4951,75 @@ mod tests {
     }
 
     #[test]
+    fn dict_update_clear_setdefault_keys_values_items() {
+        let _g = heap_guard();
+        let d = p2w_dict_new();
+        p2w_setindex(d, str_val("a"), p2w_int(1));
+        p2w_setindex(d, str_val("b"), p2w_int(2));
+
+        let other = p2w_dict_new();
+        p2w_setindex(other, str_val("b"), p2w_int(20));
+        p2w_setindex(other, str_val("c"), p2w_int(3));
+        // `owned(other)`: the compiler retains a variable's value before
+        // handing it to a call as a transferred argument, so `other` stays
+        // valid for the caller too — matching that here since the test
+        // reuses `other` afterward.
+        unsafe { p2w_method1(d, "update".as_ptr(), 6, owned(other)) };
+        assert_eq!(shown(d), "{'a': 1, 'b': 20, 'c': 3}");
+        // `other` keeps its own pairs (update retains copies, doesn't move).
+        assert_eq!(shown(other), "{'b': 20, 'c': 3}");
+
+        assert_eq!(
+            shown(unsafe { p2w_method0(d, "keys".as_ptr(), 4) }),
+            "['a', 'b', 'c']"
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method0(d, "values".as_ptr(), 6) }),
+            "[1, 20, 3]"
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method0(d, "items".as_ptr(), 5) }),
+            "[('a', 1), ('b', 20), ('c', 3)]"
+        );
+
+        // setdefault: present key returns the existing value, unchanged.
+        assert_eq!(
+            as_int(unsafe { p2w_method1(d, "setdefault".as_ptr(), 10, str_val("a")) }),
+            1
+        );
+        assert_eq!(as_int(p2w_len(d)), 3);
+        // absent key (1-arg form): inserts key=None, returns None.
+        assert_eq!(
+            unsafe { p2w_method1(d, "setdefault".as_ptr(), 10, str_val("z")) },
+            V_NONE
+        );
+        assert_eq!(p2w_index(d, str_val("z")), V_NONE);
+        // absent key (2-arg form): inserts key=default, returns default.
+        assert_eq!(
+            as_int(unsafe { p2w_method2(d, "setdefault".as_ptr(), 10, str_val("w"), p2w_int(42)) }),
+            42
+        );
+        assert_eq!(as_int(p2w_index(d, str_val("w"))), 42);
+
+        unsafe { p2w_method0(d, "clear".as_ptr(), 5) };
+        assert_eq!(as_int(p2w_len(d)), 0);
+    }
+
+    #[test]
+    fn math_fabs_floor_ceil_trunc() {
+        let _g = heap_guard();
+        assert_eq!(shown(p2w_math_fabs(p2w_float(-2.5))), "2.5");
+        assert_eq!(as_int(p2w_math_floor(p2w_float(2.7))), 2);
+        assert_eq!(as_int(p2w_math_floor(p2w_float(-2.7))), -3);
+        assert_eq!(as_int(p2w_math_ceil(p2w_float(2.1))), 3);
+        assert_eq!(as_int(p2w_math_ceil(p2w_float(-2.1))), -2);
+        assert_eq!(as_int(p2w_math_trunc(p2w_float(2.9))), 2);
+        assert_eq!(as_int(p2w_math_trunc(p2w_float(-2.9))), -2);
+        // floor/ceil/trunc return an INT, not a float — CPython's rule.
+        assert!(is_int(p2w_math_floor(p2w_float(2.0))));
+    }
+
+    #[test]
     fn for_each_iterates_list_string_dict() {
         let _g = heap_guard();
         let xs = p2w_list_new();
@@ -4072,6 +5061,296 @@ mod tests {
         assert_eq!(as_int(first), 1);
         assert_eq!(as_int(p2w_len(xs)), 1);
         assert_eq!(as_int(p2w_index(xs, p2w_int(0))), 2);
+    }
+
+    #[test]
+    fn list_sort_reverse_extend_insert() {
+        let _g = heap_guard();
+        let xs = p2w_list_new();
+        unsafe {
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(3));
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(1));
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(2));
+        }
+        unsafe { p2w_method0(xs, "sort".as_ptr(), 4) };
+        assert_eq!(shown(xs), "[1, 2, 3]");
+        unsafe { p2w_method0(xs, "reverse".as_ptr(), 7) };
+        assert_eq!(shown(xs), "[3, 2, 1]");
+
+        let ys = p2w_list_new();
+        unsafe {
+            p2w_method1(ys, "append".as_ptr(), 6, p2w_int(9));
+            p2w_method1(ys, "append".as_ptr(), 6, p2w_int(8));
+        }
+        unsafe { p2w_method1(xs, "extend".as_ptr(), 6, ys) };
+        assert_eq!(shown(xs), "[3, 2, 1, 9, 8]");
+
+        unsafe { p2w_method2(xs, "insert".as_ptr(), 6, p2w_int(0), p2w_int(99)) };
+        assert_eq!(shown(xs), "[99, 3, 2, 1, 9, 8]");
+        // negative index counts from the end; past the end clamps to append.
+        unsafe { p2w_method2(xs, "insert".as_ptr(), 6, p2w_int(-1), p2w_int(7)) };
+        assert_eq!(shown(xs), "[99, 3, 2, 1, 9, 7, 8]");
+        unsafe { p2w_method2(xs, "insert".as_ptr(), 6, p2w_int(1000), p2w_int(5)) };
+        assert_eq!(shown(xs), "[99, 3, 2, 1, 9, 7, 8, 5]");
+
+        // sort() on strings is lexicographic, same comparator as sorted().
+        let ss = p2w_list_new();
+        unsafe {
+            p2w_method1(ss, "append".as_ptr(), 6, str_val("pear"));
+            p2w_method1(ss, "append".as_ptr(), 6, str_val("apple"));
+        }
+        unsafe { p2w_method0(ss, "sort".as_ptr(), 4) };
+        assert_eq!(shown(ss), "['apple', 'pear']");
+    }
+
+    #[test]
+    fn string_case_and_strip_methods() {
+        let _g = heap_guard();
+        let s = str_val("  Hello World  ");
+        assert_eq!(
+            shown(unsafe { p2w_method0(s, "strip".as_ptr(), 5) }),
+            "Hello World"
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method0(s, "lstrip".as_ptr(), 6) }),
+            "Hello World  "
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method0(s, "rstrip".as_ptr(), 6) }),
+            "  Hello World"
+        );
+        let hw = str_val("Hello World");
+        assert_eq!(
+            shown(unsafe { p2w_method0(hw, "upper".as_ptr(), 5) }),
+            "HELLO WORLD"
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method0(hw, "lower".as_ptr(), 5) }),
+            "hello world"
+        );
+        let mixed = str_val("hELLO wORLD");
+        assert_eq!(
+            shown(unsafe { p2w_method0(mixed, "capitalize".as_ptr(), 10) }),
+            "Hello world"
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method0(mixed, "title".as_ptr(), 5) }),
+            "Hello World"
+        );
+        // non-ASCII bytes pass through untouched (UTF-8 continuation/lead
+        // bytes are always >= 0x80, never mistaken for an ASCII letter).
+        let accented = str_val("café");
+        assert_eq!(
+            shown(unsafe { p2w_method0(accented, "upper".as_ptr(), 5) }),
+            "CAFé"
+        );
+    }
+
+    #[test]
+    fn string_split_and_join() {
+        let _g = heap_guard();
+        // whitespace split: no args
+        let ws = str_val("  a  bb   c  ");
+        assert_eq!(
+            shown(unsafe { p2w_method0(ws, "split".as_ptr(), 5) }),
+            "['a', 'bb', 'c']"
+        );
+        // split(None) is the same as no args
+        assert_eq!(
+            shown(unsafe { p2w_method1(ws, "split".as_ptr(), 5, V_NONE) }),
+            "['a', 'bb', 'c']"
+        );
+        // separator split keeps empty tokens
+        let csv = str_val("a,,b,");
+        assert_eq!(
+            shown(unsafe { p2w_method1(csv, "split".as_ptr(), 5, str_val(",")) }),
+            "['a', '', 'b', '']"
+        );
+        // empty separator: whole string as one element (this project's own
+        // simplification, not CPython's ValueError)
+        let plain = str_val("xy");
+        assert_eq!(
+            shown(unsafe { p2w_method1(plain, "split".as_ptr(), 5, str_val("")) }),
+            "['xy']"
+        );
+        // join: sep.join(list)
+        let sep = str_val(", ");
+        let parts = unsafe { p2w_method0(ws, "split".as_ptr(), 5) }; // ['a','bb','c']
+        assert_eq!(
+            shown(unsafe { p2w_method1(sep, "join".as_ptr(), 4, parts) }),
+            "a, bb, c"
+        );
+        // join on an empty list is the empty string
+        let empty_list = unsafe { p2w_method0(str_val("   "), "split".as_ptr(), 5) };
+        assert_eq!(
+            shown(unsafe { p2w_method1(sep, "join".as_ptr(), 4, empty_list) }),
+            ""
+        );
+    }
+
+    #[test]
+    fn string_find_count_index_startswith_endswith_isdigit_isalpha_zfill_replace() {
+        let _g = heap_guard();
+        let s = str_val("abcabc");
+        assert_eq!(
+            as_int(unsafe { p2w_method1(s, "find".as_ptr(), 4, str_val("bc")) }),
+            1
+        );
+        assert_eq!(
+            as_int(unsafe { p2w_method1(s, "find".as_ptr(), 4, str_val("zz")) }),
+            -1
+        );
+        // empty needle matches at 0 — CPython's rule.
+        assert_eq!(
+            as_int(unsafe { p2w_method1(s, "find".as_ptr(), 4, str_val("")) }),
+            0
+        );
+        assert_eq!(
+            as_int(unsafe { p2w_method1(s, "count".as_ptr(), 5, str_val("bc")) }),
+            2
+        );
+        assert_eq!(
+            as_int(unsafe { p2w_method1(s, "index".as_ptr(), 5, str_val("ca")) }),
+            2
+        );
+        // index() on a list — the SAME dispatch, shared with strings.
+        let xs = p2w_list_new();
+        unsafe {
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(1));
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(2));
+            p2w_method1(xs, "append".as_ptr(), 6, p2w_int(3));
+        }
+        assert_eq!(
+            as_int(unsafe { p2w_method1(xs, "index".as_ptr(), 5, p2w_int(3)) }),
+            2
+        );
+        assert_eq!(
+            as_int(unsafe { p2w_method1(xs, "count".as_ptr(), 5, p2w_int(2)) }),
+            1
+        );
+        assert_eq!(
+            unsafe { p2w_method1(str_val("hello"), "startswith".as_ptr(), 10, str_val("he")) },
+            V_TRUE
+        );
+        assert_eq!(
+            unsafe { p2w_method1(str_val("hello"), "endswith".as_ptr(), 8, str_val("lo")) },
+            V_TRUE
+        );
+        assert_eq!(
+            unsafe { p2w_method1(str_val("hello"), "endswith".as_ptr(), 8, str_val("he")) },
+            V_FALSE
+        );
+        assert_eq!(
+            unsafe { p2w_method0(str_val("123"), "isdigit".as_ptr(), 7) },
+            V_TRUE
+        );
+        assert_eq!(
+            unsafe { p2w_method0(str_val("12a"), "isdigit".as_ptr(), 7) },
+            V_FALSE
+        );
+        assert_eq!(
+            unsafe { p2w_method0(str_val(""), "isdigit".as_ptr(), 7) },
+            V_FALSE
+        );
+        assert_eq!(
+            unsafe { p2w_method0(str_val("abc"), "isalpha".as_ptr(), 7) },
+            V_TRUE
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method1(str_val("42"), "zfill".as_ptr(), 5, p2w_int(5)) }),
+            "00042"
+        );
+        assert_eq!(
+            shown(unsafe { p2w_method1(str_val("-42"), "zfill".as_ptr(), 5, p2w_int(5)) }),
+            "-0042"
+        );
+        // width <= current length is a no-op.
+        assert_eq!(
+            shown(unsafe { p2w_method1(str_val("hello"), "zfill".as_ptr(), 5, p2w_int(3)) }),
+            "hello"
+        );
+        assert_eq!(
+            shown(unsafe {
+                p2w_method2(
+                    str_val("abcabc"),
+                    "replace".as_ptr(),
+                    7,
+                    str_val("a"),
+                    str_val("XY"),
+                )
+            }),
+            "XYbcXYbc"
+        );
+        // empty `old` is lenient: unchanged, not CPython's insert-everywhere.
+        assert_eq!(
+            shown(unsafe {
+                p2w_method2(
+                    str_val("ab"),
+                    "replace".as_ptr(),
+                    7,
+                    str_val(""),
+                    str_val("X"),
+                )
+            }),
+            "ab"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ValueError")]
+    fn string_index_of_a_missing_substring_traps() {
+        let _g = heap_guard();
+        // Call `py_index_of` directly, not through `p2w_method1` — a panic
+        // can't unwind out of an `extern "C"` fn (it aborts the process
+        // instead), the same reason `p2w_open`'s trap test calls `open_impl`
+        // directly.
+        py_index_of(str_val("abc"), str_val("zz"));
+    }
+
+    #[test]
+    fn file_open_read_write_close_round_trip() {
+        let _g = heap_guard();
+        // Read mode: the fixed stub file "data.txt" ("one\ntwo").
+        let f = p2w_open(str_val("data.txt"), str_val("r"));
+        let line1 = unsafe { p2w_method0(f, "readline".as_ptr(), 8) };
+        assert_eq!(shown(line1), "one\n");
+        p2w_release(line1);
+        let rest = unsafe { p2w_method0(f, "read".as_ptr(), 4) };
+        assert_eq!(shown(rest), "two");
+        p2w_release(rest);
+        let closed = unsafe { p2w_method0(f, "close".as_ptr(), 5) };
+        assert_eq!(closed, V_NONE);
+        p2w_release(f);
+
+        // Write mode: write() returns the character count; the stub records
+        // what was written so the round trip is actually checkable.
+        let out = p2w_open(str_val("out.txt"), str_val("w"));
+        let n = unsafe { p2w_method1(out, "write".as_ptr(), 5, str_val("hi")) };
+        assert_eq!(as_int(n), 2);
+        p2w_release(out);
+        assert_eq!(*FILE_WRITE_BUF.lock().unwrap(), b"hi");
+    }
+
+    #[test]
+    #[should_panic(expected = "FileNotFoundError")]
+    fn file_open_rejects_an_unstaged_name() {
+        let _g = heap_guard();
+        // The stub only answers "data.txt" in read mode — anything else traps
+        // (FileNotFoundError), same as the real host-capability contract.
+        open_impl(str_val("missing.txt"), str_val("r"));
+    }
+
+    #[test]
+    fn file_enter_retains_and_exit_closes() {
+        let _g = heap_guard();
+        let f = p2w_open(str_val("data.txt"), str_val("r"));
+        let entered = unsafe { p2w_method0(f, "__enter__".as_ptr(), 9) };
+        // Same object, now TWO owned references (f and entered).
+        assert_eq!(entered, f);
+        assert_eq!(rd(f as usize + 4), 2);
+        let exited = p2w_file_exit(entered, V_NONE, V_NONE, V_NONE);
+        assert_eq!(exited, V_NONE);
+        p2w_release(f); // the original binding's own reference
     }
 
     #[test]

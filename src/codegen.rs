@@ -26,6 +26,7 @@
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::emit::{Body, Func, Module};
 use crate::error::CompileError;
+use crate::lint::{each_child_expr, for_each_child_block, stmt_exprs};
 use crate::repr::{Repr, infer_expr_repr, infer_slot_reprs};
 use std::collections::HashMap;
 
@@ -50,9 +51,57 @@ type Vars = HashMap<String, Ty>;
 const I31_MAX: i64 = (1 << 30) - 1;
 const I31_MIN: i64 = -(1 << 30);
 
+/// Whether `open(...)` is called anywhere in the program — decided ONCE, in
+/// pass 1, before any codegen. This can't be decided per call site the way
+/// string methods are (a non-string receiver just falls back, no import
+/// needed either way): WASM resolves every declared import at
+/// module-instantiation time regardless of whether it's ever actually
+/// called, so a program using `with` on a plain class (no file anywhere)
+/// must not end up requiring `file_open` etc. just because it also happens
+/// to call `.close()`/`__enter__`/`__exit__` by name.
+fn program_calls_open(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_calls_open)
+}
+
+fn stmt_calls_open(s: &Stmt) -> bool {
+    let mut found = false;
+    stmt_exprs(s, &mut |e| {
+        if expr_calls_open(e) {
+            found = true;
+        }
+    });
+    if found {
+        return found;
+    }
+    for_each_child_block(s, |b, _| {
+        if !found && program_calls_open(b) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn expr_calls_open(e: &Expr) -> bool {
+    if let ExprKind::Call(name, _) = &e.kind
+        && name == "open"
+    {
+        return true;
+    }
+    let mut found = false;
+    each_child_expr(e, &mut |child| {
+        if expr_calls_open(child) {
+            found = true;
+        }
+    });
+    found
+}
+
 pub fn generate(stmts: &[Stmt]) -> Result<String> {
     STR_LITS.with(|t| t.borrow_mut().clear());
-    let mut g = Gen::default();
+    let mut g = Gen {
+        uses_files: program_calls_open(stmts),
+        ..Gen::default()
+    };
 
     // Pass 1: collect function and class signatures so calls/construction
     // (including mutual recursion) resolve regardless of definition order.
@@ -344,6 +393,13 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .types
         .push("(type $TUPLE (struct (field i32) (field (ref null $ITEMS))))".into());
+    // An open file: just the host-side handle. `(mut i32)` specifically —
+    // type canonicalization here is STRUCTURAL (see the $BOOL/$NONE_T note
+    // above), and `$INT` already claims plain non-mut `(field i32)`; reusing
+    // that shape would make `ref.test (ref $FILE)` also match a boxed int.
+    module
+        .types
+        .push("(type $FILE (struct (field (mut i32))))".into());
     // A set: count + element array. The trailing i8 marker makes it
     // structurally distinct from $LIST (count + items). Insertion-ordered (a
     // documented divergence from CPython's hash order).
@@ -624,6 +680,115 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             body: b,
         });
     }
+    if g.uses_files {
+        // File capability: `file_open` takes the (name, mode) strings and
+        // answers a handle, or -1 when the host refuses the name (the
+        // per-filename capability check lives host-side — HOST_INTERFACE.md,
+        // same width as get_field). Strings cross the same two ways
+        // `write_str`/`get_field` already do (`$unwrap` out, `$JSSTR`-wrapped
+        // externref back).
+        for imp in [
+            r#"(import "env" "file_open" (func $host_file_open (param externref externref) (result i32)))"#,
+            // Nullable `externref` (not `(ref extern)`): wasmtime's typed
+            // `func_wrap` always returns an externref through `Option<Rooted
+            // <ExternRef>>`, never a provably-non-null one — the mismatch
+            // this caught was `(ref extern)` here against that at the host
+            // (`incompatible import type`). `ref.as_non_null` at the call
+            // site narrows it back (these two never actually return null).
+            r#"(import "env" "file_readline" (func $host_file_readline (param i32) (result externref)))"#,
+            r#"(import "env" "file_read" (func $host_file_read (param i32) (result externref)))"#,
+            r#"(import "env" "file_write" (func $host_file_write (param i32 externref)))"#,
+            r#"(import "env" "file_close" (func $host_file_close (param i32)))"#,
+        ] {
+            module.imports.push(imp.into());
+        }
+        let mut b = Body::new();
+        b.push(
+            "(local.set $h (call $host_file_open (call $unwrap (local.get $name)) (call $unwrap (local.get $mode))))",
+        );
+        b.push("(if (i32.lt_s (local.get $h) (i32.const 0)) (then (call $raise_file_not_found (local.get $name))))");
+        b.push("(struct.new $FILE (local.get $h))");
+        module.funcs.push(Func {
+            signature: "(func $file_open (param $name (ref null any)) (param $mode (ref null any)) (result (ref null any))"
+                .into(),
+            locals: vec!["(local $h i32)".into()],
+            body: b,
+        });
+
+        // The five dispatched methods, each: a non-`$FILE` receiver falls
+        // back to ordinary method dispatch (`$call_method`, the same
+        // mechanism string methods use) — so a user class may still define
+        // its own `__enter__`/`__exit__` (needed for `with` to keep working
+        // on plain classes, already verified) or even reuse these names.
+        let handle = "(struct.get $FILE 0 (ref.cast (ref $FILE) (local.get $self)))";
+        // (name, the file-specific op, whether `op` is void and needs a
+        // trailing `None` appended, whether it reads `write`'s one argument
+        // out of the fallback path's packed `$args`).
+        for (name, op, void) in [
+            (
+                "$file_readline",
+                format!(
+                    "(struct.new $JSSTR (ref.as_non_null (call $host_file_readline {handle})))"
+                ),
+                false,
+            ),
+            (
+                "$file_read",
+                format!("(struct.new $JSSTR (ref.as_non_null (call $host_file_read {handle})))"),
+                false,
+            ),
+            (
+                "$file_close",
+                format!("(call $host_file_close {handle})"),
+                true,
+            ),
+            ("$file_enter", "(local.get $self)".to_string(), false),
+            (
+                "$file_exit",
+                format!("(call $host_file_close {handle})"),
+                true,
+            ),
+        ] {
+            let mut b = Body::new();
+            b.push("(if (i32.eqz (ref.test (ref $FILE) (local.get $self)))");
+            b.push_in(
+                1,
+                "(then (return (call $call_method (local.get $self) (local.get $name) (local.get $args)))))",
+            );
+            b.push(op);
+            if void {
+                b.push("(global.get $NONE)");
+            }
+            module.funcs.push(Func {
+                signature: format!(
+                    "(func {name} (param $self (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))"
+                ),
+                locals: vec![],
+                body: b,
+            });
+        }
+
+        // `write(text)` is its own function (not part of the loop above): it
+        // needs its one argument unpacked from the fallback path's packed
+        // `$args`, and returns the character count written (matching real
+        // Python's `write()`, and `debug.rs`'s file support — not `None`).
+        let mut b = Body::new();
+        b.push("(if (i32.eqz (ref.test (ref $FILE) (local.get $self)))");
+        b.push_in(
+            1,
+            "(then (return (call $call_method (local.get $self) (local.get $name) (local.get $args)))))",
+        );
+        b.push("(local.set $text (array.get $ITEMS (struct.get $LIST 1 (ref.cast (ref $LIST) (local.get $args))) (i32.const 0)))");
+        b.push(format!(
+            "(call $host_file_write {handle} (call $unwrap (local.get $text)))"
+        ));
+        b.push("(call $box (call $slen (local.get $text)))");
+        module.funcs.push(Func {
+            signature: "(func $file_write (param $self (ref null any)) (param $name (ref null any)) (param $args (ref null any)) (result (ref null any))".into(),
+            locals: vec!["(local $text (ref null any))".into()],
+            body: b,
+        });
+    }
     if g.uses_timer {
         module
             .imports
@@ -815,6 +980,25 @@ fn raise_helpers() -> Vec<Func> {
     b.push("unreachable");
     fs.push(Func {
         signature: "(func $raise_zero_div".into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $raise_file_not_found: `open()` asked for a name the host never staged
+    // (the capability check — see HOST_INTERFACE.md, "not for student code"
+    // on `wasi:filesystem` — lives host-side, same width as `get_field`; this
+    // is just reporting what the host already said no to). `$name` prints
+    // raw (`$print_str`, not `$print_repr`): the message text already quotes
+    // the slot itself.
+    let mut b = Body::new();
+    b.push("(call $write_char (i32.const 10))");
+    push_msg(&mut b, 0, &crate::messages::FILE_NOT_FOUND, |b, d, _| {
+        b.push_in(d, "(call $print_str (local.get $name))");
+    });
+    b.push("(call $write_char (i32.const 10))");
+    b.push("unreachable");
+    fs.push(Func {
+        signature: "(func $raise_file_not_found (param $name (ref null any))".into(),
         locals: vec![],
         body: b,
     });
@@ -6062,6 +6246,11 @@ struct Gen {
     /// Set when `set_field`/`get_field` are used → forward marshalling (shared)
     /// plus the field-storage imports and the `$get_field` reverse helper.
     uses_fields: bool,
+    /// Set when `open()` is used → the file-capability host imports
+    /// (`file_open`/`file_readline`/`file_close`) and the `$FILE` wrapper
+    /// helpers. Per-filename capability checks live host-side (same width as
+    /// `get_field`), not in this flag — see `HOST_INTERFACE.md`.
+    uses_files: bool,
     /// Set when `evidence(key, value)` is used → forward marshalling (shared)
     /// plus the `env.evidence` import (the ECD structured-observable channel).
     uses_evidence: bool,
@@ -7577,6 +7766,27 @@ impl Gen {
                 let rhs = self.value_expr(cx, b)?;
                 Ok(format!("(call $py_pow {lhs} {rhs})"))
             }
+            // `is None` / `is not None` — the parser only accepts this
+            // against `None`, and unlike `==`, it must never dispatch to a
+            // custom `__eq__` (that's the whole reason `is` exists apart
+            // from `==`). A representation-level check instead: `None` is
+            // always the single `$NONE_T` struct, so testing BOTH operands'
+            // runtime type against `$NONE_T` is correct regardless of which
+            // side the parser let be the literal (the literal side always
+            // trivially passes its own test).
+            ExprKind::Bin(op @ (BinOp::Is | BinOp::IsNot), a, b) => {
+                let lhs = self.value_expr(cx, a)?;
+                let rhs = self.value_expr(cx, b)?;
+                let both_none = format!(
+                    "(i32.and (ref.test (ref $NONE_T) {lhs}) (ref.test (ref $NONE_T) {rhs}))"
+                );
+                let raw = if *op == BinOp::Is {
+                    both_none
+                } else {
+                    format!("(i32.eqz {both_none})")
+                };
+                Ok(format!("(call $bool {raw})"))
+            }
             // Set operators: union / intersection / symmetric difference
             // (modes 0/1/2). Both operands must be sets.
             ExprKind::Bin(op @ (BinOp::BitOr | BinOp::BitXor | BinOp::BitAnd), a, b) => {
@@ -7856,6 +8066,49 @@ impl Gen {
                 {
                     let tmpl = tmpl.clone();
                     return self.gen_str_format(cx, &tmpl, args, e.line);
+                }
+                // File methods — ONLY when `open()` is called anywhere in the
+                // program (`uses_files`, decided once in pass 1). Gating on
+                // that rather than "this method name appeared" matters
+                // because WASM resolves every declared import at
+                // module-instantiation time regardless of whether it's ever
+                // called: if this dispatch fired for ANY `.close()`/
+                // `__enter__`/`__exit__` call, `with Guard(...) as g:` on a
+                // plain class with no file anywhere would suddenly require
+                // `file_open` etc. host imports it never needs — a real
+                // regression this caught (see the commit this comment rode
+                // in on). Same fallback shape as the string methods just
+                // below either way: a non-`$FILE` receiver dispatches
+                // normally, so a user class may still define these names.
+                if self.uses_files {
+                    match method.as_str() {
+                        "readline" | "read" | "close" | "__enter__" if args.is_empty() => {
+                            let r = self.value_expr(cx, recv)?;
+                            let argl = self.list_of(cx, args)?;
+                            let helper = match method.as_str() {
+                                "readline" => "$file_readline",
+                                "read" => "$file_read",
+                                "close" => "$file_close",
+                                "__enter__" => "$file_enter",
+                                _ => unreachable!(),
+                            };
+                            return Ok(format!("(call {helper} {r} {} {argl})", str_lit(method)));
+                        }
+                        "write" if args.len() == 1 => {
+                            let r = self.value_expr(cx, recv)?;
+                            let argl = self.list_of(cx, args)?;
+                            return Ok(format!(
+                                "(call $file_write {r} {} {argl})",
+                                str_lit(method)
+                            ));
+                        }
+                        "__exit__" if args.len() == 3 => {
+                            let r = self.value_expr(cx, recv)?;
+                            let argl = self.list_of(cx, args)?;
+                            return Ok(format!("(call $file_exit {r} {} {argl})", str_lit(method)));
+                        }
+                        _ => {}
+                    }
                 }
                 // String methods. Each helper falls back to method dispatch for
                 // a non-string receiver, so a class may reuse these names.
@@ -8202,8 +8455,11 @@ impl Gen {
                             let seq = self.value_expr(cx, &args[0])?;
                             return Ok(format!("(call $py_sum {seq})"));
                         }
-                        // sorted(seq) / sorted(seq, reverse=<bool>). `key=` needs
-                        // first-class functions and isn't supported yet.
+                        // sorted(seq) / sorted(seq, reverse=<bool>). `key=`
+                        // isn't supported yet. First-class functions (the
+                        // monomorphic case) landed, but `key=` specifically
+                        // needs its own decorate-sort-undecorate lowering on
+                        // both backends — a separate, sequenced follow-up.
                         "sorted" if (1..=2).contains(&args.len()) => {
                             let seq = self.value_expr(cx, &args[0])?;
                             let rev = if args.len() == 2 {
@@ -8516,6 +8772,22 @@ impl Gen {
                                 ));
                             }
                             return Ok("(call $read_line)".to_string());
+                        }
+                        // open(name[, mode]) -> a $FILE handle, or a trap
+                        // (FileNotFoundError) if the host refuses the name.
+                        // No try/except exists yet to catch it — same reason
+                        // `with` doesn't need try/finally (see parser.rs's
+                        // `with_stmt`): nothing can trap and keep running
+                        // afterward regardless. `uses_files` is already
+                        // decided (pass 1, `program_calls_open`), not set here.
+                        "open" if args.len() == 1 || args.len() == 2 => {
+                            let name = self.value_expr(cx, &args[0])?;
+                            let mode = if args.len() == 2 {
+                                self.value_expr(cx, &args[1])?
+                            } else {
+                                str_lit("r")
+                            };
+                            return Ok(format!("(call $file_open {name} {mode})"));
                         }
                         _ => {}
                     }
@@ -9516,6 +9788,8 @@ impl Gen {
                     // mix (the result isn't a plain number).
                     BinOp::Eq
                     | BinOp::Ne
+                    | BinOp::Is
+                    | BinOp::IsNot
                     | BinOp::And
                     | BinOp::Or
                     | BinOp::In

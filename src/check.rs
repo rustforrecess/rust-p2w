@@ -749,7 +749,9 @@ impl Checker {
                 _ if ta.numeric() && tb.numeric() => (num_join(&ta, &tb), None),
                 _ => (Ty::Dyn, None),
             },
-            BinOp::Eq | BinOp::Ne | BinOp::In | BinOp::NotIn => (Ty::Bool, None),
+            BinOp::Eq | BinOp::Ne | BinOp::In | BinOp::NotIn | BinOp::Is | BinOp::IsNot => {
+                (Ty::Bool, None)
+            }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 // Mixed text/number ordering on NAMES is a real mistake, but
                 // the literal case is a compile error already; stay quiet on

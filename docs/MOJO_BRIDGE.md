@@ -3,6 +3,61 @@
 Decided 2026-08-21, the week Mojo 1.0 shipped (Aug 11), its compiler went
 Apache 2.0 (Aug 18), and Modular formally abandoned the Python-superset goal.
 
+## PAUSED 2026-10-19
+
+The `mojo-bridge` CI job (`tools/mojo/mojo_diff.sh`) is disabled
+(`if: false` in `.github/workflows/ci.yml`), not deleted. What broke it:
+Mojo 1.1 made `var` mandatory for every new local binding — annotated or
+not. The "What first contact with Mojo 1.0.0 taught" section below already
+spotted the warning and predicted the future-proof spelling would be an
+annotated first assignment (`s: str = ...`); that prediction didn't survive
+contact with 1.1 — Mojo rejects the annotated form too, `var` is the only
+thing that satisfies it.
+
+That alone would just be a syntax inconvenience, except `var` is
+**block-scoped** in Mojo, while implicit Python assignment (and this
+project's whole semantic model) is **function-scoped** — a name assigned
+anywhere in a function is visible throughout it. So there's no safe
+mechanical fix: inserting `var` at a name's first assignment changes
+*behavior*, not just syntax, for any name first assigned inside an `if`/
+`for`/`while` and read afterward:
+
+```python
+if x > 0:
+    total = 1
+else:
+    total = -1
+print(total)
+```
+
+`var`-at-first-assignment would give each branch its own block-scoped
+`total`, invisible outside the `if` — `print(total)` breaks. That pattern
+is completely ordinary code, not an edge case, so there's no honest way to
+auto-patch around it. (Scoping this to only unconditionally-first-assigned
+names was considered — it would have covered the test cases we actually
+hit — but it still abandons the bridge's real claim, see below, so it
+wasn't pursued either.)
+
+This matters more than a compatibility wrinkle because it breaks the
+specific claim the bridge existed to make: **the same text, unchanged, is
+valid in both languages.** A mechanical rewrite step (even a correct one)
+is a different, weaker claim — "Python code that can be converted to
+Mojo" — and this one can't even be made correct in general. Per the design
+principle at the top of this doc, a bridge that's sometimes silently wrong
+is worse than no bridge: exactly the "silent divergence" failure class the
+whole profile exists to refuse, just relocated from text-splitting to
+variable scoping.
+
+Modular's own announcement of the `var` requirement left room for it to
+be revisited post-1.0 (cited as an additive change that would preserve
+1.0 source compatibility), so this is parked pending that, not closed for
+good. The `## Reopen conditions` section below predates this and lists
+different triggers (Mojo shipping wasm/classes/K-12 presence) — none of
+those fired; this is a new condition the doc didn't anticipate.
+
+Rest of this document is kept as-is below — the historical record of what
+was tried and verified before this.
+
 ## The decision it implements
 
 **Look, don't shift.** Mojo occupies none of this project's load-bearing axes
@@ -99,6 +154,27 @@ output. Three corrections came from the compiler, not the docs:
   decomposed accent or ZWJ emoji there prints different counts on the two
   sides. No static check can close this; it is the price of the layers
   disagreeing, and the three-lengths lesson is where a student learns it.
+
+## Known divergences — tracked, not gating (updated 2026-10-24)
+
+CPython compatibility is the priority when these conflict with Mojo; the
+bridge stays opt-in and advisory. Kept here as one scannable list so a
+future Mojo release can be checked against it without re-deriving each
+point from the sections above.
+
+| divergence | since | watch for |
+|---|---|---|
+| `var` mandatory + block-scoped vs. Python's function-scoped implicit assignment — the job-disabling one | Mojo 1.1 | Modular relaxing the `var` requirement post-1.0 (left open in their own announcement) |
+| `len(<str>)` is a hard error in Mojo (bytes/codepoints/graphemes ambiguity) | Mojo 1.0 | a default `len` landing for `String` |
+| `for c in s` yields grapheme clusters in Mojo, code points in Python — diverges on decomposed accents / ZWJ emoji | Mojo 1.0 | unlikely to change; Swift-style grapheme iteration looks settled on their side |
+| No classes in Mojo (Phase 3 unstarted) | ongoing | Mojo shipping classes |
+| Integer edges: CPython bignums / p2w traps at i32 / Mojo wraps at i64 | ongoing | n/a — three-way, not a pairwise fix |
+| `random` stdlib has no prelude mapping | ongoing | low priority, nobody's blocked on it |
+
+When any "watch for" fires, re-run `tools/mojo/mojo_diff.sh` by hand against
+a current Mojo install before touching CI — don't re-enable the `mojo-bridge`
+job speculatively, confirm first that the specific blocking divergence is
+actually gone.
 
 ## Reopen conditions (for the larger shift-to-Mojo question)
 

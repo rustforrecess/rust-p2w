@@ -6,11 +6,10 @@ Regenerate with `P2W_BLESS=1 cargo test --test upstream_gap`. **A row moving is 
 
 See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's designs are worth taking.
 
-## Rejected (30)
+## Rejected (26)
 
 | feature | message |
 |---|---|
-| `with / context manager` | expected a new line, but found `open` |
 | `match / case` | expected a new line, but found `x` |
 | `walrus :=` | expected ')', but found `:` |
 | `yield / generator function` | expected a new line, but found the number 1 |
@@ -20,7 +19,6 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `assert` | expected a new line, but found the number 1 |
 | `global` | expected a new line, but found `x` |
 | `nonlocal` | expected a new line, but found `x` |
-| `is / is not` | expected ',' or ')' in call, found Name("is") |
 | `del name` | `del` removes an item like `del xs[0]` or `del d[key]` — deleting a whole variab… |
 | `for ... else` | expected a value, found Newline |
 | `while ... else` | expected a value, found Newline |
@@ -28,8 +26,6 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `*args` | expected a parameter name, found Star |
 | `**kwargs` | expected a parameter name, found DoubleStar |
 | `multiple inheritance` | multiple inheritance isn't supported — one base class only |
-| `bind a function to a name` | 'f' is a function — call it with f(...) |
-| `pass a function as an argument` | 'd' is a function — call it with d(...) |
 | `return a closure` | expected ',' or ')' in call, found LParen |
 | `map / filter` | unknown name 'abs' (define it with `abs = ...` first) |
 | `sorted(key=...)` | unknown name 'len' (define it with `len = ...` first) |
@@ -41,10 +37,14 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `type()` | unknown function 'type' |
 | `isinstance()` | unknown name 'int' (define it with `int = ...` first) |
 
-## Compiles (12)
+## Compiles (16)
 
+- `with / context manager`
+- `is / is not`
 - `pass in a class body`
 - `from X import Y`
+- `bind a function to a name`
+- `pass a function as an argument`
 - `inheritance`
 - `super()`
 - `lambda`
