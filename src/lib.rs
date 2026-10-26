@@ -368,6 +368,19 @@ pub fn component_lints(source: &str, specs: &[(String, Vec<String>)]) -> Vec<Lin
     out
 }
 
+/// The AST alone, for a tool that wants to walk it directly (e.g. a
+/// diagram/flowchart view) rather than consume `analyze`'s derived
+/// outputs. Deliberately its own lex+parse, not threaded through
+/// `analyze`'s hot path — that path runs on every keystroke even when
+/// such a tool's view isn't open; this one is meant to be called lazily,
+/// only while that view is actually visible. Strict (fails on the first
+/// error), unlike `analyze`'s `parse_recovering` — callers that want
+/// partial-program recovery should use `analyze`/`to_blocks` instead.
+pub fn parse(source: &str) -> Result<Vec<Stmt>, CompileError> {
+    let toks = lexer::lex(source)?;
+    parser::parse(&toks)
+}
+
 /// Blocks conversion + the full lint set from ONE lex+parse. This pair runs on
 /// every editor keystroke; calling [`to_blocks`] and [`lints`] separately parses
 /// the identical source twice, which is pure waste on the IDE's hottest path.
@@ -454,6 +467,21 @@ mod tests {
         let wat = compile_to_wat("print(\"hello world\")").unwrap();
         assert!(wat.contains("(export \"_start\")"));
         assert!(wat.contains("call $write_char"));
+    }
+
+    #[test]
+    fn parse_returns_the_ast_for_a_well_formed_program() {
+        let stmts = parse("x = 1\nif x > 0:\n    print(x)\n").unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(stmts[0].kind, StmtKind::Assign(..)));
+        assert!(matches!(stmts[1].kind, StmtKind::If { .. }));
+    }
+
+    #[test]
+    fn parse_fails_on_the_first_error_unlike_analyze() {
+        // Strict, not recovering — a caller that wants partial recovery
+        // should use `analyze`/`to_blocks` instead.
+        assert!(parse("if x\n    print(x)\n").is_err());
     }
 
     #[test]
