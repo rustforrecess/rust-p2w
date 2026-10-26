@@ -3281,11 +3281,14 @@ impl Vm {
             Ok(())
         } else if name == "open" {
             // `open(name[, mode])` — the debugger has no real filesystem, only
-            // what `set_files` staged (same shape as `input`'s `set_stdin`).
-            // Read mode ("r", the default) needs the name pre-staged; write
-            // mode ("w") always succeeds and starts from an empty buffer —
-            // what's written is read back via `Vm::file_writes` after the
-            // run, not committed anywhere real here.
+            // what `set_files` staged (same shape as `input`'s `set_stdin`)
+            // plus whatever this run has itself written and closed. Read
+            // mode ("r", the default) needs the name pre-staged OR already
+            // written-and-closed earlier in this same run (see `close`'s
+            // `file_sources` commit below); write mode ("w") always succeeds
+            // and starts from an empty buffer. `Vm::file_writes` still
+            // surfaces every write-mode file's final content after the run,
+            // for the embedder, independent of this in-run commit.
             let filename = match args.first() {
                 Some(Value::Str(s)) => s.clone(),
                 _ => return Err("open() needs a text filename".to_string()),
@@ -3374,10 +3377,18 @@ impl Vm {
             ("write", [_]) => Err("write() needs text".to_string()),
             ("close", []) => {
                 f.closed = true;
+                if f.mode == FileMode::Write {
+                    let (name, writes) = (f.name.clone(), f.writes.clone());
+                    self.file_sources.insert(name, writes);
+                }
                 Ok(Value::None)
             }
             ("__exit__", [_, _, _]) => {
                 f.closed = true;
+                if f.mode == FileMode::Write {
+                    let (name, writes) = (f.name.clone(), f.writes.clone());
+                    self.file_sources.insert(name, writes);
+                }
                 Ok(Value::None)
             }
             (m, _) => Err(format!("a file object has no method '{m}' yet")),
@@ -5318,19 +5329,26 @@ mod tests {
     }
 
     #[test]
-    fn vm_writes_are_readable_back_after_the_run_not_during() {
+    fn vm_writes_are_readable_back_both_after_the_run_and_within_it() {
+        // write -> close -> reopen for read -> read, all in one run: close
+        // commits into file_sources, so the reopen sees it immediately —
+        // the single most common file-I/O exercise ("did I save it right?").
         let mut vm = Vm::new(
             "f = open(\"out.txt\", \"w\")\n\
              n = f.write(\"hi\")\n\
              print(n)\n\
-             f.close()\n",
+             f.close()\n\
+             g = open(\"out.txt\", \"r\")\n\
+             print(g.read())\n\
+             g.close()\n",
         )
         .unwrap();
         while vm.is_paused() {
             vm.step();
         }
         assert_eq!(*vm.status(), Status::Finished, "{:?}", vm.status());
-        assert_eq!(vm.output(), "2\n"); // write() returns the character count
+        assert_eq!(vm.output(), "2\nhi\n"); // write() returns the character count
+        // Still surfaced after the run too, unaffected by the in-run commit.
         assert_eq!(
             vm.file_writes().get("out.txt").map(String::as_str),
             Some("hi")

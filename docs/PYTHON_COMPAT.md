@@ -181,6 +181,25 @@ semantics and leak-freedom are oracle-gated). Differences:
   and `list(range(n))` step cleanly. **Classes and functions** run in the
   step-into / call-stack mode (the mode the IDE uses). The simpler step-over
   interpreter still leaves classes to that mode.
+- **File capability** (`open`/`readline`/`read`/`write`/`close`, plus
+  `with open(...) as f:`) is a bespoke host capability, not real disk I/O
+  — see `HOST_INTERFACE.md`. What backs a name is entirely the host's
+  choice and differs **on purpose** across surfaces:
+  - **The step debugger (`Vm`)** stages read content via `set_files(...)`
+    before a run, and — same run only — a `write()`-then-`close()`-then
+    reopen-for-read sees what was just written (committed into the
+    staged map at `close()`/`__exit__`). `Vm::file_writes()` still
+    surfaces every write-mode file's final content after the run too,
+    independent of that in-run commit.
+  - **The `p2w check`/`p2w run` CLI reference host** (`src/harness.rs`)
+    stays frozen on purpose: writes accumulate but are never fed back
+    into a later read in the same run, matching that host's whole
+    design (fuel as an instruction count, not wall-clock — no ambient
+    filesystem, same reason as no ambient clock).
+  - **The browser IDE's Run-mode host** (in the separate `acornstem-ide`
+    repo) is expected to behave like the step debugger — mutable,
+    read-after-write — since that's an interactive practice surface, not
+    a grading oracle.
 - **`import`** is `math` and `random`: `math.pi`/`e`/`tau` and
   `sqrt`/`fabs`/`floor`/`ceil`/`trunc`; `random.random`/`randint`/`choice`/
   `shuffle`/`seed` (seeded, deterministic per attempt, bit-for-bit identical
