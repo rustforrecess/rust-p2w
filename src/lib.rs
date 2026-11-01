@@ -25,6 +25,7 @@
 //! the design of ruff_python_parser (front-end architecture). See the NOTICE
 //! file for full attribution.
 
+pub mod activity;
 mod ast;
 mod blockly;
 mod builtins;
@@ -47,7 +48,7 @@ mod repr;
 mod reuse;
 mod roles;
 
-pub use ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
+pub use ast::{BinOp, Expr, ExprKind, Span, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
 pub use builtins::{BUILTINS, Builtin, builtins_json};
 pub use check::{GATED, TypeFinding, is_gated};
