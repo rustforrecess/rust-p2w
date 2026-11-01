@@ -5804,4 +5804,72 @@ mod tests {
         vm.run(&[]);
         assert_eq!(vm.watch_hit().unwrap().2, "1");
     }
+
+    fn run_vm_to_end(src: &str) -> (String, Status) {
+        let mut v = Vm::new(src).expect("parse");
+        let mut guard = 0;
+        while v.is_paused() {
+            v.step();
+            guard += 1;
+            assert!(guard < 100_000, "ran away");
+        }
+        (v.output().to_string(), v.status().clone())
+    }
+
+    /// **Known bug, not yet fixed**: a list passed into a function and
+    /// mutated there (`xs.append(v)`) does not mutate the caller's list —
+    /// Python shares the list binding, the Vm hands the callee a copy. This
+    /// is the dangerous one: it finishes cleanly with a silently wrong
+    /// answer instead of an error. Once fixed, this assertion should
+    /// change to `"[1]\n"` — if it starts failing here, that's good news,
+    /// update it.
+    #[test]
+    fn known_bug_list_mutated_through_function_param_does_not_persist() {
+        let (out, status) =
+            run_vm_to_end("def add(xs, v):\n    xs.append(v)\nh = []\nadd(h, 1)\nprint(h)\n");
+        assert_eq!(status, Status::Finished);
+        assert_eq!(
+            out, "[]\n",
+            "expected today's bug (caller's list unchanged); got {out:?} — \
+             if this is now \"[1]\\n\", the bug is fixed, update this test"
+        );
+    }
+
+    /// **Known bug, not yet fixed**: assigning through a subscript whose
+    /// base isn't a bare name (`obj.attr[i] = v`) is rejected outright,
+    /// even though reading `obj.attr[i]` and calling `obj.attr.append(v)`
+    /// both work. Once fixed, this should run cleanly instead of erroring.
+    #[test]
+    fn known_bug_item_assignment_through_attribute_subscript_is_rejected() {
+        let (_out, status) = run_vm_to_end(
+            "class Node:\n    def __init__(self):\n        self.children = [1, 2, 3]\nn = Node()\nn.children[0] = 9\nprint(n.children)\n",
+        );
+        match status {
+            Status::Error { message, .. } => assert!(
+                message.contains("item assignment needs a simple variable"),
+                "expected today's rejection message, got: {message}"
+            ),
+            other => panic!(
+                "expected today's known rejection, got {other:?} — if this now runs, the bug is fixed, update this test"
+            ),
+        }
+    }
+
+    /// **Known bug, not yet fixed**: unpacking into subscript targets
+    /// (`a[i], a[j] = a[j], a[i]`, the classic swap idiom) is rejected —
+    /// at plain module level, not just inside a function call despite the
+    /// error message's "call-stack mode" wording.
+    #[test]
+    fn known_bug_tuple_unpack_into_subscript_targets_is_rejected() {
+        let (_out, status) = run_vm_to_end("a = [1, 2, 3]\na[0], a[1] = a[1], a[0]\nprint(a)\n");
+        match status {
+            Status::Error { message, .. } => assert!(
+                message.contains("tuple unpacking to non-variable targets"),
+                "expected today's rejection message, got: {message}"
+            ),
+            other => panic!(
+                "expected today's known rejection, got {other:?} — if this now runs, the bug is fixed, update this test"
+            ),
+        }
+    }
 }
