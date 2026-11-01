@@ -36,15 +36,24 @@ pub enum Value {
     Float(f64),
     Bool(bool),
     Str(String),
-    List(Vec<Value>),
+    /// `Rc`-shared and `RefCell`-mutable, like `Object` below — Python lists
+    /// are a reference type: binding one to a new name, or passing one as a
+    /// function argument, must let both names see the same mutations. A
+    /// site that means an actual copy (slicing, `list(x)`, `.copy()`,
+    /// concatenation) builds a *fresh* `Rc` instead of cloning this one.
+    List(Rc<std::cell::RefCell<Vec<Value>>>),
     /// An immutable tuple `(a, b)`. A distinct type from `List`: it has no item
-    /// assignment and isn't equal to a list with the same elements.
+    /// assignment and isn't equal to a list with the same elements. Tuples
+    /// are immutable in Python, so (unlike `List`) a plain owned `Vec` is
+    /// correct here — nothing can mutate it to make aliasing observable.
     Tuple(Vec<Value>),
     /// Insertion-ordered unique elements (matches the compiled backends; sets are
-    /// conceptually unordered, so equality below ignores order).
-    Set(Vec<Value>),
-    /// Insertion-ordered key/value pairs, like Python dicts.
-    Dict(Vec<(Value, Value)>),
+    /// conceptually unordered, so equality below ignores order). `Rc`-shared
+    /// for the same reference-type reason as `List`.
+    Set(Rc<std::cell::RefCell<Vec<Value>>>),
+    /// Insertion-ordered key/value pairs, like Python dicts. `Rc`-shared for
+    /// the same reference-type reason as `List`.
+    Dict(Rc<std::cell::RefCell<Vec<(Value, Value)>>>),
     /// A class instance. `Rc`-shared so aliases see each other's attribute
     /// writes (true reference semantics, like the compiled backends).
     Object(Rc<VmObj>),
@@ -117,6 +126,23 @@ impl PartialEq for VmObj {
 }
 
 impl Value {
+    /// Build a fresh, independently-owned list — use this (never
+    /// `existing.clone()`) at every site that means a genuine copy (a
+    /// literal, slicing, `list(x)`, `.copy()`, concatenation). Cloning an
+    /// existing `Value::List` is correct only when the intent IS aliasing
+    /// (binding a name, passing an argument) — `Value`'s derived `Clone`
+    /// already does that right, since it clones the `Rc` (shares), not the
+    /// `Vec` inside it.
+    fn list(v: Vec<Value>) -> Value {
+        Value::List(Rc::new(std::cell::RefCell::new(v)))
+    }
+    fn set(v: Vec<Value>) -> Value {
+        Value::Set(Rc::new(std::cell::RefCell::new(v)))
+    }
+    fn dict(v: Vec<(Value, Value)>) -> Value {
+        Value::Dict(Rc::new(std::cell::RefCell::new(v)))
+    }
+
     /// Python truthiness.
     fn truthy(&self) -> bool {
         match self {
@@ -124,10 +150,10 @@ impl Value {
             Value::Float(f) => *f != 0.0,
             Value::Bool(b) => *b,
             Value::Str(s) => !s.is_empty(),
-            Value::List(v) => !v.is_empty(),
+            Value::List(v) => !v.borrow().is_empty(),
             Value::Tuple(v) => !v.is_empty(),
-            Value::Set(v) => !v.is_empty(),
-            Value::Dict(d) => !d.is_empty(),
+            Value::Set(v) => !v.borrow().is_empty(),
+            Value::Dict(d) => !d.borrow().is_empty(),
             Value::Object(_) => true, // instances are truthy (CPython default)
             Value::File(_) => true,
             Value::None => false,
@@ -159,7 +185,7 @@ impl Value {
             Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
             Value::None => "None".to_string(),
             Value::List(v) => {
-                let items: Vec<String> = v.iter().map(Value::py_repr).collect();
+                let items: Vec<String> = v.borrow().iter().map(Value::py_repr).collect();
                 format!("[{}]", items.join(", "))
             }
             // A 1-tuple keeps its trailing comma: `(1,)`. Empty is `()`.
@@ -172,17 +198,22 @@ impl Value {
                 }
             }
             // Empty set prints `set()` (Python) — `{}` is an empty dict.
-            Value::Set(v) if v.is_empty() => "set()".to_string(),
+            Value::Set(v) if v.borrow().is_empty() => "set()".to_string(),
             Value::Set(v) => {
                 // Canonical *sorted* display when elements are homogeneously
                 // orderable; mixed-type sets fall back to insertion order. Display
                 // only — storage/iteration keep insertion order. Matches the WASM
                 // backend's `$print_set`.
-                let items: Vec<String> = sorted_set_view(v).iter().map(|x| x.py_repr()).collect();
+                let borrowed = v.borrow();
+                let items: Vec<String> = sorted_set_view(&borrowed)
+                    .iter()
+                    .map(|x| x.py_repr())
+                    .collect();
                 format!("{{{}}}", items.join(", "))
             }
             Value::Dict(d) => {
                 let items: Vec<String> = d
+                    .borrow()
                     .iter()
                     .map(|(k, v)| format!("{}: {}", k.py_repr(), v.py_repr()))
                     .collect();
@@ -223,14 +254,20 @@ fn py_eq(a: &Value, b: &Value) -> bool {
         (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::None, Value::None) => true,
-        (Value::List(x), Value::List(y)) | (Value::Tuple(x), Value::Tuple(y)) => {
+        (Value::List(x), Value::List(y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| py_eq(p, q))
+        }
+        (Value::Tuple(x), Value::Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
         }
         // Sets are unordered: equal iff same size and every element is in both.
         (Value::Set(x), Value::Set(y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
             x.len() == y.len() && x.iter().all(|p| y.iter().any(|q| py_eq(p, q)))
         }
         (Value::Dict(x), Value::Dict(y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
             x.len() == y.len()
                 && x.iter()
                     .all(|(k, v)| y.iter().any(|(k2, v2)| py_eq(k, k2) && py_eq(v, v2)))
@@ -239,6 +276,29 @@ fn py_eq(a: &Value, b: &Value) -> bool {
             (Some(x), Some(y)) => x == y,
             _ => false,
         },
+    }
+}
+
+/// A true deep copy — unlike `Value`'s derived `Clone`, which shares
+/// `List`/`Set`/`Dict`'s `Rc` on purpose (ordinary aliasing). Needed
+/// wherever an independent snapshot matters, e.g. `Stepper::clone_scope`'s
+/// side-effect-free watch evaluation. `Object` is left sharing its `Rc` —
+/// Python instances are reference types even under `copy.copy`-free code
+/// like this debugger's subset, so there is no "deep copy an object"
+/// operation to mirror here.
+fn deep_clone(v: &Value) -> Value {
+    match v {
+        Value::List(items) => Value::list(items.borrow().iter().map(deep_clone).collect()),
+        Value::Set(items) => Value::set(items.borrow().iter().map(deep_clone).collect()),
+        Value::Dict(pairs) => Value::dict(
+            pairs
+                .borrow()
+                .iter()
+                .map(|(k, v)| (deep_clone(k), deep_clone(v)))
+                .collect(),
+        ),
+        Value::Tuple(items) => Value::Tuple(items.iter().map(deep_clone).collect()),
+        other => other.clone(),
     }
 }
 
@@ -503,8 +563,17 @@ impl Stepper {
         Self::eval_in(&self.funcs, &mut scratch, &mut None, &expr).map(|v| v.py_repr())
     }
 
+    /// A scratch copy of `scope` for `eval_watch` to evaluate against —
+    /// **must** be a real deep copy, not `scope.clone()`. `Value`'s derived
+    /// `Clone` shares `List`/`Set`/`Dict`'s `Rc` (that's the point, for
+    /// ordinary aliasing); a watch evaluating a mutating method call (e.g.
+    /// `xs.append(99)`) needs an independent copy instead, so the real
+    /// program state stays untouched.
     fn clone_scope(&self) -> HashMap<String, Value> {
-        self.scope.clone()
+        self.scope
+            .iter()
+            .map(|(k, v)| (k.clone(), deep_clone(v)))
+            .collect()
     }
 
     /// Execute exactly one statement, then re-prime to the next. No-op once the
@@ -865,9 +934,10 @@ impl Stepper {
 
     fn iterable_items(&mut self, e: &Expr) -> Result<Vec<Value>, String> {
         match self.eval(e)? {
-            Value::List(v) | Value::Set(v) | Value::Tuple(v) => Ok(v),
+            Value::List(v) | Value::Set(v) => Ok(v.borrow().clone()),
+            Value::Tuple(v) => Ok(v),
             Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
-            Value::Dict(d) => Ok(d.into_iter().map(|(k, _)| k).collect()),
+            Value::Dict(d) => Ok(d.borrow().iter().map(|(k, _)| k.clone()).collect()),
             other => Err(fill_msg(
                 &crate::messages::TYPE_FOR_NOT_ITERABLE,
                 &[("type", &type_label(&other))],
@@ -921,7 +991,7 @@ impl Stepper {
                 for it in items {
                     out_items.push(Self::eval_in(funcs, scope, out, it)?);
                 }
-                Ok(Value::List(out_items))
+                Ok(Value::list(out_items))
             }
             ExprKind::Tuple(items) => {
                 let mut out_items = Vec::with_capacity(items.len());
@@ -938,7 +1008,7 @@ impl Stepper {
                         Self::eval_in(funcs, scope, out, v)?,
                     ));
                 }
-                Ok(Value::Dict(out_pairs))
+                Ok(Value::dict(out_pairs))
             }
             ExprKind::Index(obj, idx) => {
                 let target = Self::eval_in(funcs, scope, out, obj)?;
@@ -1075,8 +1145,9 @@ impl Stepper {
         match (name, vals.as_slice()) {
             ("len", [v]) => match v {
                 Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-                Value::List(l) | Value::Set(l) | Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
-                Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
+                Value::List(l) | Value::Set(l) => Ok(Value::Int(l.borrow().len() as i64)),
+                Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
+                Value::Dict(d) => Ok(Value::Int(d.borrow().len() as i64)),
                 _ => Err(fill_msg(
                     &crate::messages::TYPE_NO_LEN,
                     &[("type", &type_label(v))],
@@ -1107,13 +1178,13 @@ impl Stepper {
                     .ok_or_else(|| expected_number(v)),
             },
             ("bool", [v]) => Ok(Value::Bool(v.truthy())),
-            ("set", []) => Ok(Value::Set(Vec::new())),
+            ("set", []) => Ok(Value::set(Vec::new())),
             ("set", [v]) => make_set(v),
-            ("list", []) => Ok(Value::List(Vec::new())),
-            ("list", [v]) => Ok(Value::List(to_elements(v)?)),
+            ("list", []) => Ok(Value::list(Vec::new())),
+            ("list", [v]) => Ok(Value::list(to_elements(v)?)),
             ("tuple", []) => Ok(Value::Tuple(Vec::new())),
             ("tuple", [v]) => Ok(Value::Tuple(to_elements(v)?)),
-            ("dict", []) => Ok(Value::Dict(Vec::new())),
+            ("dict", []) => Ok(Value::dict(Vec::new())),
             ("print", _) => {
                 // print used as a value: write, return None.
                 if let Some(sink) = out {
@@ -1334,9 +1405,9 @@ impl Stepper {
                 body,
             } => {
                 let items = match Self::eval_in(funcs, scope, out, iterable)? {
-                    Value::List(v) => v,
+                    Value::List(v) => v.borrow().clone(),
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
-                    Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
+                    Value::Dict(d) => d.borrow().iter().map(|(k, _)| k.clone()).collect(),
                     other => {
                         return Err(fill_msg(
                             &crate::messages::TYPE_FOR_NOT_ITERABLE,
@@ -1418,6 +1489,7 @@ fn assign_index_in(
         .ok_or_else(|| format!("name '{name}' is not defined"))?;
     match slot {
         Value::List(items) => {
+            let mut items = items.borrow_mut();
             let i = as_int(&index).ok_or_else(|| expected_number(&index))?;
             let n = items.len() as i64;
             let real = if i < 0 { i + n } else { i };
@@ -1431,6 +1503,7 @@ fn assign_index_in(
             Ok(())
         }
         Value::Dict(pairs) => {
+            let mut pairs = pairs.borrow_mut();
             if let Some(slot) = pairs.iter_mut().find(|(k, _)| py_eq(k, &index)) {
                 slot.1 = value;
             } else {
@@ -1453,7 +1526,20 @@ fn assign_index_in(
 /// string), and dicts (any key).
 fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
     match target {
-        Value::List(items) | Value::Tuple(items) => {
+        Value::List(items) => {
+            let items = items.borrow();
+            let i = as_int(index).ok_or_else(|| expected_number(index))?;
+            let n = items.len() as i64;
+            let real = if i < 0 { i + n } else { i };
+            if real < 0 || real >= n {
+                return Err(fill_msg(
+                    &crate::messages::INDEX_OUT_OF_RANGE,
+                    &[("seq", "list")],
+                ));
+            }
+            Ok(items[real as usize].clone())
+        }
+        Value::Tuple(items) => {
             let i = as_int(index).ok_or_else(|| expected_number(index))?;
             let n = items.len() as i64;
             let real = if i < 0 { i + n } else { i };
@@ -1479,6 +1565,7 @@ fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
             Ok(Value::Str(chars[real as usize].to_string()))
         }
         Value::Dict(pairs) => pairs
+            .borrow()
             .iter()
             .find(|(k, _)| py_eq(k, index))
             .map(|(_, v)| v.clone())
@@ -1494,10 +1581,11 @@ fn index_get(target: &Value, index: &Value) -> Result<Value, String> {
 /// keys.
 fn contains(haystack: &Value, needle: &Value) -> Result<bool, String> {
     match haystack {
-        Value::List(items) | Value::Set(items) | Value::Tuple(items) => {
-            Ok(items.iter().any(|v| py_eq(v, needle)))
+        Value::List(items) | Value::Set(items) => {
+            Ok(items.borrow().iter().any(|v| py_eq(v, needle)))
         }
-        Value::Dict(pairs) => Ok(pairs.iter().any(|(k, _)| py_eq(k, needle))),
+        Value::Tuple(items) => Ok(items.iter().any(|v| py_eq(v, needle))),
+        Value::Dict(pairs) => Ok(pairs.borrow().iter().any(|(k, _)| py_eq(k, needle))),
         Value::Str(s) => match needle {
             Value::Str(sub) => Ok(s.contains(sub.as_str())),
             _ => Err(fill_msg(
@@ -1541,9 +1629,9 @@ fn add(l: &Value, r: &Value) -> Result<Value, String> {
     match (l, r) {
         (Value::Str(x), Value::Str(y)) => Ok(Value::Str(format!("{x}{y}"))),
         (Value::List(x), Value::List(y)) => {
-            let mut v = x.clone();
-            v.extend(y.clone());
-            Ok(Value::List(v))
+            let mut v = x.borrow().clone();
+            v.extend(y.borrow().iter().cloned());
+            Ok(Value::list(v))
         }
         _ => arith(BinOp::Add, l, r),
     }
@@ -1563,7 +1651,8 @@ fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             match seq {
                 Value::Str(s) => Value::Str(s.repeat(n)),
                 Value::List(xs) => {
-                    Value::List(xs.iter().cloned().cycle().take(xs.len() * n).collect())
+                    let xs = xs.borrow();
+                    Value::list(xs.iter().cloned().cycle().take(xs.len() * n).collect())
                 }
                 _ => unreachable!("guarded to str/list"),
             }
@@ -2635,7 +2724,7 @@ impl Vm {
                     items.push(self.pop_op()?);
                 }
                 items.reverse();
-                self.push_op(Value::List(items));
+                self.push_op(Value::list(items));
             }
             Task::BuildTuple(n) => {
                 let mut items = Vec::with_capacity(n);
@@ -2657,7 +2746,7 @@ impl Vm {
                     pairs.push((flat[i].clone(), flat[i + 1].clone()));
                     i += 2;
                 }
-                self.push_op(Value::Dict(pairs));
+                self.push_op(Value::dict(pairs));
             }
             Task::IndexGet => {
                 let idx = self.pop_op()?;
@@ -2718,9 +2807,10 @@ impl Vm {
             }
             Task::ForEachSetup(var, body) => {
                 let items = match self.pop_op()? {
-                    Value::List(v) | Value::Set(v) | Value::Tuple(v) => v,
+                    Value::List(v) | Value::Set(v) => v.borrow().clone(),
+                    Value::Tuple(v) => v,
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
-                    Value::Dict(d) => d.into_iter().map(|(k, _)| k).collect(),
+                    Value::Dict(d) => d.borrow().iter().map(|(k, _)| k.clone()).collect(),
                     other => {
                         return Err(fill_msg(
                             &crate::messages::TYPE_FOR_NOT_ITERABLE,
@@ -3101,22 +3191,20 @@ impl Vm {
                         && let [arg] = args.as_slice()
                         && let ExprKind::Name(xs) = &arg.kind
                     {
-                        let rnd = &mut self.rnd;
-                        match self.frames.last_mut().and_then(|f| f.scope.get_mut(xs)) {
-                            Some(Value::List(items)) => {
-                                let mut i = items.len().saturating_sub(1);
-                                while i > 0 {
-                                    let j = (rnd_next(rnd) % (i as u64 + 1)) as usize;
-                                    items.swap(i, j);
-                                    i -= 1;
-                                }
-                                self.push_op(Value::None);
-                                return Ok(());
-                            }
-                            _ => {
-                                return Err("random.shuffle() needs a list variable".into());
-                            }
+                        let items = match self.frames.last_mut().and_then(|f| f.scope.get_mut(xs)) {
+                            Some(Value::List(items)) => items.clone(),
+                            _ => return Err("random.shuffle() needs a list variable".into()),
+                        };
+                        let mut items = items.borrow_mut();
+                        let mut i = items.len().saturating_sub(1);
+                        while i > 0 {
+                            let j = (rnd_next(&mut self.rnd) % (i as u64 + 1)) as usize;
+                            items.swap(i, j);
+                            i -= 1;
                         }
+                        drop(items);
+                        self.push_op(Value::None);
+                        return Ok(());
                     }
                     let task = if m == "random" {
                         Task::RandomCall(method.clone(), args.len())
@@ -3586,7 +3674,7 @@ impl Vm {
                 for it in items {
                     out.push(self.watch_eval(it)?);
                 }
-                Ok(Value::List(out))
+                Ok(Value::list(out))
             }
             ExprKind::Tuple(items) => {
                 let mut out = Vec::with_capacity(items.len());
@@ -3600,7 +3688,7 @@ impl Vm {
                 for (k, v) in pairs {
                     out.push((self.watch_eval(k)?, self.watch_eval(v)?));
                 }
-                Ok(Value::Dict(out))
+                Ok(Value::dict(out))
             }
             _ => Err("that watch isn't supported in call-stack mode yet".to_string()),
         }
@@ -3625,9 +3713,10 @@ fn check_set_elem(v: &Value) -> Result<(), String> {
 /// `set()`, `list()`, and `tuple()`.
 fn to_elements(v: &Value) -> Result<Vec<Value>, String> {
     match v {
-        Value::List(x) | Value::Set(x) | Value::Tuple(x) => Ok(x.clone()),
+        Value::List(x) | Value::Set(x) => Ok(x.borrow().clone()),
+        Value::Tuple(x) => Ok(x.clone()),
         Value::Str(s) => Ok(s.chars().map(|c| Value::Str(c.to_string())).collect()),
-        Value::Dict(d) => Ok(d.iter().map(|(k, _)| k.clone()).collect()),
+        Value::Dict(d) => Ok(d.borrow().iter().map(|(k, _)| k.clone()).collect()),
         _ => Err(fill_msg(
             &crate::messages::TYPE_NO_LEN,
             &[("type", &type_label(v))],
@@ -3672,7 +3761,8 @@ fn slice_value(
     };
     let in_range = |i: i64, e: i64| (step > 0 && i < e) || (step < 0 && i > e);
     match target {
-        Value::List(xs) | Value::Tuple(xs) => {
+        Value::List(xs) => {
+            let xs = xs.borrow();
             let (s, e) = bounds(xs.len() as i64);
             let mut out = Vec::new();
             let mut i = s;
@@ -3680,11 +3770,17 @@ fn slice_value(
                 out.push(xs[i as usize].clone());
                 i += step;
             }
-            Ok(if matches!(target, Value::Tuple(_)) {
-                Value::Tuple(out)
-            } else {
-                Value::List(out)
-            })
+            Ok(Value::list(out))
+        }
+        Value::Tuple(xs) => {
+            let (s, e) = bounds(xs.len() as i64);
+            let mut out = Vec::new();
+            let mut i = s;
+            while in_range(i, e) {
+                out.push(xs[i as usize].clone());
+                i += step;
+            }
+            Ok(Value::Tuple(out))
         }
         Value::Str(sv) => {
             let chars: Vec<char> = sv.chars().collect();
@@ -3825,6 +3921,7 @@ fn random_call(st: &mut u64, func: &str, args: &mut [Value]) -> Result<Value, St
             Ok(Value::Int(a + (rnd_next(st) % span) as i64))
         }
         ("choice", [Value::List(items)]) => {
+            let items = items.borrow();
             if items.is_empty() {
                 return Err(crate::messages::INDEX_CHOICE_EMPTY.text.into());
             }
@@ -3832,6 +3929,7 @@ fn random_call(st: &mut u64, func: &str, args: &mut [Value]) -> Result<Value, St
             Ok(items[i].clone())
         }
         ("shuffle", [Value::List(items)]) => {
+            let mut items = items.borrow_mut();
             let mut i = items.len().saturating_sub(1);
             while i > 0 {
                 let j = (rnd_next(st) % (i as u64 + 1)) as usize;
@@ -3883,7 +3981,7 @@ fn builtin_extra(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
                 out.push(Value::Int(i));
                 i += step;
             }
-            Value::List(out)
+            Value::list(out)
         }
         ("sum", [v]) => {
             let mut acc = Value::Int(0);
@@ -3902,7 +4000,7 @@ fn builtin_extra(name: &str, args: &[Value]) -> Result<Option<Value>, String> {
         ("zip", [a, b]) => {
             let (ea, eb) = (to_elements(a)?, to_elements(b)?);
             let n = ea.len().min(eb.len());
-            Value::List(
+            Value::list(
                 (0..n)
                     .map(|i| Value::Tuple(vec![ea[i].clone(), eb[i].clone()]))
                     .collect(),
@@ -3960,7 +4058,7 @@ fn sorted_values(seq: &Value, reverse: bool) -> Result<Value, String> {
             j -= 1;
         }
     }
-    Ok(Value::List(items))
+    Ok(Value::list(items))
 }
 
 fn round_value(v: &Value, ndigits: Option<i64>) -> Result<Value, String> {
@@ -3984,7 +4082,7 @@ fn round_value(v: &Value, ndigits: Option<i64>) -> Result<Value, String> {
 }
 
 fn enumerate_values(seq: &Value, start: i64) -> Result<Value, String> {
-    Ok(Value::List(
+    Ok(Value::list(
         to_elements(seq)?
             .into_iter()
             .enumerate()
@@ -4002,7 +4100,7 @@ fn make_set(v: &Value) -> Result<Value, String> {
             out.push(it);
         }
     }
-    Ok(Value::Set(out))
+    Ok(Value::set(out))
 }
 
 /// A set-theory operation on two sets: `|` union, `&` intersection, `^`
@@ -4011,28 +4109,29 @@ fn set_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     let (Value::Set(a), Value::Set(b)) = (l, r) else {
         return Err(expected_number_bin(op, l, r));
     };
+    let (a, b) = (a.borrow(), b.borrow());
     let in_set = |set: &[Value], v: &Value| set.iter().any(|y| py_eq(y, v));
     let res: Vec<Value> = match op {
         BinOp::BitOr => {
             let mut v = a.clone();
-            for x in b {
+            for x in b.iter() {
                 if !in_set(&v, x) {
                     v.push(x.clone());
                 }
             }
             v
         }
-        BinOp::BitAnd => a.iter().filter(|x| in_set(b, x)).cloned().collect(),
-        BinOp::Sub => a.iter().filter(|x| !in_set(b, x)).cloned().collect(),
+        BinOp::BitAnd => a.iter().filter(|x| in_set(&b, x)).cloned().collect(),
+        BinOp::Sub => a.iter().filter(|x| !in_set(&b, x)).cloned().collect(),
         BinOp::BitXor => a
             .iter()
-            .filter(|x| !in_set(b, x))
-            .chain(b.iter().filter(|x| !in_set(a, x)))
+            .filter(|x| !in_set(&b, x))
+            .chain(b.iter().filter(|x| !in_set(&a, x)))
             .cloned()
             .collect(),
         _ => unreachable!("non-set-op passed to set_binop"),
     };
-    Ok(Value::Set(res))
+    Ok(Value::set(res))
 }
 
 /// `&`/`|`/`^`: a set operation when both sides are sets, else integer bitwise
@@ -4079,7 +4178,10 @@ fn int_shift(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
 /// Whether every element of `a` is in `b` (both must be sets).
 fn set_subset(a: &Value, b: &Value) -> Result<bool, String> {
     match (a, b) {
-        (Value::Set(x), Value::Set(y)) => Ok(x.iter().all(|e| y.iter().any(|f| py_eq(f, e)))),
+        (Value::Set(x), Value::Set(y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
+            Ok(x.iter().all(|e| y.iter().any(|f| py_eq(f, e))))
+        }
         _ => Err("issubset/issuperset need a set argument".to_string()),
     }
 }
@@ -4225,15 +4327,15 @@ fn str_method_val(s: &str, method: &str, args: &[Value]) -> Option<Result<Value,
                 .collect();
             Ok(Value::Str(String::from_utf8(bytes).unwrap()))
         }
-        ("split", []) => Ok(Value::List(
+        ("split", []) => Ok(Value::list(
             s.split_ascii_whitespace()
                 .map(|w| Value::Str(w.to_string()))
                 .collect(),
         )),
         ("split", [sepv]) => match arg_str(sepv, method) {
             Err(e) => Err(e),
-            Ok("") => Ok(Value::List(vec![Value::Str(s.to_string())])),
-            Ok(sep) => Ok(Value::List(
+            Ok("") => Ok(Value::list(vec![Value::Str(s.to_string())])),
+            Ok(sep) => Ok(Value::list(
                 s.split(sep).map(|w| Value::Str(w.to_string())).collect(),
             )),
         },
@@ -4326,10 +4428,11 @@ fn str_method_val(s: &str, method: &str, args: &[Value]) -> Option<Result<Value,
 /// Mutating set methods on the set's elements (the receiver is a set variable).
 /// Returns `None` if `method` isn't a mutating set method.
 fn set_method_mut(
-    items: &mut Vec<Value>,
+    items: &Rc<std::cell::RefCell<Vec<Value>>>,
     method: &str,
     args: &[Value],
 ) -> Option<Result<Value, String>> {
+    let mut items = items.borrow_mut();
     let r = match (method, args) {
         ("add", [v]) => match check_set_elem(v) {
             Err(e) => Err(e),
@@ -4378,7 +4481,10 @@ fn set_method_val(recv: &Value, method: &str, args: &[Value]) -> Option<Result<V
         ("symmetric_difference", [o]) => set_binop(BinOp::BitXor, recv, o),
         ("issubset", [o]) => set_subset(recv, o).map(Value::Bool),
         ("issuperset", [o]) => set_subset(o, recv).map(Value::Bool),
-        ("copy", []) => Ok(recv.clone()),
+        ("copy", []) => match recv {
+            Value::Set(items) => Ok(Value::set(items.borrow().clone())),
+            _ => unreachable!("guarded by the matches! check above"),
+        },
         _ => return None,
     };
     Some(r)
@@ -4448,8 +4554,9 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match (name, args) {
         ("len", [v]) => match v {
             Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-            Value::List(l) | Value::Set(l) | Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
-            Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
+            Value::List(l) | Value::Set(l) => Ok(Value::Int(l.borrow().len() as i64)),
+            Value::Tuple(l) => Ok(Value::Int(l.len() as i64)),
+            Value::Dict(d) => Ok(Value::Int(d.borrow().len() as i64)),
             _ => Err(fill_msg(
                 &crate::messages::TYPE_NO_LEN,
                 &[("type", &type_label(v))],
@@ -4480,13 +4587,13 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
                 .ok_or_else(|| expected_number(v)),
         },
         ("bool", [v]) => Ok(Value::Bool(v.truthy())),
-        ("set", []) => Ok(Value::Set(Vec::new())),
+        ("set", []) => Ok(Value::set(Vec::new())),
         ("set", [v]) => make_set(v),
-        ("list", []) => Ok(Value::List(Vec::new())),
-        ("list", [v]) => Ok(Value::List(to_elements(v)?)),
+        ("list", []) => Ok(Value::list(Vec::new())),
+        ("list", [v]) => Ok(Value::list(to_elements(v)?)),
         ("tuple", []) => Ok(Value::Tuple(Vec::new())),
         ("tuple", [v]) => Ok(Value::Tuple(to_elements(v)?)),
-        ("dict", []) => Ok(Value::Dict(Vec::new())),
+        ("dict", []) => Ok(Value::dict(Vec::new())),
         // Host-capability builtins (seed/report lower to env.* at runtime). The
         // step debugger has no host, so they no-op with a placeholder — the
         // control flow still traces; the real effect happens under Run.
@@ -4535,62 +4642,65 @@ fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<
     let unsupported =
         || format!(".{method}() isn't in the step debugger's call-stack mode yet — use Run");
     match recv {
-        Value::List(items) => match (method, args.as_slice()) {
-            ("append", [v]) => {
-                items.push(v.clone());
-                Ok(Value::None)
-            }
-            ("pop", []) => items
-                .pop()
-                .ok_or_else(|| fill_msg(&crate::messages::INDEX_OUT_OF_RANGE, &[("seq", "list")])),
-            ("pop", [i]) => {
-                let i = as_int(i).ok_or_else(|| expected_number(i))?;
-                let n = items.len() as i64;
-                let real = if i < 0 { i + n } else { i };
-                if real < 0 || real >= n {
-                    return Err(fill_msg(
-                        &crate::messages::INDEX_OUT_OF_RANGE,
-                        &[("seq", "list")],
-                    ));
+        Value::List(items) => {
+            let mut items = items.borrow_mut();
+            match (method, args.as_slice()) {
+                ("append", [v]) => {
+                    items.push(v.clone());
+                    Ok(Value::None)
                 }
-                Ok(items.remove(real as usize))
-            }
-            // Stable insertion sort via `py_lt` — same shape as `sorted()`.
-            ("sort", []) => {
-                for i in 1..items.len() {
-                    let mut j = i;
-                    while j > 0 && py_lt(&items[j], &items[j - 1])? {
-                        items.swap(j, j - 1);
-                        j -= 1;
+                ("pop", []) => items.pop().ok_or_else(|| {
+                    fill_msg(&crate::messages::INDEX_OUT_OF_RANGE, &[("seq", "list")])
+                }),
+                ("pop", [i]) => {
+                    let i = as_int(i).ok_or_else(|| expected_number(i))?;
+                    let n = items.len() as i64;
+                    let real = if i < 0 { i + n } else { i };
+                    if real < 0 || real >= n {
+                        return Err(fill_msg(
+                            &crate::messages::INDEX_OUT_OF_RANGE,
+                            &[("seq", "list")],
+                        ));
                     }
+                    Ok(items.remove(real as usize))
                 }
-                Ok(Value::None)
+                // Stable insertion sort via `py_lt` — same shape as `sorted()`.
+                ("sort", []) => {
+                    for i in 1..items.len() {
+                        let mut j = i;
+                        while j > 0 && py_lt(&items[j], &items[j - 1])? {
+                            items.swap(j, j - 1);
+                            j -= 1;
+                        }
+                    }
+                    Ok(Value::None)
+                }
+                ("reverse", []) => {
+                    items.reverse();
+                    Ok(Value::None)
+                }
+                ("extend", [it]) => {
+                    items.extend(to_elements(it)?);
+                    Ok(Value::None)
+                }
+                ("insert", [idx, v]) => {
+                    let i = as_int(idx).ok_or_else(|| expected_number(idx))?;
+                    let n = items.len() as i64;
+                    let real = i.clamp(0, n);
+                    items.insert(real as usize, v.clone());
+                    Ok(Value::None)
+                }
+                ("count", [v]) => Ok(Value::Int(
+                    items.iter().filter(|x| py_eq(x, v)).count() as i64
+                )),
+                ("index", [v]) => items
+                    .iter()
+                    .position(|x| py_eq(x, v))
+                    .map(|i| Value::Int(i as i64))
+                    .ok_or_else(|| crate::messages::VALUE_NOT_IN_SEQUENCE.text.to_string()),
+                _ => Err(unsupported()),
             }
-            ("reverse", []) => {
-                items.reverse();
-                Ok(Value::None)
-            }
-            ("extend", [it]) => {
-                items.extend(to_elements(it)?);
-                Ok(Value::None)
-            }
-            ("insert", [idx, v]) => {
-                let i = as_int(idx).ok_or_else(|| expected_number(idx))?;
-                let n = items.len() as i64;
-                let real = i.clamp(0, n);
-                items.insert(real as usize, v.clone());
-                Ok(Value::None)
-            }
-            ("count", [v]) => Ok(Value::Int(
-                items.iter().filter(|x| py_eq(x, v)).count() as i64
-            )),
-            ("index", [v]) => items
-                .iter()
-                .position(|x| py_eq(x, v))
-                .map(|i| Value::Int(i as i64))
-                .ok_or_else(|| crate::messages::VALUE_NOT_IN_SEQUENCE.text.to_string()),
-            _ => Err(unsupported()),
-        },
+        }
         // Tuples are immutable, so only the non-mutating element queries apply.
         Value::Tuple(items) => match (method, args.as_slice()) {
             ("count", [v]) => Ok(Value::Int(
@@ -4611,47 +4721,50 @@ fn container_method(recv: &mut Value, method: &str, args: Vec<Value>) -> Result<
             let recv = Value::Set(items.clone());
             set_method_val(&recv, method, &args).unwrap_or_else(|| Err(unsupported()))
         }
-        Value::Dict(pairs) => match (method, args.as_slice()) {
-            ("pop", [k]) => match pairs.iter().position(|(dk, _)| py_eq(dk, k)) {
-                Some(i) => Ok(pairs.remove(i).1),
-                None => Err(fill_msg(
-                    &crate::messages::KEY_MISSING,
-                    &[("key", &k.py_repr())],
-                )),
-            },
-            ("update", [other]) => {
-                let Value::Dict(extra) = other else {
-                    return Err(".update() needs a dict argument".to_string());
-                };
-                for (k, v) in extra {
-                    match pairs.iter_mut().find(|(dk, _)| py_eq(dk, k)) {
-                        Some(slot) => slot.1 = v.clone(),
-                        None => pairs.push((k.clone(), v.clone())),
+        Value::Dict(pairs) => {
+            let mut pairs = pairs.borrow_mut();
+            match (method, args.as_slice()) {
+                ("pop", [k]) => match pairs.iter().position(|(dk, _)| py_eq(dk, k)) {
+                    Some(i) => Ok(pairs.remove(i).1),
+                    None => Err(fill_msg(
+                        &crate::messages::KEY_MISSING,
+                        &[("key", &k.py_repr())],
+                    )),
+                },
+                ("update", [other]) => {
+                    let Value::Dict(extra) = other else {
+                        return Err(".update() needs a dict argument".to_string());
+                    };
+                    for (k, v) in extra.borrow().iter() {
+                        match pairs.iter_mut().find(|(dk, _)| py_eq(dk, k)) {
+                            Some(slot) => slot.1 = v.clone(),
+                            None => pairs.push((k.clone(), v.clone())),
+                        }
                     }
+                    Ok(Value::None)
                 }
-                Ok(Value::None)
-            }
-            ("clear", []) => {
-                pairs.clear();
-                Ok(Value::None)
-            }
-            ("setdefault", [k, default]) => match pairs.iter().find(|(dk, _)| py_eq(dk, k)) {
-                Some((_, v)) => Ok(v.clone()),
-                None => {
-                    pairs.push((k.clone(), default.clone()));
-                    Ok(default.clone())
+                ("clear", []) => {
+                    pairs.clear();
+                    Ok(Value::None)
                 }
-            },
-            ("keys", []) => Ok(Value::List(pairs.iter().map(|(k, _)| k.clone()).collect())),
-            ("values", []) => Ok(Value::List(pairs.iter().map(|(_, v)| v.clone()).collect())),
-            ("items", []) => Ok(Value::List(
-                pairs
-                    .iter()
-                    .map(|(k, v)| Value::Tuple(vec![k.clone(), v.clone()]))
-                    .collect(),
-            )),
-            _ => Err(unsupported()),
-        },
+                ("setdefault", [k, default]) => match pairs.iter().find(|(dk, _)| py_eq(dk, k)) {
+                    Some((_, v)) => Ok(v.clone()),
+                    None => {
+                        pairs.push((k.clone(), default.clone()));
+                        Ok(default.clone())
+                    }
+                },
+                ("keys", []) => Ok(Value::list(pairs.iter().map(|(k, _)| k.clone()).collect())),
+                ("values", []) => Ok(Value::list(pairs.iter().map(|(_, v)| v.clone()).collect())),
+                ("items", []) => Ok(Value::list(
+                    pairs
+                        .iter()
+                        .map(|(k, v)| Value::Tuple(vec![k.clone(), v.clone()]))
+                        .collect(),
+                )),
+                _ => Err(unsupported()),
+            }
+        }
         Value::Str(s) => {
             str_method_val(s.as_str(), method, &args).unwrap_or_else(|| Err(unsupported()))
         }
@@ -5816,23 +5929,17 @@ mod tests {
         (v.output().to_string(), v.status().clone())
     }
 
-    /// **Known bug, not yet fixed**: a list passed into a function and
-    /// mutated there (`xs.append(v)`) does not mutate the caller's list —
-    /// Python shares the list binding, the Vm hands the callee a copy. This
-    /// is the dangerous one: it finishes cleanly with a silently wrong
-    /// answer instead of an error. Once fixed, this assertion should
-    /// change to `"[1]\n"` — if it starts failing here, that's good news,
-    /// update it.
+    /// **Fixed 2026-11-01**: a list passed into a function and mutated
+    /// there (`xs.append(v)`) now mutates the caller's list, matching
+    /// Python's shared-binding semantics — `Value::List` is `Rc`-shared
+    /// (like `Value::Object` already was), so `args[i].clone()` at the
+    /// call-binding site shares the list instead of deep-copying it.
     #[test]
-    fn known_bug_list_mutated_through_function_param_does_not_persist() {
+    fn list_mutated_through_function_param_persists_to_the_caller() {
         let (out, status) =
             run_vm_to_end("def add(xs, v):\n    xs.append(v)\nh = []\nadd(h, 1)\nprint(h)\n");
         assert_eq!(status, Status::Finished);
-        assert_eq!(
-            out, "[]\n",
-            "expected today's bug (caller's list unchanged); got {out:?} — \
-             if this is now \"[1]\\n\", the bug is fixed, update this test"
-        );
+        assert_eq!(out, "[1]\n");
     }
 
     /// **Known bug, not yet fixed**: assigning through a subscript whose
@@ -5871,5 +5978,37 @@ mod tests {
                 "expected today's known rejection, got {other:?} — if this now runs, the bug is fixed, update this test"
             ),
         }
+    }
+
+    /// Binding a list to a second name aliases it — mutating through
+    /// either name is visible through the other, matching Python.
+    #[test]
+    fn two_names_bound_to_one_list_share_mutations_vm() {
+        let (out, status) = run_vm_to_end("h = []\nk = h\nk.append(1)\nprint(h)\nprint(k)\n");
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "[1]\n[1]\n");
+    }
+
+    /// Slicing, `list(x)`, and `+` concatenation must each produce an
+    /// independent list — the representation change that made plain
+    /// binding alias (above) must NOT make an actual copy operation
+    /// alias too.
+    #[test]
+    fn slicing_and_list_and_concat_still_produce_independent_copies_vm() {
+        let (out, status) = run_vm_to_end(
+            "a = [1, 2, 3]\nb = a[0:2]\nb.append(99)\nprint(a)\nc = list(a)\nc.append(99)\nprint(a)\nd = a + []\nd.append(99)\nprint(a)\n",
+        );
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "[1, 2, 3]\n[1, 2, 3]\n[1, 2, 3]\n");
+    }
+
+    /// Same two properties for dicts and sets.
+    #[test]
+    fn dict_and_set_alias_on_bind_but_not_through_dict_and_set_constructors_vm() {
+        let (out, status) = run_vm_to_end(
+            "d1 = {\"x\": 1}\nd2 = d1\nd2[\"x\"] = 2\nprint(d1[\"x\"])\ns1 = {1, 2}\ns2 = s1\ns2.add(3)\nprint(len(s1))\n",
+        );
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "2\n3\n");
     }
 }
