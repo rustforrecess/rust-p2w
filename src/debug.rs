@@ -924,7 +924,8 @@ impl Stepper {
 
     /// Assign into `target[index]` against the step machine's scope.
     fn assign_index(&mut self, target: &Expr, index: Value, value: Value) -> Result<(), String> {
-        assign_index_in(&mut self.scope, target, index, value)
+        let t = self.eval(target)?;
+        assign_index_value(&t, index, value)
     }
 
     fn eval_int(&mut self, e: &Expr, what: &str) -> Result<i64, String> {
@@ -1339,9 +1340,10 @@ impl Stepper {
                 index,
                 value,
             } => {
+                let t = Self::eval_in(funcs, scope, out, target)?;
                 let idx = Self::eval_in(funcs, scope, out, index)?;
                 let val = Self::eval_in(funcs, scope, out, value)?;
-                assign_index_in(scope, target, idx, val)?;
+                assign_index_value(&t, idx, val)?;
                 Ok(Flow::Normal)
             }
             StmtKind::If {
@@ -1447,8 +1449,9 @@ impl Stepper {
                             scope.insert(n.clone(), item);
                         }
                         ExprKind::Index(obj, idx) => {
+                            let t = Self::eval_in(funcs, scope, out, obj)?;
                             let index = Self::eval_in(funcs, scope, out, idx)?;
-                            assign_index_in(scope, obj, index, item)?;
+                            assign_index_value(&t, index, item)?;
                         }
                         _ => {
                             return Err("an unpacking target must be a variable or an index here"
@@ -1470,24 +1473,15 @@ impl Stepper {
     }
 }
 
-/// Assign into `target[index]` in `scope` — a list (int index, negative ok) or a
-/// dict (any key). MVP: `target` must be a simple variable.
-fn assign_index_in(
-    scope: &mut HashMap<String, Value>,
-    target: &Expr,
-    index: Value,
-    value: Value,
-) -> Result<(), String> {
-    let ExprKind::Name(name) = &target.kind else {
-        return Err(
-            "item assignment is only supported on a simple variable in the step debugger yet"
-                .to_string(),
-        );
-    };
-    let slot = scope
-        .get_mut(name)
-        .ok_or_else(|| format!("name '{name}' is not defined"))?;
-    match slot {
+/// Assign into `target[index] = value`, where `target` is an already-
+/// evaluated value (a list or a dict — int index, negative ok, for a list;
+/// any key for a dict). Works for ANY target expression, not just a bare
+/// variable: `target` was evaluated like any other expression before this
+/// runs, so `obj.attr[i] = v` arrives here holding the attribute's own
+/// `Rc`-shared container — mutating it through `.borrow_mut()` here is
+/// already mutating the real object's attribute, no write-back needed.
+fn assign_index_value(target: &Value, index: Value, value: Value) -> Result<(), String> {
+    match target {
         Value::List(items) => {
             let mut items = items.borrow_mut();
             let i = as_int(&index).ok_or_else(|| expected_number(&index))?;
@@ -1881,8 +1875,16 @@ enum Task {
     Ternary(Rc<Expr>, Rc<Expr>),
     /// Pop a value and bind it to a name in the current scope.
     Store(String),
-    /// Pop an iterable value and bind its elements to these names (one each).
-    Unpack(Vec<String>),
+    /// Push an already-known value — for stitching a pre-resolved value
+    /// into an operand-stack sequence built from other, still-pending
+    /// `Eval` tasks (see `Task::Unpack`'s index-target case).
+    Push(Value),
+    /// Pop an iterable value, then assign its elements to these targets
+    /// (one each). A `Name` target binds directly; anything else (e.g. an
+    /// `Index` target, for `a[i], a[j] = a[j], a[i]`) schedules its own
+    /// `obj`/`index` evaluation followed by `StoreIndex`, exactly like a
+    /// single `target[index] = value` statement would.
+    Unpack(Vec<Expr>),
     /// Pop the reverse flag then the sequence; push `sorted(seq, reverse=…)`.
     SortedKw,
     /// Pop one argument; push `math.<func>(arg)`.
@@ -1938,8 +1940,11 @@ enum Task {
         idx: usize,
         body: Rc<Vec<Stmt>>,
     },
-    /// Pop value then index; assign `name[index] = value`.
-    StoreIndex(String),
+    /// Pop value, then index, then target; assign `target[index] = value`.
+    /// `target` is evaluated like any other expression (so `obj.attr[i] = v`
+    /// mutates through the SAME `Rc`-shared container the attribute holds,
+    /// not a scope slot) — no restriction to a bare name.
+    StoreIndex,
     /// Pop the (discarded) __init__ return and push the constructed instance.
     ReplaceTop(Value),
     /// Pop an instance; push its attribute's value.
@@ -2389,14 +2394,10 @@ impl Vm {
                 index,
                 value,
             } => {
-                let ExprKind::Name(name) = &target.kind else {
-                    return Err(
-                        "item assignment needs a simple variable (e.g. xs[i] = ..) yet".to_string(),
-                    );
-                };
-                self.push_task(Task::StoreIndex(name.clone()));
+                self.push_task(Task::StoreIndex);
                 self.push_task(Task::Eval(Rc::new(value.clone())));
                 self.push_task(Task::Eval(Rc::new(index.clone())));
+                self.push_task(Task::Eval(Rc::new(target.clone())));
             }
             StmtKind::ClassDef {
                 name,
@@ -2500,20 +2501,10 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new(obj.clone())));
             }
             StmtKind::UnpackAssign { targets, value } => {
-                // `a, b = value` / `for k, v in …`. Targets are simple names in
-                // the K-12 forms (tuple/dict iteration, enumerate/zip); the
-                // Unpack task binds each after the value is evaluated.
-                let mut names = Vec::with_capacity(targets.len());
-                for t in targets {
-                    let ExprKind::Name(n) = &t.kind else {
-                        return Err(
-                            "tuple unpacking to non-variable targets isn't in call-stack mode yet — use Run"
-                                .to_string(),
-                        );
-                    };
-                    names.push(n.clone());
-                }
-                self.push_task(Task::Unpack(names));
+                // `a, b = value` / `for k, v in …`, and also the swap idiom
+                // `a[i], a[j] = a[j], a[i]` — see Task::Unpack for how a
+                // non-Name target is handled.
+                self.push_task(Task::Unpack(targets.clone()));
                 self.push_task(Task::Eval(Rc::new(value.clone())));
             }
             StmtKind::Import(names) => {
@@ -2584,14 +2575,29 @@ impl Vm {
                 let v = self.pop_op()?;
                 self.top().scope.insert(name, v);
             }
-            Task::Unpack(names) => {
+            Task::Push(v) => self.push_op(v),
+            Task::Unpack(targets) => {
                 let v = self.pop_op()?;
                 let items = to_elements(&v)?;
-                if items.len() != names.len() {
+                if items.len() != targets.len() {
                     return Err(crate::messages::VALUE_UNPACK_COUNT.text.into());
                 }
-                for (name, item) in names.into_iter().zip(items) {
-                    self.top().scope.insert(name, item);
+                for (target, item) in targets.into_iter().zip(items) {
+                    match target.kind {
+                        ExprKind::Name(n) => {
+                            self.top().scope.insert(n, item);
+                        }
+                        ExprKind::Index(obj, idx) => {
+                            self.push_task(Task::StoreIndex);
+                            self.push_task(Task::Push(item));
+                            self.push_task(Task::Eval(Rc::new(*idx)));
+                            self.push_task(Task::Eval(Rc::new(*obj)));
+                        }
+                        _ => {
+                            return Err("an unpacking target must be a variable or an index here"
+                                .to_string());
+                        }
+                    }
                 }
             }
             Task::SortedKw => {
@@ -2842,15 +2848,11 @@ impl Vm {
                     self.push_task(Task::Next(body, 0));
                 }
             }
-            Task::StoreIndex(name) => {
+            Task::StoreIndex => {
                 let value = self.pop_op()?;
                 let index = self.pop_op()?;
-                let target = Expr {
-                    kind: ExprKind::Name(name),
-                    line: 0,
-                    span: (0, 0),
-                };
-                assign_index_in(&mut self.top().scope, &target, index, value)?;
+                let target = self.pop_op()?;
+                assign_index_value(&target, index, value)?;
             }
             Task::ReplaceTop(v) => {
                 self.pop_op()?; // the discarded __init__ return value
@@ -5947,19 +5949,12 @@ mod tests {
     /// even though reading `obj.attr[i]` and calling `obj.attr.append(v)`
     /// both work. Once fixed, this should run cleanly instead of erroring.
     #[test]
-    fn known_bug_item_assignment_through_attribute_subscript_is_rejected() {
-        let (_out, status) = run_vm_to_end(
+    fn item_assignment_through_attribute_subscript_works() {
+        let (out, status) = run_vm_to_end(
             "class Node:\n    def __init__(self):\n        self.children = [1, 2, 3]\nn = Node()\nn.children[0] = 9\nprint(n.children)\n",
         );
-        match status {
-            Status::Error { message, .. } => assert!(
-                message.contains("item assignment needs a simple variable"),
-                "expected today's rejection message, got: {message}"
-            ),
-            other => panic!(
-                "expected today's known rejection, got {other:?} — if this now runs, the bug is fixed, update this test"
-            ),
-        }
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "[9, 2, 3]\n");
     }
 
     /// **Known bug, not yet fixed**: unpacking into subscript targets
@@ -5967,17 +5962,21 @@ mod tests {
     /// at plain module level, not just inside a function call despite the
     /// error message's "call-stack mode" wording.
     #[test]
-    fn known_bug_tuple_unpack_into_subscript_targets_is_rejected() {
-        let (_out, status) = run_vm_to_end("a = [1, 2, 3]\na[0], a[1] = a[1], a[0]\nprint(a)\n");
-        match status {
-            Status::Error { message, .. } => assert!(
-                message.contains("tuple unpacking to non-variable targets"),
-                "expected today's rejection message, got: {message}"
-            ),
-            other => panic!(
-                "expected today's known rejection, got {other:?} — if this now runs, the bug is fixed, update this test"
-            ),
-        }
+    fn tuple_unpack_into_subscript_targets_swaps_correctly() {
+        let (out, status) = run_vm_to_end("a = [1, 2, 3]\na[0], a[1] = a[1], a[0]\nprint(a)\n");
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "[2, 1, 3]\n");
+    }
+
+    /// The swap idiom still works from inside a function call (`call-stack
+    /// mode`, the case the old rejection message specifically named).
+    #[test]
+    fn tuple_unpack_into_subscript_targets_swaps_correctly_inside_a_function() {
+        let (out, status) = run_vm_to_end(
+            "def swap(a):\n    a[0], a[1] = a[1], a[0]\na = [1, 2, 3]\nswap(a)\nprint(a)\n",
+        );
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "[2, 1, 3]\n");
     }
 
     /// Binding a list to a second name aliases it — mutating through
@@ -6010,5 +6009,29 @@ mod tests {
         );
         assert_eq!(status, Status::Finished);
         assert_eq!(out, "2\n3\n");
+    }
+
+    /// The same generalized assignment-target path for a dict attribute,
+    /// not just a list — `assign_index_value` doesn't special-case either
+    /// container type by how its target expression was spelled.
+    #[test]
+    fn item_assignment_through_a_dict_attribute_works() {
+        let (out, status) = run_vm_to_end(
+            "class Node:\n    def __init__(self):\n        self.fields = {\"x\": 1}\nn = Node()\nn.fields[\"x\"] = 2\nprint(n.fields[\"x\"])\n",
+        );
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "2\n");
+    }
+
+    /// A doubly-nested subscript target (`a[0][1] = v`) — `target` here is
+    /// itself an `Index` expression, not a bare name or an attribute,
+    /// confirming `assign_index_value` really does work for ANY expression
+    /// that evaluates to a mutable container, not just the two shapes the
+    /// fix specifically set out to unblock.
+    #[test]
+    fn nested_subscript_assignment_works_vm() {
+        let (out, status) = run_vm_to_end("a = [[1, 2], [3, 4]]\na[0][1] = 99\nprint(a)\n");
+        assert_eq!(status, Status::Finished);
+        assert_eq!(out, "[[1, 99], [3, 4]]\n");
     }
 }
