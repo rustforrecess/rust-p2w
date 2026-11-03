@@ -174,8 +174,68 @@ impl Builder {
                 else_body,
             } => Some(self.build_if(s.line, cond, body, elifs, else_body.as_deref())),
             StmtKind::While { cond, body } => Some(self.build_while(s.line, cond, body)),
+            StmtKind::ForEach { iterable, body, .. } => {
+                Some(self.build_foreach(s.line, iterable, body))
+            }
+            // `For` (the counted `for var in range(...)` form) is deferred,
+            // not merely unsequenced: the parser destructures it into
+            // separate `start`/`end`/`step` `Expr`s and keeps no span for
+            // the statement itself or for the original `range(...)` call
+            // (confirmed by reading `parser.rs` — both synthesized-literal
+            // fields and the statement's own `span` come back `(0, 0)` when
+            // an argument is omitted). There's no real source text to slice
+            // a Decision label from without re-serializing — exactly the
+            // thing this module's own doc comment on `Action`/`Decision`
+            // rules out. Needs a parser-side span fix first, not a
+            // workaround here.
+            //
+            // `Break`/`Continue` are deferred for a different reason: they
+            // jump to a node (the enclosing loop's `exit` or back to its
+            // `Decision`) that lives in an OUTER `Activity` once they're
+            // nested inside another `Structured` node's own body (e.g. an
+            // `if` inside a `while`) — this IR's nested bodies are each a
+            // self-contained `Activity` with their own local `NodeId`
+            // space (see `flatten_and_layout`'s own doc comment), so a
+            // `Break` built from inside that inner body has no local id
+            // for the outer loop's `exit` to connect to. Needs a design
+            // decision (thread a non-local target through nested builds,
+            // or flatten differently) before implementing, not a hack
+            // that only works for the unnested case.
+            StmtKind::For { .. } | StmtKind::Break | StmtKind::Continue => None,
             _ => None,
         }
+    }
+
+    /// `for var in iterable: ...` — like `build_while`, but the Decision's
+    /// label is the iterable's own source text (there's no boolean
+    /// condition to slice a span from), roughly "more items in `iterable`?"
+    fn build_foreach(&mut self, line: usize, iterable: &Expr, body: &[Stmt]) -> (NodeId, NodeId) {
+        let mut inner = Builder::default();
+        let decision = inner.push(ActivityNode::Decision(iterable.span), line);
+        let exit = inner.push(ActivityNode::Merge, line);
+        match inner.block(body) {
+            Some((entry, tail)) => {
+                inner.connect(decision, entry, Some(Guard::Cond(iterable.span)));
+                inner.connect(tail, decision, None);
+            }
+            None => inner.connect(decision, decision, Some(Guard::Cond(iterable.span))),
+        }
+        inner.connect(decision, exit, Some(Guard::Else));
+        let body_activity = Activity {
+            nodes: inner.nodes,
+            edges: inner.edges,
+            initial: decision,
+            finals: vec![exit],
+        };
+        let node = self.push(
+            ActivityNode::Structured {
+                stereotype: Stereotype::Loop,
+                setup: None,
+                body: body_activity,
+            },
+            line,
+        );
+        (node, node)
     }
 
     fn build_if(
@@ -711,5 +771,78 @@ mod tests {
         let a = build_src("while x > 0:\n    x = x - 1\n");
         let (nodes, _edges, positions) = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
+    }
+
+    #[test]
+    fn a_foreach_loop_is_a_structured_loop_with_a_back_edge() {
+        let a = build_src("for x in xs:\n    y = x\n");
+        let ActivityNode::Structured {
+            stereotype, body, ..
+        } = structured(&a)
+        else {
+            unreachable!()
+        };
+        assert_eq!(*stereotype, Stereotype::Loop);
+        // Decision, Merge (the loop's own exit), one Action for the body.
+        assert_eq!(body.nodes.len(), 3);
+        let decision_id = body
+            .nodes
+            .iter()
+            .find(|n| matches!(n.kind, ActivityNode::Decision(_)))
+            .unwrap()
+            .id;
+        assert!(
+            body.edges
+                .iter()
+                .any(|e| e.to == decision_id && e.guard.is_none())
+        );
+    }
+
+    #[test]
+    fn an_empty_foreach_body_is_a_self_loop_not_a_crash() {
+        let a = build_src("for x in xs:\n    pass\n");
+        let ActivityNode::Structured { body, .. } = structured(&a) else {
+            unreachable!()
+        };
+        let decision_id = body
+            .nodes
+            .iter()
+            .find(|n| matches!(n.kind, ActivityNode::Decision(_)))
+            .unwrap()
+            .id;
+        assert!(
+            body.edges
+                .iter()
+                .any(|e| e.from == decision_id && e.to == decision_id)
+        );
+    }
+
+    #[test]
+    fn a_foreach_loop_flattens_and_lays_out_without_crashing() {
+        let a = build_src("for x in xs:\n    y = x\n");
+        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        assert_eq!(positions.len(), nodes.len());
+    }
+
+    /// Counted `for`, `break`, and `continue` are deferred (see `stmt`'s own
+    /// doc comment on why) — confirm they're a graceful `None`, not a panic,
+    /// so a program using them still renders everything around them.
+    #[test]
+    fn deferred_statement_kinds_are_skipped_not_a_crash() {
+        let a = build_src("x = 1\nfor i in range(3):\n    print(i)\ny = 2\n");
+        // x=1 and y=2 survive as Actions; the counted for is skipped.
+        assert_eq!(
+            a.nodes
+                .iter()
+                .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+                .count(),
+            2
+        );
+        assert!(
+            a.nodes
+                .iter()
+                .all(|n| !matches!(n.kind, ActivityNode::Structured { .. })),
+            "a deferred statement kind should produce no node at all, not a broken one"
+        );
     }
 }
