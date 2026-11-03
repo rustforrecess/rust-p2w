@@ -17,12 +17,12 @@
 //!
 //! **Narrow slice, deliberately**: `Assign`/`AnnAssign`/`SetIndex`/
 //! `SetAttr`/`UnpackAssign`/bare `Expr` as plain `Action`s, `If`/`While`/
-//! `ForEach` as `Structured` nodes, `Break`/`Continue` as a routing
-//! decision on an enclosing block's tail rather than a node of their own
-//! (see `ControlFlow`'s `Target` and `Builder::block`'s doc comments).
-//! Counted `for` (parser span gap), `Return`/`Pass`/`Def`/`ClassDef`/
-//! `Method` are a deliberately sequenced follow-up, so this can be
-//! verified end to end on a small slice before expanding.
+//! `ForEach`/`For` (counted) as `Structured` nodes, `Break`/`Continue` as
+//! a routing decision on an enclosing block's tail rather than a node of
+//! their own (see `ControlFlow`'s `Target` and `Builder::block`'s doc
+//! comments). `Return`/`Pass`/`Def`/`ClassDef`/`Method` are a
+//! deliberately sequenced follow-up, so this can be verified end to end
+//! on a small slice before expanding.
 
 use crate::ast::{Expr, Span, Stmt, StmtKind};
 
@@ -251,18 +251,13 @@ impl Builder {
             StmtKind::ForEach { iterable, body, .. } => {
                 Some(self.build_foreach(s.line, iterable, body))
             }
-            // `For` (the counted `for var in range(...)` form) is deferred,
-            // not merely unsequenced: the parser destructures it into
-            // separate `start`/`end`/`step` `Expr`s and keeps no span for
-            // the statement itself or for the original `range(...)` call
-            // (confirmed by reading `parser.rs` — both synthesized-literal
-            // fields and the statement's own `span` come back `(0, 0)` when
-            // an argument is omitted). There's no real source text to slice
-            // a Decision label from without re-serializing — exactly the
-            // thing this module's own doc comment on `Action`/`Decision`
-            // rules out. Needs a parser-side span fix first, not a
-            // workaround here.
-            //
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => Some(self.build_for(s.line, var, start, end, step, body)),
             // `Break`/`Continue` are handled one level up, by `block()`
             // itself (see its own doc comment) — they produce no node
             // and change how the *block* wires its own tail, which
@@ -270,7 +265,7 @@ impl Builder {
             // `block()` intercepts them before ever calling `stmt()`, so
             // this arm is unreachable in practice; it exists only so the
             // match stays exhaustive.
-            StmtKind::For { .. } | StmtKind::Break | StmtKind::Continue => None,
+            StmtKind::Break | StmtKind::Continue => None,
             _ => None,
         }
     }
@@ -321,6 +316,76 @@ impl Builder {
             ActivityNode::Structured {
                 stereotype: Stereotype::Loop,
                 setup: None,
+                body: body_activity,
+            },
+            line,
+        );
+        (node, node)
+    }
+
+    /// `for var in range(start, end, step): ...` — the counted fast path.
+    /// Shaped like `build_while`/`build_foreach`, with `end`'s own span as
+    /// the Decision's label (`end` is always a genuinely parsed `Expr` —
+    /// the only positional form the parser accepts, `range(end)`, still
+    /// parses it as a real expression; `start`/`step` are what get
+    /// synthesized when omitted). `LoopSetup` carries all three spans on
+    /// the outer `Structured` node for a renderer that wants the full
+    /// `for var in range(...)` text — `start`/`step` there CAN be the
+    /// synthesized placeholder's `(0, 0)` span when omitted (confirmed by
+    /// running the parser, not assumed), same "no real source text here,
+    /// fall back to a minimal hand-written label" situation this design's
+    /// own `with`-desugar note already accepted, not a new problem.
+    fn build_for(
+        &mut self,
+        line: usize,
+        var: &str,
+        start: &Expr,
+        end: &Expr,
+        step: &Expr,
+        body: &[Stmt],
+    ) -> (NodeId, NodeId) {
+        let mut inner = Builder::default();
+        let decision = inner.push(ActivityNode::Decision(end.span), line);
+        let exit = inner.push(ActivityNode::Merge, line);
+        match inner.block(body) {
+            BlockOutcome::Flows(entry, tail) => {
+                inner.connect(decision, Target::Local(entry), Some(Guard::Cond(end.span)));
+                inner.connect(tail, Target::Local(decision), None);
+            }
+            BlockOutcome::Empty => {
+                inner.connect(
+                    decision,
+                    Target::Local(decision),
+                    Some(Guard::Cond(end.span)),
+                );
+            }
+            // The body always diverges (e.g. `for i in range(n): break`) —
+            // no back-edge; the divert was already wired above by
+            // `block`, or (if it was the very first thing) wired right
+            // here.
+            BlockOutcome::Diverts(Some(entry), _) => {
+                inner.connect(decision, Target::Local(entry), Some(Guard::Cond(end.span)));
+            }
+            BlockOutcome::Diverts(None, target) => {
+                inner.connect(decision, target, Some(Guard::Cond(end.span)));
+            }
+        }
+        inner.connect(decision, Target::Local(exit), Some(Guard::Else));
+        let body_activity = Activity {
+            nodes: inner.nodes,
+            edges: inner.edges,
+            initial: decision,
+            finals: vec![exit],
+        };
+        let node = self.push(
+            ActivityNode::Structured {
+                stereotype: Stereotype::Loop,
+                setup: Some(LoopSetup {
+                    var: var.to_string(),
+                    start: start.span,
+                    end: end.span,
+                    step: step.span,
+                }),
                 body: body_activity,
             },
             line,
@@ -1014,13 +1079,81 @@ mod tests {
         assert_eq!(positions.len(), nodes.len());
     }
 
-    /// Counted `for` is deferred (see `stmt`'s own doc comment on why) —
+    #[test]
+    fn a_counted_for_is_a_structured_loop_carrying_its_loop_setup() {
+        let a = build_src("for i in range(3):\n    y = i\n");
+        let ActivityNode::Structured {
+            stereotype, setup, ..
+        } = structured(&a)
+        else {
+            unreachable!()
+        };
+        assert_eq!(*stereotype, Stereotype::Loop);
+        let setup = setup.as_ref().expect("counted for must carry a LoopSetup");
+        assert_eq!(setup.var, "i");
+        // `range(3)` — a single positional arg is `end`; `start`/`step`
+        // are synthesized defaults with no real source to point at.
+        assert_eq!(setup.start.0, 0);
+        assert_eq!(setup.start.1, 0);
+        assert_eq!(setup.step.0, 0);
+        assert_eq!(setup.step.1, 0);
+        assert_ne!(setup.end, (0, 0), "end is always a real parsed Expr");
+    }
+
+    #[test]
+    fn a_counted_for_s_three_arg_range_gives_every_field_a_real_span() {
+        let a = build_src("for i in range(1, 6, 2):\n    y = i\n");
+        let ActivityNode::Structured { setup, .. } = structured(&a) else {
+            unreachable!()
+        };
+        let setup = setup.as_ref().unwrap();
+        assert_ne!(setup.start, (0, 0));
+        assert_ne!(setup.end, (0, 0));
+        assert_ne!(setup.step, (0, 0));
+    }
+
+    #[test]
+    fn a_counted_for_flattens_and_lays_out_without_crashing() {
+        let a = build_src("for i in range(3):\n    y = i\n");
+        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        assert_eq!(positions.len(), nodes.len());
+    }
+
+    #[test]
+    fn break_inside_a_counted_for_resolves_to_its_exit() {
+        // The same cross-Activity-boundary case already covered for
+        // while/for-each, now exercised on the newly-built counted for.
+        let a = build_src(
+            "for i in range(10):\n    if arr[i] == target:\n        found = i\n        break\n",
+        );
+        let (nodes, edges, positions) = flatten_and_layout(&a);
+        assert_eq!(positions.len(), nodes.len());
+        let exit_id = nodes
+            .iter()
+            .find(|n| {
+                matches!(n.kind, ActivityNode::Merge) && {
+                    let froms: std::collections::HashSet<_> = edges
+                        .iter()
+                        .filter(|e| e.to == n.id)
+                        .map(|e| e.from)
+                        .collect();
+                    froms.len() >= 2
+                }
+            })
+            .map(|n| n.id);
+        assert!(
+            exit_id.is_some(),
+            "the break and the loop's own Else path must both resolve to the same exit"
+        );
+    }
+
+    /// `Def` is still deferred (see the module's own doc comment on why) —
     /// confirm it's a graceful `None`, not a panic, so a program using it
     /// still renders everything around it.
     #[test]
     fn deferred_statement_kinds_are_skipped_not_a_crash() {
-        let a = build_src("x = 1\nfor i in range(3):\n    print(i)\ny = 2\n");
-        // x=1 and y=2 survive as Actions; the counted for is skipped.
+        let a = build_src("x = 1\ndef f():\n    pass\ny = 2\n");
+        // x=1 and y=2 survive as Actions; the def is skipped.
         assert_eq!(
             a.nodes
                 .iter()
