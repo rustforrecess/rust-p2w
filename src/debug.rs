@@ -2111,17 +2111,7 @@ impl Vm {
 
     /// Variables in the current (innermost) frame, sorted, sans temporaries.
     pub fn variables(&self) -> Vec<(String, String)> {
-        let Some(frame) = self.frames.last() else {
-            return Vec::new();
-        };
-        let mut out: Vec<(String, String)> = frame
-            .scope
-            .iter()
-            .filter(|(n, _)| !n.contains('.'))
-            .map(|(n, v)| (n.clone(), v.py_repr()))
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        self.variables_at(0).unwrap_or_default()
     }
 
     /// Evaluate a watch expression against the current frame (read-only; no calls
@@ -2336,7 +2326,6 @@ impl Vm {
             }
             StmtKind::While { cond, body } => {
                 self.push_task(Task::WhileHead(
-                ..
                     Rc::new(cond.clone()),
                     Rc::new(body.clone()),
                 ));
@@ -2347,6 +2336,7 @@ impl Vm {
                 end,
                 step,
                 body,
+                ..
             } => {
                 self.push_task(Task::ForSetup(var.clone(), Rc::new(body.clone())));
                 self.push_task(Task::Eval(Rc::new(step.clone())));
@@ -2354,7 +2344,6 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new(start.clone())));
             }
             StmtKind::Break => self.push_task(Task::Break),
-                        full_span: (0, 0),
             StmtKind::Continue => self.push_task(Task::Continue),
             StmtKind::Pass => {}
             StmtKind::Return(opt) => {
@@ -2365,6 +2354,7 @@ impl Vm {
                         kind: ExprKind::NoneLit,
                         line: s.line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     },
                 };
                 self.push_task(Task::Eval(Rc::new(e)));
@@ -2864,45 +2854,8 @@ impl Vm {
             }
             Task::AttrGet(attr) => {
                 let v = self.pop_op()?;
-                let Value::Object(o) = &v else {
-                    return Err(fill_msg(
-                        &crate::messages::ATTR_MISSING,
-                        &[("type", &type_label(&v)), ("name", &attr)],
-                    ));
-                };
-                // Instance attrs shadow class variables; the fallback walks
-                // the inheritance chain (nearest class first).
-                if let Some(got) = o.attrs.borrow().get(&attr).cloned() {
-                    self.push_op(got);
-                    return Ok(());
-                }
-                let mut cur = Some(o.class.clone());
-                let mut hops = 0;
-                while let Some(cname) = cur {
-                    hops += 1;
-                    if hops > self.classes.len() + 1 {
-                        break;
-                    }
-                    let Some(c) = self.classes.get(&cname) else {
-                        break;
-                    };
-                    if let Some(cv) = c.class_vars.get(&attr) {
-                        let cv = cv.clone();
-                        self.push_op(cv);
-                        return Ok(());
-                    }
-                    if c.methods.contains_key(&attr) {
-                        return Err(fill_msg(
-                            &crate::messages::TYPE_METHOD_AS_VALUE,
-                            &[("name", &attr)],
-                        ));
-                    }
-                    cur = c.base.clone();
-                }
-                return Err(fill_msg(
-                    &crate::messages::ATTR_MISSING,
-                    &[("type", &o.class), ("name", &attr)],
-                ));
+                let got = self.get_attr(&v, &attr)?;
+                self.push_op(got);
             }
             Task::StoreAttr(attr) => {
                 let value = self.pop_op()?;
@@ -3696,9 +3649,116 @@ impl Vm {
                 }
                 Ok(Value::dict(out))
             }
+            ExprKind::Attr(obj, name) => self.get_attr(&self.watch_eval(obj)?, name),
             _ => Err("that watch isn't supported in call-stack mode yet".to_string()),
         }
     }
+
+    /// Read an attribute: instance attrs shadow class variables, then the
+    /// inheritance chain is searched, nearest class first.
+    fn get_attr(&self, v: &Value, attr: &str) -> Result<Value, String> {
+        let Value::Object(o) = v else {
+            return Err(fill_msg(
+                &crate::messages::ATTR_MISSING,
+                &[("type", &type_label(v)), ("name", attr)],
+            ));
+        };
+        if let Some(got) = o.attrs.borrow().get(attr).cloned() {
+            return Ok(got);
+        }
+        let mut cur = Some(o.class.clone());
+        let mut hops = 0;
+        while let Some(cname) = cur {
+            hops += 1;
+            if hops > self.classes.len() + 1 {
+                break;
+            }
+            let Some(c) = self.classes.get(&cname) else {
+                break;
+            };
+            if let Some(cv) = c.class_vars.get(attr) {
+                return Ok(cv.clone());
+            }
+            if c.methods.contains_key(attr) {
+                return Err(fill_msg(
+                    &crate::messages::TYPE_METHOD_AS_VALUE,
+                    &[("name", attr)],
+                ));
+            }
+            cur = c.base.clone();
+        }
+        Err(fill_msg(
+            &crate::messages::ATTR_MISSING,
+            &[("type", &o.class), ("name", attr)],
+        ))
+    }
+
+    /// Evaluate a watch to an instance and list its fields, sorted by name.
+    /// `id`s let a caller spot a cycle such as a node's `.parent`. They're
+    /// addresses, so compare them only within one paused state.
+    pub fn watch_object_fields(&self, src: &str) -> Result<ObjectFields, String> {
+        let tokens = crate::lexer::lex(src).map_err(|e| e.to_string())?;
+        let expr = crate::parser::parse_expression(&tokens).map_err(|e| e.to_string())?;
+        let v = self.watch_eval(&expr)?;
+        let Value::Object(o) = &v else {
+            return Err(format!("{} is not an instance", v.py_repr()));
+        };
+        let mut fields: Vec<(String, FieldValue)> = o
+            .attrs
+            .borrow()
+            .iter()
+            .map(|(k, fv)| (k.clone(), FieldValue::from(fv)))
+            .collect();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(ObjectFields {
+            class: o.class.clone(),
+            id: Rc::as_ptr(o) as usize,
+            fields,
+        })
+    }
+
+    /// Variables in frame `depth`, sorted, sans temporaries. 0 is the
+    /// innermost, matching `call_stack`. `None` if out of range.
+    pub fn variables_at(&self, depth: usize) -> Option<Vec<(String, String)>> {
+        let frame = self.frames.iter().rev().nth(depth)?;
+        let mut out: Vec<(String, String)> = frame
+            .scope
+            .iter()
+            .filter(|(n, _)| !n.contains('.'))
+            .map(|(n, v)| (n.clone(), v.py_repr()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(out)
+    }
+}
+
+/// A field in [`ObjectFields`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    /// Any non-instance value, as its repr.
+    Scalar(String),
+    /// An instance, which a caller can expand.
+    Object { class: String, id: usize },
+}
+
+impl From<&Value> for FieldValue {
+    fn from(v: &Value) -> Self {
+        match v {
+            Value::Object(o) => FieldValue::Object {
+                class: o.class.clone(),
+                id: Rc::as_ptr(o) as usize,
+            },
+            other => FieldValue::Scalar(other.py_repr()),
+        }
+    }
+}
+
+/// An instance as returned by [`Vm::watch_object_fields`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectFields {
+    pub class: String,
+    pub id: usize,
+    pub fields: Vec<(String, FieldValue)>,
 }
 
 /// Set members must be immutable (hashable). A list/dict/set can change, so it
@@ -5312,6 +5372,73 @@ mod tests {
             vm.status()
         );
         vm.output().to_string()
+    }
+
+    #[test]
+    fn watch_reads_attribute_chains_object_fields_and_outer_frame_locals() {
+        let mut vm = Vm::new(
+            "class Node:\n    def __init__(self, key):\n        self.key = key\n        self.left = None\n        self.parent = None\n\
+             def rebalance_up(n):\n    old = n.key\n    return old\n\
+             def update(start):\n    cur = start\n    return rebalance_up(cur)\n\
+             low = Node(5)\ntop = Node(9)\ntop.left = low\nlow.parent = top\nprint(update(top))\n",
+        )
+        .expect("parse");
+
+        let mut guard = 0;
+        while !vm
+            .variables_at(0)
+            .is_some_and(|vs| vs.iter().any(|(n, _)| n == "old"))
+        {
+            assert!(vm.is_paused(), "finished without reaching rebalance_up");
+            vm.step();
+            guard += 1;
+            assert!(guard < 1000, "ran away");
+        }
+
+        assert_eq!(vm.eval_watch("n.key").unwrap(), "9");
+        assert_eq!(vm.eval_watch("n.left.key").unwrap(), "5");
+        assert!(vm.eval_watch("n.nope").is_err());
+
+        // 0 = rebalance_up, 1 = update, 2 = <module>, same order as call_stack().
+        let names = |d: usize| -> Vec<String> {
+            vm.variables_at(d)
+                .unwrap()
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        assert_eq!(names(0), vec!["n", "old"]);
+        assert_eq!(names(1), vec!["cur", "start"]);
+        assert!(names(2).contains(&"top".to_string()));
+        assert_eq!(vm.variables_at(3), None);
+        assert_eq!(vm.call_stack()[1].0, "update");
+
+        let n = vm.watch_object_fields("n").unwrap();
+        assert_eq!(n.class, "Node");
+        let field = |o: &ObjectFields, name: &str| {
+            o.fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(field(&n, "key"), FieldValue::Scalar("9".to_string()));
+        assert_eq!(field(&n, "parent"), FieldValue::Scalar("None".to_string()));
+        let FieldValue::Object { class, id: left_id } = field(&n, "left") else {
+            panic!("left should be an instance");
+        };
+        assert_eq!(class, "Node");
+
+        // The cycle identity exists for: n.left.parent IS n.
+        let left = vm.watch_object_fields("n.left").unwrap();
+        assert_eq!(left.id, left_id);
+        assert_ne!(left.id, n.id);
+        let FieldValue::Object { id: back, .. } = field(&left, "parent") else {
+            panic!("parent should be an instance");
+        };
+        assert_eq!(back, n.id);
+
+        assert!(vm.watch_object_fields("n.key").is_err());
     }
 
     #[test]
