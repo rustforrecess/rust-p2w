@@ -2,7 +2,7 @@
 //!
 //! Pass 1 (`build`, `build_program`) turns statements into an `Activity`,
 //! with each `if`/loop body nested in a `Structured` node. Pass 2
-//! (`flatten_and_layout`) flattens that into one positioned graph.
+//! (`flatten`, then `layout`) turns that into one positioned graph.
 //!
 //! The IR follows the OMG metamodel: `Decision` and `Merge` are separate
 //! metaclasses, and an edge has no "kind". A back-edge or a `break` is just
@@ -403,8 +403,15 @@ pub struct FlatEdge {
     pub guard: Option<Guard>,
 }
 
-/// A positioned graph, with no UI types: a renderer converts the plain
-/// `(x, y)` pairs itself.
+/// A flattened graph with no positions, so any layout can be applied to it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FlatGraph {
+    pub nodes: Vec<FlatNode>,
+    pub edges: Vec<FlatEdge>,
+}
+
+/// A graph plus positions. They're plain `(x, y)` pairs, so a renderer
+/// converts them itself and a 3D view can use its own layout instead.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FlatActivity {
     pub nodes: Vec<FlatNode>,
@@ -412,20 +419,26 @@ pub struct FlatActivity {
     pub positions: HashMap<usize, (f64, f64)>,
 }
 
-/// Pass 2: flatten `activity` and its nested bodies into one graph, laying
-/// out each node as it goes.
+/// Pass 2 with the default 2D layout.
+pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
+    let graph = flatten(activity);
+    let positions = layout(&graph);
+    FlatActivity {
+        nodes: graph.nodes,
+        edges: graph.edges,
+        positions,
+    }
+}
+
+/// Flatten `activity` and its nested bodies into one graph.
 ///
 /// A `Structured` node is spliced out: edges into it land on its body's
 /// entry and edges out of it leave from its body's exit. Anything
 /// unreachable from the start is then dropped, such as the `Merge` of an
 /// `if` whose branches all `return`.
-///
-/// **Known rough edge**: a shared `Merge` takes its position from whichever
-/// branch reaches it first, so with very unequal branches it can sit a
-/// little higher than ideal.
-pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
+pub fn flatten(activity: &Activity) -> FlatGraph {
     let mut f = Flattener::default();
-    let placed = f.place_activity(activity, 0.0, 0.0, Role::Function, Jumps::default());
+    let placed = f.walk_activity(activity, Role::Function, Jumps::default());
     let mut out = f.out;
 
     let mut reachable = HashSet::from([placed.entry]);
@@ -439,12 +452,116 @@ pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
     }
     out.nodes.retain(|n| reachable.contains(&n.id));
     out.edges.retain(|e| reachable.contains(&e.from));
-    out.positions.retain(|id, _| reachable.contains(id));
     out
 }
 
 const ROW_H: f64 = 70.0;
 const COL_W: f64 = 180.0;
+
+/// Top-to-bottom layered layout. A node's row is its longest path from the
+/// start, so a merge sits below all its branches. Its column follows its
+/// parents, with `[cond]` left and `[else]` right, then each row is spread
+/// out so no two nodes overlap.
+pub fn layout(graph: &FlatGraph) -> HashMap<usize, (f64, f64)> {
+    let Some(start) = graph.nodes.iter().find(|n| n.kind == FlatKind::Initial) else {
+        return HashMap::new();
+    };
+    let forward = forward_edges(graph, start.id);
+
+    let mut incoming: HashMap<usize, usize> = HashMap::new();
+    for e in &forward {
+        *incoming.entry(e.to).or_default() += 1;
+    }
+    let mut row: HashMap<usize, usize> = HashMap::from([(start.id, 0)]);
+    let mut ready = vec![start.id];
+    while let Some(id) = ready.pop() {
+        let next = row[&id] + 1;
+        for e in forward.iter().filter(|e| e.from == id) {
+            let r = row.entry(e.to).or_default();
+            *r = (*r).max(next);
+            let left = incoming.get_mut(&e.to).expect("counted above");
+            *left -= 1;
+            if *left == 0 {
+                ready.push(e.to);
+            }
+        }
+    }
+
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new(); row.values().max().map_or(0, |m| m + 1)];
+    for n in &graph.nodes {
+        rows[row[&n.id]].push(n.id);
+    }
+
+    let mut x: HashMap<usize, f64> = HashMap::new();
+    for ids in &rows {
+        let mut wanted: Vec<(f64, usize)> = ids
+            .iter()
+            .map(|&id| {
+                let from_parents: Vec<f64> = forward
+                    .iter()
+                    .filter(|e| e.to == id)
+                    .map(|e| x[&e.from] + branch_offset(e))
+                    .collect();
+                let sum: f64 = from_parents.iter().sum();
+                (sum / from_parents.len().max(1) as f64, id)
+            })
+            .collect();
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut next_free = f64::NEG_INFINITY;
+        for (want, id) in wanted {
+            let at = want.max(next_free);
+            x.insert(id, at);
+            next_free = at + COL_W;
+        }
+    }
+
+    graph
+        .nodes
+        .iter()
+        .map(|n| (n.id, (x[&n.id], row[&n.id] as f64 * ROW_H)))
+        .collect()
+}
+
+fn branch_offset(e: &FlatEdge) -> f64 {
+    match e.guard {
+        Some(Guard::Cond(_)) => -COL_W / 2.0,
+        Some(Guard::Else) => COL_W / 2.0,
+        None => 0.0,
+    }
+}
+
+/// Every edge except back-edges, so what's left has no cycles.
+fn forward_edges(graph: &FlatGraph, start: usize) -> Vec<&FlatEdge> {
+    fn visit<'a>(
+        graph: &'a FlatGraph,
+        id: usize,
+        active: &mut HashSet<usize>,
+        done: &mut HashSet<usize>,
+        out: &mut Vec<&'a FlatEdge>,
+    ) {
+        active.insert(id);
+        for e in graph.edges.iter().filter(|e| e.from == id) {
+            if active.contains(&e.to) {
+                continue;
+            }
+            out.push(e);
+            if !done.contains(&e.to) {
+                visit(graph, e.to, active, done, out);
+            }
+        }
+        active.remove(&id);
+        done.insert(id);
+    }
+    let mut out = Vec::new();
+    visit(
+        graph,
+        start,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        &mut out,
+    );
+    out
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -476,7 +593,6 @@ impl Jumps {
 }
 
 struct Placed {
-    y_end: f64,
     entry: usize,
     exit: usize,
 }
@@ -493,18 +609,11 @@ struct Walk<'a> {
 #[derive(Default)]
 struct Flattener {
     next_id: usize,
-    out: FlatActivity,
+    out: FlatGraph,
 }
 
 impl Flattener {
-    fn place_activity(
-        &mut self,
-        activity: &Activity,
-        x: f64,
-        y: f64,
-        role: Role,
-        jumps: Jumps,
-    ) -> Placed {
+    fn walk_activity(&mut self, activity: &Activity, role: Role, jumps: Jumps) -> Placed {
         let mut walk = Walk {
             activity,
             ids: HashMap::new(),
@@ -518,12 +627,8 @@ impl Flattener {
             Role::Loop => walk.jumps.loop_ids = Some((entry, exit)),
             Role::Conditional => {}
         }
-        let y_end = self.place(&mut walk, activity.initial, x, y);
-        // A final reached only by `return` edges is never walked to.
-        if role == Role::Function && !walk.visited.contains(&activity.exit) {
-            self.out.positions.insert(exit, (x, y_end));
-        }
-        Placed { y_end, entry, exit }
+        self.walk_node(&mut walk, activity.initial);
+        Placed { entry, exit }
     }
 
     fn global_id(&mut self, walk: &mut Walk, local: NodeId) -> usize {
@@ -552,15 +657,14 @@ impl Flattener {
         id
     }
 
-    /// Place `local` and everything after it, returning the Y just past it.
-    fn place(&mut self, walk: &mut Walk, local: NodeId, x: f64, y: f64) -> f64 {
+    /// Emit `local` and everything reachable after it in this `Activity`.
+    fn walk_node(&mut self, walk: &mut Walk, local: NodeId) {
         let id = self.global_id(walk, local);
         if !walk.visited.insert(local) {
-            return y; // a back-edge, or a shared Merge
+            return; // a back-edge, or a shared Merge
         }
         let activity = walk.activity;
 
-        let mut y_after = y + ROW_H;
         let mut from = id;
         if let ActivityNode::Structured {
             stereotype, body, ..
@@ -570,19 +674,15 @@ impl Flattener {
                 Stereotype::Loop => Role::Loop,
                 Stereotype::Conditional => Role::Conditional,
             };
-            let placed = self.place_activity(body, x, y, role, walk.jumps);
-            // Every edge into this node was pushed before it was placed.
+            let placed = self.walk_activity(body, role, walk.jumps);
+            // Every edge into this node was pushed before it was walked.
             for e in self.out.edges.iter_mut().filter(|e| e.to == id) {
                 e.to = placed.entry;
             }
-            y_after = placed.y_end;
             from = placed.exit;
-        } else {
-            self.out.positions.insert(id, (x, y));
         }
 
-        let outs: Vec<&ControlFlow> = activity.edges.iter().filter(|e| e.from == local).collect();
-        for e in &outs {
+        for e in activity.edges.iter().filter(|e| e.from == local) {
             let to = match e.to {
                 Target::Local(next) => Some(self.global_id(walk, next)),
                 jump => walk.jumps.resolve(jump),
@@ -594,28 +694,11 @@ impl Flattener {
                     guard: e.guard.clone(),
                 });
             }
-        }
-
-        // Only local targets are walked: a jump's target is placed by the
-        // `Activity` that owns it.
-        if let [only] = outs[..] {
-            return match only.to {
-                Target::Local(next) => self.place(walk, next, x, y_after),
-                _ => y_after,
-            };
-        }
-        // A `Decision`: `[cond]` goes left and `[else]` goes right.
-        let mut y_end = y_after;
-        for e in &outs {
+            // A jump's target is walked by the `Activity` that owns it.
             if let Target::Local(next) = e.to {
-                let dx = match e.guard {
-                    Some(Guard::Cond(_)) => -COL_W / 2.0,
-                    _ => COL_W / 2.0,
-                };
-                y_end = y_end.max(self.place(walk, next, x + dx, y_after));
+                self.walk_node(walk, next);
             }
         }
-        y_end
     }
 }
 
@@ -1430,6 +1513,61 @@ mod tests {
         assert!(got.contains(&"return a + 1".to_string()), "{got:?}");
         let got = labels("def f(a):\n    return a.b, 2\n");
         assert!(got.contains(&"return a.b, 2".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn no_two_nodes_share_a_position() {
+        let src = "if a:\n    if b:\n        p = 1\n    else:\n        q = 2\n\
+                   else:\n    if c:\n        r = 3\n    else:\n        s = 4\n";
+        let flat = flatten_and_layout(&build_src(src));
+        let mut seen = std::collections::HashSet::new();
+        for n in &flat.nodes {
+            let (x, y) = flat.positions[&n.id];
+            assert!(
+                seen.insert((x.to_bits(), y.to_bits())),
+                "overlap at {x},{y}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_merge_sits_below_both_of_its_branches() {
+        let flat = flatten_and_layout(&build_src(
+            "if a:\n    x = 1\n    y = 2\n    z = 3\nelse:\n    w = 4\nv = 5\n",
+        ));
+        let y_of = |id: usize| flat.positions[&id].1;
+        let merge = flat
+            .nodes
+            .iter()
+            .find(|n| n.kind == FlatKind::Merge)
+            .unwrap()
+            .id;
+        assert!(
+            flat.edges
+                .iter()
+                .filter(|e| e.to == merge)
+                .all(|e| y_of(e.from) < y_of(merge))
+        );
+    }
+
+    #[test]
+    fn only_a_loop_s_back_edge_points_upward() {
+        let flat = flatten_and_layout(&build_src(
+            "while x > 0:\n    if x > 5:\n        break\n    x = x - 1\nz = 1\n",
+        ));
+        let y_of = |id: usize| flat.positions[&id].1;
+        let up: Vec<_> = flat
+            .edges
+            .iter()
+            .filter(|e| y_of(e.to) <= y_of(e.from))
+            .collect();
+        assert_eq!(up.len(), 1, "{up:?}");
+    }
+
+    #[test]
+    fn layout_is_separate_from_the_graph() {
+        let graph = flatten(&build_src("if a:\n    x = 1\n"));
+        assert_eq!(layout(&graph).len(), graph.nodes.len());
     }
 
     /// Every id reachable from the `Initial` node by following flat edges.
