@@ -17,12 +17,14 @@
 //!
 //! **Narrow slice, deliberately**: `Assign`/`AnnAssign`/`SetIndex`/
 //! `SetAttr`/`UnpackAssign`/bare `Expr` as plain `Action`s, `If`/`While`/
-//! `ForEach`/`For` (counted) as `Structured` nodes, `Break`/`Continue` as
-//! a routing decision on an enclosing block's tail rather than a node of
-//! their own (see `ControlFlow`'s `Target` and `Builder::block`'s doc
-//! comments). `Return`/`Pass`/`Def`/`ClassDef`/`Method` are a
-//! deliberately sequenced follow-up, so this can be verified end to end
-//! on a small slice before expanding.
+//! `ForEach`/`For` (counted) as `Structured` nodes, `Break`/`Continue`/
+//! `Return` as a routing decision on an enclosing block's tail rather
+//! than a node of their own (see `ControlFlow`'s `Target` and
+//! `Builder::block`'s doc comments), `Pass` a true no-op needing no
+//! special case at all. `build_program` walks top-level `Def`/
+//! `ClassDef` into their own `Activity` each (one per function/method,
+//! same shape as the module-level one), so this can be verified end to
+//! end on a small slice before expanding to a nested-`Def` case.
 
 use crate::ast::{Expr, Span, Stmt, StmtKind};
 
@@ -113,6 +115,16 @@ pub enum Target {
     LoopExit,
     /// `continue` — the nearest enclosing loop's own `Decision`.
     LoopBack,
+    /// `return` — this `Activity`'s own `ActivityFinal` (there's exactly
+    /// one per function, same as the module-level one `build()` already
+    /// creates — every `return`, wherever nested, converges on it, the
+    /// same way every loop's `break` converges on one `exit`). Resolved
+    /// against a context established once per function `Activity` and
+    /// inherited through every nested `Structured` body unchanged
+    /// (never re-established at a loop/conditional boundary the way
+    /// `LoopExit`/`LoopBack`'s context is) — a `return` two loops deep
+    /// still means THIS function's own end, not something loop-scoped.
+    Return,
 }
 
 /// The `[cond]` / `[else]` label UML puts on an edge leaving a `Decision`.
@@ -123,6 +135,15 @@ pub enum Guard {
 }
 
 /// Build the module-level activity for a parsed program.
+/// Build one self-contained `Activity` for a sequence of statements —
+/// module-level code, or (via `build_program`) one function/method's own
+/// body. Nothing here is module-specific: `return` diverges to
+/// `Target::Return` exactly the same way `break`/`continue` divert to
+/// `Target::LoopExit`/`LoopBack` (see `Builder::block`'s doc comment),
+/// and `BlockOutcome::Diverts(Some(entry), _)` already connects `initial`
+/// to the right entry regardless of what it diverts to — `block()` wired
+/// the actual diverging edge itself, so this function never needs to
+/// know or care whether a divert was a `return`.
 pub fn build(stmts: &[Stmt]) -> Activity {
     let mut b = Builder::default();
     let initial = b.push(ActivityNode::Initial, 0);
@@ -133,11 +154,12 @@ pub fn build(stmts: &[Stmt]) -> Activity {
             b.connect(tail, Target::Local(fin), None);
         }
         BlockOutcome::Empty => b.connect(initial, Target::Local(fin), None),
-        // `break`/`continue` at module level, outside any loop — not
-        // valid Python, so not a case this view needs to render nicely.
-        // Fall back to whatever node exists (if any) and otherwise to
-        // the empty-program behavior, rather than crashing on malformed
-        // input a real compile would already have rejected elsewhere.
+        // `break`/`continue`/`return` at module level, outside any
+        // loop/function — not valid Python, so not a case this view
+        // needs to render nicely. Fall back to whatever node exists (if
+        // any) and otherwise to the empty-program behavior, rather than
+        // crashing on malformed input a real compile would already have
+        // rejected elsewhere.
         BlockOutcome::Diverts(Some(entry), _) => b.connect(initial, Target::Local(entry), None),
         BlockOutcome::Diverts(None, _) => b.connect(initial, Target::Local(fin), None),
     }
@@ -147,6 +169,50 @@ pub fn build(stmts: &[Stmt]) -> Activity {
         initial,
         finals: vec![fin],
     }
+}
+
+/// One named `Activity` — the module's own top-level code (`"<module>"`),
+/// a top-level function (its name), or a class method (`"Class.method"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedActivity {
+    pub name: String,
+    pub activity: Activity,
+}
+
+/// Build every `Activity` a program has: one for module-level code
+/// (exactly `build()`'s own behavior — top-level `Def`/`ClassDef`
+/// statements already produce no node there, same as any other
+/// still-deferred kind, so nothing needs filtering out), plus one more
+/// per top-level `Def` and per `ClassDef` method, each built with the
+/// SAME `build()` — a function/method body is just another self-
+/// contained sequence of statements with its own `Initial`/
+/// `ActivityFinal`. Nested `Def`s (a function defined inside another
+/// function's body, a loop, or an `if`) are a deliberate follow-up, not
+/// walked into yet — this is top-level only, matching `Activity`'s own
+/// original doc comment ("one per top-level def/Method").
+pub fn build_program(stmts: &[Stmt]) -> Vec<NamedActivity> {
+    let mut out = vec![NamedActivity {
+        name: "<module>".to_string(),
+        activity: build(stmts),
+    }];
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Def { name, body, .. } => out.push(NamedActivity {
+                name: name.clone(),
+                activity: build(body),
+            }),
+            StmtKind::ClassDef { name, methods, .. } => {
+                for m in methods {
+                    out.push(NamedActivity {
+                        name: format!("{name}.{}", m.name),
+                        activity: build(&m.body),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[derive(Default)]
@@ -212,6 +278,32 @@ impl Builder {
                     None => BlockOutcome::Diverts(None, target),
                 };
             }
+            // `return` is the same routing decision as `break`/`continue`
+            // — but unlike them it can carry a value worth showing, so
+            // `return x + 1` (unlike a bare `return`) gets its own
+            // `Action` node labeled with that expression before
+            // diverging, the same way an `Assign` gets one.
+            if let StmtKind::Return(ret_expr) = &s.kind {
+                let own_node = ret_expr
+                    .as_ref()
+                    .map(|e| self.push(ActivityNode::Action(e.span), s.line));
+                return match (result, own_node) {
+                    (Some((first, prev_tail)), Some(n)) => {
+                        self.connect(prev_tail, Target::Local(n), None);
+                        self.connect(n, Target::Return, None);
+                        BlockOutcome::Diverts(Some(first), Target::Return)
+                    }
+                    (Some((first, prev_tail)), None) => {
+                        self.connect(prev_tail, Target::Return, None);
+                        BlockOutcome::Diverts(Some(first), Target::Return)
+                    }
+                    (None, Some(n)) => {
+                        self.connect(n, Target::Return, None);
+                        BlockOutcome::Diverts(Some(n), Target::Return)
+                    }
+                    (None, None) => BlockOutcome::Diverts(None, Target::Return),
+                };
+            }
             if let Some((entry, tail)) = self.stmt(s) {
                 result = match result {
                     None => Some((entry, tail)),
@@ -258,14 +350,20 @@ impl Builder {
                 step,
                 body,
             } => Some(self.build_for(s.line, var, start, end, step, body)),
-            // `Break`/`Continue` are handled one level up, by `block()`
-            // itself (see its own doc comment) — they produce no node
-            // and change how the *block* wires its own tail, which
-            // `stmt()`'s uniform `(entry, tail)` shape can't express.
-            // `block()` intercepts them before ever calling `stmt()`, so
-            // this arm is unreachable in practice; it exists only so the
-            // match stays exhaustive.
-            StmtKind::Break | StmtKind::Continue => None,
+            // `Break`/`Continue`/`Return` are handled one level up, by
+            // `block()` itself (see its own doc comment) — they change
+            // how the *block* wires its own tail, which `stmt()`'s
+            // uniform `(entry, tail)` shape can't express. `block()`
+            // intercepts them before ever calling `stmt()`, so this arm
+            // is unreachable in practice; it exists only so the match
+            // stays exhaustive.
+            StmtKind::Break | StmtKind::Continue | StmtKind::Return(_) => None,
+            // `Pass` is a true no-op — already correctly handled by
+            // falling through to `_ => None` below: a block containing
+            // only `pass` produces no node, which `BlockOutcome::Empty`
+            // (and every caller's handling of it, e.g. `while x: pass`'s
+            // self-loop) already covers correctly. Never actually needed
+            // special-casing, despite being listed as deferred earlier.
             _ => None,
         }
     }
@@ -540,12 +638,24 @@ pub struct FlatEdge {
 /// `«conditional»` container box yet, per the design plan, so there's
 /// nothing to offset the body relative to.
 ///
-/// **Known rough edge, left for when there's a real render to look at**:
-/// where two branches of a `Decision` reconverge at their shared
-/// `Merge`, that node's position is claimed by whichever branch's walk
-/// reaches it first — if the branches are very unequal in length, the
-/// merge can end up a little higher than ideal. Topologically correct
-/// either way; only the exact Y looks a bit off in the asymmetric case.
+/// **Known rough edges, left for when there's a real render to look
+/// at**:
+/// - where two branches of a `Decision` reconverge at their shared
+///   `Merge`, that node's position is claimed by whichever branch's
+///   walk reaches it first — if the branches are very unequal in
+///   length, the merge can end up a little higher than ideal.
+///   Topologically correct either way; only the exact Y looks a bit off
+///   in the asymmetric case.
+/// - a `Structured` node (an `if`/loop) always gets a plain fallthrough
+///   edge to whatever follows it in the OUTER sequence, even when every
+///   branch inside it actually diverges (every path `return`s, say) and
+///   that edge can never fire. Suppressing it needs each `Structured`
+///   node to report its own reachability up through `stmt()`'s uniform
+///   return shape — a real refactor, not a one-line fix — so it's a
+///   deliberately accepted dead edge for this narrow slice, not a
+///   correctness bug: everything it points at still resolves to a real,
+///   correctly-shared node.
+///
 /// `(flattened nodes, flattened edges, node id -> (x, y))`.
 pub type FlatActivity = (
     Vec<FlatNode>,
@@ -553,6 +663,10 @@ pub type FlatActivity = (
     std::collections::HashMap<usize, (f64, f64)>,
 );
 
+/// `activity` is always one whole, self-contained function-or-module
+/// body — `build()`'s module activity, or one of `build_program`'s
+/// per-function/per-method activities — so this is always where a
+/// `Target::Return` context gets established, never a nested call.
 pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
     let mut next_id = 0usize;
     let mut nodes = Vec::new();
@@ -567,6 +681,8 @@ pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
         &mut edges,
         &mut positions,
         false,
+        None,
+        true,
         None,
     );
     (nodes, edges, positions)
@@ -590,6 +706,17 @@ pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
 /// active around it — a `break` inside an `if` inside a `while` still
 /// means the `while`, so the context has to see through non-loop
 /// nesting rather than reset at every `Structured` boundary.
+///
+/// `establish_fn_ctx` / `inherited_fn_ctx`: same idea, one layer up —
+/// `true` only when `activity` is itself a whole function/module body
+/// (every call from `flatten_and_layout` directly; never from a nested
+/// `Structured` recursion), resolving `activity.finals[0]` (there's
+/// exactly one, same guarantee `build()` already gives the module
+/// activity) up front so `Target::Return` can resolve from anywhere
+/// inside, however many loops or `if`s deep. Unlike `loop_ctx`, this
+/// NEVER gets re-established at a nested boundary — a `return` two
+/// loops deep still means THIS function's own end, not the nearest
+/// loop's.
 #[allow(clippy::too_many_arguments)]
 fn place_activity(
     activity: &Activity,
@@ -601,6 +728,8 @@ fn place_activity(
     positions: &mut std::collections::HashMap<usize, (f64, f64)>,
     is_loop: bool,
     inherited_loop_ctx: Option<(usize, usize)>,
+    establish_fn_ctx: bool,
+    inherited_fn_ctx: Option<usize>,
 ) -> f64 {
     const ROW_H: f64 = 70.0;
     const COL_W: f64 = 180.0;
@@ -638,6 +767,7 @@ fn place_activity(
         positions: &mut std::collections::HashMap<usize, (f64, f64)>,
         visited: &mut std::collections::HashSet<NodeId>,
         loop_ctx: Option<(usize, usize)>,
+        fn_ctx: Option<usize>,
     ) -> f64 {
         let gid = assign(activity, local_id, local_to_global, next_id, nodes);
         if !visited.insert(local_id) {
@@ -663,6 +793,8 @@ fn place_activity(
                 positions,
                 *stereotype == Stereotype::Loop,
                 loop_ctx,
+                false,
+                fn_ctx,
             );
         }
 
@@ -672,13 +804,14 @@ fn place_activity(
             .filter(|e| e.from == local_id)
             .collect();
         for e in &outs {
-            // `Target::LoopExit`/`LoopBack` resolve against the loop
-            // context already active here (see `place_activity`'s doc
-            // comment) rather than through `activity`'s own local node
-            // list — their destination was never local to begin with.
-            // `None` here only happens for a `break`/`continue` outside
-            // any loop, which isn't valid Python; skip the edge rather
-            // than invent a destination for input a real compile would
+            // `Target::LoopExit`/`LoopBack`/`Return` resolve against
+            // whatever context is already active here (see
+            // `place_activity`'s doc comment) rather than through
+            // `activity`'s own local node list — their destination was
+            // never local to begin with. `None` here only happens for a
+            // `break`/`continue`/`return` outside any loop/function,
+            // which isn't valid Python; skip the edge rather than
+            // invent a destination for input a real compile would
             // already have rejected.
             let to_gid = match e.to {
                 Target::Local(local) => {
@@ -686,6 +819,7 @@ fn place_activity(
                 }
                 Target::LoopExit => loop_ctx.map(|(_, exit)| exit),
                 Target::LoopBack => loop_ctx.map(|(decision, _)| decision),
+                Target::Return => fn_ctx,
             };
             if let Some(to_gid) = to_gid {
                 edges.push(FlatEdge {
@@ -716,8 +850,9 @@ fn place_activity(
                     positions,
                     visited,
                     loop_ctx,
+                    fn_ctx,
                 ),
-                Target::LoopExit | Target::LoopBack => y_after,
+                Target::LoopExit | Target::LoopBack | Target::Return => y_after,
             },
             _ => {
                 // A Decision: its guarded edges branch side by side —
@@ -745,6 +880,7 @@ fn place_activity(
                         positions,
                         visited,
                         loop_ctx,
+                        fn_ctx,
                     ));
                 }
                 if let Some(Target::Local(to)) = other {
@@ -760,6 +896,7 @@ fn place_activity(
                         positions,
                         visited,
                         loop_ctx,
+                        fn_ctx,
                     ));
                 }
                 max_y
@@ -788,6 +925,28 @@ fn place_activity(
     } else {
         inherited_loop_ctx
     };
+    let fn_ctx = if establish_fn_ctx {
+        // Unlike a loop's `exit` (always reached by the Decision's own
+        // `Guard::Else` edge, so `place()`'s normal recursion always
+        // positions it), a function's `ActivityFinal` can be reached
+        // ONLY via `Target::Return` edges (e.g. every branch of the
+        // function's top-level `if` returns) — `place()` never visits
+        // it locally in that case, so it'd otherwise end up with a
+        // `FlatNode` but no entry in `positions`. Give it a provisional
+        // one now; a later genuine local visit overwrites it with the
+        // real computed position, same `positions.insert` either way.
+        let final_gid = assign(
+            activity,
+            activity.finals[0],
+            &mut local_to_global,
+            next_id,
+            nodes,
+        );
+        positions.entry(final_gid).or_insert((x0, y0));
+        Some(final_gid)
+    } else {
+        inherited_fn_ctx
+    };
     place(
         activity,
         activity.initial,
@@ -800,6 +959,7 @@ fn place_activity(
         positions,
         &mut visited,
         loop_ctx,
+        fn_ctx,
     )
 }
 
@@ -1144,6 +1304,124 @@ mod tests {
         assert!(
             exit_id.is_some(),
             "the break and the loop's own Else path must both resolve to the same exit"
+        );
+    }
+
+    #[test]
+    fn a_bare_return_resolves_to_the_function_s_activity_final() {
+        let a = build_src("if x:\n    return\ny = 1\n");
+        let (nodes, edges, positions) = flatten_and_layout(&a);
+        assert_eq!(positions.len(), nodes.len());
+        let fin_id = nodes
+            .iter()
+            .find(|n| matches!(n.kind, ActivityNode::ActivityFinal))
+            .unwrap()
+            .id;
+        let if_decision = nodes
+            .iter()
+            .find(|n| matches!(n.kind, ActivityNode::Decision(_)))
+            .unwrap()
+            .id;
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.from == if_decision && e.to == fin_id),
+            "a bare return nested in an if must resolve to this Activity's own final"
+        );
+    }
+
+    #[test]
+    fn a_return_with_a_value_gets_its_own_labeled_action_node() {
+        let a = build_src("return x + 1\n");
+        let returns: Vec<_> = a
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+            .collect();
+        assert_eq!(returns.len(), 1, "return's own expression gets an Action");
+    }
+
+    #[test]
+    fn a_bare_return_gets_no_node_of_its_own() {
+        let a = build_src("return\n");
+        assert!(
+            a.nodes
+                .iter()
+                .all(|n| !matches!(n.kind, ActivityNode::Action(_))),
+            "a bare return is pure routing, same as break/continue"
+        );
+    }
+
+    #[test]
+    fn multiple_returns_in_one_function_converge_on_the_same_final() {
+        let a = build_src("if x:\n    return 1\nelse:\n    return 2\n");
+        let (nodes, edges, positions) = flatten_and_layout(&a);
+        assert_eq!(positions.len(), nodes.len());
+        let fin_id = nodes
+            .iter()
+            .find(|n| matches!(n.kind, ActivityNode::ActivityFinal))
+            .unwrap()
+            .id;
+        let returns: Vec<usize> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(
+            returns.len(),
+            2,
+            "both return expressions got their own node"
+        );
+        let froms: std::collections::HashSet<_> = edges
+            .iter()
+            .filter(|e| e.to == fin_id)
+            .map(|e| e.from)
+            .collect();
+        assert!(
+            returns.iter().all(|r| froms.contains(r)),
+            "both returns' own Action nodes must reach the SAME final"
+        );
+        // Known rough edge (same spirit as the asymmetric-merge-Y-position
+        // one documented on `flatten_and_layout`): the `if`'s own outer
+        // "box" ALSO gets a dead fallthrough edge to `fin`, since
+        // `build_if` always returns a plain pass-through node regardless
+        // of whether its merge is actually reachable — here it never is
+        // (both branches return), so this edge can never fire. Cosmetic,
+        // not a correctness bug; not worth the reachability-propagation
+        // refactor it'd take to suppress for this narrow slice.
+        assert_eq!(
+            froms.len(),
+            3,
+            "includes the if's own dead fallthrough edge"
+        );
+    }
+
+    #[test]
+    fn build_program_collects_the_module_plus_one_activity_per_def_and_method() {
+        let src = "x = 1\n\
+                   def f():\n\
+                   \x20   return 1\n\
+                   class C:\n\
+                   \x20   def m1(self):\n\
+                   \x20       pass\n\
+                   \x20   def m2(self):\n\
+                   \x20       pass\n";
+        let toks = crate::lexer::lex(src).unwrap();
+        let stmts = parser::parse(&toks).unwrap();
+        let program = build_program(&stmts);
+        let names: Vec<&str> = program.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["<module>", "f", "C.m1", "C.m2"]);
+        // The module's own activity still renders x=1 as an Action even
+        // though Def/ClassDef statements sit alongside it (unchanged
+        // `build()` behavior — they just produce no node there).
+        assert_eq!(
+            program[0]
+                .activity
+                .nodes
+                .iter()
+                .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+                .count(),
+            1
         );
     }
 
