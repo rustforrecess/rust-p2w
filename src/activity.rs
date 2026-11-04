@@ -1,45 +1,31 @@
-//! UML 2.5.1 activity diagrams as a fourth projection over the shared AST —
-//! a read-only view, not a new execution surface. Built directly against
-//! the real OMG metamodel (`DecisionNode`/`MergeNode` kept distinct,
-//! `StructuredActivityNode` with a `«loop»`/`«conditional»` stereotype for
-//! loops/conditionals, no synthetic edge "kinds" UML doesn't have) rather
-//! than an ad-hoc shape reshaped toward UML later — one retrofit instead
-//! of two.
+//! UML 2.5.1 activity diagrams: a read-only projection over the shared AST.
 //!
-//! **Licensing, if this is ever rendered anywhere**: cite OMG UML 2.5.1,
-//! carry the UML(R) trademark line, never copy spec text or figures.
+//! Pass 1 (`build`, `build_program`) turns statements into an `Activity`,
+//! with each `if`/loop body nested in a `Structured` node. Pass 2
+//! (`flatten_and_layout`) flattens that into one positioned graph.
 //!
-//! No synthetic edge kinds for loop-back/break/continue/return: an edge is
-//! just an edge, and the special meaning (it's a loop back-edge, a break)
-//! is purely a consequence of which nodes it connects, not a label this
-//! pass needs to invent — a layout pass can infer the special routing from
-//! topology instead.
+//! The IR follows the OMG metamodel: `Decision` and `Merge` are separate
+//! metaclasses, and an edge has no "kind". A back-edge or a `break` is just
+//! an edge, identified by what it connects.
 //!
-//! **Narrow slice, deliberately**: `Assign`/`AnnAssign`/`SetIndex`/
-//! `SetAttr`/`UnpackAssign`/bare `Expr` as plain `Action`s, `If`/`While`/
-//! `ForEach`/`For` (counted) as `Structured` nodes, `Break`/`Continue`/
-//! `Return` as a routing decision on an enclosing block's tail rather
-//! than a node of their own (see `ControlFlow`'s `Target` and
-//! `Builder::block`'s doc comments), `Pass` a true no-op needing no
-//! special case at all. `build_program` walks top-level `Def`/
-//! `ClassDef` into their own `Activity` each (one per function/method,
-//! same shape as the module-level one), so this can be verified end to
-//! end on a small slice before expanding to a nested-`Def` case.
+//! **Licensing, if this is rendered anywhere**: cite OMG UML 2.5.1, carry the
+//! UML(R) trademark line, never copy spec text or figures.
+
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Expr, Span, Stmt, StmtKind};
 
 pub type NodeId = usize;
 
-/// One activity. Eventually one per top-level `def`/`Method`; for now, one
-/// for the whole program's module-level code, since `Def`/`Method` aren't
-/// walked into yet. `Initial`/`ActivityFinal` mark function start/return —
-/// they never appear inside a nested `Structured` node's own `body`.
+/// One self-contained graph: a function, a method, module-level code, or a
+/// `Structured` node's body. `NodeId`s are local to the `Activity`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Activity {
     pub nodes: Vec<Node>,
     pub edges: Vec<ControlFlow>,
     pub initial: NodeId,
-    pub finals: Vec<NodeId>,
+    /// Where control leaves: the `ActivityFinal`, or a body's `Merge`.
+    pub exit: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,22 +39,15 @@ pub struct Node {
 pub enum ActivityNode {
     Initial,
     ActivityFinal,
-    /// label = `source[span.0..span.1]`.
+    /// Label is `source[span.0..span.1]`.
     Action(Span),
-    /// The guarded condition of an `If`/`While` — label = the source slice.
+    /// Label is `source[span.0..span.1]`.
     Decision(Span),
-    /// Where a `Decision`'s branches rejoin. Kept distinct from `Decision`
-    /// — UML defines them as separate metaclasses (one-in/many-out vs.
-    /// many-in/one-out), not one diamond concept reused at each end.
     Merge,
     Structured {
         stereotype: Stereotype,
         setup: Option<LoopSetup>,
         body: Activity,
-    },
-    CallBehavior {
-        callee: String,
-        call_span: Span,
     },
 }
 
@@ -78,7 +57,8 @@ pub enum Stereotype {
     Conditional,
 }
 
-/// A `For` loop's init — not produced by this narrow slice yet.
+/// A counted `for`'s header. `start` and `step` are `(0, 0)` when omitted
+/// from the `range(...)` call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopSetup {
     pub var: String,
@@ -94,102 +74,49 @@ pub struct ControlFlow {
     pub guard: Option<Guard>,
 }
 
-/// An edge's destination. Usually a plain local node — but `break`/
-/// `continue` target the nearest enclosing loop's `exit`/`decision`,
-/// which live in an ANCESTOR `Structured` node's own `Activity`: a
-/// statement built deep inside a nested body has no local id for them
-/// (each nested body is its own self-contained `NodeId` space, by
-/// design — see `flatten_and_layout`'s doc comment). Recording the
-/// *intent* here and resolving it to a concrete id during flattening
-/// (which already walks the full nesting and knows every loop's global
-/// ids by the time it reaches anything inside that loop's body) avoids
-/// needing Pass 1 to reach outside the `Builder` that's currently
-/// running — the same "resolve from topology, don't pre-digest" split
-/// this module already uses for back-edges, just one layer deeper: the
-/// *destination itself*, not merely its presentational meaning, isn't
-/// knowable without more context than one `Builder` has.
+/// An edge's destination. A jump's target lives in an enclosing `Activity`
+/// with its own id space, so Pass 1 records the intent and flattening
+/// resolves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Local(NodeId),
-    /// `break` — the nearest enclosing loop's `exit` (`Merge`).
+    /// `break`: the nearest enclosing loop's exit.
     LoopExit,
-    /// `continue` — the nearest enclosing loop's own `Decision`.
+    /// `continue`: the nearest enclosing loop's `Decision`.
     LoopBack,
-    /// `return` — this `Activity`'s own `ActivityFinal` (there's exactly
-    /// one per function, same as the module-level one `build()` already
-    /// creates — every `return`, wherever nested, converges on it, the
-    /// same way every loop's `break` converges on one `exit`). Resolved
-    /// against a context established once per function `Activity` and
-    /// inherited through every nested `Structured` body unchanged
-    /// (never re-established at a loop/conditional boundary the way
-    /// `LoopExit`/`LoopBack`'s context is) — a `return` two loops deep
-    /// still means THIS function's own end, not something loop-scoped.
+    /// `return`: the enclosing function's `ActivityFinal`.
     Return,
 }
 
-/// The `[cond]` / `[else]` label UML puts on an edge leaving a `Decision`.
+/// The `[cond]` / `[else]` label on an edge leaving a `Decision`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Guard {
     Cond(Span),
     Else,
 }
 
-/// Build the module-level activity for a parsed program.
-/// Build one self-contained `Activity` for a sequence of statements —
-/// module-level code, or (via `build_program`) one function/method's own
-/// body. Nothing here is module-specific: `return` diverges to
-/// `Target::Return` exactly the same way `break`/`continue` divert to
-/// `Target::LoopExit`/`LoopBack` (see `Builder::block`'s doc comment),
-/// and `BlockOutcome::Diverts(Some(entry), _)` already connects `initial`
-/// to the right entry regardless of what it diverts to — `block()` wired
-/// the actual diverging edge itself, so this function never needs to
-/// know or care whether a divert was a `return`.
+/// Build one `Activity` from module-level code or a function body.
 pub fn build(stmts: &[Stmt]) -> Activity {
     let mut b = Builder::default();
     let initial = b.push(ActivityNode::Initial, 0);
     let fin = b.push(ActivityNode::ActivityFinal, 0);
-    match b.block(stmts) {
-        BlockOutcome::Flows(entry, tail) => {
-            b.connect(initial, Target::Local(entry), None);
-            b.connect(tail, Target::Local(fin), None);
-        }
-        BlockOutcome::Empty => b.connect(initial, Target::Local(fin), None),
-        // `break`/`continue`/`return` at module level, outside any
-        // loop/function — not valid Python, so not a case this view
-        // needs to render nicely. Fall back to whatever node exists (if
-        // any) and otherwise to the empty-program behavior, rather than
-        // crashing on malformed input a real compile would already have
-        // rejected elsewhere.
-        BlockOutcome::Diverts(Some(entry), _) => b.connect(initial, Target::Local(entry), None),
-        BlockOutcome::Diverts(None, _) => b.connect(initial, Target::Local(fin), None),
+    let outcome = b.block(stmts);
+    b.connect(initial, outcome.entry().unwrap_or(Target::Local(fin)), None);
+    if let BlockOutcome::Flows(_, tail) = outcome {
+        b.connect(tail, Target::Local(fin), None);
     }
-    Activity {
-        nodes: b.nodes,
-        edges: b.edges,
-        initial,
-        finals: vec![fin],
-    }
+    b.finish(initial, fin)
 }
 
-/// One named `Activity` — the module's own top-level code (`"<module>"`),
-/// a top-level function (its name), or a class method (`"Class.method"`).
+/// One named `Activity`: `"<module>"`, a function's name, or `"Class.method"`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NamedActivity {
     pub name: String,
     pub activity: Activity,
 }
 
-/// Build every `Activity` a program has: one for module-level code
-/// (exactly `build()`'s own behavior — top-level `Def`/`ClassDef`
-/// statements already produce no node there, same as any other
-/// still-deferred kind, so nothing needs filtering out), plus one more
-/// per top-level `Def` and per `ClassDef` method, each built with the
-/// SAME `build()` — a function/method body is just another self-
-/// contained sequence of statements with its own `Initial`/
-/// `ActivityFinal`. Nested `Def`s (a function defined inside another
-/// function's body, a loop, or an `if`) are a deliberate follow-up, not
-/// walked into yet — this is top-level only, matching `Activity`'s own
-/// original doc comment ("one per top-level def/Method").
+/// Build the module's `Activity` plus one per top-level `def` and method.
+/// A `def` nested inside anything else gets no diagram of its own.
 pub fn build_program(stmts: &[Stmt]) -> Vec<NamedActivity> {
     let mut out = vec![NamedActivity {
         name: "<module>".to_string(),
@@ -221,21 +148,28 @@ struct Builder {
     edges: Vec<ControlFlow>,
 }
 
-/// What a sequence of statements did, control-flow-wise.
+/// How a sequence of statements ends.
 enum BlockOutcome {
-    /// No node produced at all (every statement was `pass` or a deferred
-    /// kind) — execution just falls through.
+    /// Produced no node; control falls straight through.
     Empty,
-    /// `(entry, tail)` — the first node reached and the last; execution
-    /// falls through past `tail` normally.
+    /// `(entry, tail)`: control falls through past `tail`.
     Flows(NodeId, NodeId),
-    /// The block ends by jumping to `target` (`break`/`continue`)
-    /// instead of falling through. `Some(entry)` if some node existed
-    /// before the jump (the caller wires its own incoming edge to it,
-    /// same as `Flows`); `None` if the jump was the first thing in the
-    /// block (the caller must wire its own incoming edge straight to
-    /// `target` instead).
+    /// Ends in a jump, already wired from any node before it. `None` means
+    /// the jump came first, so there's no node to enter.
     Diverts(Option<NodeId>, Target),
+}
+
+impl BlockOutcome {
+    /// Where an edge entering this block should go. `None` for an empty one.
+    fn entry(&self) -> Option<Target> {
+        match *self {
+            BlockOutcome::Empty => None,
+            BlockOutcome::Flows(entry, _) | BlockOutcome::Diverts(Some(entry), _) => {
+                Some(Target::Local(entry))
+            }
+            BlockOutcome::Diverts(None, target) => Some(target),
+        }
+    }
 }
 
 impl Builder {
@@ -249,63 +183,22 @@ impl Builder {
         self.edges.push(ControlFlow { from, to, guard });
     }
 
-    /// Build a sequence of statements, wiring each to the next.
+    fn finish(self, initial: NodeId, exit: NodeId) -> Activity {
+        Activity {
+            nodes: self.nodes,
+            edges: self.edges,
+            initial,
+            exit,
+        }
+    }
+
+    /// Build a sequence of statements, wiring each to the next. A jump ends
+    /// the block: anything after it is unreachable.
     fn block(&mut self, stmts: &[Stmt]) -> BlockOutcome {
-        let mut result: Option<(NodeId, NodeId)> = None;
+        let mut chain: Option<(NodeId, NodeId)> = None;
         for s in stmts {
-            // `break`/`continue` produce no node of their own — UML has
-            // no shape for "jump," and a diamond/box here would be
-            // decoration, not information. They're purely a routing
-            // decision: whatever this block's tail would otherwise
-            // connect to, it connects to the loop's exit/decision
-            // instead. Everything after one is genuinely unreachable, so
-            // the block stops here rather than building dead nodes.
-            if matches!(s.kind, StmtKind::Break | StmtKind::Continue) {
-                let target = if matches!(s.kind, StmtKind::Break) {
-                    Target::LoopExit
-                } else {
-                    Target::LoopBack
-                };
-                return match result {
-                    Some((first, prev_tail)) => {
-                        self.connect(prev_tail, target, None);
-                        BlockOutcome::Diverts(Some(first), target)
-                    }
-                    // Nothing before it in this block — there's no node
-                    // to wire the divert from; the caller (e.g.
-                    // `wire_branch`) must route its own incoming edge
-                    // straight to `target` instead of to an entry node.
-                    None => BlockOutcome::Diverts(None, target),
-                };
-            }
-            // `return` is the same routing decision as `break`/`continue`
-            // — but unlike them it can carry a value worth showing, so
-            // `return x + 1` (unlike a bare `return`) gets its own
-            // `Action` node labeled with that expression before
-            // diverging, the same way an `Assign` gets one.
-            if let StmtKind::Return(ret_expr) = &s.kind {
-                let own_node = ret_expr
-                    .as_ref()
-                    .map(|e| self.push(ActivityNode::Action(e.span), s.line));
-                return match (result, own_node) {
-                    (Some((first, prev_tail)), Some(n)) => {
-                        self.connect(prev_tail, Target::Local(n), None);
-                        self.connect(n, Target::Return, None);
-                        BlockOutcome::Diverts(Some(first), Target::Return)
-                    }
-                    (Some((first, prev_tail)), None) => {
-                        self.connect(prev_tail, Target::Return, None);
-                        BlockOutcome::Diverts(Some(first), Target::Return)
-                    }
-                    (None, Some(n)) => {
-                        self.connect(n, Target::Return, None);
-                        BlockOutcome::Diverts(Some(n), Target::Return)
-                    }
-                    (None, None) => BlockOutcome::Diverts(None, Target::Return),
-                };
-            }
             if let Some((entry, tail)) = self.stmt(s) {
-                result = match result {
+                chain = match chain {
                     None => Some((entry, tail)),
                     Some((first, prev_tail)) => {
                         self.connect(prev_tail, Target::Local(entry), None);
@@ -313,15 +206,26 @@ impl Builder {
                     }
                 };
             }
+            let target = match s.kind {
+                StmtKind::Break => Target::LoopExit,
+                StmtKind::Continue => Target::LoopBack,
+                StmtKind::Return(_) => Target::Return,
+                _ => continue,
+            };
+            if let Some((_, tail)) = chain {
+                self.connect(tail, target, None);
+            }
+            return BlockOutcome::Diverts(chain.map(|(first, _)| first), target);
         }
-        match result {
+        match chain {
             Some((entry, tail)) => BlockOutcome::Flows(entry, tail),
             None => BlockOutcome::Empty,
         }
     }
 
-    /// Build one statement. Returns `(entry, tail)` for the node(s) it
-    /// produced, or `None` for a deferred kind.
+    /// Build one statement's node(s), returning `(entry, tail)`. `None` means
+    /// it draws nothing here: jumps are edges, and `def`/`class` get their
+    /// own `Activity`.
     fn stmt(&mut self, s: &Stmt) -> Option<(NodeId, NodeId)> {
         match &s.kind {
             StmtKind::Assign(..)
@@ -333,15 +237,19 @@ impl Builder {
                 let n = self.push(ActivityNode::Action(s.span), s.line);
                 Some((n, n))
             }
+            StmtKind::Return(Some(value)) => {
+                let n = self.push(ActivityNode::Action(value.span), s.line);
+                Some((n, n))
+            }
             StmtKind::If {
                 cond,
                 body,
                 elifs,
                 else_body,
             } => Some(self.build_if(s.line, cond, body, elifs, else_body.as_deref())),
-            StmtKind::While { cond, body } => Some(self.build_while(s.line, cond, body)),
+            StmtKind::While { cond, body } => Some(self.build_loop(s.line, cond.span, None, body)),
             StmtKind::ForEach { iterable, body, .. } => {
-                Some(self.build_foreach(s.line, iterable, body))
+                Some(self.build_loop(s.line, iterable.span, None, body))
             }
             StmtKind::For {
                 var,
@@ -349,146 +257,44 @@ impl Builder {
                 end,
                 step,
                 body,
-            } => Some(self.build_for(s.line, var, start, end, step, body)),
-            // `Break`/`Continue`/`Return` are handled one level up, by
-            // `block()` itself (see its own doc comment) — they change
-            // how the *block* wires its own tail, which `stmt()`'s
-            // uniform `(entry, tail)` shape can't express. `block()`
-            // intercepts them before ever calling `stmt()`, so this arm
-            // is unreachable in practice; it exists only so the match
-            // stays exhaustive.
-            StmtKind::Break | StmtKind::Continue | StmtKind::Return(_) => None,
-            // `Pass` is a true no-op — already correctly handled by
-            // falling through to `_ => None` below: a block containing
-            // only `pass` produces no node, which `BlockOutcome::Empty`
-            // (and every caller's handling of it, e.g. `while x: pass`'s
-            // self-loop) already covers correctly. Never actually needed
-            // special-casing, despite being listed as deferred earlier.
-            _ => None,
-        }
-    }
-
-    /// `for var in iterable: ...` — like `build_while`, but the Decision's
-    /// label is the iterable's own source text (there's no boolean
-    /// condition to slice a span from), roughly "more items in `iterable`?"
-    fn build_foreach(&mut self, line: usize, iterable: &Expr, body: &[Stmt]) -> (NodeId, NodeId) {
-        let mut inner = Builder::default();
-        let decision = inner.push(ActivityNode::Decision(iterable.span), line);
-        let exit = inner.push(ActivityNode::Merge, line);
-        match inner.block(body) {
-            BlockOutcome::Flows(entry, tail) => {
-                inner.connect(
-                    decision,
-                    Target::Local(entry),
-                    Some(Guard::Cond(iterable.span)),
-                );
-                inner.connect(tail, Target::Local(decision), None);
-            }
-            BlockOutcome::Empty => inner.connect(
-                decision,
-                Target::Local(decision),
-                Some(Guard::Cond(iterable.span)),
-            ),
-            // The body always diverges (e.g. `for x in xs: break`) — no
-            // back-edge; the divert was already wired above by `block`,
-            // or (if it was the very first thing) wired right here.
-            BlockOutcome::Diverts(Some(entry), _) => {
-                inner.connect(
-                    decision,
-                    Target::Local(entry),
-                    Some(Guard::Cond(iterable.span)),
-                );
-            }
-            BlockOutcome::Diverts(None, target) => {
-                inner.connect(decision, target, Some(Guard::Cond(iterable.span)));
-            }
-        }
-        inner.connect(decision, Target::Local(exit), Some(Guard::Else));
-        let body_activity = Activity {
-            nodes: inner.nodes,
-            edges: inner.edges,
-            initial: decision,
-            finals: vec![exit],
-        };
-        let node = self.push(
-            ActivityNode::Structured {
-                stereotype: Stereotype::Loop,
-                setup: None,
-                body: body_activity,
-            },
-            line,
-        );
-        (node, node)
-    }
-
-    /// `for var in range(start, end, step): ...` — the counted fast path.
-    /// Shaped like `build_while`/`build_foreach`, with `end`'s own span as
-    /// the Decision's label (`end` is always a genuinely parsed `Expr` —
-    /// the only positional form the parser accepts, `range(end)`, still
-    /// parses it as a real expression; `start`/`step` are what get
-    /// synthesized when omitted). `LoopSetup` carries all three spans on
-    /// the outer `Structured` node for a renderer that wants the full
-    /// `for var in range(...)` text — `start`/`step` there CAN be the
-    /// synthesized placeholder's `(0, 0)` span when omitted (confirmed by
-    /// running the parser, not assumed), same "no real source text here,
-    /// fall back to a minimal hand-written label" situation this design's
-    /// own `with`-desugar note already accepted, not a new problem.
-    fn build_for(
-        &mut self,
-        line: usize,
-        var: &str,
-        start: &Expr,
-        end: &Expr,
-        step: &Expr,
-        body: &[Stmt],
-    ) -> (NodeId, NodeId) {
-        let mut inner = Builder::default();
-        let decision = inner.push(ActivityNode::Decision(end.span), line);
-        let exit = inner.push(ActivityNode::Merge, line);
-        match inner.block(body) {
-            BlockOutcome::Flows(entry, tail) => {
-                inner.connect(decision, Target::Local(entry), Some(Guard::Cond(end.span)));
-                inner.connect(tail, Target::Local(decision), None);
-            }
-            BlockOutcome::Empty => {
-                inner.connect(
-                    decision,
-                    Target::Local(decision),
-                    Some(Guard::Cond(end.span)),
-                );
-            }
-            // The body always diverges (e.g. `for i in range(n): break`) —
-            // no back-edge; the divert was already wired above by
-            // `block`, or (if it was the very first thing) wired right
-            // here.
-            BlockOutcome::Diverts(Some(entry), _) => {
-                inner.connect(decision, Target::Local(entry), Some(Guard::Cond(end.span)));
-            }
-            BlockOutcome::Diverts(None, target) => {
-                inner.connect(decision, target, Some(Guard::Cond(end.span)));
-            }
-        }
-        inner.connect(decision, Target::Local(exit), Some(Guard::Else));
-        let body_activity = Activity {
-            nodes: inner.nodes,
-            edges: inner.edges,
-            initial: decision,
-            finals: vec![exit],
-        };
-        let node = self.push(
-            ActivityNode::Structured {
-                stereotype: Stereotype::Loop,
-                setup: Some(LoopSetup {
-                    var: var.to_string(),
+            } => {
+                let setup = LoopSetup {
+                    var: var.clone(),
                     start: start.span,
                     end: end.span,
                     step: step.span,
-                }),
-                body: body_activity,
-            },
-            line,
-        );
-        (node, node)
+                };
+                Some(self.build_loop(s.line, end.span, Some(setup), body))
+            }
+            StmtKind::Return(None)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Pass
+            | StmtKind::Def { .. }
+            | StmtKind::ClassDef { .. }
+            | StmtKind::Import(_) => None,
+        }
+    }
+
+    fn build_loop(
+        &mut self,
+        line: usize,
+        label: Span,
+        setup: Option<LoopSetup>,
+        body: &[Stmt],
+    ) -> (NodeId, NodeId) {
+        let mut inner = Builder::default();
+        let decision = inner.push(ActivityNode::Decision(label), line);
+        let exit = inner.push(ActivityNode::Merge, line);
+        let outcome = inner.block(body);
+        // An empty body loops straight back to its own decision.
+        let into_body = outcome.entry().unwrap_or(Target::Local(decision));
+        inner.connect(decision, into_body, Some(Guard::Cond(label)));
+        if let BlockOutcome::Flows(_, tail) = outcome {
+            inner.connect(tail, Target::Local(decision), None);
+        }
+        inner.connect(decision, Target::Local(exit), Some(Guard::Else));
+        self.structured(Stereotype::Loop, setup, inner.finish(decision, exit), line)
     }
 
     fn build_if(
@@ -511,454 +317,283 @@ impl Builder {
             inner.wire_branch(d2, Guard::Cond(econd.span), ebody, merge);
             last_decision = d2;
         }
-        match else_body {
-            Some(eb) => inner.wire_branch(last_decision, Guard::Else, eb, merge),
-            None => inner.connect(last_decision, Target::Local(merge), Some(Guard::Else)),
-        }
-
-        let body_activity = Activity {
-            nodes: inner.nodes,
-            edges: inner.edges,
-            initial: decision,
-            finals: vec![merge],
-        };
-        let node = self.push(
-            ActivityNode::Structured {
-                stereotype: Stereotype::Conditional,
-                setup: None,
-                body: body_activity,
-            },
+        inner.wire_branch(last_decision, Guard::Else, else_body.unwrap_or(&[]), merge);
+        self.structured(
+            Stereotype::Conditional,
+            None,
+            inner.finish(decision, merge),
             line,
-        );
+        )
+    }
+
+    fn structured(
+        &mut self,
+        stereotype: Stereotype,
+        setup: Option<LoopSetup>,
+        body: Activity,
+        line: usize,
+    ) -> (NodeId, NodeId) {
+        let kind = ActivityNode::Structured {
+            stereotype,
+            setup,
+            body,
+        };
+        let node = self.push(kind, line);
         (node, node)
     }
 
-    /// Wire `from --guard--> (branch's entry)`, and the branch's tail (or
-    /// `from` itself, guarded, if the branch produced no node) `--> join`
-    /// (unguarded — `join` is a plain `Merge`, not another decision).
-    /// If the branch diverges (`break`/`continue`) instead of falling
-    /// through, it never connects to `join` at all — that edge was
-    /// already wired (or is wired right here) straight to the loop
-    /// target instead.
+    /// Wire `from --guard--> branch --> join`. A branch that ends in a jump
+    /// never reaches `join`.
     fn wire_branch(&mut self, from: NodeId, guard: Guard, stmts: &[Stmt], join: NodeId) {
-        match self.block(stmts) {
-            BlockOutcome::Flows(entry, tail) => {
-                self.connect(from, Target::Local(entry), Some(guard));
-                self.connect(tail, Target::Local(join), None);
-            }
-            BlockOutcome::Empty => self.connect(from, Target::Local(join), Some(guard)),
-            BlockOutcome::Diverts(Some(entry), _) => {
-                self.connect(from, Target::Local(entry), Some(guard));
-            }
-            BlockOutcome::Diverts(None, target) => self.connect(from, target, Some(guard)),
+        let outcome = self.block(stmts);
+        let into_branch = outcome.entry().unwrap_or(Target::Local(join));
+        self.connect(from, into_branch, Some(guard));
+        if let BlockOutcome::Flows(_, tail) = outcome {
+            self.connect(tail, Target::Local(join), None);
         }
-    }
-
-    fn build_while(&mut self, line: usize, cond: &Expr, body: &[Stmt]) -> (NodeId, NodeId) {
-        let mut inner = Builder::default();
-        let decision = inner.push(ActivityNode::Decision(cond.span), line);
-        let exit = inner.push(ActivityNode::Merge, line); // "after the loop"
-        match inner.block(body) {
-            BlockOutcome::Flows(entry, tail) => {
-                inner.connect(decision, Target::Local(entry), Some(Guard::Cond(cond.span)));
-                // The back-edge: an ordinary edge that happens to point
-                // backward. A layout pass infers the special routing from
-                // topology, not from a label built here.
-                inner.connect(tail, Target::Local(decision), None);
-            }
-            // `while cond: pass` — the body is a no-op, so the loop's own
-            // decision is an immediate self-loop. Correct, not a hack.
-            BlockOutcome::Empty => {
-                inner.connect(
-                    decision,
-                    Target::Local(decision),
-                    Some(Guard::Cond(cond.span)),
-                );
-            }
-            // The body always diverges (e.g. `while True: break`) — no
-            // back-edge; the divert was already wired by `block`, or (if
-            // it was the very first thing) wired right here.
-            BlockOutcome::Diverts(Some(entry), _) => {
-                inner.connect(decision, Target::Local(entry), Some(Guard::Cond(cond.span)));
-            }
-            BlockOutcome::Diverts(None, target) => {
-                inner.connect(decision, target, Some(Guard::Cond(cond.span)));
-            }
-        }
-        inner.connect(decision, Target::Local(exit), Some(Guard::Else));
-        let body_activity = Activity {
-            nodes: inner.nodes,
-            edges: inner.edges,
-            initial: decision,
-            finals: vec![exit],
-        };
-        let node = self.push(
-            ActivityNode::Structured {
-                stereotype: Stereotype::Loop,
-                setup: None,
-                body: body_activity,
-            },
-            line,
-        );
-        (node, node)
     }
 }
 
-/// One node ready to render, flattened out of an `Activity` and all of
-/// its nested `Structured` bodies into a single space. `Activity`'s own
-/// `NodeId` is only unique *within* one `Activity` — a nested body's
-/// ids restart at 0 — so flattening assigns a fresh, globally unique
-/// `id` to every node, outer and nested alike.
-#[derive(Debug, Clone)]
+/// What a flattened node draws as. `Structured` has no entry because
+/// flattening splices it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatKind {
+    Initial,
+    ActivityFinal,
+    Action(Span),
+    Decision(Span),
+    Merge,
+}
+
+/// A node with an id that's unique across the whole flattened graph.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlatNode {
     pub id: usize,
-    pub kind: ActivityNode,
+    pub kind: FlatKind,
     pub line: usize,
 }
 
-/// One edge between two `FlatNode::id`s (already remapped from
-/// whichever `Activity`'s own local ids it was declared with).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlatEdge {
     pub from: usize,
     pub to: usize,
     pub guard: Option<Guard>,
 }
 
-/// Pass 2: flatten `activity` and all nested `Structured` bodies into
-/// one node/edge list with globally unique ids, and lay out each node's
-/// 2D position in the same pass. Plain `(f64, f64)` — no UI/rendering
-/// dependency belongs here (a renderer converts these to whatever its
-/// own coordinate type is; that conversion is the only UI-specific
-/// part).
+/// A positioned graph, with no UI types: a renderer converts the plain
+/// `(x, y)` pairs itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FlatActivity {
+    pub nodes: Vec<FlatNode>,
+    pub edges: Vec<FlatEdge>,
+    pub positions: HashMap<usize, (f64, f64)>,
+}
+
+/// Pass 2: flatten `activity` and its nested bodies into one graph, laying
+/// out each node as it goes.
 ///
 /// A `Structured` node is spliced out: edges into it land on its body's
-/// entry, edges out of it leave from its body's exit, and it produces no
-/// flat node of its own. Anything unreachable from the start is then
-/// dropped — e.g. the `Merge` of an `if` whose branches all `return`,
-/// and any statements after it.
+/// entry and edges out of it leave from its body's exit. Anything
+/// unreachable from the start is then dropped, such as the `Merge` of an
+/// `if` whose branches all `return`.
 ///
-/// **Known rough edge**: where two branches of a `Decision` reconverge
-/// at their shared `Merge`, that node's position is claimed by whichever
-/// branch's walk reaches it first, so with very unequal branches the
-/// merge can sit a little higher than ideal.
-///
-/// `(flattened nodes, flattened edges, node id -> (x, y))`.
-pub type FlatActivity = (
-    Vec<FlatNode>,
-    Vec<FlatEdge>,
-    std::collections::HashMap<usize, (f64, f64)>,
-);
-
-/// `activity` is always one whole, self-contained function-or-module
-/// body — `build()`'s module activity, or one of `build_program`'s
-/// per-function/per-method activities — so this is always where a
-/// `Target::Return` context gets established, never a nested call.
+/// **Known rough edge**: a shared `Merge` takes its position from whichever
+/// branch reaches it first, so with very unequal branches it can sit a
+/// little higher than ideal.
 pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
-    let mut next_id = 0usize;
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    let mut positions = std::collections::HashMap::new();
-    let (_, start, _) = place_activity(
-        activity,
-        0.0,
-        0.0,
-        &mut next_id,
-        &mut nodes,
-        &mut edges,
-        &mut positions,
-        false,
-        None,
-        true,
-        None,
-    );
+    let mut f = Flattener::default();
+    let placed = f.place_activity(activity, 0.0, 0.0, Role::Function, Jumps::default());
+    let mut out = f.out;
 
-    let mut reachable = std::collections::HashSet::from([start]);
-    let mut pending = vec![start];
+    let mut reachable = HashSet::from([placed.entry]);
+    let mut pending = vec![placed.entry];
     while let Some(id) = pending.pop() {
-        for e in edges.iter().filter(|e| e.from == id) {
+        for e in out.edges.iter().filter(|e| e.from == id) {
             if reachable.insert(e.to) {
                 pending.push(e.to);
             }
         }
     }
-    nodes.retain(|n| reachable.contains(&n.id));
-    edges.retain(|e| reachable.contains(&e.from));
-    positions.retain(|id, _| reachable.contains(id));
-    (nodes, edges, positions)
+    out.nodes.retain(|n| reachable.contains(&n.id));
+    out.edges.retain(|e| reachable.contains(&e.from));
+    out.positions.retain(|id, _| reachable.contains(id));
+    out
 }
 
-/// Walk one `Activity`'s own local structure (and, recursively, every
-/// nested body's), assigning each local `NodeId` it encounters a fresh
-/// global id via `next_id`. `local_to_global` is created fresh per
-/// `Activity` — local ids are only meaningful within the one `Activity`
-/// that assigned them, so a child body's map must never be confused
-/// with its parent's. Returns the Y coordinate just past everything
-/// this activity placed, plus the global ids of its entry and exit.
-///
-/// `is_loop` / `inherited_loop_ctx`: if this activity is a loop's own
-/// body (`is_loop`), its `decision`/`exit` get resolved to global ids
-/// up front — before anything inside it is walked — so any `break`/
-/// `continue` found anywhere within it (however deeply nested inside
-/// further non-loop `Structured` bodies) can resolve a `Target::LoopExit`/
-/// `LoopBack` to a concrete id the moment it's encountered. A non-loop
-/// body (an `if`'s) just inherits whatever loop context was already
-/// active around it — a `break` inside an `if` inside a `while` still
-/// means the `while`, so the context has to see through non-loop
-/// nesting rather than reset at every `Structured` boundary.
-///
-/// `establish_fn_ctx` / `inherited_fn_ctx`: same idea, one layer up —
-/// `true` only when `activity` is itself a whole function/module body
-/// (every call from `flatten_and_layout` directly; never from a nested
-/// `Structured` recursion), resolving `activity.finals[0]` (there's
-/// exactly one, same guarantee `build()` already gives the module
-/// activity) up front so `Target::Return` can resolve from anywhere
-/// inside, however many loops or `if`s deep. Unlike `loop_ctx`, this
-/// NEVER gets re-established at a nested boundary — a `return` two
-/// loops deep still means THIS function's own end, not the nearest
-/// loop's.
-#[allow(clippy::too_many_arguments)]
-fn place_activity(
-    activity: &Activity,
-    x0: f64,
-    y0: f64,
-    next_id: &mut usize,
-    nodes: &mut Vec<FlatNode>,
-    edges: &mut Vec<FlatEdge>,
-    positions: &mut std::collections::HashMap<usize, (f64, f64)>,
-    is_loop: bool,
-    inherited_loop_ctx: Option<(usize, usize)>,
-    establish_fn_ctx: bool,
-    inherited_fn_ctx: Option<usize>,
-) -> (f64, usize, usize) {
-    const ROW_H: f64 = 70.0;
-    const COL_W: f64 = 180.0;
+const ROW_H: f64 = 70.0;
+const COL_W: f64 = 180.0;
 
-    fn assign(
-        activity: &Activity,
-        local_id: NodeId,
-        local_to_global: &mut std::collections::HashMap<NodeId, usize>,
-        next_id: &mut usize,
-        nodes: &mut Vec<FlatNode>,
-    ) -> usize {
-        *local_to_global.entry(local_id).or_insert_with(|| {
-            let gid = *next_id;
-            *next_id += 1;
-            let n = &activity.nodes[local_id];
-            nodes.push(FlatNode {
-                id: gid,
-                kind: n.kind.clone(),
-                line: n.line,
-            });
-            gid
-        })
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Function,
+    Loop,
+    Conditional,
+}
+
+/// Global ids that jumps resolve to. A loop body sets `loop_ids`, so `break`
+/// binds to the nearest loop. `fn_final` is set once and never replaced.
+/// Either is `None` only for a jump outside any loop or function, which
+/// isn't valid Python, so that edge is skipped.
+#[derive(Clone, Copy, Default)]
+struct Jumps {
+    /// `(decision, exit)`
+    loop_ids: Option<(usize, usize)>,
+    fn_final: Option<usize>,
+}
+
+impl Jumps {
+    fn resolve(&self, target: Target) -> Option<usize> {
+        match target {
+            Target::Local(_) => None,
+            Target::LoopExit => self.loop_ids.map(|(_, exit)| exit),
+            Target::LoopBack => self.loop_ids.map(|(decision, _)| decision),
+            Target::Return => self.fn_final,
+        }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn place(
+struct Placed {
+    y_end: f64,
+    entry: usize,
+    exit: usize,
+}
+
+/// State for walking one `Activity`. `ids` is per-`Activity` because local
+/// ids mean nothing outside it.
+struct Walk<'a> {
+    activity: &'a Activity,
+    ids: HashMap<NodeId, usize>,
+    visited: HashSet<NodeId>,
+    jumps: Jumps,
+}
+
+#[derive(Default)]
+struct Flattener {
+    next_id: usize,
+    out: FlatActivity,
+}
+
+impl Flattener {
+    fn place_activity(
+        &mut self,
         activity: &Activity,
-        local_id: NodeId,
         x: f64,
         y: f64,
-        local_to_global: &mut std::collections::HashMap<NodeId, usize>,
-        next_id: &mut usize,
-        nodes: &mut Vec<FlatNode>,
-        edges: &mut Vec<FlatEdge>,
-        positions: &mut std::collections::HashMap<usize, (f64, f64)>,
-        visited: &mut std::collections::HashSet<NodeId>,
-        loop_ctx: Option<(usize, usize)>,
-        fn_ctx: Option<usize>,
-    ) -> f64 {
-        let gid = assign(activity, local_id, local_to_global, next_id, nodes);
-        if !visited.insert(local_id) {
-            // Already placed — either a loop's back-edge (correctly
-            // stops the recursion there) or the second branch reaching a
-            // shared Merge (see the "known rough edge" note above).
-            return y;
+        role: Role,
+        jumps: Jumps,
+    ) -> Placed {
+        let mut walk = Walk {
+            activity,
+            ids: HashMap::new(),
+            visited: HashSet::new(),
+            jumps,
+        };
+        let entry = self.global_id(&mut walk, activity.initial);
+        let exit = self.global_id(&mut walk, activity.exit);
+        match role {
+            Role::Function => walk.jumps.fn_final = Some(exit),
+            Role::Loop => walk.jumps.loop_ids = Some((entry, exit)),
+            Role::Conditional => {}
         }
-        positions.insert(gid, (x, y));
-        let mut y_after = y + ROW_H;
-        let mut from_gid = gid;
+        let y_end = self.place(&mut walk, activity.initial, x, y);
+        // A final reached only by `return` edges is never walked to.
+        if role == Role::Function && !walk.visited.contains(&activity.exit) {
+            self.out.positions.insert(exit, (x, y_end));
+        }
+        Placed { y_end, entry, exit }
+    }
 
+    fn global_id(&mut self, walk: &mut Walk, local: NodeId) -> usize {
+        if let Some(&id) = walk.ids.get(&local) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        walk.ids.insert(local, id);
+        let node = &walk.activity.nodes[local];
+        let kind = match node.kind {
+            ActivityNode::Initial => Some(FlatKind::Initial),
+            ActivityNode::ActivityFinal => Some(FlatKind::ActivityFinal),
+            ActivityNode::Action(span) => Some(FlatKind::Action(span)),
+            ActivityNode::Decision(span) => Some(FlatKind::Decision(span)),
+            ActivityNode::Merge => Some(FlatKind::Merge),
+            ActivityNode::Structured { .. } => None,
+        };
+        if let Some(kind) = kind {
+            self.out.nodes.push(FlatNode {
+                id,
+                kind,
+                line: node.line,
+            });
+        }
+        id
+    }
+
+    /// Place `local` and everything after it, returning the Y just past it.
+    fn place(&mut self, walk: &mut Walk, local: NodeId, x: f64, y: f64) -> f64 {
+        let id = self.global_id(walk, local);
+        if !walk.visited.insert(local) {
+            return y; // a back-edge, or a shared Merge
+        }
+        let activity = walk.activity;
+
+        let mut y_after = y + ROW_H;
+        let mut from = id;
         if let ActivityNode::Structured {
             stereotype, body, ..
-        } = &activity.nodes[local_id].kind
+        } = &activity.nodes[local].kind
         {
-            let (y_end, entry, exit) = place_activity(
-                body,
-                x,
-                y,
-                next_id,
-                nodes,
-                edges,
-                positions,
-                *stereotype == Stereotype::Loop,
-                loop_ctx,
-                false,
-                fn_ctx,
-            );
+            let role = match stereotype {
+                Stereotype::Loop => Role::Loop,
+                Stereotype::Conditional => Role::Conditional,
+            };
+            let placed = self.place_activity(body, x, y, role, walk.jumps);
             // Every edge into this node was pushed before it was placed.
-            for e in edges.iter_mut().filter(|e| e.to == gid) {
-                e.to = entry;
+            for e in self.out.edges.iter_mut().filter(|e| e.to == id) {
+                e.to = placed.entry;
             }
-            nodes.retain(|n| n.id != gid);
-            positions.remove(&gid);
-            y_after = y_end;
-            from_gid = exit;
+            y_after = placed.y_end;
+            from = placed.exit;
+        } else {
+            self.out.positions.insert(id, (x, y));
         }
 
-        let outs: Vec<&ControlFlow> = activity
-            .edges
-            .iter()
-            .filter(|e| e.from == local_id)
-            .collect();
+        let outs: Vec<&ControlFlow> = activity.edges.iter().filter(|e| e.from == local).collect();
         for e in &outs {
-            // `Target::LoopExit`/`LoopBack`/`Return` resolve against
-            // whatever context is already active here (see
-            // `place_activity`'s doc comment) rather than through
-            // `activity`'s own local node list — their destination was
-            // never local to begin with. `None` here only happens for a
-            // `break`/`continue`/`return` outside any loop/function,
-            // which isn't valid Python; skip the edge rather than
-            // invent a destination for input a real compile would
-            // already have rejected.
-            let to_gid = match e.to {
-                Target::Local(local) => {
-                    Some(assign(activity, local, local_to_global, next_id, nodes))
-                }
-                Target::LoopExit => loop_ctx.map(|(_, exit)| exit),
-                Target::LoopBack => loop_ctx.map(|(decision, _)| decision),
-                Target::Return => fn_ctx,
+            let to = match e.to {
+                Target::Local(next) => Some(self.global_id(walk, next)),
+                jump => walk.jumps.resolve(jump),
             };
-            if let Some(to_gid) = to_gid {
-                edges.push(FlatEdge {
-                    from: from_gid,
-                    to: to_gid,
+            if let Some(to) = to {
+                self.out.edges.push(FlatEdge {
+                    from,
+                    to,
                     guard: e.guard.clone(),
                 });
             }
         }
-        // Branch count — and which side each guard lays out on — is
-        // about how many guarded edges exist, regardless of whether a
-        // given one's destination is local. Recursion itself is skipped
-        // per-branch below when it isn't: `LoopExit`/`LoopBack` already
-        // got their edge above and point at a node some ancestor
-        // activity positions itself, so there's nothing left to walk.
-        match outs.len() {
-            0 => y_after,
-            1 => match outs[0].to {
-                Target::Local(to) => place(
-                    activity,
-                    to,
-                    x,
-                    y_after,
-                    local_to_global,
-                    next_id,
-                    nodes,
-                    edges,
-                    positions,
-                    visited,
-                    loop_ctx,
-                    fn_ctx,
-                ),
-                Target::LoopExit | Target::LoopBack | Target::Return => y_after,
-            },
-            _ => {
-                // A Decision: its guarded edges branch side by side —
-                // Cond left, Else right, matching the "[cond]"/"[else]"
-                // convention the guard labels themselves use.
-                let cond = outs
-                    .iter()
-                    .find(|e| matches!(e.guard, Some(Guard::Cond(_))))
-                    .map(|e| e.to);
-                let other = outs
-                    .iter()
-                    .find(|e| matches!(e.guard, Some(Guard::Else)))
-                    .map(|e| e.to);
-                let mut max_y = y_after;
-                if let Some(Target::Local(to)) = cond {
-                    max_y = max_y.max(place(
-                        activity,
-                        to,
-                        x - COL_W / 2.0,
-                        y_after,
-                        local_to_global,
-                        next_id,
-                        nodes,
-                        edges,
-                        positions,
-                        visited,
-                        loop_ctx,
-                        fn_ctx,
-                    ));
-                }
-                if let Some(Target::Local(to)) = other {
-                    max_y = max_y.max(place(
-                        activity,
-                        to,
-                        x + COL_W / 2.0,
-                        y_after,
-                        local_to_global,
-                        next_id,
-                        nodes,
-                        edges,
-                        positions,
-                        visited,
-                        loop_ctx,
-                        fn_ctx,
-                    ));
-                }
-                max_y
+
+        // Only local targets are walked: a jump's target is placed by the
+        // `Activity` that owns it.
+        if let [only] = outs[..] {
+            return match only.to {
+                Target::Local(next) => self.place(walk, next, x, y_after),
+                _ => y_after,
+            };
+        }
+        // A `Decision`: `[cond]` goes left and `[else]` goes right.
+        let mut y_end = y_after;
+        for e in &outs {
+            if let Target::Local(next) = e.to {
+                let dx = match e.guard {
+                    Some(Guard::Cond(_)) => -COL_W / 2.0,
+                    _ => COL_W / 2.0,
+                };
+                y_end = y_end.max(self.place(walk, next, x + dx, y_after));
             }
         }
+        y_end
     }
-
-    let mut local_to_global = std::collections::HashMap::new();
-    let mut visited = std::collections::HashSet::new();
-    let entry = assign(
-        activity,
-        activity.initial,
-        &mut local_to_global,
-        next_id,
-        nodes,
-    );
-    let exit = assign(
-        activity,
-        activity.finals[0],
-        &mut local_to_global,
-        next_id,
-        nodes,
-    );
-    let loop_ctx = if is_loop {
-        Some((entry, exit))
-    } else {
-        inherited_loop_ctx
-    };
-    let fn_ctx = if establish_fn_ctx {
-        Some(exit)
-    } else {
-        inherited_fn_ctx
-    };
-    let y_end = place(
-        activity,
-        activity.initial,
-        x0,
-        y0,
-        &mut local_to_global,
-        next_id,
-        nodes,
-        edges,
-        positions,
-        &mut visited,
-        loop_ctx,
-        fn_ctx,
-    );
-    // A function's final can be reached only through `Target::Return`
-    // edges, which `place()` never walks, so it goes below everything.
-    if establish_fn_ctx && !visited.contains(&activity.finals[0]) {
-        positions.insert(exit, (x0, y_end));
-    }
-    (y_end, entry, exit)
 }
 
 #[cfg(test)]
@@ -1122,7 +757,11 @@ mod tests {
         // NodeIds collide with the outer activity's — exactly the case
         // that broke the earlier HashMap<NodeId, _> design.
         let a = build_src("while x > 0:\n    if x > 1:\n        y = 1\n    else:\n        y = 2\n");
-        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges: _edges,
+            positions,
+        } = flatten_and_layout(&a);
         let mut ids: Vec<usize> = nodes.iter().map(|n| n.id).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -1141,7 +780,11 @@ mod tests {
     #[test]
     fn a_straight_line_chain_lays_out_as_one_column_of_increasing_rows() {
         let a = build_src("x = 1\ny = 2\n");
-        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges: _edges,
+            positions,
+        } = flatten_and_layout(&a);
         let xs: Vec<f64> = nodes.iter().map(|n| positions[&n.id].0).collect();
         assert!(
             xs.iter().all(|&x| x == xs[0]),
@@ -1156,10 +799,14 @@ mod tests {
     #[test]
     fn an_if_else_s_two_branches_land_in_different_columns() {
         let a = build_src("if x > 0:\n    y = 1\nelse:\n    y = 2\n");
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         let decision = nodes
             .iter()
-            .find(|n| matches!(n.kind, ActivityNode::Decision(_)))
+            .find(|n| matches!(n.kind, FlatKind::Decision(_)))
             .unwrap();
         let cond_to = edges
             .iter()
@@ -1182,7 +829,11 @@ mod tests {
         // Regression: flatten_and_layout must terminate on a cyclic
         // Activity graph (the loop's own back-edge).
         let a = build_src("while x > 0:\n    x = x - 1\n");
-        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges: _edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
     }
 
@@ -1233,7 +884,11 @@ mod tests {
     #[test]
     fn a_foreach_loop_flattens_and_lays_out_without_crashing() {
         let a = build_src("for x in xs:\n    y = x\n");
-        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges: _edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
     }
 
@@ -1273,7 +928,11 @@ mod tests {
     #[test]
     fn a_counted_for_flattens_and_lays_out_without_crashing() {
         let a = build_src("for i in range(3):\n    y = i\n");
-        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges: _edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
     }
 
@@ -1284,12 +943,16 @@ mod tests {
         let a = build_src(
             "for i in range(10):\n    if arr[i] == target:\n        found = i\n        break\n",
         );
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
         let exit_id = nodes
             .iter()
             .find(|n| {
-                matches!(n.kind, ActivityNode::Merge) && {
+                matches!(n.kind, FlatKind::Merge) && {
                     let froms: std::collections::HashSet<_> = edges
                         .iter()
                         .filter(|e| e.to == n.id)
@@ -1308,16 +971,20 @@ mod tests {
     #[test]
     fn a_bare_return_resolves_to_the_function_s_activity_final() {
         let a = build_src("if x:\n    return\ny = 1\n");
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
         let fin_id = nodes
             .iter()
-            .find(|n| matches!(n.kind, ActivityNode::ActivityFinal))
+            .find(|n| matches!(n.kind, FlatKind::ActivityFinal))
             .unwrap()
             .id;
         let if_decision = nodes
             .iter()
-            .find(|n| matches!(n.kind, ActivityNode::Decision(_)))
+            .find(|n| matches!(n.kind, FlatKind::Decision(_)))
             .unwrap()
             .id;
         assert!(
@@ -1353,16 +1020,20 @@ mod tests {
     #[test]
     fn multiple_returns_in_one_function_converge_on_the_same_final() {
         let a = build_src("if x:\n    return 1\nelse:\n    return 2\n");
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
         let fin_id = nodes
             .iter()
-            .find(|n| matches!(n.kind, ActivityNode::ActivityFinal))
+            .find(|n| matches!(n.kind, FlatKind::ActivityFinal))
             .unwrap()
             .id;
         let returns: Vec<usize> = nodes
             .iter()
-            .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+            .filter(|n| matches!(n.kind, FlatKind::Action(_)))
             .map(|n| n.id)
             .collect();
         assert_eq!(
@@ -1476,16 +1147,20 @@ mod tests {
         // every loop's global ids by the time it reaches this) can
         // resolve it.
         let a = build_src("while x > 0:\n    if x > 1:\n        break\n    x = x - 1\n");
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len(), "every node still gets placed");
         let exit_id = nodes
             .iter()
-            .find(|n| matches!(n.kind, ActivityNode::Merge))
+            .find(|n| matches!(n.kind, FlatKind::Merge))
             .unwrap()
             .id;
         let decision_ids: Vec<usize> = nodes
             .iter()
-            .filter(|n| matches!(n.kind, ActivityNode::Decision(_)))
+            .filter(|n| matches!(n.kind, FlatKind::Decision(_)))
             .map(|n| n.id)
             .collect();
         // The if's own Decision has an edge straight to the while's exit
@@ -1502,12 +1177,16 @@ mod tests {
     #[test]
     fn continue_nested_in_an_if_resolves_to_the_loop_s_own_decision() {
         let a = build_src("for x in xs:\n    if x < 0:\n        continue\n    y = x\n");
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
         let loop_decision = nodes
             .iter()
             .find(|n| {
-                matches!(n.kind, ActivityNode::Decision(_)) && {
+                matches!(n.kind, FlatKind::Decision(_)) && {
                     // the loop's own decision is the one with a self/back edge
                     // into it from somewhere, as opposed to the if's decision
                     edges.iter().any(|e| e.to == n.id && e.from != n.id)
@@ -1517,7 +1196,7 @@ mod tests {
         assert!(loop_decision.is_some());
         let if_decisions: Vec<usize> = nodes
             .iter()
-            .filter(|n| matches!(n.kind, ActivityNode::Decision(_)) && Some(n.id) != loop_decision)
+            .filter(|n| matches!(n.kind, FlatKind::Decision(_)) && Some(n.id) != loop_decision)
             .map(|n| n.id)
             .collect();
         assert!(
@@ -1552,12 +1231,16 @@ mod tests {
              \x20   else:\n\
              \x20       break\n",
         );
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len(), "every node gets placed");
         let exit_id = nodes
             .iter()
             .find(|n| {
-                matches!(n.kind, ActivityNode::Merge) && {
+                matches!(n.kind, FlatKind::Merge) && {
                     // the loop's own exit is the Merge nothing points INTO
                     // except via a break/the loop's own Else — distinguish
                     // it from the three `if`s' own merges by checking it's
@@ -1598,13 +1281,17 @@ mod tests {
              \x20   if not swapped:\n\
              \x20       break\n",
         );
-        let (nodes, edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len(), "every node gets placed");
         // Two loops, two Decisions with a back-edge each, two Merges. The
         // OUTER loop's Merge is the one reachable from the no-swaps `if`.
         let decisions: Vec<usize> = nodes
             .iter()
-            .filter(|n| matches!(n.kind, ActivityNode::Decision(_)))
+            .filter(|n| matches!(n.kind, FlatKind::Decision(_)))
             .map(|n| n.id)
             .collect();
         assert_eq!(
@@ -1614,7 +1301,7 @@ mod tests {
         );
         let merges: Vec<usize> = nodes
             .iter()
-            .filter(|n| matches!(n.kind, ActivityNode::Merge))
+            .filter(|n| matches!(n.kind, FlatKind::Merge))
             .map(|n| n.id)
             .collect();
         assert_eq!(
@@ -1647,7 +1334,7 @@ mod tests {
     fn reached(nodes: &[FlatNode], edges: &[FlatEdge]) -> std::collections::HashSet<usize> {
         let start = nodes
             .iter()
-            .find(|n| matches!(n.kind, ActivityNode::Initial))
+            .find(|n| matches!(n.kind, FlatKind::Initial))
             .unwrap()
             .id;
         let mut seen = std::collections::HashSet::from([start]);
@@ -1663,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn every_flat_node_is_connected_from_start_and_structured_nodes_are_gone() {
+    fn every_flat_node_is_connected_from_start() {
         for src in [
             "if x > 0:
     y = 1
@@ -1688,18 +1375,16 @@ z = 3
 z = 3
 ",
         ] {
-            let (nodes, edges, positions) = flatten_and_layout(&build_src(src));
+            let FlatActivity {
+                nodes,
+                edges,
+                positions,
+            } = flatten_and_layout(&build_src(src));
             assert_eq!(reached(&nodes, &edges).len(), nodes.len(), "{src}");
             assert_eq!(positions.len(), nodes.len(), "{src}");
-            assert!(
-                nodes
-                    .iter()
-                    .all(|n| !matches!(n.kind, ActivityNode::Structured { .. })),
-                "{src}"
-            );
             let fin = nodes
                 .iter()
-                .find(|n| matches!(n.kind, ActivityNode::ActivityFinal))
+                .find(|n| matches!(n.kind, FlatKind::ActivityFinal))
                 .unwrap();
             assert!(edges.iter().any(|e| e.to == fin.id), "{src}");
         }
@@ -1707,7 +1392,11 @@ z = 3
 
     #[test]
     fn the_branches_of_an_if_lead_to_the_statement_after_it() {
-        let (nodes, edges, _) = flatten_and_layout(&build_src(
+        let FlatActivity {
+            nodes,
+            edges,
+            positions: _,
+        } = flatten_and_layout(&build_src(
             "if x > 0:
     y = 1
 else:
@@ -1717,12 +1406,12 @@ z = 3
         ));
         let merge = nodes
             .iter()
-            .find(|n| matches!(n.kind, ActivityNode::Merge))
+            .find(|n| matches!(n.kind, FlatKind::Merge))
             .unwrap()
             .id;
         let actions: Vec<usize> = nodes
             .iter()
-            .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+            .filter(|n| matches!(n.kind, FlatKind::Action(_)))
             .map(|n| n.id)
             .collect();
         assert_eq!(actions.len(), 3);
@@ -1733,7 +1422,11 @@ z = 3
 
     #[test]
     fn code_after_an_if_whose_branches_all_return_is_not_drawn() {
-        let (nodes, _, _) = flatten_and_layout(&build_src(
+        let FlatActivity {
+            nodes,
+            edges: _,
+            positions: _,
+        } = flatten_and_layout(&build_src(
             "if x:
     return 1
 else:
@@ -1741,26 +1434,30 @@ else:
 z = 3
 ",
         ));
-        assert!(!nodes.iter().any(|n| matches!(n.kind, ActivityNode::Merge)));
+        assert!(!nodes.iter().any(|n| matches!(n.kind, FlatKind::Merge)));
         let actions = nodes
             .iter()
-            .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+            .filter(|n| matches!(n.kind, FlatKind::Action(_)))
             .count();
         assert_eq!(actions, 2, "z = 3 can never run");
     }
 
     #[test]
     fn a_final_reached_only_by_return_sits_below_the_rest_of_the_chart() {
-        let (nodes, _, positions) = flatten_and_layout(&build_src(
+        let FlatActivity {
+            nodes,
+            edges: _,
+            positions,
+        } = flatten_and_layout(&build_src(
             "y = 1
 return y
 ",
         ));
-        let y_of = |pick: fn(&ActivityNode) -> bool| {
+        let y_of = |pick: fn(&FlatKind) -> bool| {
             positions[&nodes.iter().find(|n| pick(&n.kind)).unwrap().id].1
         };
-        let fin = y_of(|k| matches!(k, ActivityNode::ActivityFinal));
-        let start = y_of(|k| matches!(k, ActivityNode::Initial));
+        let fin = y_of(|k| matches!(k, FlatKind::ActivityFinal));
+        let start = y_of(|k| matches!(k, FlatKind::Initial));
         assert!(fin > start);
         assert!(positions.values().all(|p| p.1 <= fin));
     }
@@ -1769,7 +1466,11 @@ return y
     fn break_outside_any_loop_is_skipped_not_a_crash() {
         // Not valid Python, but shouldn't panic the flowchart view either.
         let a = build_src("x = 1\nbreak\ny = 2\n");
-        let (nodes, _edges, positions) = flatten_and_layout(&a);
+        let FlatActivity {
+            nodes,
+            edges: _edges,
+            positions,
+        } = flatten_and_layout(&a);
         assert_eq!(positions.len(), nodes.len());
     }
 }
