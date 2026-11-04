@@ -632,29 +632,16 @@ pub struct FlatEdge {
 /// own coordinate type is; that conversion is the only UI-specific
 /// part).
 ///
-/// A `Structured` node's `body` is flattened into the SAME coordinate
-/// space as its parent (laid out starting right where the `Structured`
-/// node itself sits) — v1 doesn't draw the dashed `«loop»`/
-/// `«conditional»` container box yet, per the design plan, so there's
-/// nothing to offset the body relative to.
+/// A `Structured` node is spliced out: edges into it land on its body's
+/// entry, edges out of it leave from its body's exit, and it produces no
+/// flat node of its own. Anything unreachable from the start is then
+/// dropped — e.g. the `Merge` of an `if` whose branches all `return`,
+/// and any statements after it.
 ///
-/// **Known rough edges, left for when there's a real render to look
-/// at**:
-/// - where two branches of a `Decision` reconverge at their shared
-///   `Merge`, that node's position is claimed by whichever branch's
-///   walk reaches it first — if the branches are very unequal in
-///   length, the merge can end up a little higher than ideal.
-///   Topologically correct either way; only the exact Y looks a bit off
-///   in the asymmetric case.
-/// - a `Structured` node (an `if`/loop) always gets a plain fallthrough
-///   edge to whatever follows it in the OUTER sequence, even when every
-///   branch inside it actually diverges (every path `return`s, say) and
-///   that edge can never fire. Suppressing it needs each `Structured`
-///   node to report its own reachability up through `stmt()`'s uniform
-///   return shape — a real refactor, not a one-line fix — so it's a
-///   deliberately accepted dead edge for this narrow slice, not a
-///   correctness bug: everything it points at still resolves to a real,
-///   correctly-shared node.
+/// **Known rough edge**: where two branches of a `Decision` reconverge
+/// at their shared `Merge`, that node's position is claimed by whichever
+/// branch's walk reaches it first, so with very unequal branches the
+/// merge can sit a little higher than ideal.
 ///
 /// `(flattened nodes, flattened edges, node id -> (x, y))`.
 pub type FlatActivity = (
@@ -672,7 +659,7 @@ pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut positions = std::collections::HashMap::new();
-    place_activity(
+    let (_, start, _) = place_activity(
         activity,
         0.0,
         0.0,
@@ -685,6 +672,19 @@ pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
         true,
         None,
     );
+
+    let mut reachable = std::collections::HashSet::from([start]);
+    let mut pending = vec![start];
+    while let Some(id) = pending.pop() {
+        for e in edges.iter().filter(|e| e.from == id) {
+            if reachable.insert(e.to) {
+                pending.push(e.to);
+            }
+        }
+    }
+    nodes.retain(|n| reachable.contains(&n.id));
+    edges.retain(|e| reachable.contains(&e.from));
+    positions.retain(|id, _| reachable.contains(id));
     (nodes, edges, positions)
 }
 
@@ -694,7 +694,7 @@ pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
 /// `Activity` — local ids are only meaningful within the one `Activity`
 /// that assigned them, so a child body's map must never be confused
 /// with its parent's. Returns the Y coordinate just past everything
-/// this activity placed.
+/// this activity placed, plus the global ids of its entry and exit.
 ///
 /// `is_loop` / `inherited_loop_ctx`: if this activity is a loop's own
 /// body (`is_loop`), its `decision`/`exit` get resolved to global ids
@@ -730,7 +730,7 @@ fn place_activity(
     inherited_loop_ctx: Option<(usize, usize)>,
     establish_fn_ctx: bool,
     inherited_fn_ctx: Option<usize>,
-) -> f64 {
+) -> (f64, usize, usize) {
     const ROW_H: f64 = 70.0;
     const COL_W: f64 = 180.0;
 
@@ -778,15 +778,16 @@ fn place_activity(
         }
         positions.insert(gid, (x, y));
         let mut y_after = y + ROW_H;
+        let mut from_gid = gid;
 
         if let ActivityNode::Structured {
             stereotype, body, ..
         } = &activity.nodes[local_id].kind
         {
-            y_after = place_activity(
+            let (y_end, entry, exit) = place_activity(
                 body,
                 x,
-                y_after,
+                y,
                 next_id,
                 nodes,
                 edges,
@@ -796,6 +797,14 @@ fn place_activity(
                 false,
                 fn_ctx,
             );
+            // Every edge into this node was pushed before it was placed.
+            for e in edges.iter_mut().filter(|e| e.to == gid) {
+                e.to = entry;
+            }
+            nodes.retain(|n| n.id != gid);
+            positions.remove(&gid);
+            y_after = y_end;
+            from_gid = exit;
         }
 
         let outs: Vec<&ControlFlow> = activity
@@ -823,7 +832,7 @@ fn place_activity(
             };
             if let Some(to_gid) = to_gid {
                 edges.push(FlatEdge {
-                    from: gid,
+                    from: from_gid,
                     to: to_gid,
                     guard: e.guard.clone(),
                 });
@@ -906,48 +915,31 @@ fn place_activity(
 
     let mut local_to_global = std::collections::HashMap::new();
     let mut visited = std::collections::HashSet::new();
+    let entry = assign(
+        activity,
+        activity.initial,
+        &mut local_to_global,
+        next_id,
+        nodes,
+    );
+    let exit = assign(
+        activity,
+        activity.finals[0],
+        &mut local_to_global,
+        next_id,
+        nodes,
+    );
     let loop_ctx = if is_loop {
-        let decision_gid = assign(
-            activity,
-            activity.initial,
-            &mut local_to_global,
-            next_id,
-            nodes,
-        );
-        let exit_gid = assign(
-            activity,
-            activity.finals[0],
-            &mut local_to_global,
-            next_id,
-            nodes,
-        );
-        Some((decision_gid, exit_gid))
+        Some((entry, exit))
     } else {
         inherited_loop_ctx
     };
     let fn_ctx = if establish_fn_ctx {
-        // Unlike a loop's `exit` (always reached by the Decision's own
-        // `Guard::Else` edge, so `place()`'s normal recursion always
-        // positions it), a function's `ActivityFinal` can be reached
-        // ONLY via `Target::Return` edges (e.g. every branch of the
-        // function's top-level `if` returns) — `place()` never visits
-        // it locally in that case, so it'd otherwise end up with a
-        // `FlatNode` but no entry in `positions`. Give it a provisional
-        // one now; a later genuine local visit overwrites it with the
-        // real computed position, same `positions.insert` either way.
-        let final_gid = assign(
-            activity,
-            activity.finals[0],
-            &mut local_to_global,
-            next_id,
-            nodes,
-        );
-        positions.entry(final_gid).or_insert((x0, y0));
-        Some(final_gid)
+        Some(exit)
     } else {
         inherited_fn_ctx
     };
-    place(
+    let y_end = place(
         activity,
         activity.initial,
         x0,
@@ -960,7 +952,13 @@ fn place_activity(
         &mut visited,
         loop_ctx,
         fn_ctx,
-    )
+    );
+    // A function's final can be reached only through `Target::Return`
+    // edges, which `place()` never walks, so it goes below everything.
+    if establish_fn_ctx && !visited.contains(&activity.finals[0]) {
+        positions.insert(exit, (x0, y_end));
+    }
+    (y_end, entry, exit)
 }
 
 #[cfg(test)]
@@ -1381,19 +1379,7 @@ mod tests {
             returns.iter().all(|r| froms.contains(r)),
             "both returns' own Action nodes must reach the SAME final"
         );
-        // Known rough edge (same spirit as the asymmetric-merge-Y-position
-        // one documented on `flatten_and_layout`): the `if`'s own outer
-        // "box" ALSO gets a dead fallthrough edge to `fin`, since
-        // `build_if` always returns a plain pass-through node regardless
-        // of whether its merge is actually reachable — here it never is
-        // (both branches return), so this edge can never fire. Cosmetic,
-        // not a correctness bug; not worth the reachability-propagation
-        // refactor it'd take to suppress for this narrow slice.
-        assert_eq!(
-            froms.len(),
-            3,
-            "includes the if's own dead fallthrough edge"
-        );
+        assert_eq!(froms.len(), 2, "nothing else reaches the final");
     }
 
     #[test]
@@ -1655,6 +1641,128 @@ mod tests {
             if_decision.is_some(),
             "the no-swaps if's break must resolve to a concrete Merge, not dangle"
         );
+    }
+
+    /// Every id reachable from the `Initial` node by following flat edges.
+    fn reached(nodes: &[FlatNode], edges: &[FlatEdge]) -> std::collections::HashSet<usize> {
+        let start = nodes
+            .iter()
+            .find(|n| matches!(n.kind, ActivityNode::Initial))
+            .unwrap()
+            .id;
+        let mut seen = std::collections::HashSet::from([start]);
+        let mut pending = vec![start];
+        while let Some(id) = pending.pop() {
+            for e in edges.iter().filter(|e| e.from == id) {
+                if seen.insert(e.to) {
+                    pending.push(e.to);
+                }
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn every_flat_node_is_connected_from_start_and_structured_nodes_are_gone() {
+        for src in [
+            "if x > 0:
+    y = 1
+else:
+    y = 2
+z = 3
+",
+            "while x > 0:
+    x = x - 1
+z = 3
+",
+            "for i in range(3):
+    if i > 1:
+        break
+    y = i
+z = 3
+",
+            "for v in xs:
+    if v:
+        continue
+    y = v
+z = 3
+",
+        ] {
+            let (nodes, edges, positions) = flatten_and_layout(&build_src(src));
+            assert_eq!(reached(&nodes, &edges).len(), nodes.len(), "{src}");
+            assert_eq!(positions.len(), nodes.len(), "{src}");
+            assert!(
+                nodes
+                    .iter()
+                    .all(|n| !matches!(n.kind, ActivityNode::Structured { .. })),
+                "{src}"
+            );
+            let fin = nodes
+                .iter()
+                .find(|n| matches!(n.kind, ActivityNode::ActivityFinal))
+                .unwrap();
+            assert!(edges.iter().any(|e| e.to == fin.id), "{src}");
+        }
+    }
+
+    #[test]
+    fn the_branches_of_an_if_lead_to_the_statement_after_it() {
+        let (nodes, edges, _) = flatten_and_layout(&build_src(
+            "if x > 0:
+    y = 1
+else:
+    y = 2
+z = 3
+",
+        ));
+        let merge = nodes
+            .iter()
+            .find(|n| matches!(n.kind, ActivityNode::Merge))
+            .unwrap()
+            .id;
+        let actions: Vec<usize> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(actions.len(), 3);
+        assert_eq!(edges.iter().filter(|e| e.to == merge).count(), 2);
+        let after = edges.iter().find(|e| e.from == merge).unwrap().to;
+        assert!(actions.contains(&after), "the merge continues to z = 3");
+    }
+
+    #[test]
+    fn code_after_an_if_whose_branches_all_return_is_not_drawn() {
+        let (nodes, _, _) = flatten_and_layout(&build_src(
+            "if x:
+    return 1
+else:
+    return 2
+z = 3
+",
+        ));
+        assert!(!nodes.iter().any(|n| matches!(n.kind, ActivityNode::Merge)));
+        let actions = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, ActivityNode::Action(_)))
+            .count();
+        assert_eq!(actions, 2, "z = 3 can never run");
+    }
+
+    #[test]
+    fn a_final_reached_only_by_return_sits_below_the_rest_of_the_chart() {
+        let (nodes, _, positions) = flatten_and_layout(&build_src(
+            "y = 1
+return y
+",
+        ));
+        let y_of = |pick: fn(&ActivityNode) -> bool| {
+            positions[&nodes.iter().find(|n| pick(&n.kind)).unwrap().id].1
+        };
+        let fin = y_of(|k| matches!(k, ActivityNode::ActivityFinal));
+        let start = y_of(|k| matches!(k, ActivityNode::Initial));
+        assert!(fin > start);
+        assert!(positions.values().all(|p| p.1 <= fin));
     }
 
     #[test]
