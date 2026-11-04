@@ -52,6 +52,8 @@ pub enum StmtKind {
         end: Expr,
         step: Expr,
         body: Vec<Stmt>,
+        /// The `for var in range(...)` text, which no single `Expr` covers.
+        header: Span,
     },
     /// `for var in iterable: ...` over a sequence (list or string).
     ForEach {
@@ -121,18 +123,19 @@ pub struct Method {
     pub body: Vec<Stmt>,
 }
 
-/// Byte range `[start, end)` of a node in the source, when tracked. Currently
-/// populated only for binary-operator nodes (the *operator token's* range), to
-/// support IDE features like set-notation glyphing; `(0, 0)` everywhere else.
-/// Populating it for more node kinds (e.g. span-level error underlining) is a
-/// future extension.
+/// Byte range `[start, end)` of a node in the source. `(0, 0)` means none.
 pub type Span = (usize, usize);
 
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
     pub line: usize,
+    /// Where a diagnostic should point: the operator of a binary expression,
+    /// the callee name of a call, otherwise the whole node.
     pub span: Span,
+    /// The whole expression's source text. `(0, 0)` if the parser synthesized
+    /// it.
+    pub full_span: Span,
 }
 
 impl PartialEq for Expr {

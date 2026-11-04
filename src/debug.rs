@@ -819,6 +819,7 @@ impl Stepper {
                 end,
                 step,
                 body,
+                ..
             } => {
                 let next = self.eval_int(start, "range() start")?;
                 let stop = self.eval_int(end, "range() stop")?;
@@ -1381,6 +1382,7 @@ impl Stepper {
                 end,
                 step,
                 body,
+                ..
             } => {
                 let int =
                     |v: Value, what: &str| as_int(&v).ok_or(format!("{what} must be an integer"));
@@ -2334,6 +2336,7 @@ impl Vm {
             }
             StmtKind::While { cond, body } => {
                 self.push_task(Task::WhileHead(
+                ..
                     Rc::new(cond.clone()),
                     Rc::new(body.clone()),
                 ));
@@ -2351,6 +2354,7 @@ impl Vm {
                 self.push_task(Task::Eval(Rc::new(start.clone())));
             }
             StmtKind::Break => self.push_task(Task::Break),
+                        full_span: (0, 0),
             StmtKind::Continue => self.push_task(Task::Continue),
             StmtKind::Pass => {}
             StmtKind::Return(opt) => {

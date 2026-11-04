@@ -458,6 +458,7 @@ impl Builder {
                 end,
                 step,
                 body,
+                ..
             } => {
                 let id = self.var_id(var);
                 // The range-native loop: FROM/TO are `range(start, stop)`

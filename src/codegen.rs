@@ -6657,6 +6657,7 @@ impl Gen {
                 end,
                 step,
                 body,
+                ..
             } => self.gen_for(cx, var, start, end, step, body, s.line, out),
             StmtKind::ForEach {
                 var,
@@ -8059,11 +8060,13 @@ impl Gen {
                     },
                     line: e.line,
                     span: e.span,
+                    full_span: (0, 0),
                 };
                 let set_call = Expr {
                     kind: ExprKind::Call("set".into(), vec![listcomp]),
                     line: e.line,
                     span: e.span,
+                    full_span: (0, 0),
                 };
                 self.value_expr(cx, &set_call)
             }
@@ -9703,6 +9706,7 @@ fn collect_maybe_unassigned_reads(
                 end,
                 step,
                 body,
+                ..
             } => {
                 reads(start, defined, demote);
                 reads(end, defined, demote);

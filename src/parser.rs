@@ -3,7 +3,7 @@
 //! (`if`, `for`, `while`) consume indented blocks delimited by INDENT/DEDENT;
 //! simple statements consume their trailing NEWLINE.
 
-use crate::ast::{BinOp, CompClause, Expr, ExprKind, Method, Stmt, StmtKind, UnOp};
+use crate::ast::{BinOp, CompClause, Expr, ExprKind, Method, Span, Stmt, StmtKind, UnOp};
 use crate::error::CompileError;
 use crate::lexer::{Tok, Token};
 
@@ -504,6 +504,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::MethodCall(container, "pop".into(), vec![*index]),
                         line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     }),
                     line,
                     span: (0, 0),
@@ -545,6 +546,7 @@ impl<'a> Parser<'a> {
                 kind: ExprKind::Bin(op, Box::new(read), Box::new(rhs)),
                 line,
                 span: (0, 0),
+                full_span: (0, 0),
             };
             return match e.kind {
                 ExprKind::Name(name) => {
@@ -552,6 +554,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Name(name.clone()),
                         line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     };
                     Ok(Stmt {
                         kind: StmtKind::Assign(name, combined(read, rhs)),
@@ -564,6 +567,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Index(target.clone(), index.clone()),
                         line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     };
                     Ok(Stmt {
                         kind: StmtKind::SetIndex {
@@ -580,6 +584,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Attr(obj.clone(), attr.clone()),
                         line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     };
                     Ok(Stmt {
                         kind: StmtKind::SetAttr {
@@ -679,6 +684,7 @@ impl<'a> Parser<'a> {
                                 kind: ExprKind::Name(prev),
                                 line,
                                 span: (0, 0),
+                                full_span: (0, 0),
                             },
                         ),
                         line,
@@ -1030,11 +1036,13 @@ impl<'a> Parser<'a> {
             kind: ExprKind::NoneLit,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         let tmp_ref = || Expr {
             kind: ExprKind::Name(tmp.clone()),
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
 
         let primary = Stmt {
@@ -1047,6 +1055,7 @@ impl<'a> Parser<'a> {
             kind: ExprKind::MethodCall(Box::new(tmp_ref()), "__enter__".into(), Vec::new()),
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         self.pending.push(Stmt {
             kind: StmtKind::Assign(name, enter_call),
@@ -1064,6 +1073,7 @@ impl<'a> Parser<'a> {
             ),
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         self.pending.push(Stmt {
             kind: StmtKind::Expr(exit_call),
@@ -1076,6 +1086,7 @@ impl<'a> Parser<'a> {
 
     fn for_stmt(&mut self) -> Result<Stmt> {
         let line = self.line();
+        let lo = self.byte();
         self.eat_keyword("for")?;
         // One or more comma-separated loop variables (`for k, v in ...`).
         let mut targets = vec![self.for_target_name()?];
@@ -1092,10 +1103,12 @@ impl<'a> Parser<'a> {
             self.advance(); // range
             self.advance(); // (
             let args = self.call_args()?;
+            let header = (lo, self.prev_end());
             let int = |n: i64| Expr {
                 kind: ExprKind::Int(n),
                 line,
                 span: (0, 0),
+                full_span: (0, 0),
             };
             let (start, end, step) = match args.len() {
                 1 => (int(0), args[0].clone(), int(1)),
@@ -1115,6 +1128,7 @@ impl<'a> Parser<'a> {
                     end,
                     step,
                     body,
+                    header,
                 },
                 line,
                 span: (0, 0),
@@ -1137,12 +1151,14 @@ impl<'a> Parser<'a> {
                             kind: ExprKind::Name(n),
                             line,
                             span: (0, 0),
+                            full_span: (0, 0),
                         })
                         .collect(),
                     value: Expr {
                         kind: ExprKind::Name(tmp.clone()),
                         line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     },
                 },
                 line,
@@ -1193,6 +1209,7 @@ impl<'a> Parser<'a> {
     /// comma before `=`, newline, `:`, or `)` is handled).
     fn expr_list(&mut self) -> Result<Expr> {
         let line = self.line();
+        let lo = self.byte();
         let first = self.expr(0)?;
         if !matches!(self.peek(), Tok::Comma) {
             return Ok(first);
@@ -1212,6 +1229,7 @@ impl<'a> Parser<'a> {
             kind: ExprKind::Tuple(items),
             line,
             span: (0, 0),
+            full_span: (lo, self.prev_end()),
         })
     }
 
@@ -1259,6 +1277,7 @@ impl<'a> Parser<'a> {
                 kind: ExprKind::Tuple(items),
                 line,
                 span: (0, 0),
+                full_span: (0, 0),
             },
             star,
         ))
@@ -1291,6 +1310,7 @@ impl<'a> Parser<'a> {
             kind: k,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         let tmp_ref = |mk: &dyn Fn(ExprKind) -> Expr| mk(ExprKind::Name(tmp.clone()));
         let mut stmts = vec![Stmt {
@@ -1365,7 +1385,9 @@ impl<'a> Parser<'a> {
 
     /// Pratt expression parser.
     fn expr(&mut self, min_bp: u8) -> Result<Expr> {
+        let lo = self.byte();
         let mut lhs = self.prefix()?;
+        lhs.full_span = (lo, self.prev_end());
         while let Some((op, l_bp, r_bp)) = self.peek_infix() {
             if l_bp < min_bp {
                 break;
@@ -1381,6 +1403,7 @@ impl<'a> Parser<'a> {
             if op == BinOp::IsNot {
                 self.advance(); // the `not` of `is not`
             }
+            let op_end = self.prev_end();
             let rhs = self.expr(r_bp)?;
             if matches!(op, BinOp::Is | BinOp::IsNot)
                 && !matches!(lhs.kind, ExprKind::NoneLit)
@@ -1393,14 +1416,16 @@ impl<'a> Parser<'a> {
                 ));
             }
             if is_comparison(op) {
-                lhs = self.comparison_chain(lhs, op, rhs, op_line)?;
+                lhs = self.comparison_chain(lhs, op, rhs, op_line, (op_byte, op_end))?;
             } else {
                 lhs = Expr {
                     kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs)),
                     line: op_line,
                     span: (op_byte, op_byte + 1),
+                    full_span: (0, 0),
                 };
             }
+            lhs.full_span = (lo, self.prev_end());
         }
         // Conditional expression (ternary): `<then> if <cond> else <orelse>`.
         // Python's lowest precedence, so only at the test level (min_bp == 0),
@@ -1419,7 +1444,7 @@ impl<'a> Parser<'a> {
             self.eat_keyword("else")?;
             let orelse = self.expr(0)?; // full test (right-assoc)
             // Full extent: from the `then` operand's start to the `orelse` end.
-            let span = (lhs.span.0, orelse.span.1);
+            let span = (lhs.full_span.0, orelse.full_span.1);
             lhs = Expr {
                 kind: ExprKind::IfExp {
                     cond: Box::new(cond),
@@ -1428,6 +1453,7 @@ impl<'a> Parser<'a> {
                 },
                 line,
                 span,
+                full_span: span,
             };
         }
         Ok(lhs)
@@ -1436,11 +1462,19 @@ impl<'a> Parser<'a> {
     /// Python chains comparisons: `a < b < c` means `a < b and b < c` (each
     /// middle operand evaluated once — safe to duplicate here because the
     /// supported expressions have no side effects).
-    fn comparison_chain(&mut self, lhs: Expr, op: BinOp, rhs: Expr, line: usize) -> Result<Expr> {
+    fn comparison_chain(
+        &mut self,
+        lhs: Expr,
+        op: BinOp,
+        rhs: Expr,
+        line: usize,
+        op_span: Span,
+    ) -> Result<Expr> {
         let mut chain = Expr {
             kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs.clone())),
             line,
-            span: (0, 0),
+            span: op_span,
+            full_span: (0, 0),
         };
         let mut prev = rhs;
         while let Some((next_op, _, r_bp)) = self.peek_infix() {
@@ -1457,17 +1491,21 @@ impl<'a> Parser<'a> {
                      store the call's result in a variable first",
                 ));
             }
+            let next_byte = self.byte();
             self.advance();
+            let next_span = (next_byte, self.prev_end());
             let next = self.expr(r_bp)?;
             let pair = Expr {
                 kind: ExprKind::Bin(next_op, Box::new(prev), Box::new(next.clone())),
                 line: op_line,
-                span: (0, 0),
+                span: next_span,
+                full_span: (0, 0),
             };
             chain = Expr {
                 kind: ExprKind::Bin(BinOp::And, Box::new(chain), Box::new(pair)),
                 line: op_line,
                 span: (0, 0),
+                full_span: (0, 0),
             };
             prev = next;
         }
@@ -1495,6 +1533,7 @@ impl<'a> Parser<'a> {
                 kind: ExprKind::Unary(UnOp::Neg, Box::new(operand)),
                 line,
                 span: (0, 0),
+                full_span: (0, 0),
             });
         }
         if matches!(self.peek(), Tok::Tilde) {
@@ -1505,6 +1544,7 @@ impl<'a> Parser<'a> {
                 kind: ExprKind::Unary(UnOp::Invert, Box::new(operand)),
                 line,
                 span: (0, 0),
+                full_span: (0, 0),
             });
         }
         if self.is_keyword("not") {
@@ -1515,6 +1555,7 @@ impl<'a> Parser<'a> {
                 kind: ExprKind::Unary(UnOp::Not, Box::new(operand)),
                 line,
                 span: (0, 0),
+                full_span: (0, 0),
             });
         }
         let atom = self.primary()?;
@@ -1563,6 +1604,7 @@ impl<'a> Parser<'a> {
                             },
                             line,
                             span: (0, 0),
+                            full_span: (0, 0),
                         };
                     } else {
                         let index = first.ok_or_else(|| {
@@ -1576,6 +1618,7 @@ impl<'a> Parser<'a> {
                             kind: ExprKind::Index(Box::new(e), index),
                             line,
                             span: (0, 0),
+                            full_span: (0, 0),
                         };
                     }
                 }
@@ -1612,6 +1655,7 @@ impl<'a> Parser<'a> {
                                 kind: ExprKind::MethodCall(Box::new(e), name, args),
                                 line,
                                 span: (0, 0),
+                                full_span: (0, 0),
                             };
                         }
                     } else {
@@ -1619,6 +1663,7 @@ impl<'a> Parser<'a> {
                             kind: ExprKind::Attr(Box::new(e), name),
                             line,
                             span: (0, 0),
+                            full_span: (0, 0),
                         };
                     }
                 }
@@ -1698,6 +1743,7 @@ impl<'a> Parser<'a> {
             kind,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         match self.peek().clone() {
             Tok::Int(n) => {
@@ -1733,6 +1779,7 @@ impl<'a> Parser<'a> {
                                         kind: ExprKind::Str(spec),
                                         line,
                                         span: (0, 0),
+                                        full_span: (0, 0),
                                     },
                                 ],
                             ))
@@ -1861,6 +1908,7 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Call("set".into(), vec![arg]),
                     line,
                     span: (0, 0),
+                    full_span: (0, 0),
                 };
                 let mut elements = vec![first];
                 while matches!(self.peek(), Tok::Comma) {
@@ -1875,6 +1923,7 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::List(elements),
                     line,
                     span: (0, 0),
+                    full_span: (0, 0),
                 }))
             }
             Tok::Name(name) => {
@@ -1916,16 +1965,19 @@ impl<'a> Parser<'a> {
                                         kind: ExprKind::Int(-1),
                                         line,
                                         span: (0, 0),
+                                        full_span: (0, 0),
                                     })),
                                 },
                                 line,
                                 span: name_span,
+                                full_span: (0, 0),
                             });
                         }
                         Ok(Expr {
                             kind: ExprKind::Call(name, args),
                             line,
                             span: name_span,
+                            full_span: (0, 0),
                         })
                     }
                     _ => Ok(expr(ExprKind::Name(name))),
@@ -1956,6 +2008,7 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Kwarg(k, Box::new(value)),
                     line,
                     span: (0, 0),
+                    full_span: (0, 0),
                 });
                 seen_kwarg = true;
                 match self.peek() {
@@ -1990,6 +2043,7 @@ impl<'a> Parser<'a> {
                     },
                     line,
                     span: (0, 0),
+                    full_span: (0, 0),
                 }]);
             }
             args.push(e);
@@ -2128,6 +2182,7 @@ fn desugar_format_literal(template: &str, args: &[Expr], line: usize) -> Option<
         kind,
         line,
         span: (0, 0),
+        full_span: (0, 0),
     };
 
     let mut pieces: Vec<Expr> = Vec::new();
@@ -2502,12 +2557,14 @@ mod tests {
                 Box::new(Expr {
                     kind: ExprKind::Name("x".into()),
                     line: 0,
-                    span: (0, 0)
+                    span: (0, 0),
+                    full_span: (0, 0),
                 }),
                 Box::new(Expr {
                     kind: ExprKind::NoneLit,
                     line: 0,
-                    span: (0, 0)
+                    span: (0, 0),
+                    full_span: (0, 0),
                 })
             )
         );
@@ -2631,6 +2688,7 @@ mod tests {
                     kind: ExprKind::Name("x".into()),
                     line: 0,
                     span: (0, 0),
+                    full_span: (0, 0),
                 }]
             )
         );
@@ -2678,6 +2736,7 @@ mod tests {
             kind,
             line: 0,
             span: (0, 0),
+            full_span: (0, 0),
         }
     }
 

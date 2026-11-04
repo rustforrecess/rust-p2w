@@ -199,6 +199,7 @@ fn rewrite_call_expr(e: &mut Expr, caps: &BTreeMap<String, Vec<String>>) {
                         kind: ExprKind::Name(c.clone()),
                         line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     })
                     .collect();
                 new_args.append(args);

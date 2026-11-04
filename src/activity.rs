@@ -234,11 +234,11 @@ impl Builder {
             | StmtKind::SetAttr { .. }
             | StmtKind::UnpackAssign { .. }
             | StmtKind::Expr(_) => {
-                let n = self.push(ActivityNode::Action(s.span), s.line);
+                let n = self.push(ActivityNode::Action(action_span(s)), s.line);
                 Some((n, n))
             }
-            StmtKind::Return(Some(value)) => {
-                let n = self.push(ActivityNode::Action(value.span), s.line);
+            StmtKind::Return(Some(_)) => {
+                let n = self.push(ActivityNode::Action(action_span(s)), s.line);
                 Some((n, n))
             }
             StmtKind::If {
@@ -247,9 +247,12 @@ impl Builder {
                 elifs,
                 else_body,
             } => Some(self.build_if(s.line, cond, body, elifs, else_body.as_deref())),
-            StmtKind::While { cond, body } => Some(self.build_loop(s.line, cond.span, None, body)),
+            StmtKind::While { cond, body } => {
+                Some(self.build_loop(s.line, cond.full_span, None, body))
+            }
             StmtKind::ForEach { iterable, body, .. } => {
-                Some(self.build_loop(s.line, iterable.span, None, body))
+                let header = (s.span.0, iterable.full_span.1);
+                Some(self.build_loop(s.line, header, None, body))
             }
             StmtKind::For {
                 var,
@@ -257,6 +260,7 @@ impl Builder {
                 end,
                 step,
                 body,
+                header,
             } => {
                 let setup = LoopSetup {
                     var: var.clone(),
@@ -264,7 +268,7 @@ impl Builder {
                     end: end.span,
                     step: step.span,
                 };
-                Some(self.build_loop(s.line, end.span, Some(setup), body))
+                Some(self.build_loop(s.line, *header, Some(setup), body))
             }
             StmtKind::Return(None)
             | StmtKind::Break
@@ -306,15 +310,15 @@ impl Builder {
         else_body: Option<&[Stmt]>,
     ) -> (NodeId, NodeId) {
         let mut inner = Builder::default();
-        let decision = inner.push(ActivityNode::Decision(cond.span), line);
+        let decision = inner.push(ActivityNode::Decision(cond.full_span), line);
         let merge = inner.push(ActivityNode::Merge, line);
-        inner.wire_branch(decision, Guard::Cond(cond.span), body, merge);
+        inner.wire_branch(decision, Guard::Cond(cond.full_span), body, merge);
 
         let mut last_decision = decision;
         for (econd, ebody) in elifs {
-            let d2 = inner.push(ActivityNode::Decision(econd.span), line);
+            let d2 = inner.push(ActivityNode::Decision(econd.full_span), econd.line);
             inner.connect(last_decision, Target::Local(d2), Some(Guard::Else));
-            inner.wire_branch(d2, Guard::Cond(econd.span), ebody, merge);
+            inner.wire_branch(d2, Guard::Cond(econd.full_span), ebody, merge);
             last_decision = d2;
         }
         inner.wire_branch(last_decision, Guard::Else, else_body.unwrap_or(&[]), merge);
@@ -352,6 +356,25 @@ impl Builder {
             self.connect(tail, Target::Local(join), None);
         }
     }
+}
+
+/// A simple statement's text, stopping where its value ends so a trailing
+/// comment stays out. Desugared statements have no source, so stay `(0, 0)`.
+fn action_span(s: &Stmt) -> Span {
+    let value = match &s.kind {
+        StmtKind::Assign(_, value)
+        | StmtKind::AnnAssign { value, .. }
+        | StmtKind::SetIndex { value, .. }
+        | StmtKind::SetAttr { value, .. }
+        | StmtKind::UnpackAssign { value, .. }
+        | StmtKind::Expr(value)
+        | StmtKind::Return(Some(value)) => value,
+        _ => return s.span,
+    };
+    if s.span == (0, 0) || value.full_span == (0, 0) {
+        return s.span;
+    }
+    (s.span.0, value.full_span.1)
 }
 
 /// What a flattened node draws as. `Structured` has no entry because
@@ -1328,6 +1351,85 @@ mod tests {
             if_decision.is_some(),
             "the no-swaps if's break must resolve to a concrete Merge, not dangle"
         );
+    }
+
+    /// The text of every `Decision` and `Action`, in graph order.
+    fn labels(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for named in build_program(&parser::parse(&crate::lexer::lex(src).unwrap()).unwrap()) {
+            for n in flatten_and_layout(&named.activity).nodes {
+                if let FlatKind::Action(span) | FlatKind::Decision(span) = n.kind {
+                    out.push(src[span.0..span.1].to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decision_labels_are_the_whole_condition() {
+        for cond in [
+            "x == 1",
+            "n % 2 == 0",
+            "len(xs) > 0",
+            "a and b",
+            "a or b",
+            "x in xs",
+            "x not in xs",
+            "foo(x)",
+            "not done",
+            "(a + b) * c > 0",
+            "1 < x < 9",
+            "a + 1 if c else d",
+        ] {
+            let src = format!("if {cond}:\n    y = 1\n");
+            assert!(labels(&src).contains(&cond.to_string()), "{cond}");
+            let src = format!("while {cond}:\n    y = 1\n");
+            assert!(labels(&src).contains(&cond.to_string()), "{cond}");
+        }
+    }
+
+    #[test]
+    fn elif_decisions_have_their_own_text_and_line() {
+        let src = "if a:\n    x = 1\nelif b == 2:\n    x = 2\n";
+        assert!(labels(src).contains(&"b == 2".to_string()));
+        let stmts = parser::parse(&crate::lexer::lex(src).unwrap()).unwrap();
+        let flat = flatten_and_layout(&build(&stmts));
+        let lines: Vec<usize> = flat
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, FlatKind::Decision(_)))
+            .map(|n| n.line)
+            .collect();
+        assert!(lines.contains(&1) && lines.contains(&3), "{lines:?}");
+    }
+
+    #[test]
+    fn loop_decisions_show_the_whole_header() {
+        for header in [
+            "for i in range(1, 6, 2)",
+            "for i in range(n - 1)",
+            "for i in range(len(xs))",
+            "for x in xs",
+        ] {
+            let src = format!("{header}:\n    y = 1\n");
+            assert!(labels(&src).contains(&header.to_string()), "{header}");
+        }
+    }
+
+    #[test]
+    fn action_labels_are_the_statement_without_its_comment() {
+        assert_eq!(labels("x = 1  # set it\n"), vec!["x = 1"]);
+        assert_eq!(labels("xs[0] = y + 1  # note\n"), vec!["xs[0] = y + 1"]);
+        assert_eq!(labels("print(x)  # show\n"), vec!["print(x)"]);
+    }
+
+    #[test]
+    fn return_labels_include_the_keyword_and_whole_value() {
+        let got = labels("def f(a):\n    return a + 1\n");
+        assert!(got.contains(&"return a + 1".to_string()), "{got:?}");
+        let got = labels("def f(a):\n    return a.b, 2\n");
+        assert!(got.contains(&"return a.b, 2".to_string()), "{got:?}");
     }
 
     /// Every id reachable from the `Initial` node by following flat edges.

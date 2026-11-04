@@ -334,6 +334,7 @@ impl Checker {
                     end,
                     step,
                     body,
+                    ..
                 } => {
                     for e in [start, end, step] {
                         self.expr(e, env);

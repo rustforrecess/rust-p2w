@@ -1375,6 +1375,7 @@ impl<'a> FuncEmitter<'a> {
             kind: k,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         let arr_name = || mk(ExprKind::Name(name.to_string()));
         let idx = || mk(ExprKind::Name(iname.clone()));
@@ -1503,6 +1504,7 @@ impl<'a> FuncEmitter<'a> {
             kind: k,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         let src_name = || mk(ExprKind::Name(src.clone()));
         let idx = || mk(ExprKind::Name(iname.clone()));
@@ -1630,6 +1632,7 @@ impl<'a> FuncEmitter<'a> {
             kind: k,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         for (i, item) in items.iter().enumerate() {
             self.stmt(&Stmt {
@@ -1772,6 +1775,7 @@ impl<'a> FuncEmitter<'a> {
                     kind: k,
                     line,
                     span: (0, 0),
+                    full_span: (0, 0),
                 };
                 // A tuple target loops over a hidden element var and unpacks it at
                 // the top of the body. (`range` can't be tuple-unpacked.)
@@ -1812,6 +1816,7 @@ impl<'a> FuncEmitter<'a> {
                             end,
                             step,
                             body,
+                            header: (0, 0),
                         }
                     }
                     _ => StmtKind::ForEach {
@@ -1855,6 +1860,7 @@ impl<'a> FuncEmitter<'a> {
             kind: k,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         let append = Stmt {
             kind: StmtKind::Expr(mk(ExprKind::MethodCall(
@@ -1893,6 +1899,7 @@ impl<'a> FuncEmitter<'a> {
             kind: k,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         let set = Stmt {
             kind: StmtKind::SetIndex {
@@ -2161,6 +2168,7 @@ impl<'a> FuncEmitter<'a> {
                     kind: ExprKind::Str(attr.clone()),
                     line: s.line,
                     span: (0, 0),
+                    full_span: (0, 0),
                 })?;
                 let v = self.expr(value)?;
                 self.line(&format!(
@@ -2252,6 +2260,7 @@ impl<'a> FuncEmitter<'a> {
                 end,
                 step,
                 body,
+                ..
             } => self.emit_for(var, start, end, step, body),
             StmtKind::Break => {
                 let (_, brk) = self
@@ -2322,6 +2331,7 @@ impl<'a> FuncEmitter<'a> {
             kind: k,
             line,
             span: (0, 0),
+            full_span: (0, 0),
         };
         for (i, target) in targets.iter().enumerate() {
             let elem = mk(ExprKind::Index(
@@ -3006,6 +3016,7 @@ impl<'a> FuncEmitter<'a> {
                         kind: k,
                         line,
                         span: (0, 0),
+                        full_span: (0, 0),
                     };
                     let mk_s = |k: StmtKind| Stmt {
                         kind: k,
@@ -3105,6 +3116,7 @@ impl<'a> FuncEmitter<'a> {
                                 kind: ExprKind::Str("r".to_string()),
                                 line: e.line,
                                 span: (0, 0),
+                                full_span: (0, 0),
                             };
                             self.expr_borrow(&r_lit)?
                         }
@@ -3459,6 +3471,7 @@ impl<'a> FuncEmitter<'a> {
                     kind: ExprKind::Str(attr.clone()),
                     line: e.line,
                     span: (0, 0),
+                    full_span: (0, 0),
                 })?;
                 let r = self.call_value(&format!("call i32 @p2w_getattr(i32 {ov}, i32 {name})"));
                 self.release(&name);
@@ -3493,11 +3506,13 @@ impl<'a> FuncEmitter<'a> {
                     },
                     line: e.line,
                     span: e.span,
+                    full_span: (0, 0),
                 };
                 let set_call = Expr {
                     kind: ExprKind::Call("set".into(), vec![listcomp]),
                     line: e.line,
                     span: e.span,
+                    full_span: (0, 0),
                 };
                 self.expr_typed(&set_call)
             }
@@ -4115,6 +4130,7 @@ fn stmt_escapes(s: &Stmt, p: &str) -> bool {
             end,
             step,
             body,
+            ..
         } => {
             var == p
                 || expr_escapes(start, false, p)
