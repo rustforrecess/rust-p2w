@@ -234,6 +234,10 @@ impl Builder {
             | StmtKind::SetAttr { .. }
             | StmtKind::UnpackAssign { .. }
             | StmtKind::Expr(_) => {
+                // Desugared statements have no source the student wrote.
+                if s.span == (0, 0) {
+                    return None;
+                }
                 let n = self.push(ActivityNode::Action(action_span(s)), s.line);
                 Some((n, n))
             }
@@ -359,7 +363,7 @@ impl Builder {
 }
 
 /// A simple statement's text, stopping where its value ends so a trailing
-/// comment stays out. Desugared statements have no source, so stay `(0, 0)`.
+/// comment stays out.
 fn action_span(s: &Stmt) -> Span {
     let value = match &s.kind {
         StmtKind::Assign(_, value)
@@ -371,7 +375,7 @@ fn action_span(s: &Stmt) -> Span {
         | StmtKind::Return(Some(value)) => value,
         _ => return s.span,
     };
-    if s.span == (0, 0) || value.full_span == (0, 0) {
+    if value.full_span == (0, 0) {
         return s.span;
     }
     (s.span.0, value.full_span.1)
@@ -422,7 +426,7 @@ pub struct FlatActivity {
 /// Pass 2 with the default 2D layout.
 pub fn flatten_and_layout(activity: &Activity) -> FlatActivity {
     let graph = flatten(activity);
-    let positions = layout(&graph);
+    let positions = layout(&graph, |_| DEFAULT_WIDTH);
     FlatActivity {
         nodes: graph.nodes,
         edges: graph.edges,
@@ -457,12 +461,15 @@ pub fn flatten(activity: &Activity) -> FlatGraph {
 
 const ROW_H: f64 = 70.0;
 const COL_W: f64 = 180.0;
+const DEFAULT_WIDTH: f64 = 140.0;
+/// Space between neighbours in a row.
+const GAP: f64 = 40.0;
 
 /// Top-to-bottom layered layout. A node's row is its longest path from the
 /// start, so a merge sits below all its branches. Its column follows its
 /// parents, with `[cond]` left and `[else]` right, then each row is spread
-/// out so no two nodes overlap.
-pub fn layout(graph: &FlatGraph) -> HashMap<usize, (f64, f64)> {
+/// out so no two nodes overlap. `width` is how wide the renderer draws a node.
+pub fn layout(graph: &FlatGraph, width: impl Fn(&FlatNode) -> f64) -> HashMap<usize, (f64, f64)> {
     let Some(start) = graph.nodes.iter().find(|n| n.kind == FlatKind::Initial) else {
         return HashMap::new();
     };
@@ -492,6 +499,7 @@ pub fn layout(graph: &FlatGraph) -> HashMap<usize, (f64, f64)> {
         rows[row[&n.id]].push(n.id);
     }
 
+    let widths: HashMap<usize, f64> = graph.nodes.iter().map(|n| (n.id, width(n))).collect();
     let mut x: HashMap<usize, f64> = HashMap::new();
     for ids in &rows {
         let mut wanted: Vec<(f64, usize)> = ids
@@ -507,11 +515,12 @@ pub fn layout(graph: &FlatGraph) -> HashMap<usize, (f64, f64)> {
             })
             .collect();
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut next_free = f64::NEG_INFINITY;
+        let mut right_edge = f64::NEG_INFINITY;
         for (want, id) in wanted {
-            let at = want.max(next_free);
+            let half = widths[&id] / 2.0;
+            let at = want.max(right_edge + GAP + half);
             x.insert(id, at);
-            next_free = at + COL_W;
+            right_edge = at + half;
         }
     }
 
@@ -1567,7 +1576,36 @@ mod tests {
     #[test]
     fn layout_is_separate_from_the_graph() {
         let graph = flatten(&build_src("if a:\n    x = 1\n"));
-        assert_eq!(layout(&graph).len(), graph.nodes.len());
+        assert_eq!(layout(&graph, |_| 100.0).len(), graph.nodes.len());
+    }
+
+    #[test]
+    fn wide_nodes_in_a_row_do_not_touch() {
+        let graph = flatten(&build_src("if a:\n    x = 1\nelse:\n    y = 2\n"));
+        let w = 600.0;
+        let pos = layout(&graph, |_| w);
+        let mut rows: HashMap<u64, Vec<f64>> = HashMap::new();
+        for (x, y) in pos.values() {
+            rows.entry(y.to_bits()).or_default().push(*x);
+        }
+        for xs in rows.values_mut() {
+            xs.sort_by(f64::total_cmp);
+            assert!(xs.windows(2).all(|p| p[1] - p[0] >= w), "{xs:?}");
+        }
+    }
+
+    #[test]
+    fn desugared_statements_draw_no_blank_boxes() {
+        for src in [
+            "a = b = 1\n",
+            "with open(\"f\") as fh:\n    y = 1\n",
+            "del xs[0], xs[1]\n",
+        ] {
+            let got = labels(src);
+            assert!(got.iter().all(|l| !l.is_empty()), "{src}: {got:?}");
+            assert!(!got.is_empty(), "{src}");
+        }
+        assert!(labels("with open(\"f\") as fh:\n    y = 1\n").contains(&"y = 1".to_string()));
     }
 
     /// Every id reachable from the `Initial` node by following flat edges.
