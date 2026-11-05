@@ -326,6 +326,35 @@ fn run_expect_error(src: &str) -> String {
     out
 }
 
+/// Real programs through real WASM, so the kid layer is checked against
+/// what's actually printed rather than strings written by hand.
+#[test]
+fn runtime_errors_get_a_kid_explanation() {
+    for (src, want) in [
+        ("xs = [1, 2]\nprint(xs[5])", "past the end of the list"),
+        (
+            "print(\"ok\")\nd = {\"speed\": 1}\nprint(d[\"sped\"])",
+            "no key",
+        ),
+        ("a = 1\nb = 0\nprint(a // b)", "can't divide by zero"),
+        ("print(int(\"abc\"))", "`abc` isn't a whole number"),
+        (
+            "def go(n):\n    for x in n:\n        print(x)\ngo(5)",
+            "a whole number, just one value",
+        ),
+        (
+            "class Robot:\n    def __init__(self):\n        self.speed = 1\nr = Robot()\nprint(r.wings)",
+            "doesn't have a part called `wings`",
+        ),
+    ] {
+        let output = run_expect_error(src);
+        let kid = rust_p2w::explain_runtime_error(&output)
+            .unwrap_or_else(|| panic!("no explanation for {output:?}"));
+        assert!(kid.contains(want), "{src}: {kid}");
+        assert!(kid.contains("Try: "), "{src}: {kid}");
+    }
+}
+
 #[track_caller]
 fn assert_raises(src: &str, message_contains: &str) {
     let out = run_expect_error(src);

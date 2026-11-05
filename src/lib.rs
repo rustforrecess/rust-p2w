@@ -54,9 +54,10 @@ pub use builtins::{BUILTINS, Builtin, builtins_json};
 pub use check::{GATED, TypeFinding, is_gated};
 pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{FieldValue, ObjectFields, Status, Stepper, Value, Vm};
-pub use error::{CompileError, ErrorKind};
+pub use error::{CompileError, ErrorKind, Fact};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
 pub use floatfmt::py_float_repr;
+pub use kid_messages::explain_runtime_error;
 pub use lexer::Comment;
 pub use lint::error_scaffold;
 pub use math_wat::{MATH_DATA, MATH_FUNCS, MATH_GLOBALS, MATH_MEMORY};
@@ -110,6 +111,7 @@ mod js_string_host;
 /// The message table: every runtime diagnostic, keyed, in one place. All
 /// three surfaces (codegen, the native runtime, the Stepper) read text from
 /// here so it cannot drift between them.
+mod kid_messages;
 pub mod messages;
 
 /// Minimal RFC 8259 string escaping, for the harness's hand-written JSON.

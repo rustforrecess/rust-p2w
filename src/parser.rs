@@ -1409,8 +1409,9 @@ impl<'a> Parser<'a> {
                 && !matches!(lhs.kind, ExprKind::NoneLit)
                 && !matches!(rhs.kind, ExprKind::NoneLit)
             {
-                return Err(CompileError::at(
+                return Err(CompileError::at_span(
                     op_line,
+                    (op_byte, op_end),
                     "`is`/`is not` only compares to `None` here — use `==`/`!=` \
                      to compare values",
                 ));

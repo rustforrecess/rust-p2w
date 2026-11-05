@@ -25,7 +25,7 @@
 
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::emit::{Body, Func, Module};
-use crate::error::CompileError;
+use crate::error::{CompileError, Fact};
 use crate::lint::{each_child_expr, for_each_child_block, stmt_exprs};
 use crate::repr::{Repr, infer_expr_repr, infer_slot_reprs};
 use std::collections::HashMap;
@@ -116,13 +116,15 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         } = &s.kind
         {
             if name == "print" {
-                return Err(CompileError::at(s.line, "can't redefine print"));
+                return Err(CompileError::at(s.line, "can't redefine print")
+                    .with_kind(crate::error::ErrorKind::NotSupported));
             }
             if g.funcs.insert(name.clone(), params.len()).is_some() {
                 return Err(CompileError::at(
                     s.line,
                     format!("function '{name}' is defined twice"),
-                ));
+                )
+                .with_kind(crate::error::ErrorKind::NotSupported));
             }
             g.func_defaults.insert(name.clone(), defaults.clone());
             g.func_params.insert(name.clone(), params.clone());
@@ -162,10 +164,10 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         } = &s.kind
         {
             if g.funcs.contains_key(name) || g.classes.contains_key(name) {
-                return Err(CompileError::at(
-                    s.line,
-                    format!("'{name}' is defined twice"),
-                ));
+                return Err(
+                    CompileError::at(s.line, format!("'{name}' is defined twice"))
+                        .with_kind(crate::error::ErrorKind::NotSupported),
+                );
             }
             if let Some(b) = base
                 && !g.classes.contains_key(b)
@@ -173,7 +175,8 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                 return Err(CompileError::at(
                     s.line,
                     format!("unknown base class '{b}' (define it before '{name}')"),
-                ));
+                )
+                .with_kind(crate::error::ErrorKind::Name));
             }
             g.classes.insert(name.clone(), base.clone());
             g.class_var_names.insert(
@@ -198,7 +201,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                                 return Err(CompileError::at(
                                     s.line,
                                     format!("math has no function '{func}'"),
-                                ));
+                                )
+                                .with_kind(crate::error::ErrorKind::Attribute)
+                                .with_fact(Fact::missing_part("math", func, MATH_FNS)));
                             }
                             g.from_math.insert(func.to_string());
                         }
@@ -207,7 +212,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                                 return Err(CompileError::at(
                                     s.line,
                                     format!("random has no function '{func}'"),
-                                ));
+                                )
+                                .with_kind(crate::error::ErrorKind::Attribute)
+                                .with_fact(Fact::missing_part("random", func, RANDOM_FNS)));
                             }
                             g.from_random.insert(func.to_string());
                         }
@@ -217,7 +224,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                                 format!(
                                     "module '{module}' isn't available (only 'math' and 'random' for now)"
                                 ),
-                            ));
+                            ).with_kind(crate::error::ErrorKind::Import).with_fact(Fact::unknown_module(module)));
                         }
                     }
                 } else {
@@ -227,7 +234,9 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                             format!(
                                 "module '{m}' isn't available (only 'math' and 'random' for now)"
                             ),
-                        ));
+                        )
+                        .with_kind(crate::error::ErrorKind::Import)
+                        .with_fact(Fact::unknown_module(m)));
                     }
                     g.imported.insert(m.clone());
                 }
@@ -6384,6 +6393,25 @@ impl Gen {
         }
     }
 
+    /// `name` isn't defined: suggest the closest thing the student has.
+    fn unknown_name(&self, cx: &FuncCx, name: &str, called: bool) -> Fact {
+        let mut known: Vec<&str> = Vec::new();
+        known.extend(self.funcs.keys().map(String::as_str));
+        if called {
+            for builtin in crate::builtins::names() {
+                known.push(builtin);
+            }
+        } else {
+            known.extend(self.globals.iter().map(String::as_str));
+            known.extend(cx.vars.keys().map(String::as_str));
+        }
+        Fact::UnknownName {
+            name: name.to_string(),
+            suggestion: crate::parser::did_you_mean(name, &known).map(str::to_string),
+            called,
+        }
+    }
+
     fn is_global(&self, name: &str) -> bool {
         self.globals.iter().any(|g| g == name)
     }
@@ -6537,18 +6565,21 @@ impl Gen {
                 _ => Err(CompileError::at(
                     s.line,
                     "a bare value on its own line has no effect; did you mean print(...)?",
-                )),
+                )
+                .with_kind(crate::error::ErrorKind::NotSupported)),
             },
             StmtKind::Def { .. } => Err(CompileError::at(
                 s.line,
                 "functions can only be defined at the top level (not inside \
                  another function, loop, or if)",
-            )),
+            )
+            .with_kind(crate::error::ErrorKind::NotSupported)),
             StmtKind::ClassDef { .. } => Err(CompileError::at(
                 s.line,
                 "classes can only be defined at the top level (not inside \
                  another function, loop, or if)",
-            )),
+            )
+            .with_kind(crate::error::ErrorKind::NotSupported)),
             StmtKind::SetAttr { obj, attr, value } => {
                 self.type_of(cx, value)?;
                 // Class-name base: write the class variable in the owning
@@ -6581,7 +6612,7 @@ impl Gen {
                             format!(
                                 "'{attr}' isn't a class variable of '{cn}' — declare it in the class body first"
                             ),
-                        ));
+                        ).with_kind(crate::error::ErrorKind::Attribute));
                     };
                     let v = self.value_expr(cx, value)?;
                     out.push(format!(
@@ -6829,24 +6860,29 @@ impl Gen {
         self.require_value(cx, start, "a range start")?;
         self.require_value(cx, end, "a range end")?;
         if [start, end, step].iter().any(|b| const_float(b).is_some()) {
-            return Err(CompileError::at(
-                line,
-                "range() needs whole numbers, not decimals",
-            ));
+            return Err(
+                CompileError::at(line, "range() needs whole numbers, not decimals")
+                    .with_kind(crate::error::ErrorKind::Type),
+            );
         }
 
         // A runtime step would need a sign-aware termination check; until that
         // lands, only constant steps are accepted (so the direction is known).
         let step_v = match const_int(step) {
-            Some(0) => return Err(CompileError::at(line, "range() step can't be zero")),
-            Some(v) => {
-                i32::try_from(v).map_err(|_| CompileError::at(line, "range() step is too big"))?
+            Some(0) => {
+                return Err(CompileError::at(line, "range() step can't be zero")
+                    .with_kind(crate::error::ErrorKind::Value));
             }
+            Some(v) => i32::try_from(v).map_err(|_| {
+                CompileError::at(line, "range() step is too big")
+                    .with_kind(crate::error::ErrorKind::NotSupported)
+            })?,
             None => {
                 return Err(CompileError::at(
                     line,
                     "the range() step must be a plain number for now",
-                ));
+                )
+                .with_kind(crate::error::ErrorKind::NotSupported));
             }
         };
         let done_cmp = if step_v > 0 { "i32.ge_s" } else { "i32.le_s" };
@@ -7042,7 +7078,8 @@ impl Gen {
                         "random.{method}() takes {want} argument{}",
                         if want == 1 { "" } else { "s" }
                     ),
-                ));
+                )
+                .with_kind(crate::error::ErrorKind::Type));
             }
             Ok(())
         };
@@ -7079,10 +7116,11 @@ impl Gen {
                     "(block (result (ref null any)) (call $rnd_init (call $unbox {n})) (global.get $NONE))"
                 ))
             }
-            _ => Err(CompileError::at(
-                line,
-                format!("random has no function '{method}'"),
-            )),
+            _ => Err(
+                CompileError::at(line, format!("random has no function '{method}'"))
+                    .with_kind(crate::error::ErrorKind::Attribute)
+                    .with_fact(Fact::missing_part("random", method, RANDOM_FNS)),
+            ),
         }
     }
 
@@ -7098,7 +7136,8 @@ impl Gen {
         // one-argument gate.
         if method == "pow" {
             if args.len() != 2 {
-                return Err(CompileError::at(line, "math.pow() takes two arguments"));
+                return Err(CompileError::at(line, "math.pow() takes two arguments")
+                    .with_kind(crate::error::ErrorKind::Type));
             }
             self.uses_math = true;
             let a0 = self.value_expr(cx, &args[0])?;
@@ -7108,10 +7147,10 @@ impl Gen {
             ));
         }
         if args.len() != 1 {
-            return Err(CompileError::at(
-                line,
-                format!("math.{method}() takes one argument"),
-            ));
+            return Err(
+                CompileError::at(line, format!("math.{method}() takes one argument"))
+                    .with_kind(crate::error::ErrorKind::Type),
+            );
         }
         let x = self.value_expr(cx, &args[0])?;
         let float = |op: &str| format!("(struct.new $FLOAT ({op} (call $unbox_f64 {x})))");
@@ -7127,10 +7166,11 @@ impl Gen {
             "floor" => Ok(to_int("f64.floor")),
             "ceil" => Ok(to_int("f64.ceil")),
             "trunc" => Ok(to_int("f64.trunc")),
-            _ => Err(CompileError::at(
-                line,
-                format!("math has no function '{method}'"),
-            )),
+            _ => Err(
+                CompileError::at(line, format!("math has no function '{method}'"))
+                    .with_kind(crate::error::ErrorKind::Attribute)
+                    .with_fact(Fact::missing_part("math", method, MATH_FNS)),
+            ),
         }
     }
 
@@ -7208,7 +7248,8 @@ impl Gen {
                         j += 1;
                     }
                     if j >= cs.len() {
-                        return Err(CompileError::at(line, "missing '}' in format string"));
+                        return Err(CompileError::at(line, "missing '}' in format string")
+                            .with_kind(crate::error::ErrorKind::Value));
                     }
                     let field: String = cs[i + 1..j].iter().collect();
                     let (name, spec) = match field.split_once(':') {
@@ -7225,16 +7266,21 @@ impl Gen {
                                 line,
                                 "named format fields aren't supported; use {} or {0}",
                             )
+                            .with_kind(crate::error::ErrorKind::NotSupported)
                         })?
                     };
                     let arg = args.get(idx).ok_or_else(|| {
                         CompileError::at(line, "not enough arguments for format string")
+                            .with_kind(crate::error::ErrorKind::Index)
                     })?;
                     let v = self.value_expr(cx, arg)?;
                     pieces.push(self.format_value_wat(cx, &v, spec, line)?);
                     i = j + 1;
                 }
-                '}' => return Err(CompileError::at(line, "single '}' in format string")),
+                '}' => {
+                    return Err(CompileError::at(line, "single '}' in format string")
+                        .with_kind(crate::error::ErrorKind::Value));
+                }
                 c => {
                     lit.push(c);
                     i += 1;
@@ -7273,7 +7319,8 @@ impl Gen {
             return Err(CompileError::at(
                 line,
                 format!("method '{}' needs at least a 'self' parameter", m.name),
-            ));
+            )
+            .with_kind(crate::error::ErrorKind::NotSupported));
         }
         let self_name = &m.params[0];
         let rest = &m.params[1..];
@@ -7627,20 +7674,24 @@ impl Gen {
             _ => {
                 let sv = const_int(&args[2]).ok_or_else(|| {
                     CompileError::at(line, "the range() step must be a plain number")
+                        .with_kind(crate::error::ErrorKind::NotSupported)
                 })?;
                 if sv == 0 {
-                    return Err(CompileError::at(line, "range() step can't be zero"));
+                    return Err(CompileError::at(line, "range() step can't be zero")
+                        .with_kind(crate::error::ErrorKind::Value));
                 }
-                let sv = i32::try_from(sv)
-                    .map_err(|_| CompileError::at(line, "range() step is too big"))?;
+                let sv = i32::try_from(sv).map_err(|_| {
+                    CompileError::at(line, "range() step is too big")
+                        .with_kind(crate::error::ErrorKind::NotSupported)
+                })?;
                 (self.i32_expr(cx, &args[0])?, &args[1], sv)
             }
         };
         if const_float(end_expr).is_some() {
-            return Err(CompileError::at(
-                line,
-                "range() needs whole numbers, not decimals",
-            ));
+            return Err(
+                CompileError::at(line, "range() needs whole numbers, not decimals")
+                    .with_kind(crate::error::ErrorKind::Type),
+            );
         }
         let end_wat = self.i32_expr(cx, end_expr)?;
         let ctr = cx.scratch_local("i32");
@@ -7684,12 +7735,12 @@ impl Gen {
                         Ok(format!("(struct.new $INT (i32.const {v32}))"))
                     }
                 }
-                Err(_) => Err(CompileError::at(
-                    e.line,
+                Err(_) => Err(CompileError::at_expr(
+                    e,
                     format!(
                         "the number {v} is too big — whole numbers from -2147483648 to 2147483647 are supported for now"
                     ),
-                )),
+                ).with_kind(crate::error::ErrorKind::NotSupported)),
             };
         }
         // Float constants (and negated ones) fold to a $FLOAT literal.
@@ -7726,15 +7777,16 @@ impl Gen {
                     // boxed like any int. See docs/INTERACTIVE_WEB.md.
                     Ok(format!("(call $box (i32.const {id}))"))
                 } else if self.funcs.contains_key(n) {
-                    Err(CompileError::at(
-                        e.line,
+                    Err(CompileError::at_expr(
+                        e,
                         format!(
                             "'{n}' takes arguments — only a no-argument function can be used as an event handler"
                         ),
-                    ))
+                    ).with_kind(crate::error::ErrorKind::NotSupported))
                 } else {
-                    Err(CompileError::at(e.line, format!("unknown name '{n}'"))
-                        .with_kind(crate::error::ErrorKind::Name))
+                    Err(CompileError::at_expr(e, format!("unknown name '{n}'"))
+                        .with_kind(crate::error::ErrorKind::Name)
+                        .with_fact(self.unknown_name(cx, n, false)))
                 }
             }
             ExprKind::Unary(UnOp::Neg, inner) => {
@@ -7967,10 +8019,12 @@ impl Gen {
                         "pi" => Ok("(struct.new $FLOAT (f64.const 3.141592653589793))".into()),
                         "e" => Ok("(struct.new $FLOAT (f64.const 2.718281828459045))".into()),
                         "tau" => Ok("(struct.new $FLOAT (f64.const 6.283185307179586))".into()),
-                        _ => Err(CompileError::at(
-                            e.line,
+                        _ => Err(CompileError::at_expr(
+                            e,
                             format!("math has no attribute '{name}'"),
-                        )),
+                        )
+                        .with_kind(crate::error::ErrorKind::Attribute)
+                        .with_fact(Fact::missing_part("math", name, MATH_FNS))),
                     };
                 }
                 // `Counter.limit` — a class-name base resolves at compile
@@ -8002,17 +8056,20 @@ impl Gen {
                             .get(&c)
                             .is_some_and(|ms| ms.contains(name))
                         {
-                            return Err(CompileError::at(
-                                e.line,
+                            return Err(CompileError::at_expr(
+                                e,
                                 format!("a method isn't a value yet — call it: {cn}.{name}(...)"),
-                            ));
+                            )
+                            .with_kind(crate::error::ErrorKind::NotSupported));
                         }
                         cur = self.classes.get(&c).cloned().flatten();
                     }
-                    return Err(CompileError::at(
-                        e.line,
+                    return Err(CompileError::at_expr(
+                        e,
                         format!("class '{cn}' has no attribute '{name}'"),
-                    ));
+                    )
+                    .with_kind(crate::error::ErrorKind::Attribute)
+                    .with_fact(Fact::missing_part(cn, name, &[])));
                 }
                 let o = self.value_expr(cx, obj)?;
                 Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
@@ -8081,10 +8138,11 @@ impl Gen {
             }
             ExprKind::MethodCall(recv, method, args) => {
                 if args.iter().any(|a| matches!(a.kind, ExprKind::Kwarg(..))) {
-                    return Err(CompileError::at(
-                        e.line,
+                    return Err(CompileError::at_expr(
+                        e,
                         "keyword arguments aren't supported in method calls yet",
-                    ));
+                    )
+                    .with_kind(crate::error::ErrorKind::NotSupported));
                 }
                 // `super().m(args)` dispatches from the enclosing class's base
                 // with the current `self` (resolved at compile time — v1 has
@@ -8093,19 +8151,22 @@ impl Gen {
                     && callee == "super"
                 {
                     if !super_args.is_empty() {
-                        return Err(CompileError::at(
-                            e.line,
+                        return Err(CompileError::at_expr(
+                            e,
                             "super() takes no arguments in this subset",
-                        ));
+                        )
+                        .with_kind(crate::error::ErrorKind::NotSupported));
                     }
                     let class = cx.current_class.as_ref().ok_or_else(|| {
-                        CompileError::at(e.line, "super() can only be used inside a method")
+                        CompileError::at_expr(e, "super() can only be used inside a method")
+                            .with_kind(crate::error::ErrorKind::NotSupported)
                     })?;
                     let base = self.classes.get(class).cloned().flatten().ok_or_else(|| {
-                        CompileError::at(
-                            e.line,
+                        CompileError::at_expr(
+                            e,
                             format!("super() needs a base class, but '{class}' has none"),
                         )
+                        .with_kind(crate::error::ErrorKind::NotSupported)
                     })?;
                     let self_name = cx.self_name.clone().expect("method has self");
                     let args_list = self.list_of(cx, args)?;
@@ -8435,22 +8496,24 @@ impl Gen {
                     ))
                 }
             }
-            ExprKind::Kwarg(..) => Err(CompileError::at(
-                e.line,
+            ExprKind::Kwarg(..) => Err(CompileError::at_expr(
+                e,
                 "keyword arguments can only appear in a function call",
             )),
             ExprKind::Call(n, args) => {
                 if n == "print" {
-                    return Err(CompileError::at(
-                        e.line,
+                    return Err(CompileError::at_expr(
+                        e,
                         "print(...) can't be used inside an expression",
-                    ));
+                    )
+                    .with_kind(crate::error::ErrorKind::NotSupported));
                 }
                 if n == "super" {
-                    return Err(CompileError::at(
-                        e.line,
+                    return Err(CompileError::at_expr(
+                        e,
                         "super() is only supported as super().method(...) in this subset",
-                    ));
+                    )
+                    .with_kind(crate::error::ErrorKind::NotSupported));
                 }
                 // Keyword arguments are bound only for user functions and the
                 // few builtins that take one (`sorted(reverse=…, key=…)`).
@@ -8458,10 +8521,11 @@ impl Gen {
                     && !self.funcs.contains_key(n.as_str())
                     && n != "sorted"
                 {
-                    return Err(CompileError::at(
-                        e.line,
+                    return Err(CompileError::at_expr(
+                        e,
                         format!("keyword arguments aren't supported for '{n}'"),
-                    ));
+                    )
+                    .with_kind(crate::error::ErrorKind::Type));
                 }
                 // Class construction: `Cls(args)` builds an instance and runs
                 // __init__ (which validates its own arity at runtime).
@@ -8492,10 +8556,11 @@ impl Gen {
                                     self.i32_expr(cx, &args[2])?,
                                 ),
                                 k => {
-                                    return Err(CompileError::at(
-                                        e.line,
+                                    return Err(CompileError::at_expr(
+                                        e,
                                         format!("range() takes 1 to 3 arguments, got {k}"),
-                                    ));
+                                    )
+                                    .with_kind(crate::error::ErrorKind::Type));
                                 }
                             };
                             return Ok(format!("(call $range_list {start} {end} {step})"));
@@ -8533,27 +8598,26 @@ impl Gen {
                             let mut key_arg: Option<&Expr> = None;
                             for a in &args[1..] {
                                 let ExprKind::Kwarg(k, v) = &a.kind else {
-                                    return Err(CompileError::at(
-                                        e.line,
+                                    return Err(CompileError::at_expr(
+                                        e,
                                         "sorted()'s extra arguments must be reverse=... and/or key=...",
-                                    ));
+                                    ).with_kind(crate::error::ErrorKind::NotSupported));
                                 };
                                 match k.as_str() {
                                     "reverse" if rev_arg.is_none() => rev_arg = Some(v),
                                     "key" if key_arg.is_none() => key_arg = Some(v),
                                     "reverse" | "key" => {
-                                        return Err(CompileError::at(
-                                            e.line,
+                                        return Err(CompileError::at_expr(
+                                            e,
                                             format!("sorted() got multiple values for '{k}='"),
-                                        ));
+                                        )
+                                        .with_kind(crate::error::ErrorKind::Type));
                                     }
                                     other => {
-                                        return Err(CompileError::at(
-                                            e.line,
-                                            format!(
+                                        return Err(CompileError::at_expr(e, format!(
                                                 "sorted() doesn't take a '{other}=' argument — only reverse= and key="
                                             ),
-                                        ));
+                                        ).with_kind(crate::error::ErrorKind::Type));
                                     }
                                 }
                             }
@@ -8568,10 +8632,10 @@ impl Gen {
                                 return Ok(format!("(call $py_sorted {seq} {rev})"));
                             };
                             let ExprKind::Name(key_name) = &key_expr.kind else {
-                                return Err(CompileError::at(
-                                    e.line,
+                                return Err(CompileError::at_expr(
+                                    e,
                                     "sorted()'s key= must be a plain function name, not an expression",
-                                ));
+                                ).with_kind(crate::error::ErrorKind::NotSupported));
                             };
                             let seq_local = cx.scratch_local(VAL);
                             let n = cx.scratch_local("i32");
@@ -8690,10 +8754,11 @@ impl Gen {
                         "format" if args.len() == 2 => {
                             let v = self.value_expr(cx, &args[0])?;
                             let ExprKind::Str(spec) = &args[1].kind else {
-                                return Err(CompileError::at(
-                                    e.line,
+                                return Err(CompileError::at_expr(
+                                    e,
                                     "the format spec must be a string literal",
-                                ));
+                                )
+                                .with_kind(crate::error::ErrorKind::NotSupported));
                             };
                             let spec = spec.clone();
                             return self.format_value_wat(cx, &v, &spec, e.line);
@@ -8974,13 +9039,14 @@ impl Gen {
                     };
                     if let Some((helper, arity, boxed_i32)) = builtin {
                         if args.len() != arity {
-                            return Err(CompileError::at(
-                                e.line,
+                            return Err(CompileError::at_expr(
+                                e,
                                 format!(
                                     "{n}() takes exactly {arity} argument{}",
                                     if arity == 1 { "" } else { "s" }
                                 ),
-                            ));
+                            )
+                            .with_kind(crate::error::ErrorKind::Type));
                         }
                         let mut wat = format!("(call {helper}");
                         for a in args {
@@ -9005,7 +9071,9 @@ impl Gen {
                     if self.from_math.contains(n.as_str()) {
                         return self.gen_math_call(cx, n, args, e.line);
                     }
-                    return Err(CompileError::at(e.line, format!("unknown function '{n}'")));
+                    return Err(CompileError::at_expr(e, format!("unknown function '{n}'"))
+                        .with_kind(crate::error::ErrorKind::Name)
+                        .with_fact(self.unknown_name(cx, n, true)));
                 };
                 // Clone params/defaults so we can evaluate at the call site
                 // without holding a borrow on self.
@@ -9020,24 +9088,31 @@ impl Gen {
                 for a in args {
                     if let ExprKind::Kwarg(k, v) = &a.kind {
                         let Some(j) = params.iter().position(|p| p == k) else {
-                            return Err(CompileError::at(
-                                e.line,
+                            return Err(CompileError::at_expr(
+                                e,
                                 format!("{n}() got an unexpected keyword argument '{k}'"),
-                            ));
+                            )
+                            .with_kind(crate::error::ErrorKind::Type));
                         };
                         if slots[j].is_some() {
-                            return Err(CompileError::at(
-                                e.line,
+                            return Err(CompileError::at_expr(
+                                e,
                                 format!("{n}() got multiple values for argument '{k}'"),
-                            ));
+                            )
+                            .with_kind(crate::error::ErrorKind::Type));
                         }
                         slots[j] = Some((**v).clone());
                     } else {
                         if npos >= total {
-                            return Err(CompileError::at(
-                                e.line,
+                            return Err(CompileError::at_expr(
+                                e,
                                 format!("{n}() got too many positional arguments"),
-                            ));
+                            )
+                            .with_kind(crate::error::ErrorKind::Type)
+                            .with_fact(Fact::TooManyArguments {
+                                function: n.clone(),
+                                max: total,
+                            }));
                         }
                         slots[npos] = Some(a.clone());
                         npos += 1;
@@ -9055,13 +9130,18 @@ impl Gen {
                         Some(ex) => ex,
                         None if j >= required => defaults[j - required].clone(),
                         None => {
-                            return Err(CompileError::at(
-                                e.line,
+                            return Err(CompileError::at_expr(
+                                e,
                                 format!(
                                     "{n}() is missing a required argument '{}'",
                                     params.get(j).map(|s| s.as_str()).unwrap_or("?")
                                 ),
-                            ));
+                            )
+                            .with_kind(crate::error::ErrorKind::Type)
+                            .with_fact(Fact::MissingArgument {
+                                function: n.clone(),
+                                param: params.get(j).cloned().unwrap_or_default(),
+                            }));
                         }
                     };
                     wat.push(' ');
@@ -9107,7 +9187,8 @@ impl Gen {
                 return Err(CompileError::at(
                     line,
                     "the key function must take exactly one argument",
-                ));
+                )
+                .with_kind(crate::error::ErrorKind::Type));
             }
             let preprs = self
                 .func_param_reprs
@@ -9147,7 +9228,7 @@ impl Gen {
             return Err(CompileError::at(
                 line,
                 "sorted()'s key=repr isn't supported (repr() doesn't exist on the native backend yet)",
-            ));
+            ).with_kind(crate::error::ErrorKind::NotSupported));
         }
         Err(CompileError::at(
             line,
@@ -9165,12 +9246,12 @@ impl Gen {
         if let Some(v) = const_int(e) {
             return match i32::try_from(v) {
                 Ok(v32) => Ok(format!("(i32.const {v32})")),
-                Err(_) => Err(CompileError::at(
-                    e.line,
+                Err(_) => Err(CompileError::at_expr(
+                    e,
                     format!(
                         "the number {v} is too big — whole numbers from -2147483648 to 2147483647 are supported for now"
                     ),
-                )),
+                ).with_kind(crate::error::ErrorKind::NotSupported)),
             };
         }
         Ok(format!("(call $unbox {})", self.value_expr(cx, e)?))
@@ -9982,10 +10063,11 @@ impl Gen {
     fn require_value(&self, cx: &FuncCx, e: &Expr, what: &str) -> Result<()> {
         match self.type_of(cx, e)? {
             Ty::Num | Ty::Value => Ok(()),
-            Ty::Str => Err(CompileError::at(
-                e.line,
+            Ty::Str => Err(CompileError::at_expr(
+                e,
                 format!("{what} needs to be a number, not text"),
-            )),
+            )
+            .with_kind(crate::error::ErrorKind::Type)),
         }
     }
 
@@ -10003,10 +10085,11 @@ impl Gen {
                 match op {
                     UnOp::Not => Ok(Ty::Num), // `not "x"` is a bool
                     UnOp::Neg | UnOp::Invert => match t {
-                        Ty::Str => Err(CompileError::at(
-                            e.line,
+                        Ty::Str => Err(CompileError::at_expr(
+                            e,
                             "operator needs a number, not text",
-                        )),
+                        )
+                        .with_kind(crate::error::ErrorKind::Type)),
                         _ => Ok(Ty::Num),
                     },
                 }
@@ -10031,10 +10114,11 @@ impl Gen {
                     // (only flagged when both sides are statically known).
                     BinOp::Add => match (ta, tb) {
                         (Ty::Str, Ty::Str) => Ok(Ty::Str),
-                        (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Err(CompileError::at(
-                            e.line,
+                        (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Err(CompileError::at_expr(
+                            e,
                             "can't add text and a number together",
-                        )),
+                        )
+                        .with_kind(crate::error::ErrorKind::Type)),
                         (Ty::Num, Ty::Num) => Ok(Ty::Num),
                         _ => Ok(Ty::Value),
                     },
@@ -10043,10 +10127,11 @@ impl Gen {
                     // dynamic (`Ty::Value`) and validated at runtime.
                     BinOp::Mul => match (ta, tb) {
                         (Ty::Str, Ty::Num) | (Ty::Num, Ty::Str) => Ok(Ty::Str),
-                        (Ty::Str, Ty::Str) => Err(CompileError::at(
-                            e.line,
+                        (Ty::Str, Ty::Str) => Err(CompileError::at_expr(
+                            e,
                             "can't multiply one string by another",
-                        )),
+                        )
+                        .with_kind(crate::error::ErrorKind::Type)),
                         (Ty::Num, Ty::Num) => Ok(Ty::Num),
                         _ => Ok(Ty::Value),
                     },
@@ -10061,8 +10146,8 @@ impl Gen {
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
                         if ta == Ty::Str || tb == Ty::Str =>
                     {
-                        Err(CompileError::at(
-                            e.line,
+                        Err(CompileError::at_expr(
+                            e,
                             "can't compare text with a number — there's no way to say whether \
                              a word is bigger than 5",
                         )
@@ -10070,10 +10155,11 @@ impl Gen {
                     }
                     _ => {
                         if ta == Ty::Str || tb == Ty::Str {
-                            Err(CompileError::at(
-                                e.line,
+                            Err(CompileError::at_expr(
+                                e,
                                 "this operator needs numbers on both sides",
-                            ))
+                            )
+                            .with_kind(crate::error::ErrorKind::Type))
                         } else {
                             Ok(Ty::Num)
                         }
@@ -10084,16 +10170,18 @@ impl Gen {
                 if cx.vars.contains_key(n) || self.is_global(n) {
                     Ok(Ty::Value)
                 } else if self.funcs.contains_key(n) {
-                    Err(CompileError::at(
-                        e.line,
+                    Err(CompileError::at_expr(
+                        e,
                         format!("'{n}' is a function — call it with {n}(...)"),
-                    ))
+                    )
+                    .with_kind(crate::error::ErrorKind::NotSupported))
                 } else {
-                    Err(CompileError::at(
-                        e.line,
+                    Err(CompileError::at_expr(
+                        e,
                         format!("unknown name '{n}' (define it with `{n} = ...` first)"),
                     )
-                    .with_kind(crate::error::ErrorKind::Name))
+                    .with_kind(crate::error::ErrorKind::Name)
+                    .with_fact(self.unknown_name(cx, n, false)))
                 }
             }
             ExprKind::Call(name, args) => {

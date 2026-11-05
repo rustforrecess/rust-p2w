@@ -402,6 +402,11 @@ fn error_code(k: rust_p2w::ErrorKind) -> &'static str {
         rust_p2w::ErrorKind::Syntax => "syntax",
         rust_p2w::ErrorKind::Name => "name",
         rust_p2w::ErrorKind::Type => "type",
+        rust_p2w::ErrorKind::Attribute => "attribute",
+        rust_p2w::ErrorKind::Import => "import",
+        rust_p2w::ErrorKind::Value => "value",
+        rust_p2w::ErrorKind::Index => "index",
+        rust_p2w::ErrorKind::NotSupported => "not-supported",
     }
 }
 
