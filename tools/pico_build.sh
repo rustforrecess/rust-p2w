@@ -69,6 +69,8 @@ fails=0
 build typed_mul   'def sq(n: int) -> int:\n    return n * n\nprint(sq(7))\n'       || fails=$((fails+1))
 build loop_sum    'def s(n: int) -> int:\n    t: int = 0\n    i: int = 0\n    while i < n:\n        t = t + i\n        i = i + 1\n    return t\nprint(s(10))\n' || fails=$((fails+1))
 build comp_packed 'xs: list[int] = [1, 2, 3]\nys: list[int] = [x * x for x in xs]\nprint(ys)\n' || fails=$((fails+1))
+# input() and the temperature sensor: answers each line with the die temperature.
+build board_demo  'print("ready")\nwhile True:\n    name: str = input("name? ")\n    t: float = read_temperature()\n    print(name + " " + str(t))\n' || fails=$((fails+1))
 # Prints forever, so a serial port opened at any moment sees output.
 build uart_count  'i: int = 0\nwhile True:\n    print(i)\n    i = i + 1\n' || fails=$((fails+1))
 

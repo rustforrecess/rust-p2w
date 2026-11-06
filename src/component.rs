@@ -124,6 +124,7 @@ const UNSUPPORTED_CAPS: &[&str] = &[
     "beep",
     "flash",
     "seed",
+    "read_temperature",
     "report",
     "emit_html",
     "show",

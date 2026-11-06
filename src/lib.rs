@@ -50,7 +50,7 @@ mod roles;
 
 pub use ast::{BinOp, Expr, ExprKind, Span, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
-pub use builtins::{BUILTINS, Builtin, builtins_json};
+pub use builtins::{BUILTINS, Builtin, SIMULATED_TEMPERATURE_C, builtins_json};
 pub use check::{GATED, TypeFinding, is_gated};
 pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{FieldValue, ObjectFields, Status, Stepper, Value, Vm};

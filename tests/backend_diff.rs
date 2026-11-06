@@ -258,6 +258,8 @@ fn backends_agree_or_the_differences_are_written_down() {
          void p2w_putc(unsigned char c) { putchar(c); fflush(stdout); }\n\
          int p2w_getc(void) { return getchar(); }\n\
          int p2w_host_seed(void) { return 42; }\n\
+         extern int p2w_float(double);\n\
+         int p2w_host_read_temperature(void) { return p2w_float(21.0); }\n\
          int p2w_host_file_open(const char *np, int nl, const char *mp, int ml) {\n\
          \x20 (void)np; (void)nl; (void)mp; (void)ml; return -1;\n\
          }\n\

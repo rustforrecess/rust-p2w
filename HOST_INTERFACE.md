@@ -128,6 +128,15 @@ there either. What backs a given name (a real file, a browser OPFS entry, a
 database row, a flash page) is the host's decision per deployment, invisible
 to the compiled program.
 
+### `read_temperature` — bespoke, one float, revisit with the second sensor
+
+A lesson wants one number in degrees. It crosses as a single `f64` import on the
+browser and an `extern "C"` function on the board, and `capabilities()` lists it
+by a name a teacher can read. Any WASI sensor work needs checking before a second
+sensor arrives: that is when a shared shape starts to pay for itself, and one
+function is cheap to move. Only a board measures; every other host answers
+`SIMULATED_TEMPERATURE_C`, so programs behave the same everywhere.
+
 ### Domain capabilities — bespoke by necessity
 
 `seed`, `set_field`/`get_field`, `report`, `evidence`, `on_frame`, the DOM and

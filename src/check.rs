@@ -838,7 +838,7 @@ impl Checker {
             "input" => Ty::Str,
             "str" => Ty::Str,
             "int" => Ty::Int,
-            "float" => Ty::Float,
+            "float" | "read_temperature" => Ty::Float,
             "bool" => Ty::Bool,
             "len" => {
                 if let Some(arg) = args.first() {

@@ -11,7 +11,7 @@
 /// One callable builtin: its name, domain `category` (for grouping in the blocks
 /// toolbox), and `params` (argument labels — representative; variadic builtins
 /// list their common arguments). Categories: `io`, `convert`, `math`,
-/// `sequence`, `web`, `activity`.
+/// `sequence`, `web`, `activity`, `device`.
 #[derive(Debug, Clone, Copy)]
 pub struct Builtin {
     pub name: &'static str,
@@ -93,7 +93,14 @@ pub const BUILTINS: &[Builtin] = &[
     b("evidence", "activity", &["key", "value"]),
     b("set_field", "activity", &["key", "value"]),
     v("get_field", "activity", &["key"]),
+    // --- device (what a board measures; other hosts stand in, see below) ---
+    v("read_temperature", "device", &[]),
 ];
+
+/// What `read_temperature()` reports where there is no sensor: the browser, the
+/// step debugger and the native test hosts. Only a board measures. One fixed
+/// value keeps those surfaces in agreement and a lesson repeatable.
+pub const SIMULATED_TEMPERATURE_C: f64 = 21.0;
 
 /// Statement builtin (no value). Terse so the table reads as data.
 const fn b(name: &'static str, category: &'static str, params: &'static [&'static str]) -> Builtin {

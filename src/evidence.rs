@@ -254,7 +254,7 @@ impl Counter {
             }
             ExprKind::Call(name, args) => {
                 match name.as_str() {
-                    "print" | "input" => self.bump("io"),
+                    "print" | "input" | "read_temperature" => self.bump("io"),
                     "set" => self.bump("set"), // set literals desugar to set([...])
                     _ => {}
                 }

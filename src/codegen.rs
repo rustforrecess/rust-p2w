@@ -534,6 +534,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             .imports
             .push(r#"(import "env" "seed" (func $seed (result i32)))"#.into());
     }
+    if g.uses_temperature {
+        module.imports.push(
+            r#"(import "env" "read_temperature" (func $read_temperature (result f64)))"#.into(),
+        );
+    }
     if g.uses_dom {
         // Host capabilities (the runner provides these): register a click
         // handler by dispatch id, and the demo effects. See INTERACTIVE_WEB.md.
@@ -6309,6 +6314,8 @@ struct Gen {
     /// Set when `seed()` is used, so the `env.seed` host import is only emitted
     /// (and only required of the host) when a program actually calls it.
     uses_seed: bool,
+    /// Set when `read_temperature` is used.
+    uses_temperature: bool,
     /// Set when `report()` is used → emit the forward string-marshalling base
     /// (shared with DOM strings) plus the `env.report` host import.
     uses_report: bool,
@@ -8952,6 +8959,12 @@ impl Gen {
                         "seed" if args.is_empty() => {
                             self.uses_seed = true;
                             return Ok("(call $box (call $seed))".to_string());
+                        }
+                        // read_temperature() -> degrees C from the host: the chip's
+                        // own sensor on a board, a fixed stand-in elsewhere.
+                        "read_temperature" if args.is_empty() => {
+                            self.uses_temperature = true;
+                            return Ok("(struct.new $FLOAT (call $read_temperature))".to_string());
                         }
                         // report(score, trace): the platform REPORT capability —
                         // push score + trace as strings; the host drains them as

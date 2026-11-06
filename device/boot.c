@@ -39,6 +39,7 @@ extern uint32_t __stack_top;
 #define RESETS_UART0_BIT      (1u << 26)
 #define RESETS_PADS_BANK0_BIT (1u << 9)
 #define RESETS_IO_BANK0_BIT   (1u << 6)
+#define RESETS_ADC_BIT        (1u << 0)
 
 /* XOSC, the 12 MHz crystal (datasheet 8.2.8). ROSC, what the chip boots from,
  * is explicitly documented (8.1) as too imprecise for "frequency sensitive
@@ -70,6 +71,9 @@ extern uint32_t __stack_top;
 #define CLK_REF_CTRL_SRC_XOSC       0x2u
 #define CLK_REF_SELECTED_XOSC_BIT   (1u << 2)
 #define CLK_PERI_CTRL_ENABLE_BIT    (1u << 11)
+#define CLK_ADC_CTRL                (*(volatile uint32_t *)(CLOCKS_BASE + 0x6c))
+#define CLK_ADC_CTRL_ENABLE_BIT     (1u << 11)
+#define CLK_ADC_CTRL_AUXSRC_XOSC    (0x3u << 5)
 
 /* IO_BANK0 (datasheet 9.11.1): FUNCSEL picks which peripheral drives a GPIO.
  * GPIO0/GPIO1 are the standard Pico UART0 TX/RX pins; FUNCSEL 0x02 on each
@@ -101,6 +105,20 @@ extern uint32_t __stack_top;
 #define UART0_LCR_H  (*(volatile uint32_t *)(UART0_BASE + 0x02c))
 #define UART0_CR     (*(volatile uint32_t *)(UART0_BASE + 0x030))
 #define UART0_FR_TXFF (1u << 5)
+#define UART0_FR_RXFE (1u << 4)
+
+/* ADC. The temperature sensor is the last input: 4 on the RP2350A in a Pico 2 W
+ * (5 channels; the larger RP2350B has 9). */
+#define ADC_BASE          0x400a0000u
+#define ADC_CS            (*(volatile uint32_t *)(ADC_BASE + 0x00))
+#define ADC_RESULT        (*(volatile uint32_t *)(ADC_BASE + 0x04))
+#define ADC_CS_EN         (1u << 0)
+#define ADC_CS_TS_EN      (1u << 1)
+#define ADC_CS_START_ONCE (1u << 2)
+#define ADC_CS_READY      (1u << 8)
+#define ADC_CS_AINSEL_LSB 12
+#define ADC_TEMP_INPUT    4u
+#define ADC_SAMPLES       64u
 
 static void clocks_and_uart_init(void) {
     /* Crystal first: clk_sys follows clk_ref, so moving clk_ref onto a crystal
@@ -152,11 +170,60 @@ void p2w_putc(unsigned char c) {
     UART0_DR = c;
 }
 
-/* Byte source for input(). Clock/pin bring-up above makes UART0 RX live, but
- * the flag-register polling read itself isn't implemented yet, so input() on
- * the device still sees immediate end-of-input and returns "". */
+/* Byte source for input(). A serial line has no end-of-input, so this waits for
+ * the next byte. A terminal's Enter arrives as CR, and the runtime ends a line
+ * on LF. Typed characters are echoed, as a terminal driver would. */
 int p2w_getc(void) {
-    return -1;
+    while (UART0_FR & UART0_FR_RXFE) {
+        /* wait for a byte */
+    }
+    int c = (int)(UART0_DR & 0xffu);
+    if (c == '\r') {
+        c = '\n';
+    }
+    p2w_putc((unsigned char)c);
+    return c;
+}
+
+extern int p2w_float(double);
+
+static uint32_t adc_read(void) {
+    ADC_CS |= ADC_CS_START_ONCE;
+    /* READY can still show the last conversion just after a start; polling at
+     * once would read the old result again. */
+    for (volatile uint32_t spin = 0; spin < 8; spin++) {
+        /* wait */
+    }
+    while (!(ADC_CS & ADC_CS_READY)) {
+        /* wait */
+    }
+    return ADC_RESULT;
+}
+
+/* The chip's own sensor, in degrees C. It reads the die, so it runs warmer than
+ * the room and the absolute value is rough. The ADC is brought up on first use,
+ * clock before reset release like the UART, so other programs don't pay for it. */
+int p2w_host_read_temperature(void) {
+    static int adc_ready;
+    if (!adc_ready) {
+        CLK_ADC_CTRL = CLK_ADC_CTRL_ENABLE_BIT | CLK_ADC_CTRL_AUXSRC_XOSC;
+        RESETS_RESET_CLR = RESETS_ADC_BIT;
+        while (!(RESETS_RESET_DONE & RESETS_ADC_BIT)) {
+            /* wait */
+        }
+        ADC_CS = ADC_CS_EN | ADC_CS_TS_EN | (ADC_TEMP_INPUT << ADC_CS_AINSEL_LSB);
+        while (!(ADC_CS & ADC_CS_READY)) {
+            /* wait */
+        }
+        (void)adc_read(); /* the first sample after switching on is discarded */
+        adc_ready = 1;
+    }
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < ADC_SAMPLES; i++) {
+        sum += adc_read();
+    }
+    double volts = ((double)sum / ADC_SAMPLES) * 3.3 / 4096.0;
+    return p2w_float(27.0 - (volts - 0.706) / 0.001721);
 }
 
 /* The runtime's generic release path references this for every program. No

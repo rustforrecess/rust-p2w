@@ -4664,6 +4664,7 @@ fn call_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         // step debugger has no host, so they no-op with a placeholder — the
         // control flow still traces; the real effect happens under Run.
         ("seed", []) => Ok(Value::Int(0)),
+        ("read_temperature", []) => Ok(Value::Float(crate::builtins::SIMULATED_TEMPERATURE_C)),
         ("report", [_score, _trace]) => Ok(Value::None),
         ("evidence", [_key, _value]) => Ok(Value::None),
         ("emit_html", [_html]) => Ok(Value::None),

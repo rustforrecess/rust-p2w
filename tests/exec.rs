@@ -135,6 +135,11 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
     linker
         .func_wrap("env", "seed", |_caller: Caller<'_, Io>| -> i32 { 42 })
         .unwrap();
+    linker
+        .func_wrap("env", "read_temperature", |_: Caller<'_, Io>| -> f64 {
+            rust_p2w::SIMULATED_TEMPERATURE_C
+        })
+        .unwrap();
     // String marshalling + report (the platform REPORT capability): build each
     // pushed string from bytes; report() drains [score, trace] and echoes them.
     // Zero-copy arg push: the externref IS the string.
@@ -324,6 +329,14 @@ fn run_expect_error(src: &str) -> String {
         "expected a runtime error, program ran fine:\n{out}"
     );
     out
+}
+
+#[test]
+fn read_temperature_is_a_float_from_the_host() {
+    let src = "t: float = read_temperature()\nprint(t)\nprint(t + 1.5)\nprint(t > 20.0)";
+    assert_eq!(run(src), "21.0\n22.5\nTrue\n");
+    let wat = rust_p2w::compile_to_wat(src).unwrap();
+    assert!(rust_p2w::capabilities(&wat).contains(&"read_temperature".to_string()));
 }
 
 /// Real programs through real WASM, so the kid layer is checked against

@@ -237,6 +237,11 @@ pub fn run_with_files(
     linker
         .func_wrap("env", "seed", |_: Caller<'_, Io>| -> i32 { 42 })
         .unwrap();
+    linker
+        .func_wrap("env", "read_temperature", |_: Caller<'_, Io>| -> f64 {
+            crate::builtins::SIMULATED_TEMPERATURE_C
+        })
+        .unwrap();
     // File capability: `files` staged content is what `open()` in read mode
     // may answer (the per-filename capability check — see HOST_INTERFACE.md,
     // "not for student code" on raw `wasi:filesystem` — lives entirely here,

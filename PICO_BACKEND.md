@@ -65,6 +65,24 @@ the host with no board:
    `PICO_SDK_PATH` only needs a plain `git clone` for its header-only
    `add_subdirectory` targets, no build of the SDK itself.
 
+### On the board: `input()` and `read_temperature()` (2026-11-05)
+Both verified on a Pico 2 W through a Debug Probe.
+
+- **`input()`** reads UART0 and echoes as a terminal driver would. A serial line
+  has no end-of-input, so it waits for the next byte, and CR counts as Enter.
+- **`read_temperature()`** returns degrees C as a float: the on-chip sensor, ADC
+  input 4, averaged over 64 samples. Every other host reports the fixed
+  `SIMULATED_TEMPERATURE_C` (21.0), so backends and lessons stay in agreement.
+
+Measured: 60 readings had a standard deviation of 0.27 C, down from 0.87 C before
+the sampling fix. A fingertip on the chip took a flat 18.5 C to 21.5 C within
+about 25 seconds, falling back slowly on release.
+
+Known limits. The absolute value is uncalibrated: it uses the SDK's nominal
+formula and a nominal 3.3 V reference, and it measures the die, not the room. The
+first reading after power-up runs 1 to 3 C high, so a lesson should discard it.
+The ADC runs from the 12 MHz crystal, not the 48 MHz the SDK uses.
+
 ## Why native, not MicroPython
 We own the AST, so we can emit real machine code with DWARF debug info — which is
 exactly what lets the *same* source-level debugger follow onto the board. Shipping

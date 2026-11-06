@@ -63,6 +63,7 @@ declare i32 @p2w_host_get_field(i32)
 declare i32 @p2w_host_get_value(i32)
 declare i32 @p2w_host_pointer_x()
 declare i32 @p2w_host_pointer_y()
+declare i32 @p2w_host_read_temperature()
 declare i32 @p2w_int(i32)
 declare i32 @p2w_unbox_int(i32)
 declare i32 @p2w_float(double)
@@ -3162,6 +3163,12 @@ impl<'a> FuncEmitter<'a> {
                         i32::from(isf)
                     ));
                     self.release_if_owned(&v, o);
+                    return Ok((r, Repr::Boxed));
+                }
+                // Not a component capability: the board's boot code and the
+                // native test hosts define this, and it returns an OWNED float.
+                if name == "read_temperature" && args.is_empty() {
+                    let r = self.call_value("call i32 @p2w_host_read_temperature()");
                     return Ok((r, Repr::Boxed));
                 }
                 // Host capabilities (the component seam): a call on an

@@ -50,6 +50,8 @@ static void report(void) {
 }
 void p2w_putc(unsigned char c) { putchar(c); }
 int p2w_host_seed(void) { return 42; }
+extern int p2w_float(double);
+int p2w_host_read_temperature(void) { return p2w_float(21.0); }
 int p2w_getc(void) { return getchar(); }
 
 #define MAX_FILES 16

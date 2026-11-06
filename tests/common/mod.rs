@@ -96,6 +96,11 @@ pub fn probe(src: &str) -> Outcome {
     // The per-attempt seed (42 everywhere in tests, so `import random`
     // probes pin one reproducible sequence).
     linker
+        .func_wrap("env", "read_temperature", |_: Caller<'_, Vec<u8>>| -> f64 {
+            rust_p2w::SIMULATED_TEMPERATURE_C
+        })
+        .unwrap();
+    linker
         .func_wrap("env", "seed", |_: Caller<'_, Vec<u8>>| -> i32 { 42 })
         .unwrap();
 
@@ -199,6 +204,11 @@ pub fn groups() -> Vec<Group> {
                 e!("2 ** 2.5"),
                 e!("2 ** -1.5"),
                 p("math.exp(1.0)", "import math\nprint(math.exp(1.0))\n"),
+                p(
+                    "read_temperature() [simulated]",
+                    "print(read_temperature())
+",
+                ),
                 p(
                     "random.randint(1, 6) [seed 42]",
                     "import random\nprint(random.randint(1, 6))\n",
