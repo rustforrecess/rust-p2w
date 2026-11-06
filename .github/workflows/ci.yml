@@ -23,6 +23,21 @@ jobs:
       - run: cargo clippy --manifest-path runtime/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path runtime/Cargo.toml --check
 
+  # Cross-compiles real programs for the Pico 2 W and links them against the
+  # board's own boot code. The host-side native tests use a different shim, so
+  # a symbol missing from device/boot.c only shows up here.
+  pico:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabi
+      - run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+      - run: bash tools/pico_build.sh
+        env:
+          P2W_PICO_REQUIRED: "1"
+
   # The runtime is ~3k lines of unsafe offset arithmetic; Miri interprets the
   # whole test suite and rejects any undefined behavior (misalignment, OOB,
   # aliasing). ~8s of runtime — cheap insurance on the code both backends'

@@ -12,7 +12,8 @@
 # PICO_BACKEND.md for that and for what has been confirmed on a real board.
 #
 # Requires: clang + lld (LLVM) and the Rust target thumbv8m.main-none-eabi
-# (`rustup target add thumbv8m.main-none-eabi`). Skips cleanly if absent.
+# (`rustup target add thumbv8m.main-none-eabi`). Skips cleanly if absent, unless
+# P2W_PICO_REQUIRED is set, as it is in CI: there a skip would be a silent pass.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,11 +23,13 @@ mkdir -p "$OUT"
 TARGET="thumbv8m.main-none-eabi"
 CPU="-mcpu=cortex-m33 -mfloat-abi=soft"
 
+skip() { echo "SKIP: $1"; [ -z "${P2W_PICO_REQUIRED:-}" ]; exit $?; }
+
 if ! command -v clang >/dev/null 2>&1 || ! command -v ld.lld >/dev/null 2>&1; then
-  echo "SKIP: needs clang + ld.lld (LLVM)."; exit 0; fi
+  skip "needs clang + ld.lld (LLVM)."; fi
 if ! rustc --print target-list 2>/dev/null | grep -qx "$TARGET" \
    || ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
-  echo "SKIP: Rust target $TARGET not installed (rustup target add $TARGET)."; exit 0; fi
+  skip "Rust target $TARGET not installed (rustup target add $TARGET)."; fi
 
 # Resolve the (possibly custom) cargo target directory.
 TGTDIR=$(cargo metadata --no-deps --format-version 1 --manifest-path runtime/Cargo.toml 2>/dev/null \
@@ -71,6 +74,12 @@ build loop_sum    'def s(n: int) -> int:\n    t: int = 0\n    i: int = 0\n    wh
 build comp_packed 'xs: list[int] = [1, 2, 3]\nys: list[int] = [x * x for x in xs]\nprint(ys)\n' || fails=$((fails+1))
 # input() and the temperature sensor: answers each line with the die temperature.
 build board_demo  'print("ready")\nwhile True:\n    name: str = input("name? ")\n    t: float = read_temperature()\n    print(name + " " + str(t))\n' || fails=$((fails+1))
+# import random needs p2w_host_seed from boot.c; waits for a line, then rolls.
+build dice        'import random
+while True:
+    name: str = input("roll? ")
+    print(random.randint(1, 1000000))
+' || fails=$((fails+1))
 # Prints forever, so a serial port opened at any moment sees output.
 build uart_count  'i: int = 0\nwhile True:\n    print(i)\n    i = i + 1\n' || fails=$((fails+1))
 

@@ -120,6 +120,11 @@ extern uint32_t __stack_top;
 #define ADC_TEMP_INPUT    4u
 #define ADC_SAMPLES       64u
 
+/* ROSC: its output bit is jitter from a free-running oscillator. It stops being
+ * random if the oscillator stops, and it is fine for dice, not for secrets. */
+#define ROSC_BASE         0x400e8000u
+#define ROSC_RANDOMBIT    (*(volatile uint32_t *)(ROSC_BASE + 0x20))
+
 static void clocks_and_uart_init(void) {
     /* Crystal first: clk_sys follows clk_ref, so moving clk_ref onto a crystal
      * that isn't oscillating yet would stop the core. */
@@ -183,6 +188,19 @@ int p2w_getc(void) {
     }
     p2w_putc((unsigned char)c);
     return c;
+}
+
+/* The per-run seed behind `import random`. The other hosts fix it for repeatable
+ * tests; a board is the real thing, so a dice program should differ each boot. */
+int p2w_host_seed(void) {
+    uint32_t seed = 0;
+    for (uint32_t i = 0; i < 128u; i++) {
+        seed = (seed << 1 | seed >> 31) ^ (ROSC_RANDOMBIT & 1u);
+        for (volatile uint32_t spin = 0; spin < 16u; spin++) {
+            /* let the oscillator drift between samples */
+        }
+    }
+    return (int)seed;
 }
 
 extern int p2w_float(double);
