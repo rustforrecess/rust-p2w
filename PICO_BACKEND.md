@@ -37,19 +37,26 @@ the host with no board:
    the RPI-RP2 bootloader drive disappeared and did not reappear (no crash
    loop).** This is the first p2w-compiled program to run on physical
    hardware.
-2. **Clock + UART pin init** — implemented, awaiting hardware confirmation.
-   `device/boot.c` now runs a `clocks_and_uart_init` before `main`: releases
-   reset on UART0/IO_BANK0/PADS_BANK0 (RESETS, datasheet 7.5 — these start
-   held in reset and don't respond at all otherwise), starts the 12 MHz
-   crystal and switches `clk_ref` onto it (ROSC, what the chip boots from, is
-   explicitly documented as too imprecise for "frequency sensitive interfaces
-   such as USB or UART" — datasheet 8.1), enables `clk_peri`, routes UART0
-   TX/RX onto GPIO0/GPIO1 via IO_BANK0 FUNCSEL + PADS_BANK0 pad config, and
-   programs 115200 8N1 off the resulting precise 12 MHz (no PLL needed for
-   this milestone — within UART tolerance). Links clean, `picotool info -a`
-   still confirms the IMAGE_DEF block, and a fresh `.uf2` converts. **Not yet
-   confirmed on the real board** — needs a flash + a USB-serial adapter (or
-   similar) on the other end to actually see output.
+2. ✅ **Clock + UART pin init — DONE, verified on real hardware (2026-11-05).**
+   `device/boot.c` runs `clocks_and_uart_init` before `main`: starts the 12 MHz
+   crystal with an explicit `XOSC_STARTUP` delay (the field is undefined at
+   reset), switches `clk_ref` onto it (ROSC, what the chip boots from, is
+   documented as too imprecise for "frequency sensitive interfaces such as USB
+   or UART" — datasheet 8.1), enables `clk_peri`, and only then releases
+   UART0/IO_BANK0/PADS_BANK0 from reset, matching the SDK's clocks-first order.
+   It routes UART0 TX/RX onto GPIO0/GPIO1 and programs 115200 8N1 off the
+   precise 12 MHz (no PLL needed for this milestone).
+
+   Confirmed with a Raspberry Pi Debug Probe on GP0 + GND: a p2w program printing
+   a counter in a `while True` loop ran at full line rate (about 11.5 kB/s), and
+   8,200 consecutive numbers in a capture stepped by exactly 1. Register
+   addresses and fields were checked against the pico-sdk RP2350 headers.
+
+   Two things to know when repeating this. A program that prints with no gaps
+   gives the receiver no idle line to sync on, so attaching mid-stream can lock
+   onto the wrong start bit: the bytes look like garbage but are regular, and
+   re-framing the bit stream recovers the text. And the Pico 2 W's LED is on the
+   radio chip, so UART is the simplest sign of life.
 3. ✅ **`.uf2` packaging — DONE.** `picotool uf2 convert <elf> <uf2> --family
    rp2350-arm-s` produces a real, flashable `.uf2` from the metadata-bearing
    ELF. `picotool` itself builds clean with no `sudo`/system packages at all

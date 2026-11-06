@@ -47,10 +47,14 @@ extern uint32_t __stack_top;
 #define XOSC_BASE                      0x40048000u
 #define XOSC_CTRL                      (*(volatile uint32_t *)(XOSC_BASE + 0x00))
 #define XOSC_STATUS                    (*(volatile uint32_t *)(XOSC_BASE + 0x04))
+#define XOSC_STARTUP                   (*(volatile uint32_t *)(XOSC_BASE + 0x0c))
 #define XOSC_CTRL_FREQ_RANGE_1_15MHZ   0xaa0u
 #define XOSC_CTRL_ENABLE_VALUE_ENABLE  0xfabu
 #define XOSC_CTRL_ENABLE_LSB           12
 #define XOSC_STATUS_STABLE_BIT         (1u << 31)
+/* In units of 256 crystal periods, and undefined out of reset, so it has to
+ * be written: 47 units is 1 ms at 12 MHz, times the SDK's margin of 6. */
+#define XOSC_STARTUP_DELAY             (47u * 6u)
 
 /* CLOCKS (datasheet 8.1.6). clk_sys already defaults to tracking clk_ref
  * (CLK_SYS_CTRL.SRC resets to clk_ref), so switching clk_ref onto XOSC moves
@@ -99,19 +103,10 @@ extern uint32_t __stack_top;
 #define UART0_FR_TXFF (1u << 5)
 
 static void clocks_and_uart_init(void) {
-    /* Release reset on UART0, IO_BANK0 and PADS_BANK0. TEMP DIAGNOSTIC: the
-     * poll-for-done wait is replaced with a bounded spin-delay, so this
-     * function cannot hang here even if the RESET_DONE bit assumptions are
-     * wrong — we want a build that always reaches the UART writes below. */
-    RESETS_RESET_CLR = RESETS_UART0_BIT | RESETS_PADS_BANK0_BIT | RESETS_IO_BANK0_BIT;
-    for (volatile uint32_t spin = 0; spin < 100000; spin++) {
-        /* bounded wait instead of polling RESET_DONE */
-    }
-
-#if 0
-    /* TEMP DIAGNOSTIC: XOSC/clk_ref switch disabled below to bisect a
-     * silent-UART bug. clk_sys/clk_ref stay on the boot-default ROSC
-     * (~11 MHz, imprecise) instead. */
+    /* Crystal first: clk_sys follows clk_ref, so moving clk_ref onto a crystal
+     * that isn't oscillating yet would stop the core. */
+    XOSC_CTRL = XOSC_CTRL_FREQ_RANGE_1_15MHZ;
+    XOSC_STARTUP = XOSC_STARTUP_DELAY;
     XOSC_CTRL = XOSC_CTRL_FREQ_RANGE_1_15MHZ
               | (XOSC_CTRL_ENABLE_VALUE_ENABLE << XOSC_CTRL_ENABLE_LSB);
     while (!(XOSC_STATUS & XOSC_STATUS_STABLE_BIT)) {
@@ -122,10 +117,18 @@ static void clocks_and_uart_init(void) {
     while (!(CLK_REF_SELECTED & CLK_REF_SELECTED_XOSC_BIT)) {
         /* wait */
     }
-#endif
 
-    /* Turn on clk_peri (tracks clk_sys, which tracks clk_ref — now XOSC). */
+    /* Turn on clk_peri (tracks clk_sys, which tracks clk_ref, now XOSC). This
+     * comes before releasing UART0 from reset: the UART runs from clk_peri, so
+     * the SDK brings up clocks first and only then unresets the blocks. */
     CLK_PERI_CTRL = CLK_PERI_CTRL_ENABLE_BIT;
+
+    /* Release reset on UART0, IO_BANK0 and PADS_BANK0. */
+    const uint32_t blocks = RESETS_UART0_BIT | RESETS_PADS_BANK0_BIT | RESETS_IO_BANK0_BIT;
+    RESETS_RESET_CLR = blocks;
+    while ((RESETS_RESET_DONE & blocks) != blocks) {
+        /* wait */
+    }
 
     /* Wire GPIO0/GPIO1 to UART0 TX/RX. */
     PADS_GPIO0 = PADS_GPIO_IE_NO_ISO;
@@ -156,24 +159,27 @@ int p2w_getc(void) {
     return -1;
 }
 
-void Reset_Handler(void) {
-    clocks_and_uart_init();
+/* The runtime's generic release path references this for every program. No
+ * file can be open on a board: open() itself has no definition here, so a
+ * program that calls it fails at link time. */
+void p2w_host_file_close(int handle) {
+    (void)handle;
+}
 
-    /* TEMP DIAGNOSTIC: blast a hardcoded string directly, bypassing main()
-     * and p2w_putc entirely (no TXFF wait either — just a generous fixed
-     * delay between bytes), to test only the register init above in
-     * isolation from whatever the compiled program does. */
+void Reset_Handler(void) {
+    /* Copy initialised data from flash to RAM. */
+    uint32_t *src = &__data_load;
+    for (uint32_t *dst = &__data_start; dst < &__data_end;) {
+        *dst++ = *src++;
+    }
+    /* Zero BSS. */
+    for (uint32_t *p = &__bss_start; p < &__bss_end;) {
+        *p++ = 0;
+    }
+    clocks_and_uart_init();
+    main();
     for (;;) {
-        const char *msg = "HELLO PICO\r\n";
-        for (const char *p = msg; *p; p++) {
-            for (volatile uint32_t spin = 0; spin < 3000; spin++) {
-                /* wait */
-            }
-            UART0_DR = (unsigned char)*p;
-        }
-        for (volatile uint32_t spin = 0; spin < 3000000; spin++) {
-            /* pause between repeats */
-        }
+        /* halt */
     }
 }
 

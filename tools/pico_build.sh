@@ -7,10 +7,9 @@
 # (device/boot.c + device/rp2350.ld) into a complete Cortex-M33 ELF — then reports
 # the flash footprint.
 #
-# This VERIFIES the toolchain path end to end (compile + link). It does NOT yet
-# produce a bootable .uf2: running on hardware also needs the RP2350 bootrom
-# IMAGE_DEF metadata block and clock/UART init, which require a board + picotool
-# to validate (see PICO_BACKEND.md "Remaining hardware-gated work").
+# This VERIFIES the toolchain path end to end (compile + link). Turning an ELF
+# into a flashable .uf2 is a separate `picotool uf2 convert` step; see
+# PICO_BACKEND.md for that and for what has been confirmed on a real board.
 #
 # Requires: clang + lld (LLVM) and the Rust target thumbv8m.main-none-eabi
 # (`rustup target add thumbv8m.main-none-eabi`). Skips cleanly if absent.
@@ -54,6 +53,10 @@ build() { # name  source
   ld.lld -T device/rp2350.ld --gc-sections "$OUT/$name.o" "$OUT/boot.o" "$RT" \
     -o "$OUT/$name.elf" 2>"$OUT/$name.err" || {
     echo "FAIL [$name]: link"; cat "$OUT/$name.err"; return 1; }
+  # --gc-sections drops the whole program if boot.c stops calling main, and the
+  # link still succeeds, so a passing link alone proves nothing.
+  llvm-nm "$OUT/$name.elf" 2>/dev/null | grep -q ' T main$' || {
+    echo "FAIL [$name]: image has no main; boot.c isn't calling the program"; return 1; }
   # True flash image (code + initialised data), excluding the NOBITS arena.
   llvm-objcopy -O binary -j .vectors -j .ARM.exidx -j .text -j .data \
     "$OUT/$name.elf" "$OUT/$name.bin" 2>/dev/null
@@ -66,6 +69,8 @@ fails=0
 build typed_mul   'def sq(n: int) -> int:\n    return n * n\nprint(sq(7))\n'       || fails=$((fails+1))
 build loop_sum    'def s(n: int) -> int:\n    t: int = 0\n    i: int = 0\n    while i < n:\n        t = t + i\n        i = i + 1\n    return t\nprint(s(10))\n' || fails=$((fails+1))
 build comp_packed 'xs: list[int] = [1, 2, 3]\nys: list[int] = [x * x for x in xs]\nprint(ys)\n' || fails=$((fails+1))
+# Prints forever, so a serial port opened at any moment sees output.
+build uart_count  'i: int = 0\nwhile True:\n    print(i)\n    i = i + 1\n' || fails=$((fails+1))
 
 echo "---"
 if [ "$fails" -eq 0 ]; then
