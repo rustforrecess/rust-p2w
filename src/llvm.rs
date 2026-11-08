@@ -20,7 +20,7 @@
 //! incl. recursion). Not yet (clean errors): tuples, comprehensions, classes,
 //! default args.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::codegen::parse_format_spec;
@@ -329,7 +329,33 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         }
     }
 
+    // Module-level names that any function or method reads (and doesn't
+    // shadow) become LLVM globals; everything else stays on main's stack.
+    let mut module_names = BTreeSet::new();
+    crate::hoist::assigned_here(stmts, &mut module_names);
+    let mut read_by_functions = BTreeSet::new();
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Def { params, body, .. } => {
+                read_by_functions.extend(crate::hoist::free_vars_of(params, body));
+            }
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    read_by_functions.extend(crate::hoist::free_vars_of(&m.params, &m.body));
+                }
+            }
+            _ => {}
+        }
+    }
+    let module_globals: BTreeSet<String> = module_names
+        .intersection(&read_by_functions)
+        .cloned()
+        .collect();
+
     let mut globals = String::new();
+    for g in &module_globals {
+        globals.push_str(&format!("@g_{g} = global i32 0\n"));
+    }
     let mut defs = String::new();
     // Interned-literal cache slots from every function + main, released at
     // main's exit so a finished program ends at live == 0.
@@ -343,6 +369,7 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
         func_params: &func_params,
         func_defaults: &func_defaults,
         classes: &classes,
+        module_globals: &module_globals,
     };
     let mut dispatchers: Vec<(String, usize)> = Vec::new();
     for s in stmts {
@@ -737,6 +764,9 @@ struct Sigs<'a> {
     func_params: &'a HashMap<String, Vec<String>>,
     func_defaults: &'a HashMap<String, Vec<Expr>>,
     classes: &'a ClassTable,
+    /// Module-level names some function or method reads: they live in LLVM
+    /// globals `@g_<name>` instead of `main`'s stack, so functions see them.
+    module_globals: &'a BTreeSet<String>,
 }
 
 /// One class as the emitter sees it: its directly-defined methods (name →
@@ -836,6 +866,13 @@ fn emit_function(
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(sigs, name);
     f.current_class = current_class.map(str::to_string);
+    // Module globals this function reads and does not shadow with a local.
+    let locals = crate::hoist::function_locals(params, body);
+    for g in crate::hoist::free_vars_of(params, body) {
+        if sigs.module_globals.contains(&g) && !locals.contains(&g) {
+            f.register_global(&g);
+        }
+    }
     let mask = sigs.borrow_masks.get(name).cloned().unwrap_or_default();
     let preprs = sigs.param_reprs.get(name).cloned().unwrap_or_default();
     f.ret_repr = sigs.ret_reprs.get(name).copied().unwrap_or(Repr::Boxed);
@@ -905,6 +942,9 @@ fn emit_main(
     dispatchers: &mut Vec<(String, usize)>,
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(sigs, "main");
+    for g in sigs.module_globals {
+        f.register_global(g);
+    }
     // First-assignment slot inference for main's locals (no params here; the
     // walker skips Def bodies — separate scopes).
     f.inferred = infer_slot_reprs(stmts, &HashMap::new(), sigs.ret_reprs);
@@ -939,11 +979,13 @@ fn emit_main(
         f.emit_exit_releases();
         // ...and free the interned-literal cache (module globals filled by any
         // function or main; a never-executed literal's slot is 0 → no-op).
+        // Zeroed after release so a later p2w_dispose doesn't release twice.
         for slot in str_caches.iter().chain(cv_slots.iter()) {
             let t = f.temp();
             f.body.push_str(&format!("  {t} = load i32, ptr {slot}\n"));
             f.body
                 .push_str(&format!("  call void @p2w_release(i32 {t})\n"));
+            f.body.push_str(&format!("  store i32 0, ptr {slot}\n"));
         }
         f.body.push_str("  ret i32 0\n");
     }
@@ -955,7 +997,19 @@ fn emit_main(
     // dispose instead of settling for a steady-state check. Dead code in a
     // normal native build (nothing references it; the linker drops it).
     def.push_str("define void @p2w_dispose() {\nentry:\n");
-    for (n, slot) in str_caches.iter().chain(cv_slots.iter()).enumerate() {
+    // Module globals too: functions read them, so main leaves them alive
+    // (a board's callbacks run after main returns).
+    let global_slots: Vec<String> = sigs
+        .module_globals
+        .iter()
+        .map(|g| format!("@g_{g}"))
+        .collect();
+    for (n, slot) in str_caches
+        .iter()
+        .chain(cv_slots.iter())
+        .chain(global_slots.iter())
+        .enumerate()
+    {
         def.push_str(&format!(
             "  %d{n} = load i32, ptr {slot}\n  call void @p2w_release(i32 %d{n})\n  store i32 0, ptr {slot}\n"
         ));
@@ -1084,6 +1138,10 @@ struct FuncEmitter<'a> {
     /// This function's own parameters that are borrowed (slots we must NOT
     /// release at exit — the caller still owns them).
     borrowed_params: Vec<String>,
+    /// Slots that are module globals here. Never released by this function:
+    /// `p2w_dispose` owns them, and on a board callbacks still read them
+    /// after `main` returns.
+    global_slots: BTreeSet<String>,
     /// This function's return representation (what `return` coerces to).
     ret_repr: Repr,
     /// Representation of each variable slot (default `Boxed`; typed params set
@@ -1135,6 +1193,7 @@ impl<'a> FuncEmitter<'a> {
             current_class: None,
             dispatchers: Vec::new(),
             borrowed_params: Vec::new(),
+            global_slots: BTreeSet::new(),
             ret_repr: Repr::Boxed,
             var_reprs: HashMap::new(),
             inferred: HashMap::new(),
@@ -1176,6 +1235,10 @@ impl<'a> FuncEmitter<'a> {
         for name in vars {
             // Borrowed params are owned by the caller — don't release them.
             if self.borrowed_params.contains(&name) {
+                continue;
+            }
+            // Globals outlive the function (and main): p2w_dispose owns them.
+            if self.global_slots.contains(&name) {
                 continue;
             }
             // Only heap-ref slots (Boxed/IntArray) carry a refcount to release;
@@ -1246,6 +1309,22 @@ impl<'a> FuncEmitter<'a> {
             self.var_reprs.insert(name.to_string(), repr);
         }
         ptr
+    }
+
+    /// Make module global `name` visible in this function as the ordinary
+    /// slot `%v_<name>`: an entry-block alias for `@g_<name>`, so every load
+    /// and store that already works on slots reaches the global unchanged.
+    /// Globals are always Boxed, since several functions share them.
+    fn register_global(&mut self, name: &str) {
+        if self.vars.iter().any(|v| v == name) {
+            return;
+        }
+        self.allocas.push_str(&format!(
+            "  %v_{name} = getelementptr i8, ptr @g_{name}, i64 0\n"
+        ));
+        self.vars.push(name.to_string());
+        self.var_reprs.insert(name.to_string(), Repr::Boxed);
+        self.global_slots.insert(name.to_string());
     }
 
     /// The common case: a Boxed slot (plain `x = …` locals).
@@ -2067,7 +2146,7 @@ impl<'a> FuncEmitter<'a> {
     /// borrowed params (the caller owns those) and non-heap (unboxed) slots.
     fn early_releases(&mut self, dead: &[String]) {
         for name in dead {
-            if self.borrowed_params.contains(name) {
+            if self.borrowed_params.contains(name) || self.global_slots.contains(name) {
                 continue;
             }
             if !self.vars.iter().any(|v| v == name) {
@@ -2332,6 +2411,8 @@ impl<'a> FuncEmitter<'a> {
                 body,
                 ..
             } => self.emit_for(var, start, end, step, body),
+            // `pass` does nothing, on purpose.
+            StmtKind::Pass => Ok(()),
             StmtKind::Break => {
                 let (_, brk) = self
                     .loops
@@ -2535,6 +2616,9 @@ impl<'a> FuncEmitter<'a> {
         // bound is a raw i32 held across the loop (no refcount, so no cleanup).
         let start_v = self.expr_int(start)?;
         let end_v = self.expr_int(end_expr)?;
+        if self.global_slots.contains(var) {
+            return self.emit_for_global(var, &start_v, &end_v, step_lit, body);
+        }
         // Only an existing boxed binding of this name needs releasing before we
         // repurpose the slot as a native int counter; a fresh counter does not.
         let existed = self.vars.iter().any(|v| v == var);
@@ -2574,6 +2658,62 @@ impl<'a> FuncEmitter<'a> {
         let inc = self.temp();
         self.line(&format!("{inc} = add i32 {cur}, {step_lit}"));
         self.line(&format!("store i32 {inc}, ptr {slot}"));
+        self.br_to(&head);
+
+        self.place_label(&end);
+        Ok(())
+    }
+
+    /// A counted loop whose variable is a module global. Functions read the
+    /// global as a boxed value, so it can't become a raw counter the way a
+    /// local does: the loop counts in a private raw slot and stores each
+    /// value, boxed, into the global, releasing the one before. After the
+    /// loop the global holds the last value, as in Python.
+    fn emit_for_global(
+        &mut self,
+        var: &str,
+        start_v: &str,
+        end_v: &str,
+        step_lit: i64,
+        body: &[Stmt],
+    ) -> Result<(), String> {
+        let slot = self.var_slot(var);
+        let counter = format!("%fc_{}", self.next_label);
+        self.next_label += 1;
+        self.allocas
+            .push_str(&format!("  {counter} = alloca i32\n"));
+        self.line(&format!("store i32 {start_v}, ptr {counter}"));
+
+        let head = self.fresh_label("fhead");
+        let body_l = self.fresh_label("fbody");
+        let cont = self.fresh_label("fcont");
+        let end = self.fresh_label("fend");
+
+        self.br_to(&head);
+        self.place_label(&head);
+        let iv = self.temp();
+        self.line(&format!("{iv} = load i32, ptr {counter}"));
+        let pred = if step_lit > 0 { "slt" } else { "sgt" };
+        let cond = self.temp();
+        self.line(&format!("{cond} = icmp {pred} i32 {iv}, {end_v}"));
+        self.terminator(&format!("br i1 {cond}, label %{body_l}, label %{end}"));
+
+        self.place_label(&body_l);
+        let boxed = self.call_value(&format!("call i32 @p2w_int(i32 {iv})"));
+        let old = self.call_value(&format!("load i32, ptr {slot}"));
+        self.release(&old);
+        self.line(&format!("store i32 {boxed}, ptr {slot}"));
+        self.loops.push((cont.clone(), end.clone()));
+        self.block(body)?;
+        self.loops.pop();
+        self.br_to(&cont);
+
+        self.place_label(&cont);
+        let cur = self.temp();
+        self.line(&format!("{cur} = load i32, ptr {counter}"));
+        let inc = self.temp();
+        self.line(&format!("{inc} = add i32 {cur}, {step_lit}"));
+        self.line(&format!("store i32 {inc}, ptr {counter}"));
         self.br_to(&head);
 
         self.place_label(&end);

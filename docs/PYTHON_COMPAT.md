@@ -220,9 +220,10 @@ semantics and leak-freedom are oracle-gated). Differences:
   Two limits: function names must be unique across the program (no shadowing),
   and if a nested function must pass a capture along to a sibling but has its
   own same-named local, that's a clean error rather than a silently wrong value.
-  (Native keeps its existing limit that a function can't read a module global —
-  so a global-reading nested function is browser-only, exactly like a
-  global-reading top-level one.)
+  Functions and methods read module globals on both backends: natively,
+  any module name a function reads lives in an LLVM global rather than on
+  `main`'s stack (since 2026-11-08). `global` itself, to rebind one from a
+  function, is not supported on either backend yet.
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.

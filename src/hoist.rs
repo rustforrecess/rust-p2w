@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Names ASSIGNED at this function level (params are added by the caller):
 /// `Assign` / `AnnAssign` / `for` var / unpack targets, recursing into
 /// `if`/`for`/`while` but NOT into nested `def`/`class` bodies (their own scope).
-fn assigned_here(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+pub(crate) fn assigned_here(stmts: &[Stmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match &s.kind {
             StmtKind::Assign(n, _) | StmtKind::AnnAssign { name: n, .. } => {
@@ -66,7 +66,7 @@ fn reads_here(stmts: &[Stmt], out: &mut BTreeSet<String>) {
 }
 
 /// A function's local names: params plus everything it assigns (this scope).
-fn function_locals(params: &[String], body: &[Stmt]) -> BTreeSet<String> {
+pub(crate) fn function_locals(params: &[String], body: &[Stmt]) -> BTreeSet<String> {
     let mut set: BTreeSet<String> = params.iter().cloned().collect();
     assigned_here(body, &mut set);
     set
@@ -83,7 +83,7 @@ fn nested_defs(body: &[Stmt]) -> Vec<&Stmt> {
 /// Names this function's whole subtree needs from OUTSIDE it: what it reads at
 /// its own level, plus what its nested functions need, minus its own locals.
 /// (So a doubly-nested function's capture is threaded through the middle one.)
-fn free_vars_of(params: &[String], body: &[Stmt]) -> BTreeSet<String> {
+pub(crate) fn free_vars_of(params: &[String], body: &[Stmt]) -> BTreeSet<String> {
     let locals = function_locals(params, body);
     let mut free = BTreeSet::new();
     reads_here(body, &mut free); // includes nested defs' *default* exprs

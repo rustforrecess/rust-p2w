@@ -44,7 +44,11 @@ cat > "$OUT/putc.c" <<'EOF'
 extern int p2w_live(void);
 extern int p2w_allocs(void);
 extern int p2w_str(const char *ptr, int len);
+/* Module globals outlive main (a board's callbacks still read them), so the
+ * program's own dispose releases them before the leak count is taken. */
+extern void p2w_dispose(void);
 static void report(void) {
+  p2w_dispose();
   fprintf(stderr, "P2W_LIVE=%d\n", p2w_live());
   fprintf(stderr, "P2W_ALLOCS=%d\n", p2w_allocs());
 }
@@ -196,6 +200,18 @@ run_case floats    'print(7 / 2)\nprint(2 ** 10)\nprint(1.5 + 2)\n'            '
 run_case nativearith 'print(2 + 3 * 4)\nprint((10 - 3) * 2)\nprint(1 - 5)\n'    '14\n14\n-4'    || fails=$((fails+1))
 run_case floatmath 'print(1.5 * 2.0)\nprint(7 / 2)\nprint(1 + 2.5)\nprint(10.0 - 3)\n' '3.0\n3.5\n3.5\n7.0' || fails=$((fails+1))
 run_case floatcmp  'print(1.5 < 2.0)\nprint(2.5 > 3.0)\nprint(3.0 == 3.0)\n'     'True\nFalse\nTrue' || fails=$((fails+1))
+# Module globals read from functions (docs/COMPILER_FRONTIER.md, task 8).
+run_case globals_read    'n = 5\ndef f():\n    return n * 2\nprint(f())\n' '10' || fails=$((fails+1))
+run_case globals_list    'count = [0]\ndef tick():\n    count[0] = count[0] + 5\n    print(count[0])\ntick()\ntick()\n' '5\n10' || fails=$((fails+1))
+run_case globals_shadow  'x = 1\ndef f():\n    x = 2\n    return x\nprint(f())\nprint(x)\n' '2\n1' || fails=$((fails+1))
+run_case globals_rebind  'x = 1\ndef f():\n    return x\nx = 3\nprint(f())\n' '3' || fails=$((fails+1))
+run_case globals_int     'speed: int = 40\ndef go() -> int:\n    return speed + 1\nprint(go())\n' '41' || fails=$((fails+1))
+run_case globals_float   'g: float = 9.5\ndef f():\n    return g / 2\nprint(f())\n' '4.75' || fails=$((fails+1))
+run_case globals_str     'name = "bot"\ndef hi():\n    print("hi " + name)\nhi()\n' 'hi bot' || fails=$((fails+1))
+run_case globals_method  'limit = 3\nclass R:\n    def ok(self, v):\n        return v < limit\nr = R()\nprint(r.ok(2))\nprint(r.ok(5))\n' 'True\nFalse' || fails=$((fails+1))
+run_case globals_loopvar 'for i in range(3):\n    y = i\ndef f():\n    return i\nprint(f())\n' '2' || fails=$((fails+1))
+# `pass` was unsupported on native: an empty if-branch, a placeholder def.
+run_case pass_stmt       'x = 1\nif x > 0:\n    pass\ndef later():\n    pass\nlater()\nfor i in range(2):\n    pass\nprint(x)\n' '1' || fails=$((fails+1))
 # `is None` / `is not None`: once printed the UN-negated value for `is not`.
 # The cause was p2w_bool being passed an i1 that the runtime reads as a full
 # i32, so leftover register bits decided the result; `box_bool` in

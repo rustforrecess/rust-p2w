@@ -272,6 +272,17 @@ liveness, since the source dies after the loop, not at a statement).
 
 ### 8. Module-level globals readable from functions (native backend)
 
+**Done 2026-11-08, except the `nbody` acceptance run, which has not been
+tried.** Module names any `def` or method reads become `@g_<name>`; each
+function sees one through an entry-block alias `%v_<name>`, so the existing
+slot code reaches it unchanged. Globals are always Boxed, are never released
+by `main` (a board's `every` callbacks still read them after it returns),
+and `p2w_dispose` releases them. A module-level counted `for` whose variable
+is a global counts in a private raw slot and stores each value boxed.
+`tools/native_run.sh` covers read, list mutation, shadowing, rebinding after
+the `def`, typed int/float, strings, methods and the loop variable, all at
+`live == 0`. Rebinding with `global` is a separate, later step.
+
 The WASM backend has real globals (`(global $g_x …)`); the native backend
 emits top-level bindings as allocas inside `main`, so a function body reading
 a module constant fails with "name is not defined". This is the last blocker
