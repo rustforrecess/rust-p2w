@@ -48,6 +48,7 @@ mod parser;
 mod repr;
 mod reuse;
 mod roles;
+pub mod sim;
 
 pub use ast::{BinOp, Expr, ExprKind, Span, Stmt, StmtKind, UnOp};
 pub use blockly::{BlocksOutcome, to_blockly_json, to_blocks};
