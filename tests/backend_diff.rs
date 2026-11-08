@@ -260,6 +260,7 @@ fn backends_agree_or_the_differences_are_written_down() {
          int p2w_host_seed(void) { return 42; }\n\
          extern int p2w_float(double);\n\
          int p2w_host_read_temperature(void) { return p2w_float(21.0); }\n\
+         void p2w_host_every(int ms, int id) { (void)ms; (void)id; }\n\
          void p2w_robot_set_motor(int left, int right) { (void)left; (void)right; }\n\
          void p2w_robot_stop(void) { }\n\
          int p2w_robot_read_distance(int sensor) { (void)sensor; return 2000; }\n\

@@ -40,6 +40,7 @@ extern uint32_t __stack_top;
 #define RESETS_PADS_BANK0_BIT (1u << 9)
 #define RESETS_IO_BANK0_BIT   (1u << 6)
 #define RESETS_ADC_BIT        (1u << 0)
+#define RESETS_TIMER0_BIT     (1u << 23)
 
 /* XOSC, the 12 MHz crystal (datasheet 8.2.8). ROSC, what the chip boots from,
  * is explicitly documented (8.1) as too imprecise for "frequency sensitive
@@ -107,6 +108,15 @@ extern uint32_t __stack_top;
 #define UART0_FR_TXFF (1u << 5)
 #define UART0_FR_RXFE (1u << 4)
 
+/* TIMER0 counts microseconds, but only once its tick generator runs: on the
+ * RP2350 every tick destination has its own generator, fed from clk_ref.
+ * 12 cycles of the 12 MHz crystal make one microsecond. */
+#define TICKS_BASE            0x40108000u
+#define TICKS_TIMER0_CTRL     (*(volatile uint32_t *)(TICKS_BASE + 0x18))
+#define TICKS_TIMER0_CYCLES   (*(volatile uint32_t *)(TICKS_BASE + 0x1c))
+#define TIMER0_BASE           0x400b0000u
+#define TIMER0_TIMERAWL       (*(volatile uint32_t *)(TIMER0_BASE + 0x28))
+
 /* ADC. The temperature sensor is the last input: 4 on the RP2350A in a Pico 2 W
  * (5 channels; the larger RP2350B has 9). */
 #define ADC_BASE          0x400a0000u
@@ -147,7 +157,10 @@ static void clocks_and_uart_init(void) {
     CLK_PERI_CTRL = CLK_PERI_CTRL_ENABLE_BIT;
 
     /* Release reset on UART0, IO_BANK0 and PADS_BANK0. */
-    const uint32_t blocks = RESETS_UART0_BIT | RESETS_PADS_BANK0_BIT | RESETS_IO_BANK0_BIT;
+    TICKS_TIMER0_CYCLES = 12;
+    TICKS_TIMER0_CTRL = 1; /* enable */
+
+    const uint32_t blocks = RESETS_UART0_BIT | RESETS_PADS_BANK0_BIT | RESETS_IO_BANK0_BIT | RESETS_TIMER0_BIT;
     RESETS_RESET_CLR = blocks;
     while ((RESETS_RESET_DONE & blocks) != blocks) {
         /* wait */
@@ -261,6 +274,62 @@ void p2w_host_file_close(int handle) {
     (void)handle;
 }
 
+/* every(ms, handler): timers kept here; after main returns the scheduler runs
+ * whichever is due, earliest first and then in registration order, the same
+ * rule as rust_p2w::sim::Timers. Times are microseconds in a wrapping 32-bit
+ * counter, compared by difference, so the roll-over every 71 minutes is
+ * harmless as long as no period is longer than half of that. */
+#define MAX_TIMERS     16u
+#define MIN_PERIOD_MS  10
+extern void p2w_dispatch(int id);
+
+static struct {
+    uint32_t period_us;
+    uint32_t next_us;
+    int id;
+} timers[MAX_TIMERS];
+static uint32_t timer_count;
+
+static void say(const char *text) {
+    for (const char *p = text; *p; p++) {
+        p2w_putc((unsigned char)*p);
+    }
+}
+
+void p2w_host_every(int ms, int id) {
+    if (timer_count == MAX_TIMERS) {
+        say("every(): this board runs at most 16 timers; this one is ignored\n");
+        return;
+    }
+    if (ms < MIN_PERIOD_MS) {
+        ms = MIN_PERIOD_MS;
+    }
+    uint32_t period = (uint32_t)ms * 1000u;
+    timers[timer_count].period_us = period;
+    timers[timer_count].next_us = TIMER0_TIMERAWL + period;
+    timers[timer_count].id = id;
+    timer_count++;
+}
+
+static void run_scheduler(void) {
+    for (;;) {
+        uint32_t now = TIMER0_TIMERAWL;
+        int best = -1;
+        for (uint32_t i = 0; i < timer_count; i++) {
+            if ((int32_t)(now - timers[i].next_us) < 0) {
+                continue; /* not due yet */
+            }
+            if (best < 0 || (int32_t)(timers[i].next_us - timers[best].next_us) < 0) {
+                best = (int)i;
+            }
+        }
+        if (best >= 0) {
+            timers[best].next_us += timers[best].period_us;
+            p2w_dispatch(timers[best].id);
+        }
+    }
+}
+
 void Reset_Handler(void) {
     /* Copy initialised data from flash to RAM. */
     uint32_t *src = &__data_load;
@@ -273,9 +342,7 @@ void Reset_Handler(void) {
     }
     clocks_and_uart_init();
     main();
-    for (;;) {
-        /* halt */
-    }
+    run_scheduler(); /* never returns; with no timers it simply waits */
 }
 
 void Default_Handler(void) {

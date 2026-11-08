@@ -82,6 +82,10 @@ while True:
 ' || fails=$((fails+1))
 # The robot module links against boot.c's stand-ins (docs/ROBOT.md).
 build robot      'import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.tilt() >= robot.FLIPPED)\nrobot.stop()\n' || fails=$((fails+1))
+# every() on the board: two timers, 100 ms and 250 ms, run by the scheduler.
+# Handlers keep no state: functions can't read module globals on native yet
+# (docs/COMPILER_FRONTIER.md, task 8).
+build ticks      'def fast():\n    print("fast")\ndef slow():\n    print("slow")\nprint("start")\nevery(100, fast)\nevery(250, slow)\n' || fails=$((fails+1))
 # Prints forever, so a serial port opened at any moment sees output.
 build uart_count  'i: int = 0\nwhile True:\n    print(i)\n    i = i + 1\n' || fails=$((fails+1))
 

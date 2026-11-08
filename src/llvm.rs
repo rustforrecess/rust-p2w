@@ -63,6 +63,9 @@ declare i32 @p2w_host_get_field(i32)
 declare i32 @p2w_host_get_value(i32)
 declare i32 @p2w_host_pointer_x()
 declare i32 @p2w_host_pointer_y()
+; every(ms, handler): the host keeps the timer and later calls
+; @p2w_dispatch(id) — the board's scheduler, or a test host's.
+declare void @p2w_host_every(i32, i32)
 declare i32 @p2w_host_read_temperature()
 declare i32 @p2w_int(i32)
 declare i32 @p2w_unbox_int(i32)
@@ -391,6 +394,13 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
     let (gen_defs, gen_globals) = emit_class_glue(&classes, &dispatchers);
     defs.push_str(&gen_defs);
     globals.push_str(&gen_globals);
+
+    // `p2w_dispatch(id)`: how a host runs a handler registered with `every`.
+    // Ids are the zero-parameter functions sorted by name, the same numbering
+    // the WASM backend's `__dispatch` uses, so both backends agree on which
+    // function an id means. Defined in every module, possibly empty, because
+    // the board's boot code always references it.
+    defs.push_str(&emit_dispatch(&func_params, &ret_reprs));
 
     // Host-module functions are declared whether used or not: an unused
     // declaration costs nothing and links nothing.
@@ -997,6 +1007,45 @@ fn fmt_double(f: f64) -> String {
 /// True if a value of this repr is a heap reference (`Boxed`/`IntArray`/
 /// `FloatArray`) that participates in reference counting — retained on owned
 /// load, released at scope exit. Unboxed scalars (Int/Float/Bool) are not.
+/// The zero-parameter functions, sorted by name: index = handler id.
+fn handler_names(func_params: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut names: Vec<String> = func_params
+        .iter()
+        .filter(|(_, ps)| ps.is_empty())
+        .map(|(n, _)| n.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `define void @p2w_dispatch(i32 %id)`: switch to the handler, call it,
+/// drop whatever it returns.
+fn emit_dispatch(
+    func_params: &HashMap<String, Vec<String>>,
+    ret_reprs: &HashMap<String, Repr>,
+) -> String {
+    let names = handler_names(func_params);
+    let cases: String = (0..names.len())
+        .map(|i| format!(" i32 {i}, label %h{i}"))
+        .collect();
+    let mut out = format!(
+        "define void @p2w_dispatch(i32 %id) {{\nentry:\n  switch i32 %id, label %done [{cases} ]\n"
+    );
+    for (i, name) in names.iter().enumerate() {
+        let repr = ret_reprs.get(name).copied().unwrap_or(Repr::Boxed);
+        out.push_str(&format!(
+            "h{i}:\n  %r{i} = call {} @u_{name}()\n",
+            llvm_ty(repr)
+        ));
+        if is_heap_repr(repr) {
+            out.push_str(&format!("  call void @p2w_release(i32 %r{i})\n"));
+        }
+        out.push_str("  br label %done\n");
+    }
+    out.push_str("done:\n  ret void\n}\n\n");
+    out
+}
+
 fn is_heap_repr(r: Repr) -> bool {
     matches!(r, Repr::Boxed | Repr::IntArray | Repr::FloatArray)
 }
@@ -2932,6 +2981,28 @@ impl<'a> FuncEmitter<'a> {
                     self.release_if_owned(&a, ao);
                     return Ok((r, Repr::Boxed));
                 }
+                // every(ms, handler): hand the host a period and a handler id;
+                // it calls @p2w_dispatch(id) when the timer is due.
+                if name == "every" && args.len() == 2 {
+                    let ExprKind::Name(h) = &args[1].kind else {
+                        return Err(format!(
+                            "line {}: every() needs the name of a function, like every(50, drive)",
+                            e.line
+                        ));
+                    };
+                    let names = handler_names(self.func_params);
+                    let Some(id) = names.iter().position(|n| n == h) else {
+                        return Err(format!(
+                            "line {}: '{h}' must be a function with no arguments to run with every()",
+                            e.line
+                        ));
+                    };
+                    let ms = self.expr(&args[0])?;
+                    let raw = self.call_value(&format!("call i32 @p2w_unbox_int(i32 {ms})"));
+                    self.release(&ms);
+                    self.line(&format!("call void @p2w_host_every(i32 {raw}, i32 {id})"));
+                    return Ok((self.call_value("call i32 @p2w_none()"), Repr::Boxed));
+                }
                 // bool(x) — truthiness boxed to True/False.
                 if name == "bool" && args.len() == 1 {
                     let (v, o) = self.expr_borrow(&args[0])?;
@@ -4778,6 +4849,27 @@ mod tests {
         // Every bool is widened before p2w_bool, which reads a full i32:
         // an i1 there left stray register bits deciding True or False.
         assert!(!ir.contains("p2w_bool(i1"), "{ir}");
+        // every() hands the host an id that p2w_dispatch understands; ids
+        // follow the sorted zero-parameter functions, as __dispatch does.
+        let ev = crate::compile_to_llvm_ir(
+            "def zeta():\n    print(2)\ndef alpha():\n    print(1)\ndef takes(x):\n    return x\nevery(50, zeta)\n",
+        )
+        .unwrap();
+        assert!(ev.contains("call void @p2w_host_every(i32 %"), "{ev}");
+        assert!(ev.contains(", i32 1)"), "zeta is id 1 after alpha: {ev}");
+        assert!(
+            ev.contains("switch i32 %id, label %done [ i32 0, label %h0 i32 1, label %h1 ]"),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("call i32 @u_alpha()") && !ev.contains("@u_takes()"),
+            "{ev}"
+        );
+        assert!(
+            crate::compile_to_llvm_ir("every(50, 3)\n")
+                .unwrap_err()
+                .contains("name of a function")
+        );
         assert!(ir.contains("call i32 @p2w_bool(i32 "), "{ir}");
         assert!(
             out.contains("store double 0x400C000000000000"),

@@ -52,6 +52,8 @@ void p2w_putc(unsigned char c) { putchar(c); }
 int p2w_host_seed(void) { return 42; }
 extern int p2w_float(double);
 int p2w_host_read_temperature(void) { return p2w_float(21.0); }
+/* every(): recorded nowhere; a test run ends when main returns. */
+void p2w_host_every(int ms, int id) { (void)ms; (void)id; }
 /* robot: the stand-ins from src/hostmod.rs (a lockstep test checks these). */
 void p2w_robot_set_motor(int left, int right) { (void)left; (void)right; }
 void p2w_robot_stop(void) { }

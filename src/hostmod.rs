@@ -295,6 +295,11 @@ mod tests {
                     assert!(text.contains(&sym), "{file} does not define {sym}");
                 }
             }
+            // Not a host module, but every native host needs it just the same.
+            assert!(
+                text.contains("p2w_host_every"),
+                "{file} does not define p2w_host_every"
+            );
         }
     }
 }
