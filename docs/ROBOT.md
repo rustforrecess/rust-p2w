@@ -1,0 +1,178 @@
+# The `robot` module — design
+
+Status: **design, not built** (2026-11-07). Supersedes the June draft in
+`acornstem/stdlib/robot/`, which was written for a compiler layout that was
+never built (`__hal_call__`, an embassy HAL). Its function names are kept
+where they still fit.
+
+## What it is for
+
+One 150 g robot design for a whole class, under $80, programmed in p2w. The
+first games are sumo with judo-style scoring, tag, and human/code handover.
+Every program runs in the browser simulator and on a Raspberry Pi Pico 2 W
+unchanged: **both targets or neither**, as for the rest of the language.
+
+## Programs are callbacks, not loops
+
+A robot program registers callbacks and returns. The host — the browser
+simulator or the board firmware — then calls them. There is no `while True`
+loop and no blocking delay.
+
+```python
+import robot
+
+def drive():                      # a timer callback
+    if robot.read_line(0):        # ring edge: most important rule first
+        robot.set_motor(-60, -60)
+    elif robot.read_distance(0) < 300:
+        robot.set_motor(100, 100)
+    else:
+        robot.set_motor(40, -40)
+
+def got_flipped():                # an event callback
+    print("help!")
+
+every(50, drive)
+robot.on_flipped(got_flipped)
+```
+
+Why:
+
+- **The browser cannot block.** Run calls the program's start function
+  directly; a `while True` loop would hold the tab. Callbacks need no worker,
+  no special headers and no interpreter.
+- **It is how industry robots work.** A ROS 2 node registers timer and
+  subscription callbacks and an executor calls them. `every` is what ROS calls
+  a timer; `robot.on_flipped` is a subscription. Lessons name ROS's names when
+  the concept is taught (see `ROS.md`); nothing here depends on ROS.
+- **It already half exists.** `every(ms, handler)` and the `on_` handlers are
+  existing builtins in the browser. `every` is reused as-is rather than adding
+  a second `robot.every`.
+
+## Design patterns, named for lessons and lints
+
+| Pattern | Where | Kid version |
+|---|---|---|
+| Observer (publish/subscribe) | `robot.on_flipped`, `robot.on_tagged` | "Tell me when this happens" |
+| Reactor / event loop | the host calling callbacks | "Don't call us, we'll call you" |
+| Timer | `every(50, drive)` | "Do this every 50 ms" |
+| State machine | tag: hunting, fleeing, frozen, immune | "What mode am I in?" |
+| Strategy | human/code handover | "Who is driving right now?" |
+| Subsumption (layered behaviours) | edge check before attack before search | "Most important rule wins" |
+| Arbiter / guard | firmware rules over student commands | "Rules your code can't break" |
+
+Subsumption order is checkable. A lint can notice that an edge check comes
+after an attack rule, so the attack always wins and the robot drives off the
+ring, and say so about the student's own code.
+
+## API (first slice)
+
+Units are for people, not physics: speed −100..100, distances in mm,
+angles in degrees.
+
+| Call | Returns | Notes |
+|---|---|---|
+| `robot.set_motor(left, right)` | — | −100..100 each; the arbiter may limit or zero it |
+| `robot.stop()` | — | both motors to 0 |
+| `robot.read_distance(n)` | `int` mm | distance sensor `n` (time-of-flight) |
+| `robot.read_line(n)` | `bool` | line sensor `n` sees the ring edge |
+| `robot.tilt()` | `float` degrees | angle between the robot's up and real up: 0 level, 180 upside down |
+| `robot.TILTED`, `robot.FLIPPED` | `float` | threshold angles, starting at 30 and 150 |
+| `robot.tagged()` | `bool` | an IR tag is freezing this robot now |
+| `robot.on_flipped(fn)` | — | called when `tilt()` reaches `FLIPPED` |
+| `robot.on_tagged(fn)` | — | called when a tag starts |
+| `every(ms, fn)` | — | existing builtin; minimum interval 10 ms |
+
+`read_ir` from the June draft is renamed `read_line`: "IR" now also means IR
+tag.
+
+### `tilt()` and the thresholds
+
+One number, with named reference angles, compared with `>=`:
+
+```python
+if robot.tilt() >= robot.FLIPPED:
+    print("help!")
+elif robot.tilt() >= robot.TILTED:
+    robot.set_motor(100, 100)        # push back while lifted
+```
+
+The thresholds are ranges, not exact angles: a flipped robot reads 179.4 or
+176.8, almost never 180.0. The firmware's scoring uses the same constants, so
+a student's code and the referee agree on what "flipped" means. There is no
+`UPRIGHT`; upright is `robot.tilt() < robot.TILTED`.
+
+**The floating-point lint.** `robot.tilt() == robot.FLIPPED`, or `== 180`,
+is almost never true, the same trap as comparing any float with `== 0.0`. A
+lint flags `==` and `!=` on a float measurement and says so about the
+student's own line: a robot's angle is almost never exactly 180; `>=` means
+"at least this far over". The same lint covers floats generally, so the
+lesson is "measurements are never exact", not a robot special case. Later slices: `robot.position(id)` and `robot.heading()` from the
+overhead camera, `robot.mode()` for handover, a servo for flippers.
+
+## The arbiter: rules the student's code cannot break
+
+The arbiter sits between `set_motor` and the motors, in the browser simulator
+and in the board firmware. Student code keeps running; only motion is
+overridden. Every number is a setting, tuned in play.
+
+| Rule | Starting value |
+|---|---|
+| Motor power cap (a full 2S battery on 6 V motors) | 70% |
+| IR tag freezes motion while the beam is received | up to 10 s |
+| Gap in the beam still counted as tagged | 0.2 s |
+| Immunity after a tag releases | 3 s |
+| Signal or power loss | stop |
+
+Tilt is measured by the firmware, not reported by student code, so a
+program cannot claim to be upright. Scoring for lifts and flips is the game
+layer's job and reads these states.
+
+## Two hosts
+
+**Browser simulator.** A 2D arena with robots, the same arbiter, and its own
+clock. The simulator advances time in fixed steps and calls due callbacks,
+rather than using `setInterval`, so a run replays exactly and a test can step
+time without waiting. Sensors read the simulated world.
+
+**Board firmware.** `boot.c` (or its successor) becomes the executor: after
+`main` registers callbacks it runs a scheduler forever, calling due timers
+and pending events, with the arbiter applied before any motor write. This
+needs callback registration in the native backend, which today rejects
+`on_click` and has no `every`.
+
+Pin plan (provisional, checked against the RP2350 datasheet before any
+wiring):
+
+| Use | Pins |
+|---|---|
+| UART debug (keep free) | GP0, GP1 |
+| Motor driver (DRV8833, PWM) | GP6–GP9 |
+| I2C: IMU and distance sensor | GP4 (SDA), GP5 (SCL) |
+| Line sensors | GP26, GP27 |
+| IR tag receiver | GP10 |
+
+## Safety
+
+From `robot-magnet-safety` in the design notes: plain enclosed N20 motors, no
+magnetic encoders, no exposed or loose magnets, no magnets as a build part.
+Motor and battery voltage stay off any breadboard. Robots stay out of pockets
+and away from chests and heads, taught to everyone so nobody is singled out.
+
+## Order of work
+
+1. The language surface: `import robot` accepted, types known to the checker,
+   the names known to lints and the blocks toolbox, stubs on every backend.
+2. The browser simulator with the arbiter, deterministic clock and one arena.
+3. Native callbacks and the firmware scheduler; `every` on the board, checked
+   over UART timestamps on the existing Pico.
+4. Real motors, sensors and the IMU once parts arrive.
+5. IR tag, the overhead camera and radio.
+
+## Open questions
+
+- How a program running on a board without a given sensor reports it (an
+  error at startup is the current lean).
+- Tag rules, scoring thresholds and the spinner rule: decided in play.
+- `import robot` under CPython: the stub in `acornstem/stdlib/robot` must
+  match this API so programs stay valid Python.
