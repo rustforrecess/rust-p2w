@@ -76,6 +76,28 @@ pub enum Event {
     LeftRing { robot: usize, at_ms: u64 },
 }
 
+/// How a robot without a student program drives itself. Built-in practice
+/// opponents, until a game can give every robot its own program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Behaviour {
+    /// Driven only by `set_motor` (a student's robot, or one standing still).
+    #[default]
+    Driven,
+    /// Turns on the spot: a moving target to aim at.
+    Spin,
+    /// Turns toward the nearest robot and drives at it.
+    Charge,
+}
+
+impl Behaviour {
+    /// Every behaviour, with a name a menu can show.
+    pub const ALL: [(Behaviour, &'static str); 3] = [
+        (Behaviour::Driven, "still"),
+        (Behaviour::Spin, "spinning"),
+        (Behaviour::Charge, "charging"),
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Robot {
     pub name: String,
@@ -85,6 +107,7 @@ pub struct Robot {
     /// Motor commands as the student gave them, -100..100.
     pub command: (f64, f64),
     pub out_of_ring: bool,
+    pub behaviour: Behaviour,
 }
 
 /// A request the simulator cannot satisfy, worded for the student.
@@ -127,6 +150,7 @@ impl Arena {
             heading: heading_deg.to_radians(),
             command: (0.0, 0.0),
             out_of_ring: false,
+            behaviour: Behaviour::Driven,
         });
         self.robots.len() - 1
     }
@@ -135,6 +159,66 @@ impl Arena {
         self.robots
             .get(id)
             .ok_or_else(|| SimError(format!("there's no robot {id} in this arena")))
+    }
+
+    /// Choose how robot `id` drives itself. Switching to `Driven` stops it.
+    pub fn set_behaviour(&mut self, id: usize, behaviour: Behaviour) -> Result<(), SimError> {
+        self.robot(id)?;
+        self.robots[id].behaviour = behaviour;
+        if behaviour == Behaviour::Driven {
+            self.robots[id].command = (0.0, 0.0);
+        }
+        Ok(())
+    }
+
+    /// Set the commands of every self-driving robot from what it sees now.
+    /// Robots out of the ring stop: their round is over.
+    fn drive_behaviours(&mut self) {
+        for id in 0..self.robots.len() {
+            let r = &self.robots[id];
+            if r.out_of_ring {
+                if r.behaviour != Behaviour::Driven {
+                    self.robots[id].command = (0.0, 0.0);
+                }
+                continue;
+            }
+            let command = match r.behaviour {
+                Behaviour::Driven => continue,
+                Behaviour::Spin => (-40.0, 40.0),
+                Behaviour::Charge => match self.nearest(id) {
+                    None => (0.0, 0.0),
+                    Some(target) => {
+                        let t = &self.robots[target];
+                        let bearing = (t.y_mm - r.y_mm).atan2(t.x_mm - r.x_mm);
+                        let error = wrap(bearing - r.heading);
+                        // Turn harder the further off it points; full ahead
+                        // once roughly lined up.
+                        let turn = (error / (PI / 4.0)).clamp(-1.0, 1.0) * 60.0;
+                        let ahead = if error.abs() < PI / 6.0 { 100.0 } else { 0.0 };
+                        (ahead - turn, ahead + turn)
+                    }
+                },
+            };
+            self.robots[id].command = (
+                command.0.clamp(-100.0, 100.0),
+                command.1.clamp(-100.0, 100.0),
+            );
+        }
+    }
+
+    /// The closest other robot still in the ring.
+    fn nearest(&self, id: usize) -> Option<usize> {
+        let me = &self.robots[id];
+        self.robots
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| *i != id && !r.out_of_ring)
+            .min_by(|(_, a), (_, b)| {
+                let da = (a.x_mm - me.x_mm).hypot(a.y_mm - me.y_mm);
+                let db = (b.x_mm - me.x_mm).hypot(b.y_mm - me.y_mm);
+                da.total_cmp(&db)
+            })
+            .map(|(i, _)| i)
     }
 
     // --- the robot module's calls -------------------------------------
@@ -203,6 +287,7 @@ impl Arena {
     /// as a differential pair, contacts are resolved as pushes, then rule
     /// events are recorded.
     pub fn tick(&mut self) {
+        self.drive_behaviours();
         let dt = TICK_MS as f64 / 1000.0;
         let cap = self.rules.power_cap_pct / 100.0;
         let mut velocity = Vec::with_capacity(self.robots.len());
@@ -559,6 +644,39 @@ mod tests {
                 (60, 9),
             ]
         );
+    }
+
+    #[test]
+    fn a_charging_opponent_finds_and_pushes_a_still_robot_out() {
+        let mut a = Arena::new(Ring::MINI);
+        // The student's robot sits still; the opponent starts facing away.
+        let you = a.spawn("you", -150.0, 50.0, 0.0);
+        let them = a.spawn("practice", 150.0, -50.0, 0.0);
+        a.set_behaviour(them, Behaviour::Charge).unwrap();
+        while a.events.is_empty() && a.now_ms < 10_000 {
+            a.tick();
+        }
+        let Event::LeftRing { robot, .. } = a.events[0].clone();
+        assert_eq!(robot, you, "{:?}", a.robots);
+        assert!(!a.robots[them].out_of_ring);
+    }
+
+    #[test]
+    fn a_spinning_opponent_stays_put_and_stops_when_set_still() {
+        let mut a = Arena::new(Ring::MINI);
+        let them = a.spawn("practice", 100.0, 0.0, 0.0);
+        a.set_behaviour(them, Behaviour::Spin).unwrap();
+        a.run_for(1000);
+        let r = &a.robots[them];
+        assert!(
+            close(r.x_mm, 100.0, 1e-6) && close(r.y_mm, 0.0, 1e-6),
+            "{r:?}"
+        );
+        assert!(r.heading.abs() > 0.1, "it should have turned: {r:?}");
+        a.set_behaviour(them, Behaviour::Driven).unwrap();
+        let before = a.robots[them].heading;
+        a.run_for(500);
+        assert_eq!(a.robots[them].heading, before);
     }
 
     #[test]
