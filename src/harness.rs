@@ -170,6 +170,7 @@ pub fn run_with_files(
     }
 
     let mut linker: Linker<Io> = Linker::new(&engine);
+    define_host_stand_ins(&mut linker, &engine);
     linker
         .func_wrap("env", "write_char", {
             // Fn+Send+Sync required: surrogate state as an atomic (0 = none).
@@ -393,6 +394,46 @@ pub fn run_with_files(
             crate::json_escape(&out),
         ),
         exit: i32::from(!ok),
+    }
+}
+
+/// Every host-module import (`robot_tilt`, ...) answering with the table's
+/// stand-in, so these programs run here exactly as with nothing attached.
+fn define_host_stand_ins(linker: &mut Linker<Io>, engine: &Engine) {
+    use crate::HostTy;
+    use wasmtime::{FuncType, Val, ValType};
+    let vt = |t: HostTy| {
+        if t == HostTy::Float {
+            ValType::F64
+        } else {
+            ValType::I32
+        }
+    };
+    for m in crate::HOST_MODULES {
+        for f in m.fns {
+            let params: Vec<ValType> = f.params.iter().map(|(_, t)| vt(*t)).collect();
+            let results: Vec<ValType> = if f.ret == HostTy::None {
+                vec![]
+            } else {
+                vec![vt(f.ret)]
+            };
+            let (ret, value) = (f.ret, f.stand_in);
+            linker
+                .func_new(
+                    "env",
+                    &f.import_name(m.name),
+                    FuncType::new(engine, params, results),
+                    move |_, _, out| {
+                        match ret {
+                            HostTy::None => {}
+                            HostTy::Float => out[0] = Val::F64(value.to_bits()),
+                            HostTy::Int | HostTy::Bool => out[0] = Val::I32(value as i32),
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("define host stand-in");
+        }
     }
 }
 

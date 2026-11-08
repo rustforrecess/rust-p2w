@@ -199,7 +199,11 @@ impl Fact {
     pub fn unknown_module(name: &str) -> Self {
         Fact::UnknownModule {
             name: name.to_string(),
-            available: vec!["math".to_string(), "random".to_string()],
+            available: ["math", "random"]
+                .into_iter()
+                .chain(crate::hostmod::HOST_MODULES.iter().map(|m| m.name))
+                .map(str::to_string)
+                .collect(),
         }
     }
 }
@@ -390,7 +394,7 @@ mod tests {
             (
                 "import turtle\n",
                 "Name Error (ModuleNotFoundError) on line 1: There's no module called `turtle` here.\n\
-                 Try: You can use: math, random.",
+                 Try: You can use: math, random, robot.",
             ),
             (
                 "def drive(speed):\n    return speed\nprint(drive())\n",

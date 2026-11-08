@@ -62,6 +62,7 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         },
     );
     let mut linker: Linker<Io> = Linker::new(engine());
+    define_host_stand_ins(&mut linker, engine());
     linker
         .func_wrap("env", "write_char", {
             // Fn+Send+Sync required: surrogate state as an atomic (0 = none).
@@ -337,6 +338,40 @@ fn read_temperature_is_a_float_from_the_host() {
     assert_eq!(run(src), "21.0\n22.5\nTrue\n");
     let wat = rust_p2w::compile_to_wat(src).unwrap();
     assert!(rust_p2w::capabilities(&wat).contains(&"read_temperature".to_string()));
+}
+
+/// The robot module with nothing attached: every call reaches the host and
+/// the stand-ins come back, boxed to the right Python types.
+#[test]
+fn robot_module_reaches_the_host() {
+    let src = "import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED)\nprint(robot.FLIPPED)\nprint(robot.tagged())\nrobot.stop()\n";
+    assert_eq!(run(src), "2000\nFalse\n0.0\nFalse\n150.0\nFalse\n");
+    let wat = rust_p2w::compile_to_wat(src).unwrap();
+    let caps = rust_p2w::capabilities(&wat);
+    for name in [
+        "robot_set_motor",
+        "robot_read_distance",
+        "robot_tilt",
+        "robot_stop",
+    ] {
+        assert!(caps.contains(&name.to_string()), "{caps:?}");
+    }
+    // Only what the program calls is imported.
+    assert!(!caps.contains(&"robot_tagged".to_string()) || src.contains("tagged"));
+}
+
+#[test]
+fn robot_module_errors_name_the_students_own_words() {
+    let err = rust_p2w::compile_to_wat("import robot\nrobot.speed(5)\n").unwrap_err();
+    assert!(err.contains("robot has no attribute 'speed'"), "{err}");
+    let err = rust_p2w::compile_to_wat("import robot\nrobot.set_motor(5)\n").unwrap_err();
+    assert!(err.contains("takes 2 argument(s), got 1"), "{err}");
+    let err = rust_p2w::try_compile("import robot\nprint(robot.FLIPED)\n").unwrap_err();
+    assert!(err.kid_report().contains("FLIPPED"), "{}", err.kid_report());
+    let err = rust_p2w::compile_to_wat("from robot import tilt\n").unwrap_err();
+    assert!(err.contains("write `import robot`"), "{err}");
+    let err = rust_p2w::compile_to_wat("import robut\n").unwrap_err();
+    assert!(err.contains("math, random and robot"), "{err}");
 }
 
 /// Real programs through real WASM, so the kid layer is checked against
@@ -2781,4 +2816,44 @@ fn non_ascii_text_survives_both_print_paths() {
         "s = 'café 🦀'\nprint(s)\nprint(s + '!')\nprint(len('é'))",
         "café 🦀\ncafé 🦀!\n1\n",
     );
+}
+
+/// Every host-module import (`robot_tilt`, ...) answering with the table's
+/// stand-in, so these programs run here exactly as with nothing attached.
+fn define_host_stand_ins(linker: &mut Linker<Io>, engine: &Engine) {
+    use rust_p2w::HostTy;
+    use wasmtime::{FuncType, Val, ValType};
+    let vt = |t: HostTy| {
+        if t == HostTy::Float {
+            ValType::F64
+        } else {
+            ValType::I32
+        }
+    };
+    for m in rust_p2w::HOST_MODULES {
+        for f in m.fns {
+            let params: Vec<ValType> = f.params.iter().map(|(_, t)| vt(*t)).collect();
+            let results: Vec<ValType> = if f.ret == HostTy::None {
+                vec![]
+            } else {
+                vec![vt(f.ret)]
+            };
+            let (ret, value) = (f.ret, f.stand_in);
+            linker
+                .func_new(
+                    "env",
+                    &f.import_name(m.name),
+                    FuncType::new(engine, params, results),
+                    move |_, _, out| {
+                        match ret {
+                            HostTy::None => {}
+                            HostTy::Float => out[0] = Val::F64(value.to_bits()),
+                            HostTy::Int | HostTy::Bool => out[0] = Val::I32(value as i32),
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("define host stand-in");
+        }
+    }
 }

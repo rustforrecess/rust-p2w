@@ -41,6 +41,7 @@ pub fn probe(src: &str) -> Outcome {
     let module = Module::new(engine(), &wasm[..]).expect("module");
     let mut store: Store<Vec<u8>> = Store::new(engine(), Vec::new());
     let mut linker: Linker<Vec<u8>> = Linker::new(engine());
+    define_host_stand_ins(&mut linker, engine());
     linker
         .func_wrap("env", "write_char", {
             // Fn+Send+Sync required: surrogate state as an atomic (0 = none).
@@ -206,8 +207,11 @@ pub fn groups() -> Vec<Group> {
                 p("math.exp(1.0)", "import math\nprint(math.exp(1.0))\n"),
                 p(
                     "read_temperature() [simulated]",
-                    "print(read_temperature())
-",
+                    "print(read_temperature())\n",
+                ),
+                p(
+                    "robot module [stand-ins]",
+                    "import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED)\nprint(robot.FLIPPED)\nprint(robot.tagged())\nrobot.stop()\n",
                 ),
                 p(
                     "random.randint(1, 6) [seed 42]",
@@ -553,3 +557,43 @@ pub fn groups() -> Vec<Group> {
 #[path = "../../src/js_string_host.rs"]
 mod js_string_host;
 pub use js_string_host::{add_js_string_builtins, define_string_literals, js_str};
+
+/// Every host-module import (`robot_tilt`, ...) answering with the table's
+/// stand-in, so these programs run here exactly as with nothing attached.
+fn define_host_stand_ins(linker: &mut Linker<Vec<u8>>, engine: &Engine) {
+    use rust_p2w::HostTy;
+    use wasmtime::{FuncType, Val, ValType};
+    let vt = |t: HostTy| {
+        if t == HostTy::Float {
+            ValType::F64
+        } else {
+            ValType::I32
+        }
+    };
+    for m in rust_p2w::HOST_MODULES {
+        for f in m.fns {
+            let params: Vec<ValType> = f.params.iter().map(|(_, t)| vt(*t)).collect();
+            let results: Vec<ValType> = if f.ret == HostTy::None {
+                vec![]
+            } else {
+                vec![vt(f.ret)]
+            };
+            let (ret, value) = (f.ret, f.stand_in);
+            linker
+                .func_new(
+                    "env",
+                    &f.import_name(m.name),
+                    FuncType::new(engine, params, results),
+                    move |_, _, out| {
+                        match ret {
+                            HostTy::None => {}
+                            HostTy::Float => out[0] = Val::F64(value.to_bits()),
+                            HostTy::Int | HostTy::Bool => out[0] = Val::I32(value as i32),
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("define host stand-in");
+        }
+    }
+}

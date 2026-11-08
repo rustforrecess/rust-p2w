@@ -203,6 +203,16 @@ int p2w_host_seed(void) {
     return (int)seed;
 }
 
+/* robot: stand-ins until the board drives real motors and sensors
+ * (docs/ROBOT.md, steps 3 and 4). Same values as src/hostmod.rs, so a robot
+ * program links and behaves like the simulator with nothing attached. */
+void p2w_robot_set_motor(int left, int right) { (void)left; (void)right; }
+void p2w_robot_stop(void) { }
+int p2w_robot_read_distance(int sensor) { (void)sensor; return 2000; }
+int p2w_robot_read_line(int sensor) { (void)sensor; return 0; }
+double p2w_robot_tilt(void) { return 0.0; }
+int p2w_robot_tagged(void) { return 0; }
+
 extern int p2w_float(double);
 
 static uint32_t adc_read(void) {

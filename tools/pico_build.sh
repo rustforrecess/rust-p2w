@@ -80,6 +80,8 @@ while True:
     name: str = input("roll? ")
     print(random.randint(1, 1000000))
 ' || fails=$((fails+1))
+# The robot module links against boot.c's stand-ins (docs/ROBOT.md).
+build robot      'import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.tilt() >= robot.FLIPPED)\nrobot.stop()\n' || fails=$((fails+1))
 # Prints forever, so a serial port opened at any moment sees output.
 build uart_count  'i: int = 0\nwhile True:\n    print(i)\n    i = i + 1\n' || fails=$((fails+1))
 

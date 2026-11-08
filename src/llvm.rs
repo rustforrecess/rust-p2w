@@ -392,8 +392,17 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
     defs.push_str(&gen_defs);
     globals.push_str(&gen_globals);
 
+    // Host-module functions are declared whether used or not: an unused
+    // declaration costs nothing and links nothing.
+    let mut host_decls = String::from("; host modules — defined by the board or the test host:\n");
+    for m in crate::hostmod::HOST_MODULES {
+        for f in m.fns {
+            host_decls.push_str(&f.llvm_declare(m.name));
+            host_decls.push('\n');
+        }
+    }
     Ok(format!(
-        "; LLVM IR — rust-p2w native (Pico) backend\n{RUNTIME_DECLS}\n{globals}\n{defs}{main_def}"
+        "; LLVM IR — rust-p2w native (Pico) backend\n{RUNTIME_DECLS}{host_decls}\n{globals}\n{defs}{main_def}"
     ))
 }
 
@@ -2044,6 +2053,8 @@ impl<'a> FuncEmitter<'a> {
                         // Seed from the host where the import appears (before
                         // any use; a repeat import just re-seeds identically).
                         "random" => self.line("call void @p2w_rnd_init()"),
+                        // Host modules are compile-time only, like math.
+                        hm if crate::hostmod::module(hm).is_some() => {}
                         _ => return nope(&format!("`import {n}`")),
                     }
                 }
@@ -3453,6 +3464,17 @@ impl<'a> FuncEmitter<'a> {
                 Ok((r, Repr::Boxed))
             }
             ExprKind::Attr(obj, attr) => {
+                // `robot.FLIPPED` — a host-module constant, unless shadowed.
+                if let ExprKind::Name(m) = &obj.kind
+                    && let Some(hm) = crate::hostmod::module(m)
+                    && !self.vars.iter().any(|v| v == m)
+                {
+                    let Some(v) = hm.constant(attr) else {
+                        return Err(format!("line {}: {m} has no attribute '{attr}'", e.line));
+                    };
+                    let r = self.call_value(&format!("call i32 @p2w_float(double {v:?})"));
+                    return Ok((r, Repr::Boxed));
+                }
                 // `Counter.limit` — a CLASS NAME base resolves at COMPILE
                 // time (the class registry is static; classes aren't runtime
                 // values). A local variable of the same name shadows the
@@ -3599,6 +3621,75 @@ impl<'a> FuncEmitter<'a> {
     /// resolves the method on the receiver's type). 0–2 args for now.
     /// `math.fn(args)` / `random.fn(args)` — direct runtime calls. Args are
     /// evaluated owned and released after (the runtime borrows them).
+    /// `robot.tilt()` and the like: unbox each argument to the table's type,
+    /// call the host's symbol, box the result. The host sees plain numbers.
+    fn host_call(
+        &mut self,
+        hm: &'static crate::hostmod::HostModule,
+        method: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<String, String> {
+        use crate::hostmod::HostTy;
+        let Some(hf) = hm.func(method) else {
+            return Err(format!(
+                "line {line}: {} has no attribute '{method}'",
+                hm.name
+            ));
+        };
+        if args.len() != hf.params.len() {
+            return Err(format!(
+                "line {line}: {}.{}() takes {} argument(s), got {}",
+                hm.name,
+                hf.name,
+                hf.params.len(),
+                args.len()
+            ));
+        }
+        let mut raw = Vec::new();
+        for (a, (_, ty)) in args.iter().zip(hf.params) {
+            let v = self.expr(a)?;
+            let r = match ty {
+                HostTy::Float => {
+                    let f = self.call_value(&format!("call double @p2w_unbox_float(i32 {v})"));
+                    format!("double {f}")
+                }
+                HostTy::Bool => {
+                    let b = self.call_value(&format!("call i1 @p2w_truthy(i32 {v})"));
+                    let w = self.call_value(&format!("zext i1 {b} to i32"));
+                    format!("i32 {w}")
+                }
+                HostTy::Int | HostTy::None => {
+                    let i = self.call_value(&format!("call i32 @p2w_unbox_int(i32 {v})"));
+                    format!("i32 {i}")
+                }
+            };
+            self.release(&v);
+            raw.push(r);
+        }
+        let sym = hf.native_symbol(hm.name);
+        let call = format!("call {} @{sym}({})", hf.ret.llvm(), raw.join(", "));
+        Ok(match hf.ret {
+            HostTy::None => {
+                self.line(&call);
+                self.call_value("call i32 @p2w_none()")
+            }
+            HostTy::Int => {
+                let r = self.call_value(&call);
+                self.call_value(&format!("call i32 @p2w_int(i32 {r})"))
+            }
+            HostTy::Bool => {
+                let r = self.call_value(&call);
+                let b = self.call_value(&format!("icmp ne i32 {r}, 0"));
+                self.box_bool(&b)
+            }
+            HostTy::Float => {
+                let r = self.call_value(&call);
+                self.call_value(&format!("call i32 @p2w_float(double {r})"))
+            }
+        })
+    }
+
     fn module_call(
         &mut self,
         module: &str,
@@ -3737,6 +3828,12 @@ impl<'a> FuncEmitter<'a> {
         // `math.fn(...)` / `random.fn(...)` — module functions, not value
         // methods (codegen's is_module_ref rule: the name isn't a variable;
         // import-before-use was enforced by the checker pass).
+        if let ExprKind::Name(m) = &obj.kind
+            && let Some(hm) = crate::hostmod::module(m)
+            && !self.vars.iter().any(|v| v == m)
+        {
+            return self.host_call(hm, method, args, obj.line);
+        }
         if let ExprKind::Name(m) = &obj.kind
             && (m == "math" || m == "random")
             && !self.vars.iter().any(|v| v == m)
@@ -4674,6 +4771,14 @@ mod tests {
         // unboxed and p2w_float boxing happens at the dynamic sink (print).
         let out = ir("x = 3.5\nprint(x)\n");
         assert!(out.contains("declare i32 @p2w_float(double)"), "{out}");
+        let ir = crate::compile_to_llvm_ir("import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED)\nprint(robot.FLIPPED)\nprint(robot.tagged())\nrobot.stop()\n").unwrap();
+        assert!(ir.contains("call void @p2w_robot_set_motor(i32 "), "{ir}");
+        assert!(ir.contains("call double @p2w_robot_tilt()"), "{ir}");
+        assert!(ir.contains("declare i32 @p2w_robot_tagged()"), "{ir}");
+        // Every bool is widened before p2w_bool, which reads a full i32:
+        // an i1 there left stray register bits deciding True or False.
+        assert!(!ir.contains("p2w_bool(i1"), "{ir}");
+        assert!(ir.contains("call i32 @p2w_bool(i32 "), "{ir}");
         assert!(
             out.contains("store double 0x400C000000000000"),
             "raw literal store: {out}"

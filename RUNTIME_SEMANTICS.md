@@ -60,6 +60,7 @@ Full fractional `**` and math.exp/log/log2/log10/pow, via libm compiled to WAT (
 | `2 ** -1.5` | value | `0.35355339059327373` |
 | `math.exp(1.0)` | value | `2.7182818284590455` |
 | `read_temperature() [simulated]` | value | `21.0` |
+| `robot module [stand-ins]` | value | `2000 ⏎ False ⏎ 0.0 ⏎ False ⏎ 150.0 ⏎ False` |
 | `random.randint(1, 6) [seed 42]` | value | `2` |
 | `math.log(10.0)` | value | `2.302585092994046` |
 | `math.log2(8.0)` | value | `3.0` |

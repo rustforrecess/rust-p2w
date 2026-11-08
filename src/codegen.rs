@@ -218,21 +218,37 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
                             }
                             g.from_random.insert(func.to_string());
                         }
+                        // A host module's names always stay qualified, so a
+                        // reader can see which calls reach the hardware.
+                        hm if crate::hostmod::module(hm).is_some() => {
+                            return Err(CompileError::at(
+                                s.line,
+                                format!(
+                                    "write `import {hm}`, then call {hm}.{func}(): \
+                                     {hm}'s names stay with the module"
+                                ),
+                            )
+                            .with_kind(crate::error::ErrorKind::Import));
+                        }
                         _ => {
                             return Err(CompileError::at(
                                 s.line,
                                 format!(
-                                    "module '{module}' isn't available (only 'math' and 'random' for now)"
+                                    "module '{module}' isn't available (only {} for now)",
+                                    crate::hostmod::available_modules()
                                 ),
-                            ).with_kind(crate::error::ErrorKind::Import).with_fact(Fact::unknown_module(module)));
+                            )
+                            .with_kind(crate::error::ErrorKind::Import)
+                            .with_fact(Fact::unknown_module(module)));
                         }
                     }
                 } else {
-                    if m != "math" && m != "random" {
+                    if m != "math" && m != "random" && crate::hostmod::module(m).is_none() {
                         return Err(CompileError::at(
                             s.line,
                             format!(
-                                "module '{m}' isn't available (only 'math' and 'random' for now)"
+                                "module '{m}' isn't available (only {} for now)",
+                                crate::hostmod::available_modules()
                             ),
                         )
                         .with_kind(crate::error::ErrorKind::Import)
@@ -538,6 +554,11 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         module.imports.push(
             r#"(import "env" "read_temperature" (func $read_temperature (result f64)))"#.into(),
         );
+    }
+    for (m, func) in &g.host_used {
+        if let Some(hf) = crate::hostmod::module(m).and_then(|hm| hm.func(func)) {
+            module.imports.push(hf.wasm_import(m));
+        }
     }
     if g.uses_dom {
         // Host capabilities (the runner provides these): register a click
@@ -6316,6 +6337,8 @@ struct Gen {
     uses_seed: bool,
     /// Set when `read_temperature` is used.
     uses_temperature: bool,
+    /// Host-module functions called, as (module, function) → one env import each.
+    host_used: std::collections::BTreeSet<(&'static str, &'static str)>,
     /// Set when `report()` is used → emit the forward string-marshalling base
     /// (shared with DOM strings) plus the `env.report` host import.
     uses_report: bool,
@@ -6381,6 +6404,15 @@ struct Gen {
     /// Set when `every(ms, handler)` is used — gates the `env.every` import (the
     /// animation/game loop). Layer 4 of `docs/INTERACTIVE_WEB.md`.
     uses_timer: bool,
+}
+
+/// `robot.speed(...)` when the module has no `speed`: the same Attribute error
+/// and suggestion `math` gives.
+fn host_missing(hm: &crate::hostmod::HostModule, name: &str, line: usize) -> CompileError {
+    let known = hm.names();
+    CompileError::at(line, format!("{} has no attribute '{name}'", hm.name))
+        .with_kind(crate::error::ErrorKind::Attribute)
+        .with_fact(Fact::missing_part(hm.name, name, &known))
 }
 
 impl Gen {
@@ -7070,6 +7102,53 @@ impl Gen {
     /// (src/math_wat.rs), spliced in only when one of them is used.
     /// `random.<fn>(args)` — every arm draws from the guest-side xorshift
     /// state, so sequences are reproducible from the host seed alone.
+    /// `robot.set_motor(l, r)` and the like: a call into the host. Arguments
+    /// unbox to the table's types and the result boxes back, so the host
+    /// sees plain numbers and never a WASM-GC reference.
+    fn gen_host_call(
+        &mut self,
+        cx: &mut FuncCx,
+        hm: &'static crate::hostmod::HostModule,
+        method: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<String> {
+        use crate::hostmod::HostTy;
+        let Some(hf) = hm.func(method) else {
+            return Err(host_missing(hm, method, line));
+        };
+        if args.len() != hf.params.len() {
+            return Err(CompileError::at(
+                line,
+                format!(
+                    "{}.{}() takes {} argument(s), got {}",
+                    hm.name,
+                    hf.name,
+                    hf.params.len(),
+                    args.len()
+                ),
+            )
+            .with_kind(crate::error::ErrorKind::Type));
+        }
+        let mut lowered = String::new();
+        for (a, (_, ty)) in args.iter().zip(hf.params) {
+            let v = self.value_expr(cx, a)?;
+            lowered.push_str(&match ty {
+                HostTy::Float => format!(" (call $unbox_f64 {v})"),
+                HostTy::Bool => format!(" (call $truthy {v})"),
+                HostTy::Int | HostTy::None => format!(" (call $unbox {v})"),
+            });
+        }
+        self.host_used.insert((hm.name, hf.name));
+        let call = format!("(call ${}{lowered})", hf.import_name(hm.name));
+        Ok(match hf.ret {
+            HostTy::Int => format!("(call $box {call})"),
+            HostTy::Bool => format!("(call $bool {call})"),
+            HostTy::Float => format!("(struct.new $FLOAT {call})"),
+            HostTy::None => format!("(block (result (ref null any)) {call} (global.get $NONE))"),
+        })
+    }
+
     fn gen_random_call(
         &mut self,
         cx: &mut FuncCx,
@@ -8022,6 +8101,14 @@ impl Gen {
             ExprKind::Attr(obj, name) => {
                 // `math.pi` / `math.e` / `math.tau` — module constants.
                 if self.is_module_ref(cx, obj) {
+                    if let ExprKind::Name(m) = &obj.kind
+                        && let Some(hm) = crate::hostmod::module(m)
+                    {
+                        return match hm.constant(name) {
+                            Some(v) => Ok(format!("(struct.new $FLOAT (f64.const {v:?}))")),
+                            None => Err(host_missing(hm, name, e.line)),
+                        };
+                    }
                     return match name.as_str() {
                         "pi" => Ok("(struct.new $FLOAT (f64.const 3.141592653589793))".into()),
                         "e" => Ok("(struct.new $FLOAT (f64.const 2.718281828459045))".into()),
@@ -8185,6 +8272,11 @@ impl Gen {
                 // `math.fn(...)` / `random.fn(...)` — a module function, not
                 // a value method.
                 if self.is_module_ref(cx, recv) {
+                    if let ExprKind::Name(m) = &recv.kind
+                        && let Some(hm) = crate::hostmod::module(m)
+                    {
+                        return self.gen_host_call(cx, hm, method, args, e.line);
+                    }
                     if matches!(&recv.kind, ExprKind::Name(m) if m == "random") {
                         return self.gen_random_call(cx, method, args, e.line);
                     }

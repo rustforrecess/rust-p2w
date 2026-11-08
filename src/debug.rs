@@ -1049,6 +1049,12 @@ impl Stepper {
                     return math_const(attr)
                         .ok_or_else(|| format!("math has no attribute '{attr}'"));
                 }
+                if let ExprKind::Name(m) = &obj.kind
+                    && let Some(hm) = crate::hostmod::module(m)
+                    && !scope.contains_key(m)
+                {
+                    return host_const(hm, attr);
+                }
                 Err(
                     "attribute access isn't in the step debugger yet — use Run for that"
                         .to_string(),
@@ -1229,6 +1235,12 @@ impl Stepper {
             && !scope.contains_key(m)
         {
             return math_call(method, vals.as_slice());
+        }
+        if let ExprKind::Name(m) = &obj.kind
+            && let Some(hm) = crate::hostmod::module(m)
+            && !scope.contains_key(m)
+        {
+            return host_call(hm, method, vals.as_slice());
         }
         // Mutating list/set/dict/string methods need the variable itself (for
         // the mutating ones to write back), so require a Name — delegates to
@@ -1891,6 +1903,8 @@ enum Task {
     SortedKw,
     /// Pop one argument; push `math.<func>(arg)`.
     MathCall(String, usize),
+    /// A host-module call: (module, function, argument count).
+    HostCall(&'static str, String, usize),
     /// `random.<fn>` with N evaluated args (shuffle-on-a-variable is handled
     /// at dispatch, where the scope is reachable).
     RandomCall(String, usize),
@@ -2599,6 +2613,16 @@ impl Vm {
                 let seq = self.pop_op()?;
                 self.push_op(sorted_values(&seq, reverse)?);
             }
+            Task::HostCall(module, func, n) => {
+                let mut args = Vec::with_capacity(n);
+                for _ in 0..n {
+                    args.push(self.pop_op()?);
+                }
+                args.reverse();
+                let hm = crate::hostmod::module(module)
+                    .ok_or_else(|| format!("module '{module}' isn't available"))?;
+                self.push_op(host_call(hm, &func, &args)?);
+            }
             Task::MathCall(func, n) => {
                 let mut args = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -3078,6 +3102,14 @@ impl Vm {
                     self.push_op(c);
                     return Ok(());
                 }
+                if let ExprKind::Name(m) = &obj.kind
+                    && let Some(hm) = crate::hostmod::module(m)
+                    && self.lookup(m).is_none()
+                {
+                    let c = host_const(hm, attr)?;
+                    self.push_op(c);
+                    return Ok(());
+                }
                 // `Counter.limit` — a class-name base resolves against the
                 // registry (a same-named variable shadows, like CPython).
                 if let ExprKind::Name(cn) = &obj.kind
@@ -3131,6 +3163,18 @@ impl Vm {
                         .resolve_method(&base, method)
                         .ok_or_else(|| format!("super() found no method '{method}'"))?;
                     self.push_task(Task::CallSuper(owner, method.clone(), args.len()));
+                    for a in args.iter().rev() {
+                        self.push_task(Task::Eval(Rc::new(a.clone())));
+                    }
+                    return Ok(());
+                }
+                // `robot.tilt()` — a host-module call: arguments are
+                // evaluated like any call, then the stand-in host answers.
+                if let ExprKind::Name(m) = &obj.kind
+                    && let Some(hm) = crate::hostmod::module(m)
+                    && self.lookup(m).is_none()
+                {
+                    self.push_task(Task::HostCall(hm.name, method.clone(), args.len()));
                     for a in args.iter().rev() {
                         self.push_task(Task::Eval(Rc::new(a.clone())));
                     }
@@ -3883,6 +3927,39 @@ fn math_const(name: &str) -> Option<Value> {
     }
 }
 
+/// `robot.FLIPPED` — a host-module constant, as a float like the compiled
+/// backends make it.
+fn host_const(hm: &crate::hostmod::HostModule, name: &str) -> Result<Value, String> {
+    hm.constant(name)
+        .map(Value::Float)
+        .ok_or_else(|| format!("{} has no attribute '{name}'", hm.name))
+}
+
+/// `robot.tilt()` in the debugger: the step debugger has no hardware and no
+/// simulator, so it answers with the table's stand-ins, the same values
+/// every other host without hardware returns.
+fn host_call(hm: &crate::hostmod::HostModule, func: &str, args: &[Value]) -> Result<Value, String> {
+    use crate::hostmod::HostTy;
+    let hf = hm
+        .func(func)
+        .ok_or_else(|| format!("{} has no attribute '{func}'", hm.name))?;
+    if args.len() != hf.params.len() {
+        return Err(format!(
+            "{}.{}() takes {} argument(s), got {}",
+            hm.name,
+            hf.name,
+            hf.params.len(),
+            args.len()
+        ));
+    }
+    Ok(match hf.ret {
+        HostTy::None => Value::None,
+        HostTy::Int => Value::Int(hf.stand_in as i64),
+        HostTy::Bool => Value::Bool(hf.stand_in != 0.0),
+        HostTy::Float => Value::Float(hf.stand_in),
+    })
+}
+
 /// `math.<func>(args)` — matching the compiled backends' `gen_math_call`:
 /// sqrt/fabs/exp/log/log2/log10/pow return floats, floor/ceil/trunc ints.
 ///
@@ -3926,9 +4003,10 @@ fn math_call(func: &str, args: &[Value]) -> Result<Value, String> {
 fn check_import(names: &[String]) -> Result<(), String> {
     for m in names {
         let module = m.split_once(':').map_or(m.as_str(), |(md, _)| md);
-        if module != "math" && module != "random" {
+        if module != "math" && module != "random" && crate::hostmod::module(module).is_none() {
             return Err(format!(
-                "module '{module}' isn't available (only 'math' and 'random' for now)"
+                "module '{module}' isn't available (only {} for now)",
+                crate::hostmod::available_modules()
             ));
         }
     }
@@ -5357,6 +5435,16 @@ mod tests {
     }
 
     // --- CPS VM (step-into + call stack) ---
+
+    #[test]
+    fn robot_module_steps_with_the_same_stand_ins() {
+        let src = "import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED)\nprint(robot.FLIPPED)\nprint(robot.tagged())\nrobot.stop()\n";
+        assert_eq!(vm_run(src), "2000\nFalse\n0.0\nFalse\n150.0\nFalse\n");
+        // Inside a function the atomic evaluator answers too.
+        let src =
+            "import robot\ndef far():\n    return robot.read_distance(0) > 1000\nprint(far())\n";
+        assert_eq!(vm_run(src), "True\n");
+    }
 
     fn vm_run(src: &str) -> String {
         let mut vm = Vm::new(src).expect("parse");
