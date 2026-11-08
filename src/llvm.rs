@@ -68,7 +68,7 @@ declare i32 @p2w_int(i32)
 declare i32 @p2w_unbox_int(i32)
 declare i32 @p2w_float(double)
 declare double @p2w_unbox_float(i32)
-declare i32 @p2w_bool(i1)
+declare i32 @p2w_bool(i32)
 declare i32 @p2w_none()
 declare i32 @p2w_str(ptr, i32)
 declare i32 @p2w_open(i32, i32)
@@ -641,7 +641,7 @@ fn emit_class_glue(classes: &ClassTable, dispatchers: &[(String, usize)]) -> (St
                         ));
                     }
                 }
-                b.push_str("ident:\n  %same = icmp eq i32 %a, %b\n  %ib = call i32 @p2w_bool(i1 %same)\n  ret i32 %ib\n");
+                b.push_str("ident:\n  %same = icmp eq i32 %a, %b\n  %same32 = zext i1 %same to i32\n  %ib = call i32 @p2w_bool(i32 %same32)\n  ret i32 %ib\n");
             }
         }
         b.push_str("bad:\n  %t = call i32 @p2w_unsupported_operand()\n  ret i32 %t\n}\n");
@@ -1944,6 +1944,15 @@ impl<'a> FuncEmitter<'a> {
         }
     }
 
+    /// Box an `i1` as a Python bool. The runtime's `p2w_bool` takes a full
+    /// `i32` and tests it against zero, so the bit is widened first: passing
+    /// the `i1` directly leaves the register's upper bits unspecified, and
+    /// even `zeroext` only clears them to 8 bits on 64-bit Windows.
+    fn box_bool(&mut self, bit: &str) -> String {
+        let wide = self.call_value(&format!("zext i1 {bit} to i32"));
+        self.call_value(&format!("call i32 @p2w_bool(i32 {wide})"))
+    }
+
     /// Call a runtime function that returns a value, into a fresh temp.
     fn call_value(&mut self, sig: &str) -> String {
         let t = self.temp();
@@ -2703,7 +2712,7 @@ impl<'a> FuncEmitter<'a> {
             ExprKind::Float(f) => Ok((fmt_double(*f), Repr::Float)),
             ExprKind::Bool(b) => {
                 let v = self.call_value(&format!(
-                    "call i32 @p2w_bool(i1 {})",
+                    "call i32 @p2w_bool(i32 {})",
                     if *b { 1 } else { 0 }
                 ));
                 Ok((v, Repr::Boxed))
@@ -2916,7 +2925,7 @@ impl<'a> FuncEmitter<'a> {
                 if name == "bool" && args.len() == 1 {
                     let (v, o) = self.expr_borrow(&args[0])?;
                     let t = self.call_value(&format!("call i1 @p2w_truthy(i32 {v})"));
-                    let r = self.call_value(&format!("call i32 @p2w_bool(i1 {t})"));
+                    let r = self.box_bool(&t);
                     self.release_if_owned(&v, o);
                     return Ok((r, Repr::Boxed));
                 }
@@ -3566,7 +3575,7 @@ impl<'a> FuncEmitter<'a> {
         match repr {
             Repr::Boxed => op,
             Repr::Int => self.call_value(&format!("call i32 @p2w_int(i32 {op})")),
-            Repr::Bool => self.call_value(&format!("call i32 @p2w_bool(i1 {op})")),
+            Repr::Bool => self.box_bool(&op),
             Repr::Float => self.call_value(&format!("call i32 @p2w_float(double {op})")),
             Repr::IntArray | Repr::FloatArray => op, // already a heap-ref Value
         }
@@ -3908,11 +3917,11 @@ impl<'a> FuncEmitter<'a> {
             let r = if op == BinOp::Is {
                 both
             } else {
-                // Not `xor i1 {both}, true`: that miscompiles through this
-                // target's `p2w_bool(i1)` call boundary (verified — it
-                // prints the un-negated value; `icmp eq ..., false` is the
-                // same logical negation and was confirmed correct the same
-                // way, so this isn't a guess at the workaround).
+                // `icmp eq ..., false` is the logical negation. An `xor i1
+                // ..., true` here once printed the un-negated value; the cause
+                // was `p2w_bool` being called with an `i1` the runtime reads
+                // as a full `i32`, so the register's upper bits leaked in.
+                // `box_bool` now widens explicitly, so either form is correct.
                 let t = self.temp();
                 self.line(&format!("{t} = icmp eq i1 {both}, false"));
                 t

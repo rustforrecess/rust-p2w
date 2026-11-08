@@ -187,10 +187,10 @@ run_case floats    'print(7 / 2)\nprint(2 ** 10)\nprint(1.5 + 2)\n'            '
 run_case nativearith 'print(2 + 3 * 4)\nprint((10 - 3) * 2)\nprint(1 - 5)\n'    '14\n14\n-4'    || fails=$((fails+1))
 run_case floatmath 'print(1.5 * 2.0)\nprint(7 / 2)\nprint(1 + 2.5)\nprint(10.0 - 3)\n' '3.0\n3.5\n3.5\n7.0' || fails=$((fails+1))
 run_case floatcmp  'print(1.5 < 2.0)\nprint(2.5 > 3.0)\nprint(3.0 == 3.0)\n'     'True\nFalse\nTrue' || fails=$((fails+1))
-# `is None` / `is not None`: regression case for a real miscompile this
-# caught — `is not` lowered to `xor i1 %x, true` before the p2w_bool(i1)
-# call, which silently printed the UN-negated value on this target. Fixed
-# by using `icmp eq i1 %x, false` for the negation instead (src/llvm.rs).
+# `is None` / `is not None`: once printed the UN-negated value for `is not`.
+# The cause was p2w_bool being passed an i1 that the runtime reads as a full
+# i32, so leftover register bits decided the result; `box_bool` in
+# src/llvm.rs now widens to i32 first. Kept as a regression case.
 run_case isnone    'x = None\ny = 5\nprint(x is None)\nprint(x is not None)\nprint(y is None)\nprint(y is not None)\nprint("hi" is None)\nprint(None is None)\n' 'True\nFalse\nFalse\nTrue\nFalse\nTrue' || fails=$((fails+1))
 run_case floatparam 'def dbl(x: float) -> float:\n    return x * 2.0\nprint(dbl(2.5))\n' '5.0'   || fails=$((fails+1))
 run_case floatlocal 'total: float = 0.0\ntotal = total + 1.5\ntotal = total + 2.5\nprint(total)\n' '4.0' || fails=$((fails+1))
