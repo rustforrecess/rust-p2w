@@ -610,14 +610,26 @@ impl Checker {
                 (oty, None)
             }
             ExprKind::Call(name, args) => self.call(e, name, args, env),
-            ExprKind::MethodCall(obj, _, args) => {
+            ExprKind::MethodCall(obj, method, args) => {
+                if let Some(hm) = host_module(obj, env)
+                    && let Some(hf) = hm.func(method)
+                {
+                    return self.host_call(e, hm, hf, args, env);
+                }
                 self.expr(obj, env);
                 for a in args {
                     self.expr(a, env);
                 }
                 (Ty::Dyn, None)
             }
-            ExprKind::Attr(obj, _) => {
+            ExprKind::Attr(obj, attr) => {
+                // `robot.FLIPPED` (a state, an int) / `robot.FLIPPED_DEG` (a
+                // threshold, a float): typed from the host table.
+                if let Some(hm) = host_module(obj, env)
+                    && let Some(c) = hm.constant_def(attr)
+                {
+                    return (host_ty(c.ty), None);
+                }
                 self.expr(obj, env);
                 (Ty::Dyn, None)
             }
@@ -872,6 +884,71 @@ impl Checker {
             self.expr(a, env);
         }
         (ret, None)
+    }
+}
+
+/// `robot` in `robot.tilt()`: a host module, unless the program shadows the
+/// name with a variable of its own.
+fn host_module(
+    obj: &Expr,
+    env: &HashMap<String, Fact>,
+) -> Option<&'static crate::hostmod::HostModule> {
+    match &obj.kind {
+        ExprKind::Name(m) if !env.contains_key(m) => crate::hostmod::module(m),
+        _ => None,
+    }
+}
+
+/// The lattice type of a value crossing the host boundary.
+fn host_ty(t: crate::hostmod::HostTy) -> Ty {
+    use crate::hostmod::HostTy;
+    match t {
+        HostTy::Int => Ty::Int,
+        HostTy::Float => Ty::Float,
+        HostTy::Bool => Ty::Bool,
+        HostTy::None => Ty::NoneT,
+        HostTy::Handler => Ty::Func,
+    }
+}
+
+impl Checker {
+    /// `robot.set_motor(l, r)`: the table is the signature. A number
+    /// parameter given text, None or a collection is the same mistake as a
+    /// user function's contradicted annotation, said the same way. Ints,
+    /// floats and bools are all numbers here: the host converts between them.
+    fn host_call(
+        &mut self,
+        e: &Expr,
+        hm: &crate::hostmod::HostModule,
+        hf: &crate::hostmod::HostFn,
+        args: &[Expr],
+        env: &mut HashMap<String, Fact>,
+    ) -> (Ty, Option<Fact>) {
+        use crate::hostmod::HostTy;
+        for (i, arg) in args.iter().enumerate() {
+            let (at, prov) = self.expr(arg, env);
+            let Some((pname, want)) = hf.params.get(i) else {
+                continue; // arity is a compile error already
+            };
+            let wants_number = matches!(want, HostTy::Int | HostTy::Float | HostTy::Bool);
+            if wants_number && !at.numeric() && at != Ty::Dyn && at != Ty::Func && at != Ty::Class
+            {
+                self.out.push(TypeFinding {
+                    line: e.line,
+                    span: e.span,
+                    code: "type.argument-contradicts-signature",
+                    message: format!(
+                        "`{}.{}` wants {} for `{pname}`, but this passes {}{}.",
+                        hm.name,
+                        hf.name,
+                        host_ty(*want).name(),
+                        at.name(),
+                        prov_clause(&prov),
+                    ),
+                });
+            }
+        }
+        (host_ty(hf.ret), None)
     }
 }
 
@@ -1216,6 +1293,35 @@ mod tests {
             let f = findings(src);
             assert!(f.is_empty(), "false positive on {src:?}: {f:?}");
         }
+    }
+
+    /// Host-module calls are typed from the host table, so the derivations
+    /// reach them like any builtin.
+    #[test]
+    fn robot_calls_are_typed_from_the_host_table() {
+        let f = findings("import robot\nx: str = robot.tilt()\n");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].code, "type.annotation-contradicted");
+        assert!(f[0].message.contains("a decimal number"), "{}", f[0].message);
+        let f = findings("import robot\ns: str = robot.FLIPPED\n");
+        assert!(f[0].message.contains("a whole number"), "{f:?}");
+        let f = findings("import robot\nspeed = input()\nrobot.set_motor(speed, 50)\n");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(
+            f[0].message.contains("`robot.set_motor` wants a whole number for `left`"),
+            "{}",
+            f[0].message
+        );
+        assert!(f[0].message.contains("line 2"), "{}", f[0].message);
+        // Numbers of any kind are fine, and so is everything the table types.
+        assert!(
+            findings(
+                "import robot\nrobot.set_motor(50.5, True)\nt: float = robot.tilt()\nd: int = robot.read_distance(0)\nok: bool = robot.read_line(1)\ns: int = robot.tilt_state()\n"
+            )
+            .is_empty()
+        );
+        // A variable named like the module is the variable.
+        assert!(findings("robot = 3\nx: str = robot.tilt()\n").is_empty());
     }
 
     #[test]
