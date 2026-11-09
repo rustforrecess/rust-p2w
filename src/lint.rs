@@ -697,8 +697,18 @@ fn scope_bindings(stmts: &[Stmt], out: &mut HashSet<String>) {
                     }
                 }
             }
-            StmtKind::Def { name, .. } | StmtKind::ClassDef { name, .. } => {
+            // A function's `global x; x = …` binds `x` out here, in the
+            // scope enclosing the function (over-approximate for a nested
+            // def, which is the safe direction for this lint).
+            StmtKind::Def { name, body, .. } => {
                 out.insert(name.clone());
+                out.extend(crate::hoist::declared_globals(body));
+            }
+            StmtKind::ClassDef { name, methods, .. } => {
+                out.insert(name.clone());
+                for m in methods {
+                    out.extend(crate::hoist::declared_globals(&m.body));
+                }
             }
             StmtKind::Import(names) => {
                 for n in names {
@@ -1025,6 +1035,9 @@ fn analyze_fn_unused(
 ) {
     let mut reads: HashSet<String> = HashSet::new();
     collect_all_reads(body, &mut reads);
+    // Setting a `global` is the function's effect on the program, not a
+    // leftover: the rest of the program reads it.
+    reads.extend(crate::hoist::declared_globals(body));
     flag_unused_assigns(body, params, &reads, out);
     // Nested scopes analyze independently.
     for s in body {
@@ -1320,6 +1333,7 @@ pub(crate) fn for_each_child_block<'a>(s: &'a Stmt, mut f: impl FnMut(&'a [Stmt]
         | StmtKind::Break
         | StmtKind::Continue
         | StmtKind::Pass
+        | StmtKind::Global(_)
         | StmtKind::Return(_)
         | StmtKind::SetIndex { .. }
         | StmtKind::SetAttr { .. }
@@ -1386,6 +1400,7 @@ pub(crate) fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
         | StmtKind::Break
         | StmtKind::Continue
         | StmtKind::Pass
+        | StmtKind::Global(_)
         | StmtKind::Import(_) => {}
     }
 }
@@ -1669,6 +1684,141 @@ fn walk_shadow(
 /// the value is a literal the lint is CONFIDENT about (`lint_ty`'s coarser
 /// categories, e.g. "Number" for int/float/bool together, would sometimes
 /// suggest the wrong one here).
+/// The function that forgot `global`: a top-level `def` or method assigns a
+/// name the program also has, so Python makes that name the function's own
+/// variable for the WHOLE body, and the function reads it before giving it a
+/// value. CPython stops there with UnboundLocalError (`score = score + 1` in a
+/// callback is the classic). Flagged at the first statement that reads the
+/// name before any statement in the function has assigned it, which keeps
+/// false alarms out: assigning first, even only in a branch, is not flagged.
+/// A nested `def` is skipped; its fix would be `nonlocal`, not `global`.
+pub fn unbound_local_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
+    let mut module = HashSet::new();
+    scope_bindings(stmts, &mut module);
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Def { body, .. } => module.extend(crate::hoist::declared_globals(body)),
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    module.extend(crate::hoist::declared_globals(&m.body));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Def {
+                name, params, body, ..
+            } => unbound_in_function(name, params, body, &module, &mut out),
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    unbound_in_function(&m.name, &m.params, &m.body, &module, &mut out);
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|(line, _, _)| *line);
+    out
+}
+
+fn unbound_in_function(
+    func: &str,
+    params: &[String],
+    body: &[Stmt],
+    module: &HashSet<String>,
+    out: &mut Vec<(usize, (usize, usize), String)>,
+) {
+    let locals = crate::hoist::function_locals(params, body);
+    let watch: HashSet<&String> = locals
+        .iter()
+        .filter(|n| module.contains(*n) && !params.contains(n))
+        .collect();
+    if watch.is_empty() {
+        return;
+    }
+    fn name_span(e: &Expr, n: &str) -> Option<(usize, usize)> {
+        if matches!(&e.kind, ExprKind::Name(x) if x == n) {
+            return Some(e.span);
+        }
+        let mut found = None;
+        each_child_expr(e, &mut |c| {
+            if found.is_none() {
+                found = name_span(c, n);
+            }
+        });
+        found
+    }
+    struct Walk<'a> {
+        func: &'a str,
+        watch: HashSet<&'a String>,
+        assigned: HashSet<String>,
+        out: &'a mut Vec<(usize, (usize, usize), String)>,
+    }
+    fn walk(stmts: &[Stmt], w: &mut Walk) {
+        for s in stmts {
+            let mut read = std::collections::BTreeSet::new();
+            stmt_exprs(s, &mut |e| crate::reuse::vars_read(e, &mut read));
+            for n in &read {
+                if w.watch.contains(n) && !w.assigned.contains(n) {
+                    let mut span = None;
+                    stmt_exprs(s, &mut |e| {
+                        if span.is_none() {
+                            span = name_span(e, n);
+                        }
+                    });
+                    let func = w.func;
+                    w.out.push((
+                        s.line,
+                        span.unwrap_or(s.span),
+                        format!(
+                            "`{func}` sets `{n}`, so inside `{func}` the name `{n}` is \
+                             {func}'s own variable, and this line reads it before {func} \
+                             has given it a value (Python stops with UnboundLocalError). \
+                             To change the program's `{n}`, put `global {n}` as the first \
+                             line of `{func}`."
+                        ),
+                    ));
+                    // One warning per name: the first read is the one to fix.
+                    w.assigned.insert(n.clone());
+                }
+            }
+            let mut own = std::collections::BTreeSet::new();
+            match &s.kind {
+                StmtKind::Assign(n, _) | StmtKind::AnnAssign { name: n, .. } => {
+                    own.insert(n.clone());
+                }
+                StmtKind::For { var, .. } | StmtKind::ForEach { var, .. } => {
+                    own.insert(var.clone());
+                }
+                StmtKind::UnpackAssign { targets, .. } => {
+                    for t in targets {
+                        if let ExprKind::Name(n) = &t.kind {
+                            own.insert(n.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            w.assigned.extend(own);
+            for_each_child_block(s, |b, scope| {
+                if scope == BlockScope::Same {
+                    walk(b, w);
+                }
+            });
+        }
+    }
+    let mut w = Walk {
+        func,
+        watch,
+        assigned: HashSet::new(),
+        out,
+    };
+    walk(body, &mut w);
+}
+
 pub fn implicit_declaration_warnings(stmts: &[Stmt]) -> Vec<(usize, (usize, usize), String)> {
     let mut out = Vec::new();
     decl_scope(stmts, &mut HashSet::new(), &mut out);
@@ -1718,13 +1868,17 @@ fn decl_scope(
             StmtKind::AnnAssign { name, .. } => {
                 seen.insert(name.clone());
             }
+            // A `global` is never declared inside the function: it belongs to
+            // the program, and annotating it there is a SyntaxError.
             StmtKind::Def { params, body, .. } => {
                 let mut inner: HashSet<String> = params.iter().cloned().collect();
+                inner.extend(crate::hoist::declared_globals(body));
                 decl_scope(body, &mut inner, out);
             }
             StmtKind::ClassDef { methods, .. } => {
                 for m in methods {
                     let mut inner: HashSet<String> = m.params.iter().cloned().collect();
+                    inner.extend(crate::hoist::declared_globals(&m.body));
                     decl_scope(&m.body, &mut inner, out);
                 }
             }
@@ -2632,6 +2786,9 @@ pub enum LintKind {
     /// (`total: int = 0`) would mark the declaration as a declaration — see
     /// `implicit_declaration_warnings`.
     ImplicitDeclaration,
+    /// A function assigns a module name without `global`, then reads it
+    /// first: UnboundLocalError at run time (see `unbound_local_warnings`).
+    UnboundLocal,
 }
 
 /// A fading hint ladder for a concept-bearing lint. Rungs are least-help-first;
@@ -2717,6 +2874,16 @@ pub fn scaffold(kind: LintKind) -> Option<Scaffold> {
                    out loud instead of leaving it to look the same as every later rebinding.",
             fix: "Add a type after the name: `total = 0` becomes `total: int = 0`. Still \
                   ordinary Python (PEP 526) — nothing about how the program runs changes.",
+        },
+        LintKind::UnboundLocal => Scaffold {
+            question: "Inside this function, is this name the program's variable, or a new \
+                       one that belongs only to the function?",
+            hint: "When a function assigns a name anywhere in its body, Python makes that \
+                   name the function's own variable for the whole function, even on the \
+                   lines before the assignment. Reading it first finds no value yet.",
+            fix: "To change the program's variable, add `global name` (with your variable's \
+                  name) as the first line of the function. Or pass the value in as a \
+                  parameter and `return` the new one.",
         },
         LintKind::Typo
         | LintKind::UndefinedName
@@ -3236,6 +3403,7 @@ mod tests {
             LintKind::SelfComparison,
             LintKind::VariantMissingMethod,
             LintKind::ImplicitDeclaration,
+            LintKind::UnboundLocal,
         ] {
             let s = scaffold(k).expect("concept lint should have a scaffold");
             assert!(!s.question.is_empty() && !s.hint.is_empty() && !s.fix.is_empty());
@@ -3463,5 +3631,60 @@ mod tests {
     fn component_unclean_has_a_ladder() {
         let sc = scaffold(LintKind::ComponentUnclean).expect("concept-bearing");
         assert!(sc.question.contains("DIFFERENT page"));
+    }
+
+    fn unbound(src: &str) -> Vec<(usize, String)> {
+        unbound_local_warnings(&parse(src))
+            .into_iter()
+            .map(|(l, _, m)| (l, m))
+            .collect()
+    }
+
+    /// The forgotten `global`: flagged at the first read, with the student's
+    /// own function and variable names and the fix.
+    #[test]
+    fn unbound_local_flags_the_forgotten_global() {
+        let w = unbound("score = 0\ndef hit():\n    score = score + 1\n");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].0, 3);
+        assert!(w[0].1.contains("`hit` sets `score`"), "{}", w[0].1);
+        assert!(
+            w[0].1
+                .contains("put `global score` as the first line of `hit`")
+        );
+        // Methods too, and the read can sit in a condition.
+        let w = unbound(
+            "best = 0\nclass Bot:\n    def see(self, n):\n        if n > best:\n            best = n\n",
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].0, 4);
+    }
+
+    #[test]
+    fn unbound_local_stays_quiet_when_the_program_is_fine() {
+        // Declared global.
+        assert!(
+            unbound("score = 0\ndef hit():\n    global score\n    score = score + 1\n").is_empty()
+        );
+        // Assigned before it's read: an ordinary local.
+        assert!(unbound("score = 0\ndef f():\n    score = 5\n    print(score)\n").is_empty());
+        // Only read: Python reads the module variable.
+        assert!(unbound("score = 0\ndef f():\n    print(score)\n").is_empty());
+        // A parameter with a module name is bound on entry.
+        assert!(unbound("n = 0\ndef f(n):\n    n = n + 1\n    return n\n").is_empty());
+        // No module variable of that name: not this mistake.
+        assert!(unbound("def f():\n    k = k + 1\n").is_empty());
+    }
+
+    /// Assigning a `global` is the function's effect, not a leftover, and it
+    /// can't take an annotation, so neither lint suggests otherwise.
+    #[test]
+    fn global_assignments_are_neither_unused_nor_declarations() {
+        let src = "def setup():\n    global name\n    name = \"robot\"\nsetup()\nprint(name)\n";
+        assert!(unused(src).is_empty(), "{:?}", unused(src));
+        assert!(implicit_declaration_warnings(&parse(src)).is_empty());
+        // And a name a function creates with `global` is defined for the
+        // rest of the program.
+        assert!(undef(src).is_empty(), "{:?}", undef(src));
     }
 }

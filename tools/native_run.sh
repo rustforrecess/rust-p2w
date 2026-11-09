@@ -211,6 +211,14 @@ run_case globals_str     'name = "bot"\ndef hi():\n    print("hi " + name)\nhi()
 run_case globals_method  'limit = 3\nclass R:\n    def ok(self, v):\n        return v < limit\nr = R()\nprint(r.ok(2))\nprint(r.ok(5))\n' 'True\nFalse' || fails=$((fails+1))
 run_case globals_loopvar 'for i in range(3):\n    y = i\ndef f():\n    return i\nprint(f())\n' '2' || fails=$((fails+1))
 # `pass` was unsupported on native: an empty if-branch, a placeholder def.
+run_case global_counter   'score = 0\ndef hit():\n    global score\n    score = score + 1\nhit()\nhit()\nprint(score)\n' '2' || fails=$((fails+1))
+run_case global_created   'def setup():\n    global name\n    name = "robot"\nsetup()\nprint(name)\n' 'robot' || fails=$((fails+1))
+run_case global_retype    'x = 1\ndef f():\n    global x\n    x = "now a string"\nf()\nprint(x)\n' 'now a string' || fails=$((fails+1))
+run_case global_loopvar   'total = 0\ndef add_all():\n    global total, i\n    for i in range(4):\n        total += i\nadd_all()\nprint(total, i)\n' '6 3' || fails=$((fails+1))
+run_case global_method    'best = 0\nclass Bot:\n    def score(self, n):\n        global best\n        if n > best:\n            best = n\nb = Bot()\nb.score(3)\nb.score(1)\nprint(best)\n' '3' || fails=$((fails+1))
+run_case global_nested    'x = 5\ndef outer():\n    x = 1\n    def inner():\n        global x\n        x = x + 10\n    inner()\n    return x\nprint(outer(), x)\n' '1 15' || fails=$((fails+1))
+run_case global_unpack    'a = 0\nb = 0\ndef swap():\n    global a, b\n    a, b = 1, 2\nswap()\nprint(a, b)\n' '1 2' || fails=$((fails+1))
+run_case global_toplevel  'global q\nq = 3\nprint(q)\n' '3' || fails=$((fails+1))
 run_case pass_stmt       'x = 1\nif x > 0:\n    pass\ndef later():\n    pass\nlater()\nfor i in range(2):\n    pass\nprint(x)\n' '1' || fails=$((fails+1))
 # `is None` / `is not None`: once printed the UN-negated value for `is not`.
 # The cause was p2w_bool being passed an i1 that the runtime reads as a full

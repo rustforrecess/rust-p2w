@@ -200,6 +200,7 @@ impl Counter {
             | StmtKind::Break
             | StmtKind::Continue
             | StmtKind::Pass
+            | StmtKind::Global(_)
             | StmtKind::Import(_) => {}
         }
     }

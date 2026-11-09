@@ -591,6 +591,7 @@ impl Builder {
                 Ok(block("python_def", &fields, &inputs, &extra, next))
             }
             StmtKind::ClassDef { .. } => unsupported("classes"),
+            StmtKind::Global(_) => unsupported("`global` statements"),
             StmtKind::Return(value) => {
                 let inputs = match value {
                     Some(e) => input("VALUE", &self.value_block(e)?),

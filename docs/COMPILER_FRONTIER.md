@@ -281,7 +281,10 @@ and `p2w_dispose` releases them. A module-level counted `for` whose variable
 is a global counts in a private raw slot and stores each value boxed.
 `tools/native_run.sh` covers read, list mutation, shadowing, rebinding after
 the `def`, typed int/float, strings, methods and the loop variable, all at
-`live == 0`. Rebinding with `global` is a separate, later step.
+`live == 0`. Rebinding with `global` landed the same day: a declared name
+is never a function local, so the function aliases `@g_<name>` like any other
+global it uses, and a name only a function assigns still becomes a module
+global.
 
 The WASM backend has real globals (`(global $g_x …)`); the native backend
 emits top-level bindings as allocas inside `main`, so a function body reading

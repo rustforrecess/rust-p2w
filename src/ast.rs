@@ -69,6 +69,10 @@ pub enum StmtKind {
     Continue,
     /// `pass` — an explicit no-op statement (empty-body placeholder).
     Pass,
+    /// `global a, b` — inside a function, these names mean the module's
+    /// variables, so assigning one rebinds the module variable instead of
+    /// making a local. At module level it changes nothing, as in Python.
+    Global(Vec<String>),
     /// `def name(params) [-> ret]: ...` (top level only). `defaults` holds the
     /// default expressions for the trailing parameters (so `params[params.len()
     /// - defaults.len() ..]` each have one).

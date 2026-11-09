@@ -523,6 +523,34 @@ impl<'a> Parser<'a> {
                 span: (0, 0),
             });
         }
+        if self.is_keyword("global") {
+            self.advance();
+            let mut names = Vec::new();
+            loop {
+                match self.peek().clone() {
+                    Tok::Name(n) => {
+                        self.advance();
+                        names.push(n);
+                    }
+                    _ => {
+                        return Err(CompileError::at(
+                            line,
+                            "`global` needs the name of a variable, like `global score`",
+                        ));
+                    }
+                }
+                if !matches!(self.peek(), Tok::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.expect(&Tok::Newline, "a new line")?;
+            return Ok(Stmt {
+                kind: StmtKind::Global(names),
+                line,
+                span: (0, 0),
+            });
+        }
         // Assignment or expression statement: parse the expression first,
         // then decide based on what follows. `target_list` makes a bare comma
         // list (`a, b` / `1, 2`) into a tuple and allows one starred target.
@@ -2372,7 +2400,7 @@ fn contains_call(e: &Expr) -> bool {
 /// Statement-starting keywords we offer "did you mean" suggestions for.
 const STMT_KEYWORDS: &[&str] = &[
     "if", "elif", "else", "for", "while", "def", "class", "return", "import", "from", "pass",
-    "break", "continue", "del",
+    "break", "continue", "del", "global",
 ];
 
 /// Closest candidate within an edit-distance threshold that scales with word

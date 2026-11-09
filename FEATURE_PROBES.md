@@ -6,7 +6,7 @@ Regenerate with `P2W_BLESS=1 cargo test --test upstream_gap`. **A row moving is 
 
 See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's designs are worth taking.
 
-## Rejected (25)
+## Rejected (24)
 
 | feature | message |
 |---|---|
@@ -17,7 +17,6 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `try / finally` | expected a value, found Newline |
 | `raise` | expected a new line, but found `ValueError` |
 | `assert` | expected a new line, but found the number 1 |
-| `global` | expected a new line, but found `x` |
 | `nonlocal` | expected a new line, but found `x` |
 | `del name` | `del` removes an item like `del xs[0]` or `del d[key]` — deleting a whole variab… |
 | `for ... else` | expected a value, found Newline |
@@ -36,9 +35,10 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 | `type()` | unknown function 'type' |
 | `isinstance()` | unknown name 'int' (define it with `int = ...` first) |
 
-## Compiles (17)
+## Compiles (18)
 
 - `with / context manager`
+- `global`
 - `is / is not`
 - `pass in a class body`
 - `from X import Y`

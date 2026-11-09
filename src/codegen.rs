@@ -131,8 +131,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
             // Typed call convention. A rebound param keeps Python's freedom
             // to change type, so it stays boxed; scalar annotations on the
             // rest become raw i32/f64 params.
-            let mut rebound = std::collections::HashSet::new();
-            collect_assigned(body, &mut rebound);
+            let rebound = function_assigned(body);
             let preprs: Vec<Repr> = params
                 .iter()
                 .zip(param_types)
@@ -267,6 +266,24 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         g.uses_seed = true;
     }
 
+    let mut fn_written = std::collections::HashSet::new();
+    for st in stmts {
+        match &st.kind {
+            StmtKind::Def { body, .. } => fn_written.extend(crate::hoist::declared_globals(body)),
+            StmtKind::ClassDef { methods, .. } => {
+                for m in methods {
+                    fn_written.extend(crate::hoist::declared_globals(&m.body));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut fn_written: Vec<String> = fn_written.into_iter().collect();
+    fn_written.sort();
+    for n in &fn_written {
+        g.ensure_global(n);
+    }
+
     // Pass 1.5: top-level slot inference. The prefix rule: count how many
     // leading statements are plain assignments; only globals FIRST BOUND in
     // that prefix may be typed (nothing else has run yet, so no code path —
@@ -287,8 +304,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         let mut fn_reads = std::collections::HashSet::new();
         for st in stmts {
             if let StmtKind::Def { params, body, .. } = &st.kind {
-                let mut locals = std::collections::HashSet::new();
-                collect_assigned(body, &mut locals);
+                let mut locals = function_assigned(body);
                 for p in params {
                     locals.insert(p.clone());
                 }
@@ -310,6 +326,7 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         greprs.retain(|n, r| {
             matches!(r, Repr::Int | Repr::Float)
                 && !demoted.contains(n)
+                && !fn_written.contains(n)
                 && (!fn_reads.contains(n) || prefix_bound.contains(n))
         });
         g.global_reprs = greprs;
@@ -6512,9 +6529,18 @@ struct FuncCx {
     /// Typed module globals (a copy of `Gen::global_reprs`), consulted for
     /// names that are NOT locals (`vars` decides which is which).
     greprs: HashMap<String, Repr>,
+    /// Names this function declares `global`: assigning one sets the module
+    /// variable.
+    globals: std::collections::HashSet<String>,
 }
 
 impl FuncCx {
+    /// Whether assigning `name` here sets a module global: everything at top
+    /// level, and a declared `global` inside a function.
+    fn writes_global(&self, name: &str) -> bool {
+        self.is_top || self.globals.contains(name)
+    }
+
     fn fresh(&mut self) -> usize {
         let n = self.label;
         self.label += 1;
@@ -6558,7 +6584,7 @@ impl Gen {
             } => {
                 self.type_of(cx, expr)?; // surface literal-misuse errors
                 let value = self.value_expr(cx, expr)?;
-                if cx.is_top {
+                if cx.writes_global(name) {
                     self.ensure_global(name);
                     if let Some(r) = cx.greprs.get(name.as_str()).copied() {
                         let store = match self.scalar_expr(cx, expr, r) {
@@ -6768,7 +6794,7 @@ impl Gen {
                 )),
             },
             // `pass` — a no-op: emit no instructions.
-            StmtKind::Pass => Ok(()),
+            StmtKind::Pass | StmtKind::Global(_) => Ok(()),
         }
     }
 
@@ -6947,7 +6973,7 @@ impl Gen {
         let n = cx.fresh();
         let ctr = format!(".f{n}");
         cx.locals.push((ctr.clone(), "i32".to_string()));
-        let set_var = if cx.is_top {
+        let set_var = if cx.writes_global(var) {
             self.ensure_global(var);
             if matches!(cx.greprs.get(var), Some(Repr::Int)) {
                 format!("(global.set $g_{var} (local.get ${ctr}))")
@@ -7009,8 +7035,8 @@ impl Gen {
         for p in params {
             cx.vars.insert(p.clone(), Ty::Value);
         }
-        let mut assigned = std::collections::HashSet::new();
-        collect_assigned(body, &mut assigned);
+        let assigned = function_assigned(body);
+        cx.globals = crate::hoist::declared_globals(body).into_iter().collect();
         // Typed-slot tier (phase 1): the shared inference proves which locals
         // are Int/Float on every binding. Params stay boxed (they arrive as
         // (ref null any)), so they are `fixed` at Boxed — reads of them resolve
@@ -7041,6 +7067,7 @@ impl Gen {
                 reprs.insert(p.clone(), *r);
             }
         }
+        reprs.retain(|n, _| !cx.globals.contains(n));
         cx.reprs = reprs;
         let mut local_names: Vec<&String> = assigned.iter().collect();
         local_names.sort(); // deterministic output
@@ -7423,8 +7450,10 @@ impl Gen {
         for p in rest {
             cx.locals.push((p.clone(), VAL.to_string()));
         }
-        let mut assigned = std::collections::HashSet::new();
-        collect_assigned(&m.body, &mut assigned);
+        let assigned = function_assigned(&m.body);
+        cx.globals = crate::hoist::declared_globals(&m.body)
+            .into_iter()
+            .collect();
         let mut local_names: Vec<&String> = assigned.iter().collect();
         local_names.sort();
         for a in local_names {
@@ -7522,7 +7551,7 @@ impl Gen {
         let it = cx.scratch_local(VAL);
         let idx = format!(".f{n}");
         cx.locals.push((idx.clone(), "i32".to_string()));
-        let set_var = if cx.is_top {
+        let set_var = if cx.writes_global(var) {
             self.ensure_global(var);
             format!("(global.set $g_{var} (call $py_index (local.get ${it}) (local.get ${idx})))")
         } else {
@@ -7571,7 +7600,7 @@ impl Gen {
     ) -> Result<()> {
         match &target.kind {
             ExprKind::Name(name) => {
-                if cx.is_top {
+                if cx.writes_global(name) {
                     self.ensure_global(name);
                     out.push(format!("(global.set $g_{name} {value_wat})"));
                 } else {
@@ -10116,6 +10145,18 @@ fn all_paths_return(body: &[Stmt]) -> bool {
         },
         None => false,
     }
+}
+
+/// A function body's locals by assignment: everything it assigns, minus the
+/// names it declares `global`. Only for function bodies; at module level a
+/// `global` statement changes nothing.
+fn function_assigned(body: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    collect_assigned(body, &mut out);
+    for g in crate::hoist::declared_globals(body) {
+        out.remove(&g);
+    }
+    out
 }
 
 /// Names assigned anywhere in a statement list (assignment targets and

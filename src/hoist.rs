@@ -65,11 +65,185 @@ fn reads_here(stmts: &[Stmt], out: &mut BTreeSet<String>) {
     }
 }
 
-/// A function's local names: params plus everything it assigns (this scope).
+/// Names a `global` statement declares at this function level (recursing into
+/// `if`/`for`/`while`, not nested `def`/`class` bodies). Python applies a
+/// `global` to the whole function wherever it sits, so position doesn't matter
+/// here; `check_global_decls` rejects the out-of-order cases CPython rejects.
+pub(crate) fn declared_globals(stmts: &[Stmt]) -> BTreeSet<String> {
+    fn walk(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+        for s in stmts {
+            if let StmtKind::Global(names) = &s.kind {
+                out.extend(names.iter().cloned());
+            }
+            for_each_child_block(s, |body, scope| {
+                if scope == BlockScope::Same {
+                    walk(body, out);
+                }
+            });
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(stmts, &mut out);
+    out
+}
+
+/// A function's local names: params plus everything it assigns (this scope),
+/// minus the names it declares `global`, which stay the module's.
 pub(crate) fn function_locals(params: &[String], body: &[Stmt]) -> BTreeSet<String> {
     let mut set: BTreeSet<String> = params.iter().cloned().collect();
     assigned_here(body, &mut set);
+    for g in declared_globals(body) {
+        set.remove(&g);
+    }
     set
+}
+
+/// Module names a function's subtree uses: what it reads from outside
+/// (`free_vars_of`) plus what it, or a function nested in it, declares
+/// `global`. A `global x; x = 1` function never reads `x` but still needs
+/// the module variable.
+pub(crate) fn module_names_used(params: &[String], body: &[Stmt]) -> BTreeSet<String> {
+    let mut used = free_vars_of(params, body);
+    used.extend(declared_globals(body));
+    for g in nested_defs(body) {
+        if let StmtKind::Def {
+            params: gp,
+            body: gb,
+            ..
+        } = &g.kind
+        {
+            used.extend(module_names_used(gp, gb));
+        }
+    }
+    used
+}
+
+/// CPython's compile-time rules for `global`, checked in every scope: a
+/// parameter can't also be global, and a scope can't use a name before its
+/// own `global` statement for that name.
+pub(crate) fn check_global_decls(program: &[Stmt]) -> Result<(), CompileError> {
+    fn own_targets(s: &Stmt, out: &mut BTreeSet<String>) {
+        match &s.kind {
+            StmtKind::Assign(n, _) | StmtKind::AnnAssign { name: n, .. } => {
+                out.insert(n.clone());
+            }
+            StmtKind::For { var, .. } | StmtKind::ForEach { var, .. } => {
+                out.insert(var.clone());
+            }
+            StmtKind::UnpackAssign { targets, .. } => {
+                for t in targets {
+                    if let ExprKind::Name(n) = &t.kind {
+                        out.insert(n.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    struct Scope<'a> {
+        what: &'a str,
+        params: &'a [String],
+        read: BTreeSet<String>,
+        assigned: BTreeSet<String>,
+        /// Every name this scope annotates (`x: int = 0`), wherever it sits:
+        /// CPython rejects an annotated global even after the `global`.
+        annotated: BTreeSet<String>,
+    }
+    fn walk(stmts: &[Stmt], scope: &mut Scope) -> Result<(), CompileError> {
+        for s in stmts {
+            if let StmtKind::Global(names) = &s.kind {
+                for n in names {
+                    if scope.params.contains(n) {
+                        return Err(CompileError::at(
+                            s.line,
+                            format!(
+                                "name '{n}' is parameter and global: `{n}` already comes \
+                                 into {} as a parameter, so it can't also mean the \
+                                 module's `{n}`",
+                                scope.what
+                            ),
+                        ));
+                    }
+                    if scope.annotated.contains(n) {
+                        return Err(CompileError::at(
+                            s.line,
+                            format!(
+                                "annotated name '{n}' can't be global: give `{n}` its \
+                                 type where the program first sets it, outside {}",
+                                scope.what
+                            ),
+                        ));
+                    }
+                    // CPython's two wordings, exactly.
+                    let used = if scope.assigned.contains(n) {
+                        Some("assigned to before")
+                    } else if scope.read.contains(n) {
+                        Some("used prior to")
+                    } else {
+                        None
+                    };
+                    if let Some(used) = used {
+                        return Err(CompileError::at(
+                            s.line,
+                            format!(
+                                "name '{n}' is {used} global declaration: move \
+                                 `global {n}` to the top of {}, before it uses `{n}`",
+                                scope.what
+                            ),
+                        ));
+                    }
+                }
+            }
+            stmt_exprs(s, &mut |e| vars_read(e, &mut scope.read));
+            own_targets(s, &mut scope.assigned);
+            let mut result = Ok(());
+            for_each_child_block(s, |body, kind| {
+                if result.is_ok() && kind == BlockScope::Same {
+                    result = walk(body, scope);
+                }
+            });
+            result?;
+            match &s.kind {
+                StmtKind::Def {
+                    name, params, body, ..
+                } => function(&format!("`{name}`"), params, body)?,
+                StmtKind::ClassDef { methods, .. } => {
+                    for m in methods {
+                        function(&format!("`{}`", m.name), &m.params, &m.body)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    fn function(what: &str, params: &[String], body: &[Stmt]) -> Result<(), CompileError> {
+        walk(
+            body,
+            &mut Scope {
+                what,
+                params,
+                read: BTreeSet::new(),
+                assigned: BTreeSet::new(),
+                annotated: annotated_here(body),
+            },
+        )
+    }
+    fn annotated_here(stmts: &[Stmt]) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for s in stmts {
+            if let StmtKind::AnnAssign { name, .. } = &s.kind {
+                out.insert(name.clone());
+            }
+            for_each_child_block(s, |body, scope| {
+                if scope == BlockScope::Same {
+                    out.extend(annotated_here(body));
+                }
+            });
+        }
+        out
+    }
+    function("the program", &[], program)
 }
 
 /// The `def`s directly in this body (the only ones we lift; a `def` tucked
@@ -97,7 +271,9 @@ pub(crate) fn free_vars_of(params: &[String], body: &[Stmt]) -> BTreeSet<String>
             free.extend(free_vars_of(gp, gb));
         }
     }
-    free.retain(|v| !locals.contains(v));
+    // A name declared `global` here is the module's, never a capture.
+    let globals = declared_globals(body);
+    free.retain(|v| !locals.contains(v) && !globals.contains(v));
     free
 }
 
@@ -275,6 +451,7 @@ pub(crate) fn stmt_exprs_mut(s: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::Break
         | StmtKind::Continue
         | StmtKind::Pass
+        | StmtKind::Global(_)
         | StmtKind::Import(_) => {}
     }
 }
@@ -471,6 +648,7 @@ fn lift_in_function(
 /// just before the function it came out of, so the step debugger — which
 /// registers a `def` when it executes it — still sees definitions before use.
 pub fn hoist_nested_functions(program: Vec<Stmt>) -> Result<Vec<Stmt>, CompileError> {
+    check_global_decls(&program)?;
     let mut names: BTreeSet<String> = program
         .iter()
         .filter_map(|s| match &s.kind {
@@ -644,5 +822,63 @@ mod tests {
         let out = hoist("def f():\n    return 1\nx = f()\nprint(x)\n").unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(defs(&out), vec![("f".into(), vec![])]);
+    }
+
+    /// CPython's three compile-time `global` errors, each naming the
+    /// student's own variable and function.
+    #[test]
+    fn global_misplacements_are_cpython_syntax_errors() {
+        let err = hoist("def f(x):\n    global x\n").unwrap_err();
+        assert!(err.starts_with("name 'x' is parameter and global"), "{err}");
+        let err = hoist("x = 0\ndef f():\n    print(x)\n    global x\n").unwrap_err();
+        assert!(
+            err.starts_with("name 'x' is used prior to global declaration"),
+            "{err}"
+        );
+        assert!(err.contains("top of `f`"), "{err}");
+        let err = hoist("def f():\n    x = 1\n    global x\n").unwrap_err();
+        assert!(
+            err.starts_with("name 'x' is assigned to before global"),
+            "{err}"
+        );
+        let err = hoist("def f():\n    global x\n    x: int = 1\n").unwrap_err();
+        assert!(
+            err.starts_with("annotated name 'x' can't be global"),
+            "{err}"
+        );
+        // Methods are checked too.
+        let err = hoist("class C:\n    def m(self):\n        global self\n").unwrap_err();
+        assert!(err.contains("parameter and global"), "{err}");
+        // At module level a `global` is legal and changes nothing.
+        assert!(hoist("global q\nq = 3\n").is_ok());
+    }
+
+    /// A nested def's `global x` is the module's `x`, never a capture of the
+    /// enclosing function's local `x`.
+    #[test]
+    fn a_global_in_a_nested_def_is_not_captured() {
+        let out = hoist(
+            "x = 5\ndef outer():\n    x = 1\n    def inner():\n        global x\n        x = x + 10\n    inner()\n    return x\n",
+        )
+        .unwrap();
+        assert_eq!(
+            defs(&out),
+            vec![("inner".into(), vec![]), ("outer".into(), vec![])]
+        );
+    }
+
+    #[test]
+    fn declared_globals_leave_function_locals() {
+        let body = |src: &str| match hoist(src).unwrap().remove(0).kind {
+            StmtKind::Def { params, body, .. } => (params, body),
+            _ => unreachable!(),
+        };
+        let (params, b) = body("def f(n):\n    global total\n    total = total + n\n    k = 1\n");
+        assert_eq!(
+            function_locals(&params, &b),
+            BTreeSet::from(["k".to_string(), "n".to_string()])
+        );
+        assert_eq!(declared_globals(&b), BTreeSet::from(["total".to_string()]));
+        assert!(module_names_used(&params, &b).contains("total"));
     }
 }

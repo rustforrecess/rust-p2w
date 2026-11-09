@@ -222,8 +222,17 @@ semantics and leak-freedom are oracle-gated). Differences:
   own same-named local, that's a clean error rather than a silently wrong value.
   Functions and methods read module globals on both backends: natively,
   any module name a function reads lives in an LLVM global rather than on
-  `main`'s stack (since 2026-11-08). `global` itself, to rebind one from a
-  function, is not supported on either backend yet.
+  `main`'s stack (since 2026-11-08).
+- **`global`** works on both backends and in the step debugger (since
+  2026-11-08): assigning a declared name in a function, method or nested def
+  sets the module variable, including as a `for` variable or an unpacking
+  target, and a function may create the module variable. CPython's
+  compile-time errors are reproduced with its wording (a parameter that is
+  also global, a use or assignment before the `global`, an annotated global).
+  A function that assigns a module name *without* `global` and reads it first
+  is CPython's UnboundLocalError at run time; the `unbound_local` lint names
+  it before the program runs, and the debugger reports CPython's message.
+  `nonlocal` is not supported.
 - **Not yet implemented on native:** generators, `*args`/`**kwargs`,
   exceptions. These are rejected with a clear "not in the native backend yet"
   message rather than miscompiling.

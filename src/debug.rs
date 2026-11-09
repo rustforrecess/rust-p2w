@@ -21,7 +21,7 @@
 //! misbehaving. Semantics mirror the compiler/CPython; the same differential
 //! corpus can later guard them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
@@ -871,7 +871,7 @@ impl Stepper {
                 }
                 Ok(())
             }
-            StmtKind::Pass => Ok(()),
+            StmtKind::Pass | StmtKind::Global(_) => Ok(()),
             // Stepping over a `def` registers the function; calls to it run
             // atomically (see eval_call). The body isn't entered here.
             StmtKind::Def {
@@ -1443,7 +1443,7 @@ impl Stepper {
             }
             StmtKind::Break => Ok(Flow::Break),
             StmtKind::Continue => Ok(Flow::Continue),
-            StmtKind::Pass => Ok(Flow::Normal),
+            StmtKind::Pass | StmtKind::Global(_) => Ok(Flow::Normal),
             StmtKind::Return(opt) => {
                 let v = match opt {
                     Some(e) => Self::eval_in(funcs, scope, out, e)?,
@@ -2015,6 +2015,37 @@ struct VmFrame {
     /// The class whose method body this frame runs (None elsewhere) —
     /// `super()` resolves from this class's base at the call site.
     class_ctx: Option<String>,
+    /// A function frame's own variables (params plus what it assigns, minus
+    /// its `global`s). Reading one before it's set is UnboundLocalError, not
+    /// a fall back to the module's variable of the same name.
+    locals: HashSet<String>,
+    /// Names this function declares `global`: assigning one sets the module
+    /// frame's variable.
+    globals: HashSet<String>,
+}
+
+impl VmFrame {
+    fn function(
+        func: String,
+        params: &[String],
+        body: Rc<Vec<Stmt>>,
+        scope: HashMap<String, Value>,
+        class_ctx: Option<String>,
+    ) -> Self {
+        let line = body.first().map(|s| s.line).unwrap_or(0);
+        VmFrame {
+            func,
+            locals: crate::hoist::function_locals(params, &body)
+                .into_iter()
+                .collect(),
+            globals: crate::hoist::declared_globals(&body).into_iter().collect(),
+            work: vec![Task::Next(body, 0)],
+            operands: Vec::new(),
+            scope,
+            line,
+            class_ctx,
+        }
+    }
 }
 
 /// The CPS virtual machine. Same public surface as [`Stepper`], plus
@@ -2064,6 +2095,8 @@ impl Vm {
             scope: HashMap::new(),
             line: 0,
             class_ctx: None,
+            locals: HashSet::new(),
+            globals: HashSet::new(),
         };
         let mut vm = Vm {
             frames: vec![module],
@@ -2359,7 +2392,7 @@ impl Vm {
             }
             StmtKind::Break => self.push_task(Task::Break),
             StmtKind::Continue => self.push_task(Task::Continue),
-            StmtKind::Pass => {}
+            StmtKind::Pass | StmtKind::Global(_) => {}
             StmtKind::Return(opt) => {
                 self.push_task(Task::Return);
                 let e = match opt {
@@ -2581,7 +2614,7 @@ impl Vm {
             }
             Task::Store(name) => {
                 let v = self.pop_op()?;
-                self.top().scope.insert(name, v);
+                self.set_var(name, v);
             }
             Task::Push(v) => self.push_op(v),
             Task::Unpack(targets) => {
@@ -2593,7 +2626,7 @@ impl Vm {
                 for (target, item) in targets.into_iter().zip(items) {
                     match target.kind {
                         ExprKind::Name(n) => {
-                            self.top().scope.insert(n, item);
+                            self.set_var(n, item);
                         }
                         ExprKind::Index(obj, idx) => {
                             self.push_task(Task::StoreIndex);
@@ -2712,7 +2745,7 @@ impl Vm {
             } => {
                 let go = (step > 0 && next < stop) || (step < 0 && next > stop);
                 if go {
-                    self.top().scope.insert(var.clone(), Value::Int(next));
+                    self.set_var(var.clone(), Value::Int(next));
                     self.push_task(Task::ForHead {
                         var,
                         next: next + step,
@@ -2856,7 +2889,7 @@ impl Vm {
                 body,
             } => {
                 if idx < items.len() {
-                    self.top().scope.insert(var.clone(), items[idx].clone());
+                    self.set_var(var.clone(), items[idx].clone());
                     self.push_task(Task::ForEachHead {
                         var,
                         items: items.clone(),
@@ -3001,9 +3034,7 @@ impl Vm {
             ExprKind::Str(s) => self.push_op(Value::Str(s.clone())),
             ExprKind::NoneLit => self.push_op(Value::None),
             ExprKind::Name(n) => {
-                let v = self
-                    .lookup(n)
-                    .ok_or_else(|| format!("name '{n}' is not defined"))?;
+                let v = self.lookup(n).ok_or_else(|| self.unbound(n))?;
                 self.push_op(v);
             }
             ExprKind::Unary(op, inner) => {
@@ -3257,16 +3288,39 @@ impl Vm {
         Ok(())
     }
 
-    /// Resolve a name: current frame, then module globals (read fallback).
+    /// Resolve a name: current frame, then module globals (read fallback) —
+    /// except a function's own variable, which never falls back.
     fn lookup(&self, name: &str) -> Option<Value> {
         let top = self.frames.last()?;
         if let Some(v) = top.scope.get(name) {
             return Some(v.clone());
         }
-        if self.frames.len() > 1 {
+        if self.frames.len() > 1 && !top.locals.contains(name) {
             return self.frames[0].scope.get(name).cloned();
         }
         None
+    }
+
+    /// Bind a name: in the current frame, or in the module frame when the
+    /// current function declared it `global`.
+    fn set_var(&mut self, name: String, v: Value) {
+        let to_module = self.frames.len() > 1 && self.top().globals.contains(&name);
+        if to_module {
+            self.frames[0].scope.insert(name, v);
+        } else {
+            self.top().scope.insert(name, v);
+        }
+    }
+
+    /// The error for reading `name` when it has no value: CPython's
+    /// UnboundLocalError wording for a function's own variable.
+    fn unbound(&self, name: &str) -> String {
+        match self.frames.last() {
+            Some(top) if self.frames.len() > 1 && top.locals.contains(name) => format!(
+                "cannot access local variable '{name}' where it is not associated with a value"
+            ),
+            _ => format!("name '{name}' is not defined"),
+        }
     }
 
     /// Perform a call: user function -> push a new frame (step-into); builtin ->
@@ -3351,15 +3405,13 @@ impl Vm {
                 };
                 scope.insert(p.clone(), v);
             }
-            let line = f.body.first().map(|s| s.line).unwrap_or(0);
-            self.frames.push(VmFrame {
-                func: name.to_string(),
-                work: vec![Task::Next(f.body, 0)],
-                operands: Vec::new(),
+            self.frames.push(VmFrame::function(
+                name.to_string(),
+                &f.params,
+                f.body,
                 scope,
-                line,
-                class_ctx: None,
-            });
+                None,
+            ));
             Ok(())
         } else if name == "input" {
             // Host INPUT capability in the debugger: print the optional prompt,
@@ -3560,15 +3612,13 @@ impl Vm {
         for (i, a) in args.into_iter().enumerate() {
             scope.insert(f.params[i + 1].clone(), a);
         }
-        let line = f.body.first().map(|s| s.line).unwrap_or(0);
-        self.frames.push(VmFrame {
-            func: format!("{owner}.{method}"),
-            work: vec![Task::Next(f.body, 0)],
-            operands: Vec::new(),
+        self.frames.push(VmFrame::function(
+            format!("{owner}.{method}"),
+            &f.params,
+            f.body,
             scope,
-            line,
-            class_ctx: Some(owner.to_string()),
-        });
+            Some(owner.to_string()),
+        ));
         Ok(())
     }
 
@@ -6253,5 +6303,72 @@ mod tests {
         let (out, status) = run_vm_to_end("a = [[1, 2], [3, 4]]\na[0][1] = 99\nprint(a)\n");
         assert_eq!(status, Status::Finished);
         assert_eq!(out, "[[1, 99], [3, 4]]\n");
+    }
+
+    /// `global` in the debugger matches CPython: assigning a declared global
+    /// sets the module frame's variable, from a def, a method, a loop
+    /// variable, an unpacking, and a nested def.
+    #[test]
+    fn vm_global_statements_match_cpython() {
+        for (name, src, want) in [
+            (
+                "counter",
+                "score = 0\ndef hit():\n    global score\n    score = score + 1\nhit()\nhit()\nprint(score)\n",
+                "2\n",
+            ),
+            (
+                "created",
+                "def setup():\n    global name\n    name = \"robot\"\nsetup()\nprint(name)\n",
+                "robot\n",
+            ),
+            (
+                "retype",
+                "x = 1\ndef f():\n    global x\n    x = \"now a string\"\nf()\nprint(x)\n",
+                "now a string\n",
+            ),
+            (
+                "loopvar",
+                "total = 0\ndef add_all():\n    global total, i\n    for i in range(4):\n        total += i\nadd_all()\nprint(total, i)\n",
+                "6 3\n",
+            ),
+            (
+                "method",
+                "best = 0\nclass Bot:\n    def score(self, n):\n        global best\n        if n > best:\n            best = n\nb = Bot()\nb.score(3)\nb.score(1)\nprint(best)\n",
+                "3\n",
+            ),
+            (
+                "nested",
+                "x = 5\ndef outer():\n    x = 1\n    def inner():\n        global x\n        x = x + 10\n    inner()\n    return x\nprint(outer(), x)\n",
+                "1 15\n",
+            ),
+            (
+                "unpack",
+                "a = 0\nb = 0\ndef swap():\n    global a, b\n    a, b = 1, 2\nswap()\nprint(a, b)\n",
+                "1 2\n",
+            ),
+            ("toplevel", "global q\nq = 3\nprint(q)\n", "3\n"),
+        ] {
+            let (out, status) = run_vm_to_end(src);
+            assert_eq!(status, Status::Finished, "{name}");
+            assert_eq!(out, want, "{name}");
+        }
+    }
+
+    /// A function that assigns a module name without `global` owns that name
+    /// for its whole body: reading it first is CPython's UnboundLocalError,
+    /// not a silent read of the module's variable.
+    #[test]
+    fn vm_reading_an_own_variable_first_is_unbound_local() {
+        let (_, status) = run_vm_to_end("score = 0\ndef hit():\n    score = score + 1\nhit()\n");
+        match status {
+            Status::Error { message, .. } => assert!(
+                message.contains("cannot access local variable 'score'"),
+                "{message}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        // Reading without assigning still reaches the module variable.
+        let (out, _) = run_vm_to_end("score = 4\ndef show():\n    print(score)\nshow()\n");
+        assert_eq!(out, "4\n");
     }
 }

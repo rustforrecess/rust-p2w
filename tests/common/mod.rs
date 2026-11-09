@@ -546,6 +546,46 @@ pub fn groups() -> Vec<Group> {
                 ),
             ],
         },
+        Group {
+            title: "global",
+            note: "A function's `global` names are the module's variables: \
+                   assigning one sets the module variable on both backends, \
+                   from a def, a method, a loop variable, an unpacking and a \
+                   lifted nested def. Natively they are `@g_<name>` globals, \
+                   always boxed; in WASM, module globals the inference leaves \
+                   boxed because a function writes them.",
+            probes: vec![
+                p(
+                    "counter",
+                    "score = 0\ndef hit():\n    global score\n    score = score + 1\nhit()\nhit()\nprint(score)\n",
+                ),
+                p(
+                    "created",
+                    "def setup():\n    global name\n    name = \"robot\"\nsetup()\nprint(name)\n",
+                ),
+                p(
+                    "retype",
+                    "x = 1\ndef f():\n    global x\n    x = \"now a string\"\nf()\nprint(x)\n",
+                ),
+                p(
+                    "loopvar",
+                    "total = 0\ndef add_all():\n    global total, i\n    for i in range(4):\n        total += i\nadd_all()\nprint(total, i)\n",
+                ),
+                p(
+                    "method",
+                    "best = 0\nclass Bot:\n    def score(self, n):\n        global best\n        if n > best:\n            best = n\nb = Bot()\nb.score(3)\nb.score(1)\nprint(best)\n",
+                ),
+                p(
+                    "nested",
+                    "x = 5\ndef outer():\n    x = 1\n    def inner():\n        global x\n        x = x + 10\n    inner()\n    return x\nprint(outer(), x)\n",
+                ),
+                p(
+                    "unpack",
+                    "a = 0\nb = 0\ndef swap():\n    global a, b\n    a, b = 1, 2\nswap()\nprint(a, b)\n",
+                ),
+                p("toplevel", "global q\nq = 3\nprint(q)\n"),
+            ],
+        },
     ]
 }
 

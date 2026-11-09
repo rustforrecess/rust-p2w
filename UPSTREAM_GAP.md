@@ -49,7 +49,8 @@ and gets its front end from the `ast` module for free.
 | `yield` / generators | generator *expressions* work; generator *functions* do not |
 | `try` / `except` / `finally`, `raise` | `SUBSET_POLICY.md` blocks these at gate 1 |
 | `assert` | |
-| `global` / `nonlocal` | |
+| ~~`global`~~ | LANDED on both backends and in the debugger |
+| `nonlocal` | nested defs are lambda-lifted and may only read an enclosing local |
 | ~~`is` / `is not`~~ | LANDED |
 | decorators (`@`) | |
 | `*args` / `**kwargs` | at the definition site; keyword args at *call* sites work |

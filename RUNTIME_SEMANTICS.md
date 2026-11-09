@@ -273,3 +273,18 @@ Decorate-sort-undecorate, built as ordinary synthesized Python AST (list literal
 | `sorted(xs, key=len)` | value | `['ox', 'fig', 'kiwi', 'banana']` |
 | `sorted(xs, key=len, reverse=True)` | value | `['banana', 'kiwi', 'fig', 'ox']` |
 | `sorted(xs, key=<user def>)` | value | `[5, 4, 3, 1, 1]` |
+
+## global
+
+A function's `global` names are the module's variables: assigning one sets the module variable on both backends, from a def, a method, a loop variable, an unpacking and a lifted nested def. Natively they are `@g_<name>` globals, always boxed; in WASM, module globals the inference leaves boxed because a function writes them.
+
+| program | where | result |
+|---|---|---|
+| `counter` | value | `2` |
+| `created` | value | `robot` |
+| `retype` | value | `now a string` |
+| `loopvar` | value | `6 3` |
+| `method` | value | `3` |
+| `nested` | value | `1 15` |
+| `unpack` | value | `1 2` |
+| `toplevel` | value | `3` |

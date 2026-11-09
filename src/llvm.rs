@@ -330,25 +330,29 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
     }
 
     // Module-level names that any function or method reads (and doesn't
-    // shadow) become LLVM globals; everything else stays on main's stack.
+    // shadow) or declares `global` become LLVM globals; everything else stays
+    // on main's stack. A declared global may be assigned only inside a
+    // function, so it counts as a module name even if main never assigns it.
     let mut module_names = BTreeSet::new();
     crate::hoist::assigned_here(stmts, &mut module_names);
-    let mut read_by_functions = BTreeSet::new();
+    let mut used_by_functions = BTreeSet::new();
     for s in stmts {
         match &s.kind {
             StmtKind::Def { params, body, .. } => {
-                read_by_functions.extend(crate::hoist::free_vars_of(params, body));
+                module_names.extend(crate::hoist::declared_globals(body));
+                used_by_functions.extend(crate::hoist::module_names_used(params, body));
             }
             StmtKind::ClassDef { methods, .. } => {
                 for m in methods {
-                    read_by_functions.extend(crate::hoist::free_vars_of(&m.params, &m.body));
+                    module_names.extend(crate::hoist::declared_globals(&m.body));
+                    used_by_functions.extend(crate::hoist::module_names_used(&m.params, &m.body));
                 }
             }
             _ => {}
         }
     }
     let module_globals: BTreeSet<String> = module_names
-        .intersection(&read_by_functions)
+        .intersection(&used_by_functions)
         .cloned()
         .collect();
 
@@ -866,9 +870,10 @@ fn emit_function(
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(sigs, name);
     f.current_class = current_class.map(str::to_string);
-    // Module globals this function reads and does not shadow with a local.
+    // Module globals this function reads and does not shadow with a local,
+    // or declares `global`.
     let locals = crate::hoist::function_locals(params, body);
-    for g in crate::hoist::free_vars_of(params, body) {
+    for g in crate::hoist::module_names_used(params, body) {
         if sigs.module_globals.contains(&g) && !locals.contains(&g) {
             f.register_global(&g);
         }
@@ -2411,8 +2416,9 @@ impl<'a> FuncEmitter<'a> {
                 body,
                 ..
             } => self.emit_for(var, start, end, step, body),
-            // `pass` does nothing, on purpose.
-            StmtKind::Pass => Ok(()),
+            // `pass` does nothing, on purpose. `global` only decided which
+            // slots alias module globals, before the body was emitted.
+            StmtKind::Pass | StmtKind::Global(_) => Ok(()),
             StmtKind::Break => {
                 let (_, brk) = self
                     .loops

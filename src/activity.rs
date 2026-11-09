@@ -278,6 +278,7 @@ impl Builder {
             | StmtKind::Break
             | StmtKind::Continue
             | StmtKind::Pass
+            | StmtKind::Global(_)
             | StmtKind::Def { .. }
             | StmtKind::ClassDef { .. }
             | StmtKind::Import(_) => None,
