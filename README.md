@@ -103,6 +103,7 @@ definition.
 |---|---|
 | **compiles** | `lexer` `parser` `ast` `hoist` `codegen` (WASM) `llvm` (native) `component` `emit` `reuse` `floatfmt` `messages` (every diagnostic, keyed, one table for all three surfaces) |
 | **analyses the AST** | `debug` (interpreter + stepper), `lint` (+ fix ladders), `roles` (variable roles for assessment), `blockly` (blocks ⇄ code), `evidence` (concepts), `builtins` |
+| **hosts** | `hostmod` (host modules such as `robot`: one table for every surface), `sim` (the deterministic robot arena: physics, arbiter, timers, subscriptions) |
 | **analyses the OUTPUT** | `harness` (runs a program under a fuel budget), `capabilities()` — these need no AST, and are the parts with the weakest claim to being here |
 
 - `src/` — as above.
@@ -125,6 +126,10 @@ definition.
 - `VALUE_MODEL.md` — the boxed↔unboxed representation contract.
 - `MEMORY_MANAGEMENT.md` — the memory model and the PL research it draws on.
 - `PICO_BACKEND.md` — native backend design and status.
+- `docs/ROBOT.md` — the `robot` module: callbacks not loops, the API, the
+  arbiter, and what each host (simulator, board) does.
+- `HOST_INTERFACE.md` — what crosses the host boundary, and when to adopt WASI
+  instead of a bespoke import.
 
 ## License
 

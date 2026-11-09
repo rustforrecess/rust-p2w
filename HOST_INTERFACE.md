@@ -137,6 +137,26 @@ sensor arrives: that is when a shared shape starts to pay for itself, and one
 function is cheap to move. Only a board measures; every other host answers
 `SIMULATED_TEMPERATURE_C`, so programs behave the same everywhere.
 
+### The `robot` host module — bespoke, one table for every host
+
+`import robot` (`docs/ROBOT.md`) is a host module: its functions are provided by
+whichever host runs the program. One table, `src/hostmod.rs`, defines each
+function once, and every surface derives from it: the WASM import, the native
+symbol (`p2w_robot_<name>`), the debugger's answer, and the stand-in value every
+host without hardware returns, so all hosts print the same thing for the same
+program. Values cross as scalars (`i32` for ints and bools, `f64` for floats),
+per Rule 1 below. Constants are compiled in: a state such as `robot.FLIPPED`
+is an int, a threshold such as `robot.FLIPPED_DEG` a float.
+
+A subscription (`robot.on_tilt(handler)`) takes a `Handler` parameter: the
+name of a no-argument function, crossing as its dispatch id, the same id
+`every` hands over. The host calls `__dispatch(id)` (WASM) or `p2w_dispatch(id)`
+(native) when the event happens. No closure or function reference ever crosses
+the boundary.
+
+No standard covers motors, a tilt reading or an IR tag, so this is bespoke for
+the same reason as the domain capabilities below.
+
 ### Domain capabilities — bespoke by necessity
 
 `seed`, `set_field`/`get_field`, `report`, `evidence`, `on_frame`, the DOM and
@@ -195,7 +215,8 @@ installed** here — `wasm-tools` is.
 ## Where that leaves each capability
 
 - **Domain caps** (`seed`, `get_field`, `report`, `on_frame`, DOM/stage,
-  `open`/`read`/`write`) — bespoke, because no standard exists. Keep them
+  `open`/`read`/`write`, the `robot` module) — bespoke, because no standard
+  exists. Keep them
   WIT-shaped. Unaffected by any of the above.
 - **`wasi:clocks`** — flat functions, **no resources**, so it needs no
   `wit-bindgen` and no new machinery. **If time is ever wanted, this is the

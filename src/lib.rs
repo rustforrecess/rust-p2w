@@ -733,6 +733,28 @@ print(\"sum of evens:\", total)
         assert!(wat.contains(r#"(export "__dispatch")"#), "{wat}");
         assert_valid_wasm(ev);
 
+        // robot.on_tilt(handler): a host subscription; the handler's
+        // __dispatch id crosses as a constant, as every() hands over its own.
+        let sub = "import robot\ndef zeta():\n    print(2)\ndef alpha():\n    print(1)\nrobot.on_tilt(zeta)\nrobot.on_tag(alpha)\n";
+        let wat = compile_to_wat(sub).unwrap();
+        assert!(wat.contains("(call $robot_on_tilt (i32.const 1))"), "{wat}");
+        assert!(wat.contains("(call $robot_on_tag (i32.const 0))"), "{wat}");
+        assert!(wat.contains(r#"(export "__dispatch")"#), "{wat}");
+        assert_valid_wasm(sub);
+        for (bad, want) in [
+            (
+                "import robot\nrobot.on_tilt(3)\n",
+                "needs the name of a function, like robot.on_tilt(tilt_changed)",
+            ),
+            (
+                "import robot\ndef f(x):\n    return x\nrobot.on_tag(f)\n",
+                "'f' must be a function with no arguments to run with robot.on_tag()",
+            ),
+        ] {
+            let err = compile_to_wat(bad).unwrap_err().to_string();
+            assert!(err.contains(want), "{err}");
+        }
+
         // on_key(keyname, handler): keyboard for games (forward string + dispatch).
         let key = "def left():\n    set_attr(\"#b\", \"cx\", \"1\")\non_key(\"ArrowLeft\", left)\n";
         let wat = compile_to_wat(key).unwrap();

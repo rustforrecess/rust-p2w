@@ -83,6 +83,28 @@ formula and a nominal 3.3 V reference, and it measures the die, not the room. Th
 first reading after power-up runs 1 to 3 C high, so a lesson should discard it.
 The ADC runs from the 12 MHz crystal, not the 48 MHz the SDK uses.
 
+### On the board: `every()` and the robot scheduler (2026-11-08)
+
+A program registers callbacks and returns (`docs/ROBOT.md`); `boot.c` then runs
+a scheduler forever. Handlers cross as dispatch ids: the module's
+`p2w_dispatch(id)` switches to the handler, numbered like the WASM backend's
+`__dispatch`, so both backends agree on what an id means.
+
+- **`every(ms, handler)`** — up to 16 timers on TIMER0's microsecond count,
+  earliest due first, then registration order (the rule
+  `rust_p2w::sim::Timers` uses). Verified on a Pico 2 W: a 100 ms and a 250 ms
+  timer fired 50 and 20 times in 5 s, averaging 99.1 ms and 247.6 ms apart
+  as timed from the serial port.
+- **`robot.on_tilt` / `robot.on_tag`** — up to 16 handlers. Every 10 ms,
+  after any timers due at that moment, the scheduler classifies `tilt()` into
+  `tilt_state()` (with 10 degrees of hysteresis) and runs the handlers of each
+  state that changed, in registration order (the rule
+  `rust_p2w::sim::Subscriptions` uses). Built and cross-linked
+  (`tools/pico_build.sh`, `robot_events`); **not yet seen firing on
+  hardware**, because `tilt()` is still the table's stand-in until the IMU is
+  wired (`ROBOT.md` step 4), and `tag_state()` stays `FREE` until the IR
+  receiver is (step 5).
+
 ## Why native, not MicroPython
 We own the AST, so we can emit real machine code with DWARF debug info — which is
 exactly what lets the *same* source-level debugger follow onto the board. Shipping

@@ -10,20 +10,23 @@
 //! the same program. A board measures; everything else agrees on these.
 
 /// A value crossing the host boundary. Ints and bools cross as `i32`, floats
-/// as `f64`; `None` means the call returns nothing.
+/// as `f64`; `None` means the call returns nothing. A `Handler` parameter is
+/// the name of a no-argument function the host calls later: it crosses as
+/// the function's dispatch id, the same id `every` hands over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostTy {
     Int,
     Float,
     Bool,
     None,
+    Handler,
 }
 
 impl HostTy {
     /// The WASM value type, or `""` for no value.
     pub fn wasm(self) -> &'static str {
         match self {
-            HostTy::Int | HostTy::Bool => "i32",
+            HostTy::Int | HostTy::Bool | HostTy::Handler => "i32",
             HostTy::Float => "f64",
             HostTy::None => "",
         }
@@ -32,7 +35,7 @@ impl HostTy {
     /// The LLVM IR type at the native host boundary.
     pub fn llvm(self) -> &'static str {
         match self {
-            HostTy::Int | HostTy::Bool => "i32",
+            HostTy::Int | HostTy::Bool | HostTy::Handler => "i32",
             HostTy::Float => "double",
             HostTy::None => "void",
         }
@@ -41,7 +44,7 @@ impl HostTy {
     /// The C type a native host implements the function with.
     pub fn c(self) -> &'static str {
         match self {
-            HostTy::Int | HostTy::Bool => "int",
+            HostTy::Int | HostTy::Bool | HostTy::Handler => "int",
             HostTy::Float => "double",
             HostTy::None => "void",
         }
@@ -58,11 +61,30 @@ pub struct HostFn {
     pub stand_in: f64,
 }
 
-/// A named number a host module exports, such as `robot.FLIPPED`.
+/// A named number a host module exports: a threshold such as
+/// `robot.FLIPPED_DEG` (a float) or a state such as `robot.FLIPPED` (an int).
 #[derive(Debug)]
 pub struct HostConst {
     pub name: &'static str,
     pub value: f64,
+    /// `Int` or `Float`: the Python type the constant has.
+    pub ty: HostTy,
+}
+
+const fn int_const(name: &'static str, value: i32) -> HostConst {
+    HostConst {
+        name,
+        value: value as f64,
+        ty: HostTy::Int,
+    }
+}
+
+const fn float_const(name: &'static str, value: f64) -> HostConst {
+    HostConst {
+        name,
+        value,
+        ty: HostTy::Float,
+    }
 }
 
 #[derive(Debug)]
@@ -86,10 +108,17 @@ const fn f(
     }
 }
 
-/// The robot module, first slice: plain calls and constants. Callbacks
-/// (`robot.on_flipped`) wait for the board scheduler so they land on every
-/// backend together. Stand-ins describe a robot alone on a flat floor:
-/// nothing in range, no ring edge, level, not tagged.
+/// The robot module: plain calls, constants, and two subscriptions.
+///
+/// A sensor a game cares about has a measurement and a state. `tilt()` is the
+/// measurement, in degrees; `tilt_state()` is the state the host last
+/// classified it as: `LEVEL`, `TILTED` or `FLIPPED`. An `on_` handler runs
+/// whenever its state changes and reads the new state itself, so one rule
+/// covers every event. States are ints compared with `==`; measurements are
+/// floats compared with `>=` against the `_DEG` thresholds.
+///
+/// Stand-ins describe a robot alone on a flat floor: nothing in range, no
+/// ring edge, level, free, so a host without hardware never fires a handler.
 pub const ROBOT: HostModule = HostModule {
     name: "robot",
     fns: &[
@@ -108,19 +137,32 @@ pub const ROBOT: HostModule = HostModule {
         ),
         f("read_line", &[("sensor", HostTy::Int)], HostTy::Bool, 0.0),
         f("tilt", &[], HostTy::Float, 0.0),
-        f("tagged", &[], HostTy::Bool, 0.0),
+        f("tilt_state", &[], HostTy::Int, 0.0),
+        f("tag_state", &[], HostTy::Int, 0.0),
+        f(
+            "on_tilt",
+            &[("handler", HostTy::Handler)],
+            HostTy::None,
+            0.0,
+        ),
+        f("on_tag", &[("handler", HostTy::Handler)], HostTy::None, 0.0),
     ],
     consts: &[
-        HostConst {
-            name: "TILTED",
-            value: 30.0,
-        },
-        HostConst {
-            name: "FLIPPED",
-            value: 150.0,
-        },
+        float_const("TILTED_DEG", 30.0),
+        float_const("FLIPPED_DEG", 150.0),
+        int_const("LEVEL", 0),
+        int_const("TILTED", 1),
+        int_const("FLIPPED", 2),
+        int_const("FREE", 0),
+        int_const("TAGGED", 1),
+        int_const("IMMUNE", 2),
     ],
 };
+
+/// How far back past a threshold a robot must come before its tilt state
+/// steps back: a reading wobbling around 150 degrees is one flip, not a
+/// handler call every 10 ms.
+pub const TILT_HYSTERESIS_DEG: f64 = 10.0;
 
 /// Every host module, in the order error messages list them.
 pub const HOST_MODULES: &[&HostModule] = &[&ROBOT];
@@ -135,8 +177,18 @@ impl HostModule {
         self.fns.iter().find(|f| f.name == name)
     }
 
+    /// Whether `func` takes a handler: a subscription such as `on_tilt`.
+    pub fn takes_handler(&self, func: &str) -> bool {
+        self.func(func)
+            .is_some_and(|f| f.params.iter().any(|(_, t)| *t == HostTy::Handler))
+    }
+
     pub fn constant(&self, name: &str) -> Option<f64> {
-        self.consts.iter().find(|c| c.name == name).map(|c| c.value)
+        self.constant_def(name).map(|c| c.value)
+    }
+
+    pub fn constant_def(&self, name: &str) -> Option<&'static HostConst> {
+        self.consts.iter().find(|c| c.name == name)
     }
 
     /// Every name a program can use after `module.`: functions, then
@@ -208,12 +260,30 @@ impl HostFn {
             HostTy::None => String::new(),
             HostTy::Float => format!(" return {:?};", self.stand_in),
             HostTy::Int | HostTy::Bool => format!(" return {};", self.stand_in as i64),
+            HostTy::Handler => unreachable!("a handler is a parameter, never a result"),
         };
         format!(
             "{} {}({params}) {{{unused}{body} }}",
             self.ret.c(),
             self.native_symbol(module)
         )
+    }
+}
+
+/// The error for a subscription given something other than a no-argument
+/// function, worded the same on every backend. `got` is the name the program
+/// passed, or `None` when it passed an expression that isn't a name.
+pub fn handler_error(module: &str, func: &str, got: Option<&str>) -> String {
+    match got {
+        Some(name) => {
+            format!("'{name}' must be a function with no arguments to run with {module}.{func}()")
+        }
+        None => {
+            let example = format!("{}_changed", func.strip_prefix("on_").unwrap_or(func));
+            format!(
+                "{module}.{func}() needs the name of a function, like {module}.{func}({example})"
+            )
+        }
     }
 }
 
@@ -268,7 +338,8 @@ mod tests {
     fn names_cover_functions_and_constants() {
         let names = ROBOT.names();
         assert!(names.contains(&"tilt") && names.contains(&"FLIPPED"));
-        assert_eq!(ROBOT.constant("FLIPPED"), Some(150.0));
+        assert_eq!(ROBOT.constant("FLIPPED_DEG"), Some(150.0));
+        assert_eq!(ROBOT.constant_def("FLIPPED").unwrap().ty, HostTy::Int);
         assert!(ROBOT.func("FLIPPED").is_none());
     }
 
@@ -296,6 +367,22 @@ mod tests {
                 }
             }
             // Not a host module, but every native host needs it just the same.
+            if file == "device/boot.c" {
+                // The board classifies tilt with the table's numbers.
+                for (name, value) in [
+                    ("TILTED_DEG", ROBOT.constant("TILTED_DEG").unwrap()),
+                    ("FLIPPED_DEG", ROBOT.constant("FLIPPED_DEG").unwrap()),
+                    ("HYSTERESIS_DEG", TILT_HYSTERESIS_DEG),
+                ] {
+                    assert!(
+                        text.contains(&format!("#define {name:<15} {value:?}")),
+                        "boot.c's {name} is not {value:?}"
+                    );
+                }
+                for (name, value) in [("LEVEL", 0), ("TILTED", 1), ("FLIPPED", 2)] {
+                    assert_eq!(ROBOT.constant(name), Some(value as f64), "{name}");
+                }
+            }
             assert!(
                 text.contains("p2w_host_every"),
                 "{file} does not define p2w_host_every"

@@ -1225,6 +1225,18 @@ impl Stepper {
         method: &str,
         args: &[Expr],
     ) -> Result<Value, String> {
+        let host_args;
+        let args = if let ExprKind::Name(m) = &obj.kind
+            && let Some(hm) = crate::hostmod::module(m)
+            && !scope.contains_key(m)
+        {
+            host_args = host_handler_args(hm, method, args, |n| {
+                funcs.get(n).is_some_and(|f| f.params.is_empty())
+            })?;
+            host_args.as_slice()
+        } else {
+            args
+        };
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(Self::eval_in(funcs, scope, out, a)?);
@@ -3205,6 +3217,10 @@ impl Vm {
                     && let Some(hm) = crate::hostmod::module(m)
                     && self.lookup(m).is_none()
                 {
+                    let funcs = &self.funcs;
+                    let args = host_handler_args(hm, method, args, |n| {
+                        funcs.get(n).is_some_and(|f| f.params.is_empty())
+                    })?;
                     self.push_task(Task::HostCall(hm.name, method.clone(), args.len()));
                     for a in args.iter().rev() {
                         self.push_task(Task::Eval(Rc::new(a.clone())));
@@ -3977,12 +3993,17 @@ fn math_const(name: &str) -> Option<Value> {
     }
 }
 
-/// `robot.FLIPPED` — a host-module constant, as a float like the compiled
-/// backends make it.
+/// `robot.FLIPPED` — a host-module constant: an int for a state, a float
+/// for a threshold, as the compiled backends make them.
 fn host_const(hm: &crate::hostmod::HostModule, name: &str) -> Result<Value, String> {
-    hm.constant(name)
-        .map(Value::Float)
-        .ok_or_else(|| format!("{} has no attribute '{name}'", hm.name))
+    let c = hm
+        .constant_def(name)
+        .ok_or_else(|| format!("{} has no attribute '{name}'", hm.name))?;
+    Ok(if c.ty == crate::hostmod::HostTy::Int {
+        Value::Int(c.value as i64)
+    } else {
+        Value::Float(c.value)
+    })
 }
 
 /// `robot.tilt()` in the debugger: the step debugger has no hardware and no
@@ -4007,7 +4028,45 @@ fn host_call(hm: &crate::hostmod::HostModule, func: &str, args: &[Value]) -> Res
         HostTy::Int => Value::Int(hf.stand_in as i64),
         HostTy::Bool => Value::Bool(hf.stand_in != 0.0),
         HostTy::Float => Value::Float(hf.stand_in),
+        HostTy::Handler => unreachable!("a handler is a parameter, never a result"),
     })
+}
+
+/// A host call's arguments with each handler checked and replaced by a
+/// placeholder. The debugger has no simulator, so no event ever fires and a
+/// subscription only needs to be valid: the name of a function with no
+/// arguments, as the compiled backends require.
+fn host_handler_args(
+    hm: &crate::hostmod::HostModule,
+    func: &str,
+    args: &[Expr],
+    is_handler: impl Fn(&str) -> bool,
+) -> Result<Vec<Expr>, String> {
+    use crate::hostmod::HostTy;
+    let Some(hf) = hm.func(func) else {
+        return Ok(args.to_vec());
+    };
+    args.iter()
+        .zip(
+            hf.params
+                .iter()
+                .map(|(_, t)| *t)
+                .chain(std::iter::repeat(HostTy::None)),
+        )
+        .map(|(a, ty)| {
+            if ty != HostTy::Handler {
+                return Ok(a.clone());
+            }
+            match &a.kind {
+                ExprKind::Name(h) if is_handler(h) => Ok(Expr {
+                    kind: ExprKind::Int(0),
+                    ..a.clone()
+                }),
+                ExprKind::Name(h) => Err(crate::hostmod::handler_error(hm.name, func, Some(h))),
+                _ => Err(crate::hostmod::handler_error(hm.name, func, None)),
+            }
+        })
+        .collect()
 }
 
 /// `math.<func>(args)` — matching the compiled backends' `gen_math_call`:
@@ -5488,12 +5547,49 @@ mod tests {
 
     #[test]
     fn robot_module_steps_with_the_same_stand_ins() {
-        let src = "import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED)\nprint(robot.FLIPPED)\nprint(robot.tagged())\nrobot.stop()\n";
-        assert_eq!(vm_run(src), "2000\nFalse\n0.0\nFalse\n150.0\nFalse\n");
+        let src = "import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED_DEG)\nprint(robot.FLIPPED_DEG)\nprint(robot.tilt_state() == robot.LEVEL)\nprint(robot.FLIPPED)\nprint(robot.tag_state() == robot.FREE)\nrobot.stop()\n";
+        assert_eq!(
+            vm_run(src),
+            "2000\nFalse\n0.0\nFalse\n150.0\nTrue\n2\nTrue\n"
+        );
         // Inside a function the atomic evaluator answers too.
         let src =
             "import robot\ndef far():\n    return robot.read_distance(0) > 1000\nprint(far())\n";
         assert_eq!(vm_run(src), "True\n");
+        // Subscriptions register, at module level and inside a function, and
+        // never fire: the debugger has no events.
+        assert_eq!(
+            vm_run(
+                "import robot\ndef tilt_changed():\n    if robot.tilt_state() == robot.FLIPPED:\n        print(\"help!\")\ndef tag_changed():\n    if robot.tag_state() == robot.TAGGED:\n        print(\"frozen\")\ndef setup():\n    robot.on_tag(tag_changed)\nrobot.on_tilt(tilt_changed)\nsetup()\nprint(\"waiting\")\n"
+            ),
+            "waiting\n"
+        );
+    }
+
+    /// A subscription needs a no-argument function, with the compiled
+    /// backends' wording.
+    #[test]
+    fn robot_subscriptions_need_a_no_argument_function() {
+        for (src, want) in [
+            (
+                "import robot\nrobot.on_tilt(3)\n",
+                "robot.on_tilt() needs the name of a function, like robot.on_tilt(tilt_changed)",
+            ),
+            (
+                "import robot\ndef f(x):\n    return x\nrobot.on_tag(f)\n",
+                "'f' must be a function with no arguments to run with robot.on_tag()",
+            ),
+            (
+                "import robot\ndef f(x):\n    return x\ndef setup():\n    robot.on_tag(f)\nsetup()\n",
+                "'f' must be a function with no arguments to run with robot.on_tag()",
+            ),
+        ] {
+            let (_, status) = run_vm_to_end(src);
+            match status {
+                Status::Error { message, .. } => assert!(message.contains(want), "{message}"),
+                other => panic!("expected an error for {src:?}, got {other:?}"),
+            }
+        }
     }
 
     fn vm_run(src: &str) -> String {

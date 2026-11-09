@@ -224,7 +224,35 @@ void p2w_robot_stop(void) { }
 int p2w_robot_read_distance(int sensor) { (void)sensor; return 2000; }
 int p2w_robot_read_line(int sensor) { (void)sensor; return 0; }
 double p2w_robot_tilt(void) { return 0.0; }
-int p2w_robot_tagged(void) { return 0; }
+/* robot.tilt_state() / tag_state() and robot.on_tilt / on_tag. The scheduler
+ * classifies tilt every 10 ms; a handler runs whenever its state changes, in
+ * registration order, and tilt_state() answers the state it was called for.
+ * A state is entered at its threshold and left HYSTERESIS_DEG below it. The
+ * same rule as rust_p2w::sim::Subscriptions, with the numbers from
+ * src/hostmod.rs (a test checks they agree). */
+#define TILTED_DEG      30.0
+#define FLIPPED_DEG     150.0
+#define HYSTERESIS_DEG  10.0
+#define MAX_SUBSCRIPTIONS 16u
+#define POLL_US           10000u
+enum { LEVEL, TILTED, FLIPPED };       /* robot.LEVEL, TILTED, FLIPPED */
+enum { FREE };                         /* robot.FREE; TAGGED, IMMUNE need the IR tag */
+enum { TOPIC_TILT, TOPIC_TAG };
+static struct {
+    int topic;
+    int id;
+} subscriptions[MAX_SUBSCRIPTIONS];
+static uint32_t subscription_count;
+static int tilt_now = LEVEL;
+static int tag_now = FREE;
+
+int p2w_robot_tilt_state(void) { return tilt_now; }
+/* FREE until the IR receiver is wired (docs/ROBOT.md, step 5). */
+int p2w_robot_tag_state(void) { return tag_now; }
+
+static void subscribe(int topic, int id);
+void p2w_robot_on_tilt(int handler) { subscribe(TOPIC_TILT, handler); }
+void p2w_robot_on_tag(int handler) { subscribe(TOPIC_TAG, handler); }
 
 extern int p2w_float(double);
 
@@ -311,7 +339,47 @@ void p2w_host_every(int ms, int id) {
     timer_count++;
 }
 
+static void subscribe(int topic, int id) {
+    if (subscription_count == MAX_SUBSCRIPTIONS) {
+        say("robot: this board keeps at most 16 on_ handlers; this one is ignored\n");
+        return;
+    }
+    subscriptions[subscription_count].topic = topic;
+    subscriptions[subscription_count].id = id;
+    subscription_count++;
+}
+
+static double tilt_threshold(int state) {
+    return state == TILTED ? TILTED_DEG : FLIPPED_DEG;
+}
+
+static int next_tilt_state(int s, double deg) {
+    while (s < FLIPPED && deg >= tilt_threshold(s + 1)) {
+        s++;
+    }
+    while (s > LEVEL && deg < tilt_threshold(s) - HYSTERESIS_DEG) {
+        s--;
+    }
+    return s;
+}
+
+/* Classify this moment's readings; run the handlers of each state that
+ * changed. */
+static void poll_subscriptions(void) {
+    int tilt = next_tilt_state(tilt_now, p2w_robot_tilt());
+    int tag = FREE;
+    int changed[2] = {tilt != tilt_now, tag != tag_now};
+    tilt_now = tilt;
+    tag_now = tag;
+    for (uint32_t i = 0; i < subscription_count; i++) {
+        if (changed[subscriptions[i].topic]) {
+            p2w_dispatch(subscriptions[i].id);
+        }
+    }
+}
+
 static void run_scheduler(void) {
+    uint32_t next_poll = TIMER0_TIMERAWL + POLL_US;
     for (;;) {
         uint32_t now = TIMER0_TIMERAWL;
         int best = -1;
@@ -326,6 +394,10 @@ static void run_scheduler(void) {
         if (best >= 0) {
             timers[best].next_us += timers[best].period_us;
             p2w_dispatch(timers[best].id);
+        } else if ((int32_t)(now - next_poll) >= 0) {
+            /* Timers due at the same moment run first, as in the simulator. */
+            next_poll += POLL_US;
+            poll_subscriptions();
         }
     }
 }

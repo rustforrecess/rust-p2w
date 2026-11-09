@@ -425,7 +425,7 @@ fn define_host_stand_ins(linker: &mut Linker<Io>, engine: &Engine) {
                     FuncType::new(engine, params, results),
                     move |_, _, out| {
                         match ret {
-                            HostTy::None => {}
+                            HostTy::None | HostTy::Handler => {}
                             HostTy::Float => out[0] = Val::F64(value.to_bits()),
                             HostTy::Int | HostTy::Bool => out[0] = Val::I32(value as i32),
                         }

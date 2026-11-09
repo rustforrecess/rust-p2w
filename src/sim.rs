@@ -441,6 +441,87 @@ impl Timers {
     }
 }
 
+/// What a robot program can subscribe to with `robot.on_<topic>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Topic {
+    /// `robot.on_tilt`: `tilt_state()` changed.
+    Tilt,
+    /// `robot.on_tag`: `tag_state()` changed.
+    Tag,
+}
+
+/// `robot.LEVEL`, `robot.TILTED`, `robot.FLIPPED`.
+pub const LEVEL: i32 = 0;
+pub const TILTED: i32 = 1;
+pub const FLIPPED: i32 = 2;
+/// `robot.FREE`; `TAGGED` and `IMMUNE` follow once the IR tag exists.
+pub const FREE: i32 = 0;
+
+/// The tilt state after `previous`, given a reading in degrees. A state is
+/// entered at its threshold (`robot.TILTED_DEG`, `robot.FLIPPED_DEG`) and
+/// left only once the reading is `TILT_HYSTERESIS_DEG` back below it, so a
+/// noisy reading near a threshold doesn't flicker between states.
+pub fn next_tilt_state(previous: i32, deg: f64) -> i32 {
+    let robot = &crate::hostmod::ROBOT;
+    let threshold = |state: i32| match state {
+        TILTED => robot.constant("TILTED_DEG").unwrap_or(30.0),
+        _ => robot.constant("FLIPPED_DEG").unwrap_or(150.0),
+    };
+    let mut s = previous.clamp(LEVEL, FLIPPED);
+    while s < FLIPPED && deg >= threshold(s + 1) {
+        s += 1;
+    }
+    while s > LEVEL && deg < threshold(s) - crate::hostmod::TILT_HYSTERESIS_DEG {
+        s -= 1;
+    }
+    s
+}
+
+/// A robot's classified states and its `on_tilt` / `on_tag` handlers. The
+/// host updates it every tick, after the timers due at that moment; the
+/// handlers of each state that changed then run, in registration order, and
+/// read the new state with `tilt_state()` / `tag_state()`, which answer from
+/// here: the state the handler was called for, not a fresh reading. The board
+/// firmware (device/boot.c) follows the same rule.
+#[derive(Debug, Clone, Default)]
+pub struct Subscriptions {
+    entries: Vec<(Topic, i32)>,
+    tilt: i32,
+    tag: i32,
+}
+
+impl Subscriptions {
+    pub fn add(&mut self, topic: Topic, id: i32) {
+        self.entries.push((topic, id));
+    }
+
+    /// `robot.tilt_state()`.
+    pub fn tilt_state(&self) -> i32 {
+        self.tilt
+    }
+
+    /// `robot.tag_state()`.
+    pub fn tag_state(&self) -> i32 {
+        self.tag
+    }
+
+    /// Classify this tick's readings; return the handlers to run, in order.
+    pub fn update(&mut self, tilt_deg: f64, tag_state: i32) -> Vec<i32> {
+        let tilt = next_tilt_state(self.tilt, tilt_deg);
+        let (tilt_changed, tag_changed) = (tilt != self.tilt, tag_state != self.tag);
+        self.tilt = tilt;
+        self.tag = tag_state;
+        self.entries
+            .iter()
+            .filter(|(topic, _)| match topic {
+                Topic::Tilt => tilt_changed,
+                Topic::Tag => tag_changed,
+            })
+            .map(|&(_, id)| id)
+            .collect()
+    }
+}
+
 /// Keep an angle in (-PI, PI].
 fn wrap(a: f64) -> f64 {
     let mut a = a % (2.0 * PI);
@@ -615,6 +696,55 @@ mod tests {
         let gap = a.robots[1].x_mm - a.robots[0].x_mm;
         assert!(close(gap, 100.0, 1e-6), "{gap}");
         assert!(a.robots[1].x_mm > 100.0, "{:?}", a.robots[1]);
+    }
+
+    /// Tilt states are entered at their thresholds and left 10 degrees
+    /// below them: a reading wobbling around a threshold stays put.
+    #[test]
+    fn tilt_states_have_hysteresis() {
+        let walk = |readings: &[f64]| {
+            let mut s = LEVEL;
+            readings
+                .iter()
+                .map(|&d| {
+                    s = next_tilt_state(s, d);
+                    s
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            walk(&[0.0, 29.9, 30.0, 25.0, 20.1, 19.9]),
+            vec![0, 0, 1, 1, 1, 0]
+        );
+        assert_eq!(
+            walk(&[150.2, 149.8, 150.1, 141.0, 139.0]),
+            vec![2, 2, 2, 2, 1]
+        );
+        // Straight from flipped to level when the robot is righted at once.
+        assert_eq!(walk(&[179.4, 3.0]), vec![2, 0]);
+        // A real flip reads 176.8 or 179.4, almost never 180.0.
+        assert_eq!(walk(&[176.8]), vec![2]);
+    }
+
+    /// Every change of state runs that topic's handlers, in registration
+    /// order; a state that lasts runs nothing more.
+    #[test]
+    fn handlers_run_when_a_state_changes() {
+        let mut s = Subscriptions::default();
+        s.add(Topic::Tilt, 4);
+        s.add(Topic::Tag, 2);
+        s.add(Topic::Tilt, 1);
+        let none = Vec::<i32>::new();
+        assert_eq!(s.update(0.0, FREE), none);
+        assert_eq!(s.update(45.0, FREE), vec![4, 1]);
+        assert_eq!(s.tilt_state(), TILTED);
+        assert_eq!(s.update(50.0, FREE), none); // still tilted
+        assert_eq!(s.update(176.8, FREE), vec![4, 1]);
+        assert_eq!(s.tilt_state(), FLIPPED);
+        assert_eq!(s.update(179.4, 1), vec![2]);
+        assert_eq!(s.tag_state(), 1);
+        assert_eq!(s.update(0.0, FREE), vec![4, 2, 1]); // both changed
+        assert_eq!(s.tilt_state(), LEVEL);
     }
 
     #[test]

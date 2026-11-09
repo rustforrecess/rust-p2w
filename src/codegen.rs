@@ -7159,11 +7159,31 @@ impl Gen {
         }
         let mut lowered = String::new();
         for (a, (_, ty)) in args.iter().zip(hf.params) {
+            if *ty == HostTy::Handler {
+                // The handler's `__dispatch` id, as `every` hands over: the
+                // host calls `__dispatch(id)` when the event happens.
+                let ExprKind::Name(h) = &a.kind else {
+                    return Err(CompileError::at_expr(
+                        a,
+                        crate::hostmod::handler_error(hm.name, hf.name, None),
+                    )
+                    .with_kind(crate::error::ErrorKind::Type));
+                };
+                let Some(id) = self.handler_id(h) else {
+                    return Err(CompileError::at_expr(
+                        a,
+                        crate::hostmod::handler_error(hm.name, hf.name, Some(h)),
+                    )
+                    .with_kind(crate::error::ErrorKind::Type));
+                };
+                lowered.push_str(&format!(" (i32.const {id})"));
+                continue;
+            }
             let v = self.value_expr(cx, a)?;
             lowered.push_str(&match ty {
                 HostTy::Float => format!(" (call $unbox_f64 {v})"),
                 HostTy::Bool => format!(" (call $truthy {v})"),
-                HostTy::Int | HostTy::None => format!(" (call $unbox {v})"),
+                HostTy::Int | HostTy::None | HostTy::Handler => format!(" (call $unbox {v})"),
             });
         }
         self.host_used.insert((hm.name, hf.name));
@@ -7173,6 +7193,7 @@ impl Gen {
             HostTy::Bool => format!("(call $bool {call})"),
             HostTy::Float => format!("(struct.new $FLOAT {call})"),
             HostTy::None => format!("(block (result (ref null any)) {call} (global.get $NONE))"),
+            HostTy::Handler => unreachable!("a handler is a parameter, never a result"),
         })
     }
 
@@ -8133,8 +8154,11 @@ impl Gen {
                     if let ExprKind::Name(m) = &obj.kind
                         && let Some(hm) = crate::hostmod::module(m)
                     {
-                        return match hm.constant(name) {
-                            Some(v) => Ok(format!("(struct.new $FLOAT (f64.const {v:?}))")),
+                        return match hm.constant_def(name) {
+                            Some(c) if c.ty == crate::hostmod::HostTy::Int => {
+                                Ok(format!("(call $box (i32.const {}))", c.value as i32))
+                            }
+                            Some(c) => Ok(format!("(struct.new $FLOAT (f64.const {:?}))", c.value)),
                             None => Err(host_missing(hm, name, e.line)),
                         };
                     }

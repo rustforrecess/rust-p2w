@@ -266,7 +266,10 @@ fn backends_agree_or_the_differences_are_written_down() {
          int p2w_robot_read_distance(int sensor) { (void)sensor; return 2000; }\n\
          int p2w_robot_read_line(int sensor) { (void)sensor; return 0; }\n\
          double p2w_robot_tilt(void) { return 0.0; }\n\
-         int p2w_robot_tagged(void) { return 0; }\n\
+         int p2w_robot_tilt_state(void) { return 0; }\n\
+         int p2w_robot_tag_state(void) { return 0; }\n\
+         void p2w_robot_on_tilt(int handler) { (void)handler; }\n\
+         void p2w_robot_on_tag(int handler) { (void)handler; }\n\
          int p2w_host_file_open(const char *np, int nl, const char *mp, int ml) {\n\
          \x20 (void)np; (void)nl; (void)mp; (void)ml; return -1;\n\
          }\n\

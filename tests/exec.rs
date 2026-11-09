@@ -344,8 +344,8 @@ fn read_temperature_is_a_float_from_the_host() {
 /// the stand-ins come back, boxed to the right Python types.
 #[test]
 fn robot_module_reaches_the_host() {
-    let src = "import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED)\nprint(robot.FLIPPED)\nprint(robot.tagged())\nrobot.stop()\n";
-    assert_eq!(run(src), "2000\nFalse\n0.0\nFalse\n150.0\nFalse\n");
+    let src = "import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED_DEG)\nprint(robot.FLIPPED_DEG)\nprint(robot.tilt_state() == robot.LEVEL)\nprint(robot.FLIPPED)\nprint(robot.tag_state() == robot.FREE)\nrobot.stop()\n";
+    assert_eq!(run(src), "2000\nFalse\n0.0\nFalse\n150.0\nTrue\n2\nTrue\n");
     let wat = rust_p2w::compile_to_wat(src).unwrap();
     let caps = rust_p2w::capabilities(&wat);
     for name in [
@@ -357,7 +357,7 @@ fn robot_module_reaches_the_host() {
         assert!(caps.contains(&name.to_string()), "{caps:?}");
     }
     // Only what the program calls is imported.
-    assert!(!caps.contains(&"robot_tagged".to_string()) || src.contains("tagged"));
+    assert!(!caps.contains(&"robot_on_tilt".to_string()), "{caps:?}");
 }
 
 #[test]
@@ -2846,7 +2846,7 @@ fn define_host_stand_ins(linker: &mut Linker<Io>, engine: &Engine) {
                     FuncType::new(engine, params, results),
                     move |_, _, out| {
                         match ret {
-                            HostTy::None => {}
+                            HostTy::None | HostTy::Handler => {}
                             HostTy::Float => out[0] = Val::F64(value.to_bits()),
                             HostTy::Int | HostTy::Bool => out[0] = Val::I32(value as i32),
                         }

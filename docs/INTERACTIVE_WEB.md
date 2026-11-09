@@ -71,6 +71,10 @@ browser (HTML / SVG / Audio), the WASM instance kept ALIVE after _start
   click + visuals + audio + read-input + loop + keyboard. Still to do (only if
   wanted): generic event *data* into handlers (passing the pressed key / coords —
   needs handler arguments through `__dispatch`), a curated kid API, templates.
+  **Beyond the browser:** `every` also compiles natively, where the board's
+  scheduler calls `p2w_dispatch(id)` with the same ids, and the `robot`
+  module's subscriptions (`robot.on_tilt(handler)`) reuse the same seam
+  (`docs/ROBOT.md`, `PICO_BACKEND.md`).
 - **Layer 5 — the page designer. DONE** (in `acornstem-ide`): a visual designer
   over an element IR (`src/formir.rs` there — open prop map, data-driven widget
   registry, pluggable `Export` trait; the HTML textarea, the canvas, and the

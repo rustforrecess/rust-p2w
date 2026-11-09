@@ -3682,14 +3682,19 @@ impl<'a> FuncEmitter<'a> {
             }
             ExprKind::Attr(obj, attr) => {
                 // `robot.FLIPPED` — a host-module constant, unless shadowed.
+                // States are ints, thresholds floats.
                 if let ExprKind::Name(m) = &obj.kind
                     && let Some(hm) = crate::hostmod::module(m)
                     && !self.vars.iter().any(|v| v == m)
                 {
-                    let Some(v) = hm.constant(attr) else {
+                    let Some(c) = hm.constant_def(attr) else {
                         return Err(format!("line {}: {m} has no attribute '{attr}'", e.line));
                     };
-                    let r = self.call_value(&format!("call i32 @p2w_float(double {v:?})"));
+                    let r = if c.ty == crate::hostmod::HostTy::Int {
+                        self.call_value(&format!("call i32 @p2w_int(i32 {})", c.value as i32))
+                    } else {
+                        self.call_value(&format!("call i32 @p2w_float(double {:?})", c.value))
+                    };
                     return Ok((r, Repr::Boxed));
                 }
                 // `Counter.limit` — a CLASS NAME base resolves at COMPILE
@@ -3865,6 +3870,23 @@ impl<'a> FuncEmitter<'a> {
         }
         let mut raw = Vec::new();
         for (a, (_, ty)) in args.iter().zip(hf.params) {
+            if *ty == HostTy::Handler {
+                // The handler's p2w_dispatch id, as every() hands over.
+                let ExprKind::Name(h) = &a.kind else {
+                    return Err(format!(
+                        "line {line}: {}",
+                        crate::hostmod::handler_error(hm.name, hf.name, None)
+                    ));
+                };
+                let Some(id) = handler_names(self.func_params).iter().position(|n| n == h) else {
+                    return Err(format!(
+                        "line {line}: {}",
+                        crate::hostmod::handler_error(hm.name, hf.name, Some(h))
+                    ));
+                };
+                raw.push(format!("i32 {id}"));
+                continue;
+            }
             let v = self.expr(a)?;
             let r = match ty {
                 HostTy::Float => {
@@ -3876,7 +3898,7 @@ impl<'a> FuncEmitter<'a> {
                     let w = self.call_value(&format!("zext i1 {b} to i32"));
                     format!("i32 {w}")
                 }
-                HostTy::Int | HostTy::None => {
+                HostTy::Int | HostTy::None | HostTy::Handler => {
                     let i = self.call_value(&format!("call i32 @p2w_unbox_int(i32 {v})"));
                     format!("i32 {i}")
                 }
@@ -3904,6 +3926,7 @@ impl<'a> FuncEmitter<'a> {
                 let r = self.call_value(&call);
                 self.call_value(&format!("call i32 @p2w_float(double {r})"))
             }
+            HostTy::Handler => unreachable!("a handler is a parameter, never a result"),
         })
     }
 
@@ -4988,10 +5011,14 @@ mod tests {
         // unboxed and p2w_float boxing happens at the dynamic sink (print).
         let out = ir("x = 3.5\nprint(x)\n");
         assert!(out.contains("declare i32 @p2w_float(double)"), "{out}");
-        let ir = crate::compile_to_llvm_ir("import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED)\nprint(robot.FLIPPED)\nprint(robot.tagged())\nrobot.stop()\n").unwrap();
+        let ir = crate::compile_to_llvm_ir("import robot\nrobot.set_motor(50, -50)\nprint(robot.read_distance(0))\nprint(robot.read_line(1))\nprint(robot.tilt())\nprint(robot.tilt() >= robot.FLIPPED_DEG)\nprint(robot.FLIPPED_DEG)\nprint(robot.tilt_state() == robot.LEVEL)\nprint(robot.FLIPPED)\nprint(robot.tag_state() == robot.FREE)\nrobot.stop()\n").unwrap();
         assert!(ir.contains("call void @p2w_robot_set_motor(i32 "), "{ir}");
         assert!(ir.contains("call double @p2w_robot_tilt()"), "{ir}");
-        assert!(ir.contains("declare i32 @p2w_robot_tagged()"), "{ir}");
+        assert!(ir.contains("declare i32 @p2w_robot_tag_state()"), "{ir}");
+        assert!(
+            ir.contains("call i32 @p2w_int(i32 2)"),
+            "robot.FLIPPED is the int 2: {ir}"
+        );
         // Every bool is widened before p2w_bool, which reads a full i32:
         // an i1 there left stray register bits deciding True or False.
         assert!(!ir.contains("p2w_bool(i1"), "{ir}");
@@ -5002,6 +5029,26 @@ mod tests {
         )
         .unwrap();
         assert!(ev.contains("call void @p2w_host_every(i32 %"), "{ev}");
+        // A subscription hands over a dispatch id the same way, as a constant.
+        let sub = crate::compile_to_llvm_ir(
+            "import robot\ndef zeta():\n    print(2)\ndef alpha():\n    print(1)\nrobot.on_tilt(zeta)\nrobot.on_tag(alpha)\n",
+        )
+        .unwrap();
+        assert!(sub.contains("call void @p2w_robot_on_tilt(i32 1)"), "{sub}");
+        assert!(sub.contains("call void @p2w_robot_on_tag(i32 0)"), "{sub}");
+        for (src, want) in [
+            (
+                "import robot\nrobot.on_tilt(3)\n",
+                "needs the name of a function, like robot.on_tilt(tilt_changed)",
+            ),
+            (
+                "import robot\ndef f(x):\n    return x\nrobot.on_tag(f)\n",
+                "'f' must be a function with no arguments to run with robot.on_tag()",
+            ),
+        ] {
+            let err = crate::compile_to_llvm_ir(src).unwrap_err();
+            assert!(err.contains(want), "{err}");
+        }
         assert!(ev.contains(", i32 1)"), "zeta is id 1 after alpha: {ev}");
         assert!(
             ev.contains("switch i32 %id, label %done [ i32 0, label %h0 i32 1, label %h1 ]"),
