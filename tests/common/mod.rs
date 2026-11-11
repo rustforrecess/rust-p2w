@@ -551,6 +551,19 @@ pub fn groups() -> Vec<Group> {
             ],
         },
         Group {
+            title: "Object attributes in fixed slots",
+            note: "An object's attributes are fixed by its class \
+                   (docs/CLASS_LAYOUT.md), so each has a slot: inherited ones \
+                   at the base's index in every subclass, `self.x` in a method \
+                   read and written directly, other objects through the \
+                   attribute's id. A class variable set through an instance \
+                   shadows it for that instance only.",
+            probes: vec![p(
+                "subclass, class-variable shadow, set from outside",
+                "class Base:\n    count = 10\n    def __init__(self):\n        self.a = 1\n    def bump(self):\n        self.count = self.count + 1\n        return self.count\nclass Kid(Base):\n    def __init__(self):\n        super().__init__()\n        self.b = 2\n    def total(self):\n        return self.a + self.b\ndef poke(o):\n    o.a = 50\n    return o.a\nk = Kid()\nprint(k.total())\nprint(k.bump(), k.bump(), Base.count)\nprint(poke(k), k.total())\nother = Base()\nprint(other.count, other.a)\n",
+            )],
+        },
+        Group {
             title: "global",
             note: "A function's `global` names are the module's variables: \
                    assigning one sets the module variable on both backends, \

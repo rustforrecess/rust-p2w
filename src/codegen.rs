@@ -102,6 +102,14 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         uses_files: program_calls_open(stmts),
         ..Gen::default()
     };
+    g.slot_layouts = crate::attrs::slot_layouts(stmts);
+    let all_attrs: std::collections::BTreeSet<&String> =
+        g.slot_layouts.values().flatten().collect();
+    g.attr_ids = all_attrs
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| (a.clone(), i as i32))
+        .collect();
 
     // Pass 1: collect function and class signatures so calls/construction
     // (including mutual recursion) resolve regardless of definition order.
@@ -464,13 +472,20 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .types
         .push("(type $METHOD (struct (field (ref $MFUNC))))".into());
+    // $SLOTMAP: a class's attribute-id -> slot table (-1 = no such slot).
+    module.types.push("(type $SLOTMAP (array i32))".into());
     // $CLASS self-references via $base, so it lives in a singleton rec group.
+    // Fields: name, methods + class variables, base, slot map, slot count.
     module.types.push(
-        "(rec (type $CLASS (struct (field (ref null any)) (field (ref null $DICT)) (field (ref null $CLASS)))))".into(),
+        "(rec (type $CLASS (struct (field (ref null any)) (field (ref null $DICT)) (field (ref null $CLASS)) (field (ref null $SLOTMAP)) (field i32))))".into(),
     );
+    // An instance: its class and its attribute slots (null = not set yet).
+    // A class's attributes are fixed at compile time (docs/CLASS_LAYOUT.md);
+    // a base's slots come first, so an inherited attribute has the same
+    // index in every subclass.
     module
         .types
-        .push("(type $OBJECT (struct (field (ref $CLASS)) (field (ref null $DICT))))".into());
+        .push("(type $OBJECT (struct (field (ref $CLASS)) (field (ref $ITEMS))))".into());
     module
         .imports
         .push(r#"(import "env" "write_char" (func $write_char (param i32)))"#.into());
@@ -6078,7 +6093,7 @@ fn class_helpers() -> Vec<Func> {
     // (if defined) with self prepended.
     let mut b = Body::new();
     b.push(
-        "(local.set $obj (struct.new $OBJECT (ref.cast (ref $CLASS) (local.get $class)) (struct.new $DICT (i32.const 0) (array.new_fixed $ITEMS 0) (array.new_fixed $ITEMS 0))))",
+        "(local.set $obj (struct.new $OBJECT (ref.cast (ref $CLASS) (local.get $class)) (array.new $ITEMS (ref.null any) (struct.get $CLASS 4 (local.get $class)))))",
     );
     b.push(format!(
         "(local.set $init (call $class_lookup_method (local.get $class) {}))",
@@ -6101,8 +6116,10 @@ fn class_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $obj_getattr: attribute read — the instance dict first, then the class
-    // chain (class variables). A class entry that is a $METHOD would be a bound
+    // $obj_getattr: attribute read when the object's class isn't known at
+    // compile time — the attribute's module-wide id finds its slot through the
+    // class's slot map; an absent or unset slot falls back to the class chain
+    // (class variables). A class entry that is a $METHOD would be a bound
     // method, which v1 can't yield as a value -> clean error.
     let mut b = Body::new();
     b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
@@ -6110,12 +6127,16 @@ fn class_helpers() -> Vec<Func> {
         1,
         "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
     );
-    b.push("(local.set $attrs (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) (local.get $obj))))");
-    b.push("(local.set $idx (call $dict_find (local.get $attrs) (local.get $name)))");
+    b.push("(local.set $idx (call $slot_of (local.get $obj) (local.get $aid)))");
     b.push("(if (i32.ge_s (local.get $idx) (i32.const 0))");
+    b.push_in(1, "(then");
     b.push_in(
-        1,
-        "(then (return (array.get $ITEMS (struct.get $DICT 2 (local.get $attrs)) (local.get $idx)))))",
+        2,
+        "(local.set $m (array.get $ITEMS (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $idx)))",
+    );
+    b.push_in(
+        2,
+        "(if (i32.eqz (ref.is_null (local.get $m))) (then (return (local.get $m))))))",
     );
     // Fall back to the class namespace (class variables shared by instances).
     b.push(
@@ -6134,13 +6155,9 @@ fn class_helpers() -> Vec<Func> {
     b.push("(local.get $m)");
     fs.push(Func {
         signature:
-            "(func $obj_getattr (param $obj (ref null any)) (param $name (ref null any)) (result (ref null any))"
+            "(func $obj_getattr (param $obj (ref null any)) (param $aid i32) (param $name (ref null any)) (result (ref null any))"
                 .into(),
-        locals: vec![
-            "(local $idx i32)".into(),
-            "(local $attrs (ref null $DICT))".into(),
-            "(local $m (ref null any))".into(),
-        ],
+        locals: vec!["(local $idx i32)".into(), "(local $m (ref null any))".into()],
         body: b,
     });
 
@@ -6199,21 +6216,44 @@ fn class_helpers() -> Vec<Func> {
         body: b,
     });
 
-    // $obj_setattr: instance attribute write.
+    // $slot_of: the slot of attribute id `aid` in `obj`'s class, or -1
+    // (`obj` must be an $OBJECT; a negative id has no slot anywhere).
+    let mut b = Body::new();
+    b.push("(if (i32.lt_s (local.get $aid) (i32.const 0)) (then (return (i32.const -1))))");
+    b.push(
+        "(array.get $SLOTMAP (struct.get $CLASS 3 (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj)))) (local.get $aid))",
+    );
+    fs.push(Func {
+        signature: "(func $slot_of (param $obj (ref null any)) (param $aid i32) (result i32)"
+            .into(),
+        locals: vec![],
+        body: b,
+    });
+
+    // $obj_setattr: instance attribute write when the object's class isn't
+    // known at compile time. A class without that attribute is CPython's
+    // AttributeError for a class with __slots__: the compiler has already
+    // refused every such assignment it could see.
     let mut b = Body::new();
     b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
     b.push_in(
         1,
         "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
     );
+    b.push("(local.set $idx (call $slot_of (local.get $obj) (local.get $aid)))");
+    b.push("(if (i32.lt_s (local.get $idx) (i32.const 0))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
     b.push(
-        "(call $dict_set (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name) (local.get $val))",
+        "(array.set $ITEMS (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $idx) (local.get $val))",
     );
     fs.push(Func {
         signature:
-            "(func $obj_setattr (param $obj (ref null any)) (param $name (ref null any)) (param $val (ref null any))"
+            "(func $obj_setattr (param $obj (ref null any)) (param $aid i32) (param $name (ref null any)) (param $val (ref null any))"
                 .into(),
-        locals: vec![],
+        locals: vec!["(local $idx i32)".into()],
         body: b,
     });
 
@@ -6402,6 +6442,11 @@ struct Gen {
     /// resolves at compile time (classes aren't runtime values).
     class_var_names: HashMap<String, Vec<String>>,
     class_method_names: HashMap<String, Vec<String>>,
+    /// Each class's attribute slots (`attrs::slot_layouts`), and a
+    /// module-wide id per attribute name, used when an object's class isn't
+    /// known at compile time.
+    slot_layouts: std::collections::BTreeMap<String, Vec<String>>,
+    attr_ids: std::collections::BTreeMap<String, i32>,
     /// Top-level Python variables, in definition order — WASM globals named
     /// `$g_<name>` so function bodies can read them.
     globals: Vec<String>,
@@ -6516,6 +6561,8 @@ struct FuncCx {
     /// real `self`. `None` at top level and in plain functions.
     current_class: Option<String>,
     self_name: Option<String>,
+    /// In a method that never rebinds `self` (see `Gen::self_slot`).
+    self_fixed: bool,
     /// Typed-slot tier: locals proven Int/Float by the SHARED inference
     /// (src/repr.rs) live in raw i32/f64 wasm locals. Absent = boxed.
     reprs: HashMap<String, Repr>,
@@ -6688,7 +6735,7 @@ impl Gen {
                 }
                 let o = self.value_expr(cx, obj)?;
                 let v = self.value_expr(cx, value)?;
-                out.push(format!("(call $obj_setattr {o} {} {v})", str_lit(attr)));
+                out.push(self.set_attr_wat(cx, obj, &o, attr, &v));
                 Ok(())
             }
             // Imports are recorded in pass 1; nothing to emit here.
@@ -7123,6 +7170,59 @@ impl Gen {
         })
     }
 
+    /// The slot of `self.<attr>` in a method whose `self` is never rebound,
+    /// when the class has that attribute: `self` is then an instance of the
+    /// method's class or a subclass, and subclasses keep the base's slots at
+    /// the same indices. For a read, an attribute that is also a class
+    /// variable is left to the generic path, where an unset slot means "read
+    /// the class variable".
+    fn self_slot(&self, cx: &FuncCx, obj: &Expr, attr: &str, read: bool) -> Option<usize> {
+        if !cx.self_fixed {
+            return None;
+        }
+        let ExprKind::Name(n) = &obj.kind else {
+            return None;
+        };
+        if Some(n) != cx.self_name.as_ref() {
+            return None;
+        }
+        let class = cx.current_class.as_deref()?;
+        if read {
+            let mut cur = Some(class.to_string());
+            let mut hops = 0;
+            while let Some(c) = cur {
+                if self
+                    .class_var_names
+                    .get(&c)
+                    .is_some_and(|vs| vs.iter().any(|v| v == attr))
+                {
+                    return None;
+                }
+                hops += 1;
+                if hops > self.classes.len() {
+                    break;
+                }
+                cur = self.classes.get(&c).cloned().flatten();
+            }
+        }
+        self.slot_layouts.get(class)?.iter().position(|s| s == attr)
+    }
+
+    /// `obj.attr = value` as WAT: a direct slot store for `self.x` in a
+    /// method, otherwise through the attribute's module-wide id.
+    fn set_attr_wat(&self, cx: &FuncCx, obj: &Expr, o: &str, attr: &str, v: &str) -> String {
+        if let Some(k) = self.self_slot(cx, obj, attr, false) {
+            return format!(
+                "(array.set $ITEMS (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) {o})) (i32.const {k}) {v})"
+            );
+        }
+        let aid = self.attr_ids.get(attr).copied().unwrap_or(-1);
+        format!(
+            "(call $obj_setattr {o} (i32.const {aid}) {} {v})",
+            str_lit(attr)
+        )
+    }
+
     /// `math.<fn>(args)`. sqrt/fabs return a float; floor/ceil/trunc return an
     /// int (Python's behavior). sqrt/fabs/floor/ceil/trunc are single WASM
     /// instructions; exp/log/log2/log10/pow call the vendored libm WAT
@@ -7462,6 +7562,7 @@ impl Gen {
         let mut cx = FuncCx {
             current_class: Some(class.to_string()),
             self_name: Some(self_name.clone()),
+            self_fixed: !crate::hoist::function_locals(&[], &m.body).contains(self_name),
             ..Default::default()
         };
         for p in &m.params {
@@ -7548,9 +7649,21 @@ impl Gen {
             Some(b) => format!("(global.get $g_class_{b})"),
             None => "(ref.null $CLASS)".to_string(),
         };
+        let slots = self.slot_layouts.get(name).cloned().unwrap_or_default();
+        let map: Vec<String> = self
+            .attr_ids
+            .keys()
+            .map(|a| {
+                let k = slots.iter().position(|s| s == a).map_or(-1, |k| k as i32);
+                format!("(i32.const {k})")
+            })
+            .collect();
         out.push(format!(
-            "(global.set $g_class_{name} (struct.new $CLASS {} (local.get $.cd) {base_ref}))",
-            str_lit(name)
+            "(global.set $g_class_{name} (struct.new $CLASS {} (local.get $.cd) {base_ref} (array.new_fixed $SLOTMAP {} {}) (i32.const {})))",
+            str_lit(name),
+            map.len(),
+            map.join(" "),
+            slots.len()
         ));
         Ok(())
     }
@@ -7635,10 +7748,7 @@ impl Gen {
             }
             ExprKind::Attr(obj, attr) => {
                 let ow = self.value_expr(cx, obj)?;
-                out.push(format!(
-                    "(call $obj_setattr {ow} {} {value_wat})",
-                    str_lit(attr)
-                ));
+                out.push(self.set_attr_wat(cx, obj, &ow, attr, value_wat));
             }
             _ => return Err(CompileError::at(target.line, "invalid unpacking target")),
         }
@@ -8219,7 +8329,20 @@ impl Gen {
                     .with_fact(Fact::missing_part(cn, name, &[])));
                 }
                 let o = self.value_expr(cx, obj)?;
-                Ok(format!("(call $obj_getattr {o} {})", str_lit(name)))
+                if let Some(k) = self.self_slot(cx, obj, name, true) {
+                    // `self.x` in a method: x's slot is known here. The name
+                    // literal is built only on the error path.
+                    let t = cx.scratch_local(VAL);
+                    return Ok(format!(
+                        "(block (result (ref null any)) (local.set ${t} (array.get $ITEMS (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) {o})) (i32.const {k}))) (if (ref.is_null (local.get ${t})) (then (call $raise_no_attr {o} {}))) (local.get ${t}))",
+                        str_lit(name)
+                    ));
+                }
+                let aid = self.attr_ids.get(name).copied().unwrap_or(-1);
+                Ok(format!(
+                    "(call $obj_getattr {o} (i32.const {aid}) {})",
+                    str_lit(name)
+                ))
             }
             ExprKind::ListComp { element, clauses } => {
                 let acc = cx.scratch_local(VAL);

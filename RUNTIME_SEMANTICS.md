@@ -275,6 +275,14 @@ Decorate-sort-undecorate, built as ordinary synthesized Python AST (list literal
 | `sorted(xs, key=len, reverse=True)` | value | `['banana', 'kiwi', 'fig', 'ox']` |
 | `sorted(xs, key=<user def>)` | value | `[5, 4, 3, 1, 1]` |
 
+## Object attributes in fixed slots
+
+An object's attributes are fixed by its class (docs/CLASS_LAYOUT.md), so each has a slot: inherited ones at the base's index in every subclass, `self.x` in a method read and written directly, other objects through the attribute's id. A class variable set through an instance shadows it for that instance only.
+
+| program | where | result |
+|---|---|---|
+| `subclass, class-variable shadow, set from outside` | value | `3 ⏎ 11 12 10 ⏎ 50 52 ⏎ 10 1` |
+
 ## global
 
 A function's `global` names are the module's variables: assigning one sets the module variable on both backends, from a def, a method, a loop variable, an unpacking and a lifted nested def. Natively they are `@g_<name>` globals, always boxed; in WASM, module globals the inference leaves boxed because a function writes them.
