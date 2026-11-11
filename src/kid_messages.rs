@@ -99,6 +99,21 @@ const TABLE: &[Kid] = &[
         "Check this variable holds a list.",
     ),
     kid(
+        &msg::ATTR_UNSET,
+        "This object was never given that part.",
+        "Make sure `__init__` sets it every time, not only inside an `if`.",
+    ),
+    kid(
+        &msg::ATTR_NO_SLOT,
+        "This object doesn't have a part with that name to change.",
+        "Check the spelling after the dot, or give the class that part in `__init__`.",
+    ),
+    kid(
+        &msg::ATTR_SLOT_RANGE,
+        "Something went wrong inside the compiler, not in your program.",
+        "Tell your teacher, and show them this program.",
+    ),
+    kid(
         &msg::INDEX_OUT_OF_RANGE,
         "You asked for an item past the end of the {seq}.",
         "Items start at 0, so check the number inside the [ ].",

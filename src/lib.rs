@@ -934,7 +934,10 @@ print(\"sum of evens:\", total)
         assert!(ir.contains("call i32 @p2w_obj_new(i32 0, i32 1)"), "{ir}");
         assert!(ir.contains("call i32 @p2w_slot_get(i32 "), "{ir}");
         assert!(ir.contains("call void @p2w_slot_set(i32 "), "{ir}");
-        assert!(ir.contains("define i32 @p2w_slot_of(i32 %cid, i32 %aid)"), "{ir}");
+        assert!(
+            ir.contains("define i32 @p2w_slot_of(i32 %cid, i32 %aid)"),
+            "{ir}"
+        );
         assert!(ir.contains("define i32 @dyn_get_0"), "dispatcher: {ir}");
         assert!(ir.contains("define i32 @p2w_obj_repr"), "{ir}");
         // Every module defines p2w_obj_repr (the runtime links against it),

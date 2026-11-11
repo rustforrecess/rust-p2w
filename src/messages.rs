@@ -123,6 +123,27 @@ pub const ATTR_NO_APPEND: Msg = m(
     "AttributeError: '{type}' object has no attribute 'append'",
 );
 
+/// An attribute the object's class has but this object hasn't been given
+/// yet (its `__init__` sets it only on some paths). The native runtime reads
+/// a fixed slot and has neither the class nor the attribute name at hand.
+pub const ATTR_UNSET: Msg = m(
+    "attr.unset",
+    "AttributeError: this object's attribute hasn't been set yet",
+);
+
+/// Setting an attribute the object's class doesn't have, when the compiler
+/// couldn't see the object's class (it refuses the cases it can see).
+pub const ATTR_NO_SLOT: Msg = m(
+    "attr.no-slot",
+    "AttributeError: this object has no attribute with that name to set",
+);
+
+/// A compiler bug, never a student's: a slot index past the object's slots.
+pub const ATTR_SLOT_RANGE: Msg = m(
+    "attr.slot-range",
+    "internal error: attribute slot out of range",
+);
+
 // --- IndexError / KeyError ---------------------------------------------------
 
 pub const INDEX_OUT_OF_RANGE: Msg = m("index.out-of-range", "IndexError: {seq} index out of range");

@@ -2204,7 +2204,7 @@ fn slot_addr(obj: Value, idx: i32) -> usize {
     }
     let o = obj as usize;
     if idx < 0 || idx as u32 >= rd(o + 12) {
-        trap("attribute slot out of range");
+        trap_msg(&messages::ATTR_SLOT_RANGE, "");
     }
     o + 16 + 4 * idx as usize
 }
@@ -2216,7 +2216,7 @@ fn slot_addr(obj: Value, idx: i32) -> usize {
 pub extern "C" fn p2w_slot_get(obj: Value, idx: i32) -> Value {
     let v = rd(slot_addr(obj, idx)) as Value;
     if v == 0 {
-        trap("this object's attribute hasn't been set yet");
+        trap_msg(&messages::ATTR_UNSET, "");
     }
     owned(v)
 }
@@ -2338,7 +2338,7 @@ pub extern "C" fn p2w_method_not_value() -> Value {
 pub extern "C" fn p2w_setattr(obj: Value, attr_id: i32, value: Value) {
     let idx = slot_of(obj, attr_id);
     if idx < 0 {
-        trap("this object has no attribute with that name to set");
+        trap_msg(&messages::ATTR_NO_SLOT, "");
     }
     p2w_slot_set(obj, idx, value);
 }

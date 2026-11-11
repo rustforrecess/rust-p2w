@@ -555,7 +555,10 @@ fn emit_class_glue(classes: &ClassTable, dispatchers: &[(String, usize)]) -> (St
             .filter(|&i| !classes.decls[i].slots.is_empty())
             .map(|i| format!("i32 {i}, label %c{i}"))
             .collect();
-        b.push_str(&format!("  switch i32 %cid, label %none [ {} ]\n", arms.join(" ")));
+        b.push_str(&format!(
+            "  switch i32 %cid, label %none [ {} ]\n",
+            arms.join(" ")
+        ));
         for (i, d) in classes.decls.iter().enumerate() {
             if d.slots.is_empty() {
                 continue;
@@ -2379,7 +2382,9 @@ impl<'a> FuncEmitter<'a> {
                 let (ov, oo) = self.expr_borrow(obj)?;
                 let v = self.expr(value)?;
                 if let Some(k) = self.self_slot(obj, attr, false) {
-                    self.line(&format!("call void @p2w_slot_set(i32 {ov}, i32 {k}, i32 {v})"));
+                    self.line(&format!(
+                        "call void @p2w_slot_set(i32 {ov}, i32 {k}, i32 {v})"
+                    ));
                 } else {
                     let aid = self.classes.attr_ids.get(attr).copied().unwrap_or(-1);
                     self.line(&format!(
@@ -4115,7 +4120,10 @@ impl<'a> FuncEmitter<'a> {
             return None;
         }
         let id = *self.classes.ids.get(class)?;
-        self.classes.decls[id as usize].slots.iter().position(|s| s == attr)
+        self.classes.decls[id as usize]
+            .slots
+            .iter()
+            .position(|s| s == attr)
     }
 
     fn method_call(&mut self, obj: &Expr, method: &str, args: &[Expr]) -> Result<String, String> {
