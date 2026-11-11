@@ -168,8 +168,35 @@ in v1 above).
   you can store/pass needs the closure machinery we're otherwise avoiding.
 - **`__slots__` optimization** (per-class typed struct, O(1) fields) — a perf
   pass; v1 uses the `$DICT` attrs uniformly (fine at classroom scale).
-- **Multiple inheritance / MRO / metaclasses / descriptors** — p2w doesn't do
-  these either; likely never for the K-12 scope.
+- **General multiple inheritance / metaclasses / descriptors** — p2w doesn't
+  do these either; likely never for the K-12 scope. Today two bases is a
+  clean compile error ("multiple inheritance isn't supported — one base class
+  only").
+- **Restricted multiple inheritance: one data base plus mixins** — a
+  possible later feature, NOT scheduled; build it when a lesson asks for
+  "adds abilities" composition (the idea behind Rust traits, Swift protocols,
+  Scala traits). Noted 2026-11-08 so the design is not re-derived:
+  - *Rule:* at most one base may set instance attributes; every other base
+    is a mixin that defines methods only. Every accepted program is valid
+    Python with CPython's behavior.
+  - *Dispatch:* every class is known statically, so the compiler computes
+    CPython's C3 MRO once per class and builds that class's method table
+    with the mixin methods in it. A call costs what it costs today. A class
+    hierarchy C3 rejects is a compile error, as CPython makes it a
+    TypeError.
+  - *`isinstance(x, Mixin)`:* a precomputed per-class ancestor table, one
+    lookup.
+  - *`super()` inside a mixin:* its target depends on the class the mixin is
+    mixed into. **Chosen approach: compile one copy of each mixin method per
+    class that uses it** (as Rust monomorphizes generics), so each copy's
+    `super()` resolves at compile time, exactly as the single-inheritance
+    `super()` does now. Costs code size, not speed. (The alternative,
+    forbidding `super()` in mixins, was rejected as needlessly restrictive.)
+  - *Layout:* not an obstacle while instances keep an attribute dict; a
+    future `__slots__` pass keeps fixed fields to the data base's chain.
+  - It would let `class Tilt(Angle, Enum)` compile, but an enum whose
+    members are angles is still Enum's own member-construction machinery,
+    so `robot.AngleEnum` (docs/UNITS.md) is needed either way.
 
 ## Two-color / RT interaction
 
