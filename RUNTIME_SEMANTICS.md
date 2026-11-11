@@ -282,6 +282,11 @@ An object's attributes are fixed by its class (docs/CLASS_LAYOUT.md), so each ha
 | program | where | result |
 |---|---|---|
 | `subclass, class-variable shadow, set from outside` | value | `3 ⏎ 11 12 10 ⏎ 50 52 ⏎ 10 1` |
+| `a subclass's class variable read through a base method` | value | `1 50` |
+| `a comprehension variable named self` | value | `['z-n']` |
+| `the value is evaluated before the object` | value | `5 0 ⏎ [7, 9, 9]` |
+| `attributes as unpacking targets` | value | `[1] x` |
+| `__init__ calls a helper that sets attributes` | value | `1 0` |
 
 ## global
 

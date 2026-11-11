@@ -153,7 +153,7 @@ declare i32 @p2w_obj_new(i32, i32)
 declare i32 @p2w_class_id(i32)
 declare i32 @p2w_getattr(i32, i32, i32)
 declare void @p2w_setattr(i32, i32, i32)
-declare i32 @p2w_slot_get(i32, i32)
+declare i32 @p2w_slot_peek(i32, i32)
 declare void @p2w_slot_set(i32, i32, i32)
 declare i32 @p2w_no_such_method()
 declare i32 @p2w_unsupported_operand()
@@ -925,8 +925,7 @@ fn emit_function(
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(sigs, name);
     f.current_class = current_class.map(str::to_string);
-    f.self_fixed =
-        current_class.is_some() && !crate::hoist::function_locals(&[], body).contains("self");
+    f.self_fixed = current_class.is_some() && !crate::attrs::rebinds(body, "self");
     // Module globals this function reads and does not shadow with a local,
     // or declares `global`.
     let locals = crate::hoist::function_locals(params, body);
@@ -2379,9 +2378,12 @@ impl<'a> FuncEmitter<'a> {
                 // `obj.attr = value` — the object is borrowed and the value
                 // transferred in. `self.x` in a method stores straight into
                 // x's slot; otherwise the attribute's module-wide id finds it.
-                let (ov, oo) = self.expr_borrow(obj)?;
+                // CPython evaluates the value first, then the object. The
+                // other order borrowed `g` before `g.x = f()` ran f, and f
+                // could free the object being written to.
                 let v = self.expr(value)?;
-                if let Some(k) = self.self_slot(obj, attr, false) {
+                let (ov, oo) = self.expr_borrow(obj)?;
+                if let Some(k) = self.self_slot(obj, attr) {
                     self.line(&format!(
                         "call void @p2w_slot_set(i32 {ov}, i32 {k}, i32 {v})"
                     ));
@@ -2573,9 +2575,19 @@ impl<'a> FuncEmitter<'a> {
                     line,
                     span: (0, 0),
                 },
+                // `self.a, self.b = a, b` — as the WASM backend accepts.
+                ExprKind::Attr(o, attr) => Stmt {
+                    kind: StmtKind::SetAttr {
+                        obj: (**o).clone(),
+                        attr: attr.clone(),
+                        value: elem,
+                    },
+                    line,
+                    span: (0, 0),
+                },
                 _ => {
                     return Err(format!(
-                        "line {line}: an unpacking target must be a variable or an index"
+                        "line {line}: an unpacking target must be a variable, an index or an attribute"
                     ));
                 }
             };
@@ -3794,8 +3806,35 @@ impl<'a> FuncEmitter<'a> {
                 // module-wide id finds the slot, and the interned name (owned
                 // +1, borrowed by getattr) serves the class-variable fallback.
                 let (ov, oo) = self.expr_borrow(obj)?;
-                if let Some(k) = self.self_slot(obj, attr, true) {
-                    let r = self.call_value(&format!("call i32 @p2w_slot_get(i32 {ov}, i32 {k})"));
+                if let Some(k) = self.self_slot(obj, attr) {
+                    // One load when the slot is set. An unset slot takes the
+                    // full lookup: `self` may be a subclass instance whose
+                    // class supplies `attr` as a class variable.
+                    let tmp = format!("%sg{}", self.next_label);
+                    self.allocas.push_str(&format!("  {tmp} = alloca i32\n"));
+                    let raw =
+                        self.call_value(&format!("call i32 @p2w_slot_peek(i32 {ov}, i32 {k})"));
+                    self.line(&format!("store i32 {raw}, ptr {tmp}"));
+                    let unset = self.call_value(&format!("icmp eq i32 {raw}, 0"));
+                    let miss = self.fresh_label("slotmiss");
+                    let join = self.fresh_label("slotjoin");
+                    self.terminator(&format!("br i1 {unset}, label %{miss}, label %{join}"));
+                    self.place_label(&miss);
+                    let name = self.expr(&Expr {
+                        kind: ExprKind::Str(attr.clone()),
+                        line: e.line,
+                        span: (0, 0),
+                        full_span: (0, 0),
+                    })?;
+                    let aid = self.classes.attr_ids.get(attr).copied().unwrap_or(-1);
+                    let found = self.call_value(&format!(
+                        "call i32 @p2w_getattr(i32 {ov}, i32 {aid}, i32 {name})"
+                    ));
+                    self.release(&name);
+                    self.line(&format!("store i32 {found}, ptr {tmp}"));
+                    self.br_to(&join);
+                    self.place_label(&join);
+                    let r = self.call_value(&format!("load i32, ptr {tmp}"));
                     self.release_if_owned(&ov, oo);
                     return Ok((r, Repr::Boxed));
                 }
@@ -4096,10 +4135,9 @@ impl<'a> FuncEmitter<'a> {
     }
 
     /// The slot of `self.<attr>` when this is a method whose `self` is fixed
-    /// and the class has that attribute. For a read, an attribute that is
-    /// also a class variable is left to the generic path: an unset slot
-    /// there means "read the class variable", which only the fallback knows.
-    fn self_slot(&self, obj: &Expr, attr: &str, read: bool) -> Option<usize> {
+    /// and the class has that attribute. A read must still treat an unset
+    /// slot as "look further" (class variables, possibly a subclass's).
+    fn self_slot(&self, obj: &Expr, attr: &str) -> Option<usize> {
         if !self.self_fixed {
             return None;
         }
@@ -4110,15 +4148,6 @@ impl<'a> FuncEmitter<'a> {
             return None;
         }
         let class = self.current_class.as_deref()?;
-        if read
-            && self
-                .classes
-                .chain(class)
-                .iter()
-                .any(|d| d.class_vars.iter().any(|(v, _)| v == attr))
-        {
-            return None;
-        }
         let id = *self.classes.ids.get(class)?;
         self.classes.decls[id as usize]
             .slots

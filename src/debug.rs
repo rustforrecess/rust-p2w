@@ -2068,6 +2068,10 @@ pub struct Vm {
     /// Classes registered by executed `class` statements: name -> (base,
     /// directly-defined methods). Lookup walks the base chain (hop-capped).
     classes: HashMap<String, VmClass>,
+    /// Each class's fixed attribute set (`attrs::slot_layouts`): Run gives an
+    /// object exactly these, so Step refuses a store outside them the same
+    /// way, with Run's message.
+    attr_sets: HashMap<String, HashSet<String>>,
     output: String,
     status: Status,
     watchpoints: Vec<Watchpoint>,
@@ -2100,6 +2104,10 @@ impl Vm {
         let mut program = crate::hoist::hoist_nested_functions(program)?;
         crate::fnval::resolve(&mut program)?; // same first-class-function desugar Run gets
         crate::check::gate(&program)?; // Step refuses what Run refuses
+        let attr_sets = crate::attrs::slot_layouts(&program)
+            .into_iter()
+            .map(|(class, slots)| (class, slots.into_iter().collect()))
+            .collect();
         let module = VmFrame {
             func: "<module>".to_string(),
             work: vec![Task::Next(Rc::new(program), 0)],
@@ -2114,6 +2122,7 @@ impl Vm {
             frames: vec![module],
             funcs: HashMap::new(),
             classes: HashMap::new(),
+            attr_sets,
             output: String::new(),
             status: Status::Finished,
             watchpoints: Vec::new(),
@@ -2935,6 +2944,16 @@ impl Vm {
                         &[("type", &type_label(&objv)), ("name", &attr)],
                     ));
                 };
+                if self
+                    .attr_sets
+                    .get(&o.class)
+                    .is_some_and(|set| !set.contains(&attr))
+                {
+                    return Err(fill_msg(
+                        &crate::messages::ATTR_MISSING,
+                        &[("type", &o.class), ("name", &attr)],
+                    ));
+                }
                 o.attrs.borrow_mut().insert(attr, value);
             }
             Task::ToDisplay => {

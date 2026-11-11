@@ -96,8 +96,9 @@ all work (compile-time switch dispatch on a per-instance class id; reference
 semantics and leak-freedom are oracle-gated). Differences:
 
 - **An object's attributes are fixed by its class** (since 2026-11-08): its
-  class variables, what its `__init__` sets on `self`, and its base's; with
-  `__slots__`, exactly the slots. Setting any other attribute, such as a
+  class variables, what its `__init__` sets on `self` (including in methods
+  `__init__` calls on `self`), and its base's; with `__slots__`, exactly the
+  slots, and class variables are read-only through an instance. Setting any other attribute, such as a
   misspelt `self.speeed`, is a compile error with did-you-mean. CPython
   would create the attribute, so this is a subset rule (every accepted
   program is valid Python); it is the rule CPython applies to classes with

@@ -123,12 +123,20 @@ pub const ATTR_NO_APPEND: Msg = m(
     "AttributeError: '{type}' object has no attribute 'append'",
 );
 
-/// An attribute the object's class has but this object hasn't been given
-/// yet (its `__init__` sets it only on some paths). The native runtime reads
-/// a fixed slot and has neither the class nor the attribute name at hand.
-pub const ATTR_UNSET: Msg = m(
-    "attr.unset",
-    "AttributeError: this object's attribute hasn't been set yet",
+/// The native runtime's form of `attr.missing`: an attribute the object
+/// doesn't have, or hasn't been given yet (its `__init__` sets it only on
+/// some paths). After the slot and class-variable lookups it has neither the
+/// class name nor the attribute name at hand.
+pub const ATTR_NOT_FOUND: Msg = m(
+    "attr.not-found",
+    "AttributeError: this object has no attribute with that name",
+);
+
+/// The native runtime's form of `attr.missing` for a value that isn't an
+/// object at all (`None.x`): it knows the type but not the attribute name.
+pub const ATTR_NOT_OBJECT: Msg = m(
+    "attr.not-object",
+    "AttributeError: a '{type}' value has no attributes",
 );
 
 /// Setting an attribute the object's class doesn't have, when the compiler

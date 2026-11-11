@@ -4,7 +4,8 @@
 //!
 //! A class's attributes are its class variables, the attributes its
 //! `__init__` sets on `self` (anywhere in `__init__`, including inside `if`
-//! and loops), and everything its base class has. Assigning any other
+//! and loops, and in the methods `__init__` calls on `self`, transitively),
+//! and everything its base class has. Assigning any other
 //! attribute is a compile error on every surface. CPython accepts such a
 //! program, so this is a subset rule: every program p2w accepts is still
 //! valid Python. It is the rule CPython itself applies to a class with
@@ -12,10 +13,10 @@
 //! lets each class get a fixed layout.
 //!
 //! A class that declares `__slots__` as a tuple or list of names gets exactly
-//! those, plus its class variables: even its `__init__` can't set another,
-//! as in CPython.
+//! those: even its `__init__` can't set another, and its class variables are
+//! read-only through an instance, as in CPython.
 
-use crate::ast::{ExprKind, Stmt, StmtKind};
+use crate::ast::{CompClause, Expr, ExprKind, Stmt, StmtKind};
 use crate::error::{CompileError, ErrorKind};
 use crate::lint::for_each_child_block;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,36 +26,90 @@ use std::collections::{BTreeMap, BTreeSet};
 type OwnSets<'a> = BTreeMap<&'a str, (Option<&'a str>, BTreeSet<String>)>;
 
 fn own_sets(program: &[Stmt]) -> OwnSets<'_> {
-    let mut own: OwnSets = BTreeMap::new();
+    // Every class's methods and base, so a helper `__init__` calls can be
+    // found in the class or one of its bases.
+    let mut classes: BTreeMap<&str, (Option<&str>, &[crate::ast::Method])> = BTreeMap::new();
     for s in program {
         if let StmtKind::ClassDef {
             name,
             base,
             methods,
-            class_vars,
+            ..
         } = &s.kind
         {
-            let mut set: BTreeSet<String> = class_vars.iter().map(|(n, _)| n.clone()).collect();
+            classes.insert(name, (base.as_deref(), methods));
+        }
+    }
+    let find = |class: &str, method: &str| -> Option<&crate::ast::Method> {
+        let mut cur = Some(class);
+        for _ in 0..=classes.len() {
+            let (base, methods) = classes.get(cur?)?;
+            if let Some(m) = methods.iter().find(|m| m.name == method) {
+                return Some(m);
+            }
+            cur = *base;
+        }
+        None
+    };
+
+    let mut own: OwnSets = BTreeMap::new();
+    for s in program {
+        if let StmtKind::ClassDef {
+            name,
+            base,
+            class_vars,
+            ..
+        } = &s.kind
+        {
             if let Some(slots) = declared_slots(class_vars) {
-                set.extend(slots);
-                own.insert(name, (base.as_deref(), set));
+                own.insert(name, (base.as_deref(), slots.into_iter().collect()));
                 continue;
             }
-            for m in methods.iter().filter(|m| m.name == "__init__") {
-                if let Some(this) = m.params.first() {
-                    each_attr_target(&m.body, &mut |obj, attr, _| {
-                        if obj == Some(this.as_str()) {
-                            set.insert(attr.to_string());
-                        }
-                        Ok(())
-                    })
-                    .ok();
+            let mut set: BTreeSet<String> = class_vars.iter().map(|(n, _)| n.clone()).collect();
+            // `__init__`, then every method it calls on `self`, transitively:
+            // `def __init__(self): self.reset()` gives the object what
+            // `reset` sets.
+            let mut todo = vec!["__init__".to_string()];
+            let mut done = BTreeSet::new();
+            while let Some(mname) = todo.pop() {
+                if !done.insert(mname.clone()) {
+                    continue;
                 }
+                let Some(m) = find(name, &mname) else {
+                    continue;
+                };
+                let Some(this) = m.params.first() else {
+                    continue;
+                };
+                each_attr_target(&m.body, &mut |obj, attr, _| {
+                    if obj == Some(this.as_str()) {
+                        set.insert(attr.to_string());
+                    }
+                    Ok(())
+                })
+                .ok();
+                each_self_call(&m.body, this, &mut |called| todo.push(called.to_string()));
             }
             own.insert(name, (base.as_deref(), set));
         }
     }
     own
+}
+
+/// Call `f(method)` for every `<this>.method(...)` call in `stmts`.
+fn each_self_call(stmts: &[Stmt], this: &str, f: &mut dyn FnMut(&str)) {
+    fn in_expr(e: &Expr, this: &str, f: &mut dyn FnMut(&str)) {
+        if let ExprKind::MethodCall(obj, method, _) = &e.kind
+            && matches!(&obj.kind, ExprKind::Name(n) if n == this)
+        {
+            f(method);
+        }
+        crate::lint::each_child_expr(e, &mut |c| in_expr(c, this, f));
+    }
+    for s in stmts {
+        crate::lint::stmt_exprs(s, &mut |e| in_expr(e, this, f));
+        for_each_child_block(s, |b, _| each_self_call(b, this, f));
+    }
 }
 
 /// Every class's attribute set, inherited ones included. `None` for a class
@@ -83,6 +138,52 @@ fn attribute_sets(program: &[Stmt]) -> BTreeMap<String, Option<BTreeSet<String>>
         out.insert(name.to_string(), known.then_some(set));
     }
     out
+}
+
+/// Whether a method body ever rebinds `name` (its `self` parameter):
+/// assignment, a `for` or unpacking target, or a comprehension variable —
+/// which in this subset shares the method's scope, so `[x for self in xs]`
+/// replaces `self` for the rest of the method. A backend may compile
+/// `self.attr` to a fixed slot index only when this is false.
+pub(crate) fn rebinds(body: &[Stmt], name: &str) -> bool {
+    fn in_expr(e: &Expr, name: &str) -> bool {
+        let binds = match &e.kind {
+            ExprKind::ListComp { clauses, .. }
+            | ExprKind::SetComp { clauses, .. }
+            | ExprKind::DictComp { clauses, .. } => clauses.iter().any(
+                |c| matches!(c, CompClause::For { vars, .. } if vars.iter().any(|v| v == name)),
+            ),
+            _ => false,
+        };
+        if binds {
+            return true;
+        }
+        let mut found = false;
+        // Comprehension clauses' iterables and conditions, then the rest.
+        if let ExprKind::ListComp { clauses, .. }
+        | ExprKind::SetComp { clauses, .. }
+        | ExprKind::DictComp { clauses, .. } = &e.kind
+        {
+            for c in clauses {
+                let (CompClause::For { iter: x, .. } | CompClause::If(x)) = c;
+                found |= in_expr(x, name);
+            }
+        }
+        crate::lint::each_child_expr(e, &mut |c| found |= in_expr(c, name));
+        found
+    }
+    fn in_stmts(stmts: &[Stmt], name: &str) -> bool {
+        stmts.iter().any(|s| {
+            let mut found = false;
+            crate::lint::stmt_exprs(s, &mut |e| found |= in_expr(e, name));
+            if let StmtKind::SetAttr { obj, .. } = &s.kind {
+                found |= in_expr(obj, name);
+            }
+            for_each_child_block(s, |b, _| found |= in_stmts(b, name));
+            found
+        })
+    }
+    crate::hoist::function_locals(&[], body).contains(name) || in_stmts(body, name)
 }
 
 /// Each class's slot layout, for backends that give objects fixed fields
@@ -171,6 +272,11 @@ fn each_attr_target<'a>(
             }
             _ => {}
         }
+        // A class nested in a function is refused elsewhere, with its own
+        // message; its methods aren't this scope's business.
+        if matches!(s.kind, StmtKind::ClassDef { .. }) {
+            continue;
+        }
         let mut res = Ok(());
         for_each_child_block(s, |block, _| {
             if res.is_ok() {
@@ -202,8 +308,28 @@ fn did_you_mean(attr: &str, set: &BTreeSet<String>) -> String {
 pub(crate) fn check_attribute_sets(program: &[Stmt]) -> Result<(), CompileError> {
     let sets = attribute_sets(program);
     // Every attribute any class has: an assignment to a name outside it can
-    // never be legal, whatever the object is.
+    // never be legal, whatever the object is — unless some class's
+    // attributes can't be known.
     let any: BTreeSet<String> = sets.values().flatten().flatten().cloned().collect();
+    let any_known = !sets.values().any(Option::is_none);
+    let class_names: BTreeSet<&str> = sets.keys().map(String::as_str).collect();
+    let no_class_has = |st: &Stmt, attr: &str| {
+        error(
+            st,
+            if any.is_empty() {
+                format!(
+                    "nothing in this program has an attribute `{attr}` to set: attributes \
+                     belong to a class, which gives them out in its `__init__`."
+                )
+            } else {
+                format!(
+                    "no class in this program has an attribute `{attr}` to set: a class \
+                     gives its objects their attributes in `__init__`.{}",
+                    did_you_mean(attr, &any)
+                )
+            },
+        )
+    };
 
     for s in program {
         if let StmtKind::ClassDef {
@@ -218,12 +344,39 @@ pub(crate) fn check_attribute_sets(program: &[Stmt]) -> Result<(), CompileError>
             };
             // With `__slots__`, even `__init__` is held to the declared names.
             let slotted = declared_slots(class_vars).is_some();
-            for m in methods.iter().filter(|m| slotted || m.name != "__init__") {
+            for m in methods {
                 let Some(this) = m.params.first() else {
                     continue;
                 };
                 each_attr_target(&m.body, &mut |obj, attr, st| {
-                    if obj == Some(this.as_str()) && !set.contains(attr) {
+                    // Another object (`other.tag = …`, `me = self; me.x = …`):
+                    // its class isn't known here, so only an attribute no class
+                    // has is certainly wrong.
+                    if obj != Some(this.as_str()) {
+                        let class_target = obj.is_some_and(|o| class_names.contains(o));
+                        if any_known && !class_target && !any.contains(attr) {
+                            return Err(no_class_has(st, attr));
+                        }
+                        return Ok(());
+                    }
+                    // `__init__` gives the object its attributes, unless the
+                    // class fixed them in `__slots__`.
+                    if m.name == "__init__" && !slotted {
+                        return Ok(());
+                    }
+                    if slotted && class_vars.iter().any(|(v, _)| v == attr) {
+                        return Err(error(
+                            st,
+                            format!(
+                                "`{attr}` is a class variable of `{name}`, and `{name}` has \
+                                 `__slots__`, so `{name}` objects can't change it. Change \
+                                 `{name}.{attr}` to change it for every `{name}`, or add \
+                                 `'{attr}'` to `__slots__` (and remove the class variable) to \
+                                 give each object its own."
+                            ),
+                        ));
+                    }
+                    if !set.contains(attr) {
                         return Err(error(
                             st,
                             format!(
@@ -261,35 +414,20 @@ pub(crate) fn check_attribute_sets(program: &[Stmt]) -> Result<(), CompileError>
 
     // Outside a class's own methods the object's class isn't known here, so
     // only an attribute no class has at all is certainly a mistake.
-    if sets.values().any(Option::is_none) {
+    if !any_known {
         return Ok(()); // a class with unknown attributes could have it
     }
-    let outside: Vec<&Stmt> = program
+    for s in program
         .iter()
         .filter(|s| !matches!(s.kind, StmtKind::ClassDef { .. }))
-        .collect();
-    for s in outside {
+    {
         each_attr_target(std::slice::from_ref(s), &mut |obj, attr, st| {
             // `Counter.made = …` sets a class variable, which the class
             // pass checks with its own words; this rule is about instances.
-            if any.contains(attr) || obj.is_some_and(|o| sets.contains_key(o)) {
+            if any.contains(attr) || obj.is_some_and(|o| class_names.contains(o)) {
                 return Ok(());
             }
-            Err(error(
-                st,
-                if any.is_empty() {
-                    format!(
-                        "nothing in this program has an attribute `{attr}` to set: attributes \
-                         belong to a class, which gives them out in its `__init__`."
-                    )
-                } else {
-                    format!(
-                        "no class in this program has an attribute `{attr}` to set: a class \
-                         gives its objects their attributes in `__init__`.{}",
-                        did_you_mean(attr, &any)
-                    )
-                },
-            ))
+            Err(no_class_has(st, attr))
         })?;
     }
     Ok(())
@@ -378,6 +516,81 @@ mod tests {
         );
     }
 
+    /// A comprehension variable named `self` rebinds `self` for the rest of
+    /// the method; the fixed-slot fast path must not be used there.
+    #[test]
+    fn rebinding_self_is_seen_in_comprehensions() {
+        let body = |src: &str| {
+            let tokens = crate::lexer::lex(src).unwrap();
+            match crate::parser::parse(&tokens).unwrap().remove(0).kind {
+                StmtKind::ClassDef { mut methods, .. } => methods.remove(0).body,
+                _ => unreachable!(),
+            }
+        };
+        for src in [
+            "class A:\n    def m(self, xs):\n        return [self.n for self in xs]\n",
+            "class A:\n    def m(self, xs):\n        ys = {k: 0 for k, self in xs}\n",
+            "class A:\n    def m(self, xs):\n        if True:\n            print([0 for self in xs])\n",
+            "class A:\n    def m(self, xs):\n        for self in xs:\n            pass\n",
+            "class A:\n    def m(self, o):\n        self = o\n",
+        ] {
+            assert!(rebinds(&body(src), "self"), "{src}");
+        }
+        assert!(!rebinds(
+            &body("class A:\n    def m(self, xs):\n        return [x.n + self.n for x in xs]\n"),
+            "self"
+        ));
+    }
+
+    /// `__init__` calling a helper that sets attributes gives the object
+    /// those attributes, through any number of helpers and from a base.
+    #[test]
+    fn helpers_called_from_init_count() {
+        for src in [
+            "class R:\n    def __init__(self):\n        self.reset()\n    def reset(self):\n        self.speed = 0\n        self.zero()\n    def zero(self):\n        self.heading = 0\n    def go(self):\n        self.speed = 5\n        self.heading = 90\n",
+            "class B:\n    def __init__(self):\n        self.setup()\n    def setup(self):\n        self.n = 1\nclass K(B):\n    def __init__(self):\n        super().__init__()\n    def m(self):\n        self.n = 2\n",
+            // A subclass __init__ calling a base helper gives its objects
+            // what the helper sets.
+            "class B:\n    def __init__(self):\n        self.n = 0\n    def extra(self):\n        self.n = 1\nclass K(B):\n    def __init__(self):\n        self.n = 0\n        self.go()\n    def go(self):\n        self.k = 3\n",
+        ] {
+            assert_eq!(check(src), Ok(()), "{src}");
+        }
+        // A method __init__ never calls still can't add one.
+        let err = check(
+            "class R:\n    def __init__(self):\n        self.speed = 0\n    def later(self):\n        self.lazy = 1\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("`R` has no attribute `lazy`"), "{err}");
+    }
+
+    /// Inside a method, another object's attribute must exist on some class.
+    #[test]
+    fn other_objects_in_methods_are_checked_too() {
+        for src in [
+            "class A:\n    def __init__(self):\n        self.n = 1\n    def copy_to(self, other):\n        other.tag = 1\n",
+            "class A:\n    def __init__(self, x):\n        me = self\n        me.x = x\n",
+        ] {
+            let err = check(src).unwrap_err();
+            assert!(err.contains("in this program has an attribute"), "{err}");
+        }
+        assert_eq!(
+            check(
+                "class A:\n    def __init__(self):\n        self.n = 1\n    def copy_to(self, other):\n        other.n = self.n\n"
+            ),
+            Ok(())
+        );
+    }
+
+    /// With `__slots__`, class variables are read-only through an instance.
+    #[test]
+    fn slotted_class_variables_are_read_only() {
+        let err = check(
+            "class A:\n    __slots__ = ('x',)\n    count = 0\n    def __init__(self):\n        self.x = 1\n    def bump(self):\n        self.count = self.count + 1\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("`count` is a class variable of `A`"), "{err}");
+    }
+
     /// Inherited attributes keep their index in every subclass.
     #[test]
     fn slot_layouts_put_the_base_first() {
@@ -388,6 +601,10 @@ mod tests {
         assert_eq!(l["A"], vec!["b", "k", "z"]);
         assert_eq!(l["B"], vec!["b", "k", "z", "y"]);
         assert_eq!(l["C"], vec!["p", "q"]);
+        // A slotted class's class variables take no slot.
+        let src = "class S:\n    __slots__ = ('x',)\n    count = 0\n";
+        let program = crate::parser::parse(&crate::lexer::lex(src).unwrap()).unwrap();
+        assert_eq!(slot_layouts(&program)["S"], vec!["x"]);
     }
 
     /// A method of the base can't set what only a subclass's __init__ gives.

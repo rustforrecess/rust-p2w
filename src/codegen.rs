@@ -6733,9 +6733,13 @@ impl Gen {
                     ));
                     return Ok(());
                 }
-                let o = self.value_expr(cx, obj)?;
+                // CPython evaluates the value first, then the object:
+                // `g.x = f()` where f rebinds g sets the new object's x.
                 let v = self.value_expr(cx, value)?;
-                out.push(self.set_attr_wat(cx, obj, &o, attr, &v));
+                let tmp = cx.scratch_local(VAL);
+                out.push(format!("(local.set ${tmp} {v})"));
+                let o = self.value_expr(cx, obj)?;
+                out.push(self.set_attr_wat(cx, obj, &o, attr, &format!("(local.get ${tmp})")));
                 Ok(())
             }
             // Imports are recorded in pass 1; nothing to emit here.
@@ -6812,11 +6816,18 @@ impl Gen {
                 index,
                 value,
             } => {
+                // CPython evaluates the value first, then the target and the
+                // index: `xs[0] = f()` where f rebinds xs stores into the
+                // new list.
                 self.type_of(cx, value)?;
+                let v = self.value_expr(cx, value)?;
+                let tmp = cx.scratch_local(VAL);
+                out.push(format!("(local.set ${tmp} {v})"));
                 let t = self.value_expr(cx, target)?;
                 let k = self.value_expr(cx, index)?;
-                let v = self.value_expr(cx, value)?;
-                out.push(format!("(call $py_set_subscript {t} {k} {v})"));
+                out.push(format!(
+                    "(call $py_set_subscript {t} {k} (local.get ${tmp}))"
+                ));
                 Ok(())
             }
             StmtKind::While { cond, body } => self.gen_while(cx, cond, body, out),
@@ -7173,10 +7184,9 @@ impl Gen {
     /// The slot of `self.<attr>` in a method whose `self` is never rebound,
     /// when the class has that attribute: `self` is then an instance of the
     /// method's class or a subclass, and subclasses keep the base's slots at
-    /// the same indices. For a read, an attribute that is also a class
-    /// variable is left to the generic path, where an unset slot means "read
-    /// the class variable".
-    fn self_slot(&self, cx: &FuncCx, obj: &Expr, attr: &str, read: bool) -> Option<usize> {
+    /// the same indices. A read must still treat an unset slot as "look
+    /// further" (class variables, possibly a subclass's).
+    fn self_slot(&self, cx: &FuncCx, obj: &Expr, attr: &str) -> Option<usize> {
         if !cx.self_fixed {
             return None;
         }
@@ -7187,31 +7197,13 @@ impl Gen {
             return None;
         }
         let class = cx.current_class.as_deref()?;
-        if read {
-            let mut cur = Some(class.to_string());
-            let mut hops = 0;
-            while let Some(c) = cur {
-                if self
-                    .class_var_names
-                    .get(&c)
-                    .is_some_and(|vs| vs.iter().any(|v| v == attr))
-                {
-                    return None;
-                }
-                hops += 1;
-                if hops > self.classes.len() {
-                    break;
-                }
-                cur = self.classes.get(&c).cloned().flatten();
-            }
-        }
         self.slot_layouts.get(class)?.iter().position(|s| s == attr)
     }
 
     /// `obj.attr = value` as WAT: a direct slot store for `self.x` in a
     /// method, otherwise through the attribute's module-wide id.
     fn set_attr_wat(&self, cx: &FuncCx, obj: &Expr, o: &str, attr: &str, v: &str) -> String {
-        if let Some(k) = self.self_slot(cx, obj, attr, false) {
+        if let Some(k) = self.self_slot(cx, obj, attr) {
             return format!(
                 "(array.set $ITEMS (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) {o})) (i32.const {k}) {v})"
             );
@@ -7562,7 +7554,7 @@ impl Gen {
         let mut cx = FuncCx {
             current_class: Some(class.to_string()),
             self_name: Some(self_name.clone()),
-            self_fixed: !crate::hoist::function_locals(&[], &m.body).contains(self_name),
+            self_fixed: !crate::attrs::rebinds(&m.body, self_name),
             ..Default::default()
         };
         for p in &m.params {
@@ -8329,12 +8321,15 @@ impl Gen {
                     .with_fact(Fact::missing_part(cn, name, &[])));
                 }
                 let o = self.value_expr(cx, obj)?;
-                if let Some(k) = self.self_slot(cx, obj, name, true) {
-                    // `self.x` in a method: x's slot is known here. The name
-                    // literal is built only on the error path.
+                if let Some(k) = self.self_slot(cx, obj, name) {
+                    // `self.x` in a method: x's slot is known here. An unset
+                    // slot takes the full lookup — `self` may be a subclass
+                    // instance whose class supplies x as a class variable —
+                    // so the name literal is built only on that path.
                     let t = cx.scratch_local(VAL);
+                    let aid = self.attr_ids.get(name).copied().unwrap_or(-1);
                     return Ok(format!(
-                        "(block (result (ref null any)) (local.set ${t} (array.get $ITEMS (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) {o})) (i32.const {k}))) (if (ref.is_null (local.get ${t})) (then (call $raise_no_attr {o} {}))) (local.get ${t}))",
+                        "(block (result (ref null any)) (local.set ${t} (array.get $ITEMS (struct.get $OBJECT 1 (ref.cast (ref $OBJECT) {o})) (i32.const {k}))) (if (ref.is_null (local.get ${t})) (then (local.set ${t} (call $obj_getattr {o} (i32.const {aid}) {})))) (local.get ${t}))",
                         str_lit(name)
                     ));
                 }

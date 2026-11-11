@@ -2200,7 +2200,7 @@ pub extern "C" fn p2w_obj_new(class_id: i32, slots: i32) -> Value {
 /// past its slots (a compiler bug, never a student's).
 fn slot_addr(obj: Value, idx: i32) -> usize {
     if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
-        trap("only objects have attributes");
+        trap_msg(&messages::ATTR_NOT_OBJECT, type_label(obj));
     }
     let o = obj as usize;
     if idx < 0 || idx as u32 >= rd(o + 12) {
@@ -2209,16 +2209,14 @@ fn slot_addr(obj: Value, idx: i32) -> usize {
     o + 16 + 4 * idx as usize
 }
 
-/// `self.x` where the compiler knows x's slot. BORROWS `obj`; returns an
-/// owned (+1) value. Reading an attribute that was never set is CPython's
-/// AttributeError.
+/// `self.x` where the compiler knows x's slot: the value, owned (+1), or 0
+/// when the slot is unset. BORROWS `obj`. An unset slot is not yet an error:
+/// `self` may be an instance of a subclass that supplies `x` as a class
+/// variable, so the caller falls back to `p2w_getattr`, which knows.
 #[unsafe(no_mangle)]
-pub extern "C" fn p2w_slot_get(obj: Value, idx: i32) -> Value {
+pub extern "C" fn p2w_slot_peek(obj: Value, idx: i32) -> Value {
     let v = rd(slot_addr(obj, idx)) as Value;
-    if v == 0 {
-        trap_msg(&messages::ATTR_UNSET, "");
-    }
-    owned(v)
+    if v == 0 { 0 } else { owned(v) }
 }
 
 /// `self.x = value` where the compiler knows x's slot. BORROWS `obj`,
@@ -2235,7 +2233,7 @@ pub extern "C" fn p2w_slot_set(obj: Value, idx: i32, value: Value) {
 /// generated per module (`p2w_slot_of`).
 fn slot_of(obj: Value, attr_id: i32) -> i32 {
     if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
-        trap("only objects have attributes");
+        trap_msg(&messages::ATTR_NOT_OBJECT, type_label(obj));
     }
     if attr_id < 0 {
         return -1;
@@ -2322,7 +2320,7 @@ pub extern "C" fn p2w_str_len(v: Value) -> i32 {
 /// The generated class-namespace lookup's dead ends.
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_no_such_attribute() -> Value {
-    trap("this object has no attribute with that name");
+    trap_msg(&messages::ATTR_NOT_FOUND, "");
 }
 
 #[unsafe(no_mangle)]
@@ -4849,14 +4847,16 @@ mod tests {
         let obj = p2w_obj_new(3, 2);
         assert_eq!(p2w_class_id(obj), 3);
         assert_eq!(p2w_class_id(p2w_int(5)), -1, "non-objects are -1");
-        // A known slot: set TRANSFERS the value in, get returns an owned one.
+        // A known slot: set TRANSFERS the value in, peek returns an owned
+        // one, or 0 for a slot never set.
+        assert_eq!(p2w_slot_peek(obj, 1), 0);
         p2w_slot_set(obj, 0, str_val("Rex"));
-        let v = p2w_slot_get(obj, 0);
+        let v = p2w_slot_peek(obj, 0);
         assert_eq!(shown(v), "Rex");
         p2w_release(v);
         // Overwrite releases the replaced value.
         p2w_slot_set(obj, 0, str_val("Fido"));
-        let v2 = p2w_slot_get(obj, 0);
+        let v2 = p2w_slot_peek(obj, 0);
         assert_eq!(shown(v2), "Fido");
         p2w_release(v2);
         // Through the attribute id (the test table maps id N to slot N).

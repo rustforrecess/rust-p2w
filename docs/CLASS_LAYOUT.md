@@ -62,23 +62,45 @@ longer needed, since every class is known at compile time.
 WASM, native and both debugger engines refuse the same programs with the
 same words:
 
+- A class's attributes include what the methods `__init__` calls on `self`
+  set, transitively and through the base chain: `def __init__(self):
+  self.reset()` gives the object what `reset` sets (since 2026-11-11).
 - In a class's own methods, `self.x = …` (also `+=` and unpacking targets)
   for an `x` the class doesn't have is an error, with did-you-mean:
   "`Robot` has no attribute `speeed` to set: a `Robot` gets its attributes in
   `__init__`, so `boost` can only change those. Did you mean `speed`?"
-- Elsewhere the object's class isn't known yet, so only an attribute no
-  class in the program has is refused ("no class in this program has an
-  attribute `speeed` to set …"). When the checker can type the object, step
-  2's work, this tightens to the object's own class.
+- Any other object, inside a method (`other.tag = …`, `me = self;
+  me.x = …`) or outside, has a class not known here yet, so only an
+  attribute no class in the program has is refused ("no class in this
+  program has an attribute `speeed` to set …"). Step 2b tightens this to the
+  object's own class. Until then an assignment the rule lets through can
+  still fail at run time (`def tag(o): o.y = 5` with an `o` whose class has
+  no `y`); WASM, native and the step debugger all raise AttributeError
+  there.
 - With `__slots__`, the slots are the set: `A` with `__slots__ = ('x',)`
   whose `__init__` sets `self.y` is refused, as CPython raises
-  `AttributeError: 'A' object has no attribute 'y'`.
+  `AttributeError: 'A' object has no attribute 'y'`. A slotted class's
+  class variables are read-only through an instance (CPython: "'A' object
+  attribute 'count' is read-only") and take no slot.
 - Class variables set through the class name (`Counter.made = …`) are the
   existing class pass's business, unchanged.
 - A class whose base isn't in the program has unknown attributes and is not
   checked.
 
 FEATURE_PROBES.md now records `__slots__` as enforced.
+
+A review on 2026-11-11 (a second model, probing CPython, WASM, native and
+the step debugger) found and fixed: a base method's fast-path read of
+`self.x` trapping when a *subclass* supplies `x` as a class variable (an
+unset slot now falls back to the full lookup instead of trapping); a
+comprehension variable named `self` rebinding `self` unseen, so the fast
+path read and wrote another object's slots (`attrs::rebinds` now sees
+comprehension targets); `obj.x = f()` and `xs[i] = f()` evaluating the
+target before the value, which on native wrote into freed memory when `f`
+dropped the object (both backends now evaluate the value first, as
+CPython does); native rejecting attributes as unpacking targets; and the
+step debugger accepting attribute stores Run refuses. Each is now a
+probe in "Object attributes in fixed slots".
 
 Not yet: dataclass-style bare annotations in the class body
 (`speed: int`) don't parse; they would be a second way to declare an

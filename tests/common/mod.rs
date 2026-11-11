@@ -558,10 +558,32 @@ pub fn groups() -> Vec<Group> {
                    read and written directly, other objects through the \
                    attribute's id. A class variable set through an instance \
                    shadows it for that instance only.",
-            probes: vec![p(
-                "subclass, class-variable shadow, set from outside",
-                "class Base:\n    count = 10\n    def __init__(self):\n        self.a = 1\n    def bump(self):\n        self.count = self.count + 1\n        return self.count\nclass Kid(Base):\n    def __init__(self):\n        super().__init__()\n        self.b = 2\n    def total(self):\n        return self.a + self.b\ndef poke(o):\n    o.a = 50\n    return o.a\nk = Kid()\nprint(k.total())\nprint(k.bump(), k.bump(), Base.count)\nprint(poke(k), k.total())\nother = Base()\nprint(other.count, other.a)\n",
-            )],
+            probes: vec![
+                p(
+                    "subclass, class-variable shadow, set from outside",
+                    "class Base:\n    count = 10\n    def __init__(self):\n        self.a = 1\n    def bump(self):\n        self.count = self.count + 1\n        return self.count\nclass Kid(Base):\n    def __init__(self):\n        super().__init__()\n        self.b = 2\n    def total(self):\n        return self.a + self.b\ndef poke(o):\n    o.a = 50\n    return o.a\nk = Kid()\nprint(k.total())\nprint(k.bump(), k.bump(), Base.count)\nprint(poke(k), k.total())\nother = Base()\nprint(other.count, other.a)\n",
+                ),
+                p(
+                    "a subclass's class variable read through a base method",
+                    "class M:\n    def __init__(self):\n        self.speed = 1\n    def get(self):\n        return self.speed\nclass Fast(M):\n    speed = 50\n    def __init__(self):\n        pass\nprint(M().get(), Fast().get())\n",
+                ),
+                p(
+                    "a comprehension variable named self",
+                    "class A:\n    def __init__(self, n):\n        self.m = n + \"-m\"\n        self.n = n + \"-n\"\n    def names(self, others):\n        return [self.n for self in others]\nclass Z:\n    def __init__(self):\n        self.a = \"z-a\"\n        self.m = \"z-m\"\n        self.n = \"z-n\"\nprint(A(\"A\").names([Z()]))\n",
+                ),
+                p(
+                    "the value is evaluated before the object",
+                    "class A:\n    def __init__(self):\n        self.x = 0\ng = A()\nh = g\ndef f():\n    global g\n    g = A()\n    return 5\ng.x = f()\nprint(g.x, h.x)\nxs = [1, 2, 3]\ndef k():\n    global xs\n    xs = [9, 9, 9]\n    return 7\nxs[0] = k()\nprint(xs)\n",
+                ),
+                p(
+                    "attributes as unpacking targets",
+                    "class P:\n    def __init__(self, a, b):\n        self.a, self.b = a, b\n    def swap(self):\n        self.a, self.b = self.b, self.a\np = P(\"x\", [1])\np.swap()\nprint(p.a, p.b)\n",
+                ),
+                p(
+                    "__init__ calls a helper that sets attributes",
+                    "class R:\n    def __init__(self):\n        self.reset()\n    def reset(self):\n        self.speed = 0\n        self.heading = 0\n    def go(self):\n        self.speed = 1\n        return self.speed\nr = R()\nprint(r.go(), r.heading)\n",
+                ),
+            ],
         },
         Group {
             title: "global",

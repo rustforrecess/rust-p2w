@@ -932,7 +932,7 @@ print(\"sum of evens:\", total)
         // One slot (`n`); inside a method `self.n` is a direct slot access,
         // while `a.n` from outside goes through the attribute id.
         assert!(ir.contains("call i32 @p2w_obj_new(i32 0, i32 1)"), "{ir}");
-        assert!(ir.contains("call i32 @p2w_slot_get(i32 "), "{ir}");
+        assert!(ir.contains("call i32 @p2w_slot_peek(i32 "), "{ir}");
         assert!(ir.contains("call void @p2w_slot_set(i32 "), "{ir}");
         assert!(
             ir.contains("define i32 @p2w_slot_of(i32 %cid, i32 %aid)"),

@@ -99,9 +99,14 @@ const TABLE: &[Kid] = &[
         "Check this variable holds a list.",
     ),
     kid(
-        &msg::ATTR_UNSET,
-        "This object was never given that part.",
-        "Make sure `__init__` sets it every time, not only inside an `if`.",
+        &msg::ATTR_NOT_FOUND,
+        "This object doesn't have a part with that name, or wasn't given it yet.",
+        "Check the spelling after the dot, and make sure `__init__` sets it every time, not only inside an `if`.",
+    ),
+    kid(
+        &msg::ATTR_NOT_OBJECT,
+        "This is {type}, and only objects made from a class have parts after a dot.",
+        "Check what this variable holds just before this line.",
     ),
     kid(
         &msg::ATTR_NO_SLOT,
