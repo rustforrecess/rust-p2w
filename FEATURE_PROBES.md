@@ -58,4 +58,4 @@ See `UPSTREAM_GAP.md` for what these gaps mean and which of upstream p2w's desig
 
 ## `__slots__`
 
-Declared slots are **NOT enforced** — a class that declares `__slots__` and then takes an undeclared attribute is accepted, so the declaration is being read as an ordinary class variable. "It compiles" is the wrong signal here; the right one is whether the extra attribute is REFUSED.
+Declared slots are **enforced** — a class that declares `__slots__` and then takes an undeclared attribute is correctly rejected. "It compiles" is the wrong signal here; the right one is whether the extra attribute is REFUSED.

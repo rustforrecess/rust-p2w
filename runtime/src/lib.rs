@@ -1810,10 +1810,11 @@ fn free_object(o: usize) {
             }
         }
         T_OBJECT => {
-            // The instance owns exactly one reference: its attribute dict
-            // (which in turn owns its keys/values — the cascade handles
-            // attribute containers and nested objects).
-            p2w_release(rd(o + 12) as Value);
+            // The instance owns one reference per set slot (unset slots are
+            // 0, which release ignores); the cascade handles nested objects.
+            for i in 0..rd(o + 12) as usize {
+                p2w_release(rd(o + 16 + 4 * i) as Value);
+            }
         }
         T_IARRAY | T_FARRAY => {
             // Raw scalar elements carry no refcount — just free the buffer.
@@ -2174,16 +2175,72 @@ const OP_GE: i32 = 7;
 const OP_LEN: i32 = 8;
 const OP_GETITEM: i32 = 9;
 
-/// A fresh instance of class `class_id` with an empty attribute dict.
+/// A fresh instance of class `class_id` with `slots` attribute slots, all
+/// unset. Layout: `[tag][rc][class_id][slot count][slot 0]…`. A class's
+/// attributes are fixed at compile time (docs/CLASS_LAYOUT.md), so each has
+/// a slot index; a base class's slots come first, so an inherited attribute
+/// has the same index in every subclass. An unset slot holds 0, which no
+/// value ever is (`is_heap` excludes it and every tagged value is nonzero).
 #[unsafe(no_mangle)]
-pub extern "C" fn p2w_obj_new(class_id: i32) -> Value {
-    let p = alloc(16);
+pub extern "C" fn p2w_obj_new(class_id: i32, slots: i32) -> Value {
+    let n = slots.max(0) as usize;
+    let p = alloc(16 + 4 * n);
     wr(p, T_OBJECT);
     wr(p + 4, 1);
     live_inc();
     wr(p + 8, class_id as u32);
-    wr(p + 12, p2w_dict_new() as u32);
+    wr(p + 12, n as u32);
+    for i in 0..n {
+        wr(p + 16 + 4 * i, 0);
+    }
     p as Value
+}
+
+/// The address of `obj`'s slot `idx`, trapping on a non-object or an index
+/// past its slots (a compiler bug, never a student's).
+fn slot_addr(obj: Value, idx: i32) -> usize {
+    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
+        trap("only objects have attributes");
+    }
+    let o = obj as usize;
+    if idx < 0 || idx as u32 >= rd(o + 12) {
+        trap("attribute slot out of range");
+    }
+    o + 16 + 4 * idx as usize
+}
+
+/// `self.x` where the compiler knows x's slot. BORROWS `obj`; returns an
+/// owned (+1) value. Reading an attribute that was never set is CPython's
+/// AttributeError.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_slot_get(obj: Value, idx: i32) -> Value {
+    let v = rd(slot_addr(obj, idx)) as Value;
+    if v == 0 {
+        trap("this object's attribute hasn't been set yet");
+    }
+    owned(v)
+}
+
+/// `self.x = value` where the compiler knows x's slot. BORROWS `obj`,
+/// TRANSFERS `value` in, and releases the value it replaces.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_slot_set(obj: Value, idx: i32, value: Value) {
+    let a = slot_addr(obj, idx);
+    let old = rd(a) as Value;
+    wr(a, value as u32);
+    p2w_release(old);
+}
+
+/// The slot of attribute `attr_id` in `obj`'s class, or -1. The table is
+/// generated per module (`p2w_slot_of`).
+fn slot_of(obj: Value, attr_id: i32) -> i32 {
+    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
+        trap("only objects have attributes");
+    }
+    if attr_id < 0 {
+        return -1;
+    }
+    unsafe { p2w_slot_of(rd(obj as usize + 8) as i32, attr_id) }
 }
 
 /// The instance's class id, or -1 when `v` isn't an object — the generated
@@ -2198,21 +2255,22 @@ pub extern "C" fn p2w_class_id(v: Value) -> i32 {
     }
 }
 
-/// `obj.attr` — BORROWS both; returns an owned (+1) value. A missing
-/// attribute is a friendly trap (no exceptions in the subset).
+/// `obj.attr` when the object's class isn't known at compile time: the
+/// attribute's module-wide id finds its slot through the generated table.
+/// BORROWS `obj` and `name`; returns an owned (+1) value. An unset or absent
+/// slot falls back to the class variables (instance attributes shadow them),
+/// which trap friendly for a method name or a true miss. `name` is only for
+/// that fallback.
 #[unsafe(no_mangle)]
-pub extern "C" fn p2w_getattr(obj: Value, name: Value) -> Value {
-    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
-        trap("only objects have attributes");
+pub extern "C" fn p2w_getattr(obj: Value, attr_id: i32, name: Value) -> Value {
+    let idx = slot_of(obj, attr_id);
+    if idx >= 0 {
+        let v = rd(obj as usize + 16 + 4 * idx as usize) as Value;
+        if v != 0 {
+            return owned(v);
+        }
     }
-    let attrs = rd(obj as usize + 12) as usize;
-    match dict_find(attrs, name) {
-        Some(i) => owned(dict_val(attrs, i)),
-        // Instance attrs shadow class variables; a miss asks the module's
-        // generated class-namespace lookup (which traps friendly if the
-        // name is a method or genuinely absent).
-        None => unsafe { p2w_classvar(obj, name) },
-    }
+    unsafe { p2w_classvar(obj, name) }
 }
 
 /// Byte-compare a heap string value against a literal (for the generated
@@ -2272,14 +2330,17 @@ pub extern "C" fn p2w_method_not_value() -> Value {
     trap("a method isn't a value yet — call it: obj.method(...)");
 }
 
-/// `obj.attr = value` — BORROWS `obj`; TRANSFERS `name` and `value` in
-/// (dict_set's ownership convention).
+/// `obj.attr = value` when the object's class isn't known at compile time.
+/// BORROWS `obj`; TRANSFERS `value` in. An object whose class has no such
+/// attribute is CPython's AttributeError for a class with `__slots__`: the
+/// compiler has already refused every assignment it could see was wrong.
 #[unsafe(no_mangle)]
-pub extern "C" fn p2w_setattr(obj: Value, name: Value, value: Value) {
-    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
-        trap("only objects have attributes");
+pub extern "C" fn p2w_setattr(obj: Value, attr_id: i32, value: Value) {
+    let idx = slot_of(obj, attr_id);
+    if idx < 0 {
+        trap("this object has no attribute with that name to set");
     }
-    dict_set(rd(obj as usize + 12) as usize, name, value);
+    p2w_slot_set(obj, idx, value);
 }
 
 #[unsafe(no_mangle)]
@@ -3730,6 +3791,9 @@ unsafe extern "C" {
     /// (instance -> class-namespace chain; methods and true misses trap).
     /// BORROWS both; returns an owned value.
     fn p2w_classvar(obj: Value, name: Value) -> Value;
+    /// The slot index of attribute `attr_id` in class `class_id`, or -1 —
+    /// GENERATED per module from the classes' fixed attribute sets.
+    fn p2w_slot_of(class_id: i32, attr_id: i32) -> i32;
 
     /// File capability, host-provided (like `p2w_putc`/`p2w_getc` — not
     /// generated per module). Per-filename capability checking lives
@@ -4334,6 +4398,12 @@ mod tests {
         trap("this object has no attribute with that name");
     }
 
+    // ...and the slot table: attribute id N is slot N in every class here.
+    #[unsafe(no_mangle)]
+    extern "C" fn p2w_slot_of(_class_id: i32, attr_id: i32) -> i32 {
+        attr_id
+    }
+
     // File capability stubs: one fixed fake read-mode file ("data.txt",
     // handle 0, content "one\ntwo") and one fake write-mode handle (1,
     // whatever name/mode — its writes land in FILE_WRITE_BUF, inspectable
@@ -4776,23 +4846,27 @@ mod tests {
     #[test]
     fn objects_hold_attrs_and_release_them() {
         let _g = heap_guard();
-        let obj = p2w_obj_new(3);
+        let obj = p2w_obj_new(3, 2);
         assert_eq!(p2w_class_id(obj), 3);
         assert_eq!(p2w_class_id(p2w_int(5)), -1, "non-objects are -1");
-        // Set + read an attribute (setattr TRANSFERS name+value in; getattr
-        // BORROWS the name and returns an owned value).
-        p2w_setattr(obj, str_val("name"), str_val("Rex"));
-        let k = str_val("name");
-        let v = p2w_getattr(obj, k);
+        // A known slot: set TRANSFERS the value in, get returns an owned one.
+        p2w_slot_set(obj, 0, str_val("Rex"));
+        let v = p2w_slot_get(obj, 0);
         assert_eq!(shown(v), "Rex");
         p2w_release(v);
-        // Overwrite releases the replaced value (dict_set semantics).
-        p2w_setattr(obj, str_val("name"), str_val("Fido"));
-        let v2 = p2w_getattr(obj, k);
+        // Overwrite releases the replaced value.
+        p2w_slot_set(obj, 0, str_val("Fido"));
+        let v2 = p2w_slot_get(obj, 0);
         assert_eq!(shown(v2), "Fido");
         p2w_release(v2);
+        // Through the attribute id (the test table maps id N to slot N).
+        p2w_setattr(obj, 1, str_val("good"));
+        let k = str_val("unused");
+        let v3 = p2w_getattr(obj, 1, k);
+        assert_eq!(shown(v3), "good");
+        p2w_release(v3);
         p2w_release(k);
-        // Releasing the instance cascades through the attr dict.
+        // Releasing the instance releases every set slot.
         p2w_release(obj);
         assert_eq!(p2w_live(), 0);
     }

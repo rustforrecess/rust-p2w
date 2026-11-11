@@ -649,6 +649,7 @@ fn lift_in_function(
 /// registers a `def` when it executes it — still sees definitions before use.
 pub fn hoist_nested_functions(program: Vec<Stmt>) -> Result<Vec<Stmt>, CompileError> {
     check_global_decls(&program)?;
+    crate::attrs::check_attribute_sets(&program)?;
     let mut names: BTreeSet<String> = program
         .iter()
         .filter_map(|s| match &s.kind {

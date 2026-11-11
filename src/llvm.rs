@@ -20,7 +20,7 @@
 //! incl. recursion). Not yet (clean errors): tuples, comprehensions, classes,
 //! default args.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::{BinOp, CompClause, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::codegen::parse_format_spec;
@@ -149,10 +149,12 @@ declare i32 @p2w_slice_assign(i32, i32, i32, i32)
 declare i32 @p2w_input(i32)
 declare i32 @p2w_format(i32, i32, i32, i32, i32, i32)
 ; class instances (the object model; method dispatch is generated per module)
-declare i32 @p2w_obj_new(i32)
+declare i32 @p2w_obj_new(i32, i32)
 declare i32 @p2w_class_id(i32)
-declare i32 @p2w_getattr(i32, i32)
+declare i32 @p2w_getattr(i32, i32, i32)
 declare void @p2w_setattr(i32, i32, i32)
+declare i32 @p2w_slot_get(i32, i32)
+declare void @p2w_slot_set(i32, i32, i32)
 declare i32 @p2w_no_such_method()
 declare i32 @p2w_unsupported_operand()
 declare i1 @p2w_str_eq_lit(i32, ptr, i32)
@@ -302,9 +304,20 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
                 base: base.clone(),
                 methods: mmap,
                 class_vars: class_vars.clone(),
+                slots: Vec::new(),
             });
         }
     }
+    let layouts = crate::attrs::slot_layouts(stmts);
+    for d in &mut classes.decls {
+        d.slots = layouts.get(&d.name).cloned().unwrap_or_default();
+    }
+    let all_attrs: BTreeSet<&String> = classes.decls.iter().flat_map(|d| &d.slots).collect();
+    classes.attr_ids = all_attrs
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| (a.clone(), i as i32))
+        .collect();
     for d in &classes.decls {
         if let Some(b) = &d.base
             && !classes.ids.contains_key(b)
@@ -533,6 +546,38 @@ fn emit_class_glue(classes: &ClassTable, dispatchers: &[(String, usize)]) -> (St
     }
     defs.push_str(&body);
     defs.push('\n');
+
+    // --- p2w_slot_of(class_id, attr_id): the slot of a module-wide attribute
+    // id in a class, or -1. ALWAYS defined — the runtime links against it.
+    {
+        let mut b = String::from("define i32 @p2w_slot_of(i32 %cid, i32 %aid) {\nentry:\n");
+        let arms: Vec<String> = (0..classes.decls.len())
+            .filter(|&i| !classes.decls[i].slots.is_empty())
+            .map(|i| format!("i32 {i}, label %c{i}"))
+            .collect();
+        b.push_str(&format!("  switch i32 %cid, label %none [ {} ]\n", arms.join(" ")));
+        for (i, d) in classes.decls.iter().enumerate() {
+            if d.slots.is_empty() {
+                continue;
+            }
+            let cases: Vec<String> = d
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(k, a)| format!("i32 {}, label %c{i}s{k}", classes.attr_ids[a]))
+                .collect();
+            b.push_str(&format!(
+                "c{i}:\n  switch i32 %aid, label %none [ {} ]\n",
+                cases.join(" ")
+            ));
+            for k in 0..d.slots.len() {
+                b.push_str(&format!("c{i}s{k}:\n  ret i32 {k}\n"));
+            }
+        }
+        b.push_str("none:\n  ret i32 -1\n}\n");
+        defs.push_str(&b);
+        defs.push('\n');
+    }
 
     // --- class-variable globals + p2w_classvar (attr-miss fallback):
     // instance attrs shadow these; the lookup walks the chain nearest-first,
@@ -785,6 +830,9 @@ struct ClassDecl {
     /// fallback (an attr miss); values live in per-class module globals
     /// initialized in main's prologue.
     class_vars: Vec<(String, Expr)>,
+    /// The instance's attribute slots (`attrs::slot_layouts`): the base's
+    /// first, so an inherited attribute has the same index in subclasses.
+    slots: Vec<String>,
 }
 
 /// All classes in the module, id-ordered (the id is what `p2w_class_id`
@@ -793,6 +841,10 @@ struct ClassDecl {
 struct ClassTable {
     ids: HashMap<String, i32>,
     decls: Vec<ClassDecl>,
+    /// A module-wide id for every attribute name any class has a slot for:
+    /// what `p2w_getattr`/`p2w_setattr` pass when the object's class isn't
+    /// known at compile time, mapped to a slot by the generated `p2w_slot_of`.
+    attr_ids: BTreeMap<String, i32>,
 }
 
 impl ClassTable {
@@ -870,6 +922,8 @@ fn emit_function(
 ) -> Result<(String, String), String> {
     let mut f = FuncEmitter::new(sigs, name);
     f.current_class = current_class.map(str::to_string);
+    f.self_fixed =
+        current_class.is_some() && !crate::hoist::function_locals(&[], body).contains("self");
     // Module globals this function reads and does not shadow with a local,
     // or declares `global`.
     let locals = crate::hoist::function_locals(params, body);
@@ -1137,6 +1191,10 @@ struct FuncEmitter<'a> {
     /// Set while emitting a method body — `super().m(...)` resolves from this
     /// class's base at compile time.
     current_class: Option<String>,
+    /// In a method that never rebinds `self`: `self` is always an instance
+    /// of `current_class` or a subclass, so its attributes' slot indices are
+    /// known here (subclasses keep the base's slots at the same indices).
+    self_fixed: bool,
     /// The (method name, arity) dispatchers this function's call sites need;
     /// drained by the caller and generated once per module.
     dispatchers: Vec<(String, usize)>,
@@ -1196,6 +1254,7 @@ impl<'a> FuncEmitter<'a> {
             func_defaults: sigs.func_defaults,
             classes: sigs.classes,
             current_class: None,
+            self_fixed: false,
             dispatchers: Vec::new(),
             borrowed_params: Vec::new(),
             global_slots: BTreeSet::new(),
@@ -2314,20 +2373,19 @@ impl<'a> FuncEmitter<'a> {
                     self.line(&format!("store i32 {v}, ptr @cv_{owner}_{attr}"));
                     return Ok(());
                 }
-                // `obj.attr = value` — the attr NAME is an interned-literal
-                // handout (owned +1) and setattr TRANSFERS name + value in;
-                // the object itself is only borrowed.
+                // `obj.attr = value` — the object is borrowed and the value
+                // transferred in. `self.x` in a method stores straight into
+                // x's slot; otherwise the attribute's module-wide id finds it.
                 let (ov, oo) = self.expr_borrow(obj)?;
-                let name = self.expr(&Expr {
-                    kind: ExprKind::Str(attr.clone()),
-                    line: s.line,
-                    span: (0, 0),
-                    full_span: (0, 0),
-                })?;
                 let v = self.expr(value)?;
-                self.line(&format!(
-                    "call void @p2w_setattr(i32 {ov}, i32 {name}, i32 {v})"
-                ));
+                if let Some(k) = self.self_slot(obj, attr, false) {
+                    self.line(&format!("call void @p2w_slot_set(i32 {ov}, i32 {k}, i32 {v})"));
+                } else {
+                    let aid = self.classes.attr_ids.get(attr).copied().unwrap_or(-1);
+                    self.line(&format!(
+                        "call void @p2w_setattr(i32 {ov}, i32 {aid}, i32 {v})"
+                    ));
+                }
                 self.release_if_owned(&ov, oo);
                 Ok(())
             }
@@ -3463,7 +3521,9 @@ impl<'a> FuncEmitter<'a> {
                             args.len()
                         ));
                     }
-                    let o = self.call_value(&format!("call i32 @p2w_obj_new(i32 {cid})"));
+                    let nslots = self.classes.decls[cid as usize].slots.len();
+                    let o =
+                        self.call_value(&format!("call i32 @p2w_obj_new(i32 {cid}, i32 {nslots})"));
                     if let Some((owner, _)) = init {
                         self.line(&format!("call void @p2w_retain(i32 {o})"));
                         let mut ops = vec![format!("i32 {o}")];
@@ -3724,16 +3784,26 @@ impl<'a> FuncEmitter<'a> {
                         e.line
                     ));
                 }
-                // `obj.attr` — the object is borrowed; the interned attr-name
-                // handout is owned (+1) and getattr only borrows it.
+                // `obj.attr` — the object is borrowed. `self.x` in a method
+                // loads x's slot directly; otherwise the attribute's
+                // module-wide id finds the slot, and the interned name (owned
+                // +1, borrowed by getattr) serves the class-variable fallback.
                 let (ov, oo) = self.expr_borrow(obj)?;
+                if let Some(k) = self.self_slot(obj, attr, true) {
+                    let r = self.call_value(&format!("call i32 @p2w_slot_get(i32 {ov}, i32 {k})"));
+                    self.release_if_owned(&ov, oo);
+                    return Ok((r, Repr::Boxed));
+                }
                 let name = self.expr(&Expr {
                     kind: ExprKind::Str(attr.clone()),
                     line: e.line,
                     span: (0, 0),
                     full_span: (0, 0),
                 })?;
-                let r = self.call_value(&format!("call i32 @p2w_getattr(i32 {ov}, i32 {name})"));
+                let aid = self.classes.attr_ids.get(attr).copied().unwrap_or(-1);
+                let r = self.call_value(&format!(
+                    "call i32 @p2w_getattr(i32 {ov}, i32 {aid}, i32 {name})"
+                ));
                 self.release(&name);
                 self.release_if_owned(&ov, oo);
                 Ok((r, Repr::Boxed))
@@ -4018,6 +4088,34 @@ impl<'a> FuncEmitter<'a> {
                 "line {line}: the native (Pico) backend doesn't handle random.{method}() yet"
             )),
         }
+    }
+
+    /// The slot of `self.<attr>` when this is a method whose `self` is fixed
+    /// and the class has that attribute. For a read, an attribute that is
+    /// also a class variable is left to the generic path: an unset slot
+    /// there means "read the class variable", which only the fallback knows.
+    fn self_slot(&self, obj: &Expr, attr: &str, read: bool) -> Option<usize> {
+        if !self.self_fixed {
+            return None;
+        }
+        let ExprKind::Name(n) = &obj.kind else {
+            return None;
+        };
+        if n != "self" {
+            return None;
+        }
+        let class = self.current_class.as_deref()?;
+        if read
+            && self
+                .classes
+                .chain(class)
+                .iter()
+                .any(|d| d.class_vars.iter().any(|(v, _)| v == attr))
+        {
+            return None;
+        }
+        let id = *self.classes.ids.get(class)?;
+        self.classes.decls[id as usize].slots.iter().position(|s| s == attr)
     }
 
     fn method_call(&mut self, obj: &Expr, method: &str, args: &[Expr]) -> Result<String, String> {

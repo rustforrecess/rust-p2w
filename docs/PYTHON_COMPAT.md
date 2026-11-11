@@ -95,6 +95,13 @@ inheritance, `super().method(...)`, and `__repr__`/`__str__` in `print`/`str`
 all work (compile-time switch dispatch on a per-instance class id; reference
 semantics and leak-freedom are oracle-gated). Differences:
 
+- **An object's attributes are fixed by its class** (since 2026-11-08): its
+  class variables, what its `__init__` sets on `self`, and its base's; with
+  `__slots__`, exactly the slots. Setting any other attribute, such as a
+  misspelt `self.speeed`, is a compile error with did-you-mean. CPython
+  would create the attribute, so this is a subset rule (every accepted
+  program is valid Python); it is the rule CPython applies to classes with
+  `__slots__`. See `docs/CLASS_LAYOUT.md`.
 - **Default display is `<Dog object>`**, not CPython's
   `<__main__.Dog object at 0x...>` (no addresses on a deterministic teaching
   device — CPython's form isn't reproducible anyway).

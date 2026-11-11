@@ -62,9 +62,9 @@ and gets its front end from the `ast` module for free.
 | `%` string formatting | `.format()` and f-strings both work |
 | integers past 2³¹ | today a compile error / trap — see below |
 
-⚠ **`__slots__` compiles but means nothing.** A class can declare it and then
-still take a new attribute at runtime, so it is parsed as an ordinary class
-variable. Worse than absent: it looks supported.
+✅ **`__slots__` is enforced (2026-11-08).** Declared slots are a class's
+attribute set; even `__init__` can't set another, as in CPython. Every class
+now has a fixed attribute set, slots or not: see `docs/CLASS_LAYOUT.md`.
 
 ### ⭐ Functions are not values — the monomorphic case now SHIPPED, differently from upstream
 

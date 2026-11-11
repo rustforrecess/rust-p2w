@@ -931,8 +931,7 @@ impl Checker {
                 continue; // arity is a compile error already
             };
             let wants_number = matches!(want, HostTy::Int | HostTy::Float | HostTy::Bool);
-            if wants_number && !at.numeric() && at != Ty::Dyn && at != Ty::Func && at != Ty::Class
-            {
+            if wants_number && !at.numeric() && at != Ty::Dyn && at != Ty::Func && at != Ty::Class {
                 self.out.push(TypeFinding {
                     line: e.line,
                     span: e.span,
@@ -1302,13 +1301,18 @@ mod tests {
         let f = findings("import robot\nx: str = robot.tilt()\n");
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].code, "type.annotation-contradicted");
-        assert!(f[0].message.contains("a decimal number"), "{}", f[0].message);
+        assert!(
+            f[0].message.contains("a decimal number"),
+            "{}",
+            f[0].message
+        );
         let f = findings("import robot\ns: str = robot.FLIPPED\n");
         assert!(f[0].message.contains("a whole number"), "{f:?}");
         let f = findings("import robot\nspeed = input()\nrobot.set_motor(speed, 50)\n");
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(
-            f[0].message.contains("`robot.set_motor` wants a whole number for `left`"),
+            f[0].message
+                .contains("`robot.set_motor` wants a whole number for `left`"),
             "{}",
             f[0].message
         );

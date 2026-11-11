@@ -27,6 +27,7 @@
 
 pub mod activity;
 mod ast;
+mod attrs;
 mod blockly;
 mod builtins;
 mod check;
@@ -928,7 +929,12 @@ print(\"sum of evens:\", total)
             "class A:\n    def __init__(self, n):\n        self.n = n\n    def get(self):\n        return self.n\na = A(3)\nprint(a.get())\n",
         )
         .unwrap();
-        assert!(ir.contains("call i32 @p2w_obj_new(i32 0)"), "{ir}");
+        // One slot (`n`); inside a method `self.n` is a direct slot access,
+        // while `a.n` from outside goes through the attribute id.
+        assert!(ir.contains("call i32 @p2w_obj_new(i32 0, i32 1)"), "{ir}");
+        assert!(ir.contains("call i32 @p2w_slot_get(i32 "), "{ir}");
+        assert!(ir.contains("call void @p2w_slot_set(i32 "), "{ir}");
+        assert!(ir.contains("define i32 @p2w_slot_of(i32 %cid, i32 %aid)"), "{ir}");
         assert!(ir.contains("define i32 @dyn_get_0"), "dispatcher: {ir}");
         assert!(ir.contains("define i32 @p2w_obj_repr"), "{ir}");
         // Every module defines p2w_obj_repr (the runtime links against it),

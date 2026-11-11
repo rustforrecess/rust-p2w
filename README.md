@@ -126,6 +126,10 @@ definition.
 - `VALUE_MODEL.md` — the boxed↔unboxed representation contract.
 - `MEMORY_MANAGEMENT.md` — the memory model and the PL research it draws on.
 - `PICO_BACKEND.md` — native backend design and status.
+- `docs/CLASS_LAYOUT.md` — fixed attribute sets (built) and the path to
+  fixed layouts, unboxed fields and method tables.
+- `docs/UNITS.md` — proposal: units as casts (`inches(12)`, `feet(d)`) and
+  angle-valued robot states.
 - `docs/ROBOT.md` — the `robot` module: callbacks not loops, the API, the
   arbiter, and what each host (simulator, board) does.
 - `HOST_INTERFACE.md` — what crosses the host boundary, and when to adopt WASI
