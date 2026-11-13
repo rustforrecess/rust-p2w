@@ -144,6 +144,16 @@ semantics and leak-freedom are oracle-gated). Differences:
   empty only — `dict(mapping)` / `dict(pairs)` aren't supported yet (use `{}` or
   a dict comprehension). All forms work on both compiled backends **and** the
   step debugger.
+- **Comprehension variables have their own scope** (since 2026-11-13), as in
+  Python 3: `x = 5; ys = [x * 2 for x in range(3)]` leaves `x` at 5, and
+  using a comprehension's variable after it is a NameError. Before, they
+  leaked into the enclosing function, differently on each backend (inside a
+  function WASM left the last value and native one past it; at module level
+  only native leaked). The shared front end now renames them inside the
+  comprehension (`hoist::scope_comprehensions`), keeping Python's rules: the
+  first iterable is evaluated in the enclosing scope, and a nested
+  comprehension can read the outer one's variables. Error messages still
+  name the variable as written.
 - **`reversed(seq)`** desugars to the reverse slice `seq[::-1]`, so it works on
   both compiled backends *and* the step debugger (lists, strings, tuples). It
   yields a reversed *copy* rather than CPython's lazy iterator — identical when

@@ -489,6 +489,84 @@ fn child_blocks_mut(s: &mut Stmt, f: &mut impl FnMut(&mut Vec<Stmt>)) {
     }
 }
 
+/// Give every comprehension its own scope, as Python 3 does: `x = 5;
+/// ys = [x * 2 for x in range(3)]` leaves `x` at 5. Each comprehension's loop
+/// variables are renamed to names no program can write (`x` -> `x.c1`)
+/// everywhere inside it, so they can't collide with, or leak into, the
+/// enclosing function. Done here, in the front end every surface shares, so
+/// the backends need no scoping of their own and can't disagree.
+///
+/// Python's rules, kept exactly:
+/// - the first `for` clause's iterable is evaluated in the ENCLOSING scope
+///   (`[x for x in x]` reads the outer `x`), so it is not renamed;
+/// - everything else — later iterables, conditions, the element — sees the
+///   comprehension's variables;
+/// - a nested comprehension is its own scope that can read the outer one's
+///   variables: inner comprehensions are renamed first, so their own
+///   variables no longer match the outer names.
+pub(crate) fn scope_comprehensions(program: &mut [Stmt]) {
+    fn rename_uses(e: &mut Expr, vars: &BTreeSet<String>, id: usize) {
+        match &mut e.kind {
+            ExprKind::Name(n) if vars.contains(n.as_str()) => *n = format!("{n}.c{id}"),
+            // A comprehension variable called like a function: `[f(1) for f in fs]`.
+            ExprKind::Call(n, _) if vars.contains(n.as_str()) => *n = format!("{n}.c{id}"),
+            _ => {}
+        }
+        crate::fnval::each_child_expr_mut(e, &mut |c| rename_uses(c, vars, id));
+    }
+    fn in_expr(e: &mut Expr, next: &mut usize) {
+        // Inner comprehensions first.
+        crate::fnval::each_child_expr_mut(e, &mut |c| in_expr(c, next));
+        let (clauses, parts): (&mut Vec<crate::ast::CompClause>, Vec<&mut Expr>) =
+            match &mut e.kind {
+                ExprKind::ListComp { element, clauses }
+                | ExprKind::SetComp { element, clauses } => (clauses, vec![&mut **element]),
+                ExprKind::DictComp {
+                    key,
+                    value,
+                    clauses,
+                } => (clauses, vec![&mut **key, &mut **value]),
+                _ => return,
+            };
+        let vars: BTreeSet<String> = clauses
+            .iter()
+            .filter_map(|c| match c {
+                crate::ast::CompClause::For { vars, .. } => Some(vars.clone()),
+                crate::ast::CompClause::If(_) => None,
+            })
+            .flatten()
+            .collect();
+        if vars.is_empty() {
+            return;
+        }
+        *next += 1;
+        let id = *next;
+        for (i, c) in clauses.iter_mut().enumerate() {
+            match c {
+                crate::ast::CompClause::For { vars: bound, iter } => {
+                    for v in bound.iter_mut() {
+                        *v = format!("{v}.c{id}");
+                    }
+                    if i > 0 {
+                        rename_uses(iter, &vars, id);
+                    }
+                }
+                crate::ast::CompClause::If(cond) => rename_uses(cond, &vars, id),
+            }
+        }
+        for p in parts {
+            rename_uses(p, &vars, id);
+        }
+    }
+    fn in_stmts(stmts: &mut [Stmt], next: &mut usize) {
+        for s in stmts {
+            stmt_exprs_mut(s, &mut |e| in_expr(e, next));
+            child_blocks_mut(s, &mut |b| in_stmts(b, next));
+        }
+    }
+    in_stmts(program, &mut 0);
+}
+
 /// Lift the nested functions out of one function, converting captures into
 /// leading parameters. Lifted functions (deepest first) are pushed to `out`.
 fn lift_in_function(
@@ -647,9 +725,10 @@ fn lift_in_function(
 /// parameters). Statement order is preserved: each lifted function is inserted
 /// just before the function it came out of, so the step debugger — which
 /// registers a `def` when it executes it — still sees definitions before use.
-pub fn hoist_nested_functions(program: Vec<Stmt>) -> Result<Vec<Stmt>, CompileError> {
+pub fn hoist_nested_functions(mut program: Vec<Stmt>) -> Result<Vec<Stmt>, CompileError> {
     check_global_decls(&program)?;
     crate::attrs::check_attribute_sets(&program)?;
+    scope_comprehensions(&mut program);
     let mut names: BTreeSet<String> = program
         .iter()
         .filter_map(|s| match &s.kind {
@@ -852,6 +931,82 @@ mod tests {
         assert!(err.contains("parameter and global"), "{err}");
         // At module level a `global` is legal and changes nothing.
         assert!(hoist("global q\nq = 3\n").is_ok());
+    }
+
+    /// A comprehension's variables are renamed inside it and nowhere else:
+    /// the first iterable keeps the enclosing name, a nested comprehension
+    /// gets its own, and the statement after is untouched.
+    #[test]
+    fn comprehension_variables_get_their_own_names() {
+        fn names(e: &Expr, out: &mut Vec<String>) {
+            if let ExprKind::Name(n) = &e.kind {
+                out.push(n.clone());
+            }
+            crate::lint::each_child_expr(e, &mut |c| names(c, out));
+        }
+        let out = hoist("x = [1, 2]\nys = [x + y for x in x for y in [x]]\nprint(x)\n").unwrap();
+        let StmtKind::Assign(_, comp) = &out[1].kind else {
+            unreachable!()
+        };
+        let ExprKind::ListComp { element, clauses } = &comp.kind else {
+            unreachable!()
+        };
+        let mut used = Vec::new();
+        names(element, &mut used);
+        assert_eq!(used, vec!["x.c1", "y.c1"]);
+        let crate::ast::CompClause::For { vars, iter } = &clauses[0] else {
+            unreachable!()
+        };
+        assert_eq!(vars, &vec!["x.c1".to_string()]);
+        // The first iterable is the enclosing `x`; the second sees the
+        // comprehension's.
+        assert!(matches!(&iter.kind, ExprKind::Name(n) if n == "x"));
+        let crate::ast::CompClause::For { iter: second, .. } = &clauses[1] else {
+            unreachable!()
+        };
+        let mut used = Vec::new();
+        names(second, &mut used);
+        assert_eq!(used, vec!["x.c1"]);
+        // After the comprehension, `x` is still the module's.
+        let StmtKind::Expr(call) = &out[2].kind else {
+            unreachable!()
+        };
+        let mut used = Vec::new();
+        names(call, &mut used);
+        assert_eq!(used, vec!["x"]);
+
+        // A nested comprehension: the inner `x` is its own, and the inner's
+        // first iterable reads the outer comprehension's `x`.
+        let out = hoist("zs = [[x for x in range(x)] for x in range(3)]\n").unwrap();
+        let StmtKind::Assign(_, outer) = &out[0].kind else {
+            unreachable!()
+        };
+        let ExprKind::ListComp { element, clauses } = &outer.kind else {
+            unreachable!()
+        };
+        let crate::ast::CompClause::For { vars, .. } = &clauses[0] else {
+            unreachable!()
+        };
+        let outer_x = vars[0].clone();
+        let ExprKind::ListComp {
+            element: inner_el,
+            clauses: inner,
+        } = &element.kind
+        else {
+            unreachable!()
+        };
+        let crate::ast::CompClause::For {
+            vars: inner_vars,
+            iter: inner_iter,
+        } = &inner[0]
+        else {
+            unreachable!()
+        };
+        assert_ne!(inner_vars[0], outer_x);
+        assert!(matches!(&inner_el.kind, ExprKind::Name(n) if *n == inner_vars[0]));
+        let mut used = Vec::new();
+        names(inner_iter, &mut used);
+        assert_eq!(used, vec![outer_x]);
     }
 
     /// A nested def's `global x` is the module's `x`, never a capture of the

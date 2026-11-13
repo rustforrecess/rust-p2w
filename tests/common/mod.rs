@@ -586,6 +586,25 @@ pub fn groups() -> Vec<Group> {
             ],
         },
         Group {
+            title: "Comprehension variables have their own scope",
+            note: "As in Python 3, a comprehension's loop variables don't leak: \
+                   `x = 5; ys = [x * 2 for x in range(3)]` leaves `x` at 5. The \
+                   shared front end renames them inside the comprehension, so \
+                   both backends agree by construction. The first iterable is \
+                   evaluated in the enclosing scope, and a nested \
+                   comprehension can read the outer one's variables.",
+            probes: vec![
+                p(
+                    "module, function, dict, first iterable, nesting, tuple targets, packed",
+                    "x = 5\nys = [x * 2 for x in range(3)]\nprint(x, ys)\ndef f():\n    x = 7\n    ys = [x * 2 for x in range(3)]\n    d = {x: x + 1 for x in range(2)}\n    return x, ys, d\nprint(f())\nx = [1, 2, 3]\nprint([x * 10 for x in x])\nrows = [[1, 2], [3, 4]]\nprint([v for row in rows for v in row if v % 2 == 0])\nprint([[x + y for y in range(2)] for x in range(3)])\nprint([[x for x in range(x)] for x in range(3)])\npairs = [(1, \"a\"), (2, \"b\")]\na = \"outer\"\nprint([a * 2 for a, b in pairs], a)\nnums: list[int] = [1, 2, 3]\nsq: list[int] = [n * n for n in nums]\nn = 99\nprint(sq, n)\n",
+                ),
+                p(
+                    "a comprehension variable named self leaves self alone",
+                    "class A:\n    def __init__(self, n):\n        self.n = n\n    def others(self, xs):\n        ys = [self.n for self in xs]\n        return ys, self.n\nprint(A(\"a\").others([A(\"z\")]))\n",
+                ),
+            ],
+        },
+        Group {
             title: "global",
             note: "A function's `global` names are the module's variables: \
                    assigning one sets the module variable on both backends, \

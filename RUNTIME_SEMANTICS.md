@@ -288,6 +288,15 @@ An object's attributes are fixed by its class (docs/CLASS_LAYOUT.md), so each ha
 | `attributes as unpacking targets` | value | `[1] x` |
 | `__init__ calls a helper that sets attributes` | value | `1 0` |
 
+## Comprehension variables have their own scope
+
+As in Python 3, a comprehension's loop variables don't leak: `x = 5; ys = [x * 2 for x in range(3)]` leaves `x` at 5. The shared front end renames them inside the comprehension, so both backends agree by construction. The first iterable is evaluated in the enclosing scope, and a nested comprehension can read the outer one's variables.
+
+| program | where | result |
+|---|---|---|
+| `module, function, dict, first iterable, nesting, tuple targets, packed` | value | `5 [0, 2, 4] ⏎ (7, [0, 2, 4], {0: 1, 1: 2}) ⏎ [10, 20, 30] ⏎ [2, 4] ⏎ [[0, 1], [1, 2], [2, 3]] ⏎ [[], [0], [0, 1]] ⏎ [2, 4] outer ⏎ [1, 4, 9] 99` |
+| `a comprehension variable named self leaves self alone` | value | `(['z'], 'a')` |
+
 ## global
 
 A function's `global` names are the module's variables: assigning one sets the module variable on both backends, from a def, a method, a loop variable, an unpacking and a lifted nested def. Natively they are `@g_<name>` globals, always boxed; in WASM, module globals the inference leaves boxed because a function writes them.

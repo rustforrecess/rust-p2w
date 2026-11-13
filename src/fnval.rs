@@ -428,7 +428,7 @@ fn rewrite_expr(
 
 /// Mutable twin of `lint::each_child_expr` — every direct child expression,
 /// exhaustive on purpose (see that function's own doc comment for why).
-fn each_child_expr_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+pub(crate) fn each_child_expr_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     match &mut e.kind {
         ExprKind::Int(_)
         | ExprKind::Float(_)
