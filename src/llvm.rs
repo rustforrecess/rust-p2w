@@ -149,12 +149,16 @@ declare i32 @p2w_slice_assign(i32, i32, i32, i32)
 declare i32 @p2w_input(i32)
 declare i32 @p2w_format(i32, i32, i32, i32, i32, i32)
 ; class instances (the object model; method dispatch is generated per module)
-declare i32 @p2w_obj_new(i32, i32)
+declare i32 @p2w_obj_new(i32, i32, i32)
 declare i32 @p2w_class_id(i32)
 declare i32 @p2w_getattr(i32, i32, i32)
 declare void @p2w_setattr(i32, i32, i32)
 declare i32 @p2w_slot_peek(i32, i32)
 declare void @p2w_slot_set(i32, i32, i32)
+declare double @p2w_fslot_get(i32, i32)
+declare void @p2w_fslot_set(i32, i32, double)
+declare double @p2w_getattr_f(i32, i32)
+declare void @p2w_setattr_f(i32, i32, double)
 declare i32 @p2w_no_such_method()
 declare i32 @p2w_unsupported_operand()
 declare i1 @p2w_str_eq_lit(i32, ptr, i32)
@@ -305,14 +309,26 @@ pub fn emit_llvm_ir(stmts: &[Stmt]) -> Result<String, String> {
                 methods: mmap,
                 class_vars: class_vars.clone(),
                 slots: Vec::new(),
+                fslots: Vec::new(),
             });
         }
     }
     let layouts = crate::attrs::slot_layouts(stmts);
-    for d in &mut classes.decls {
-        d.slots = layouts.get(&d.name).cloned().unwrap_or_default();
+    classes.float_attrs = crate::attrs::float_fields(stmts, &ret_reprs);
+    for a in &classes.float_attrs {
+        // Recorded where `infer_expr_repr` looks, so a read of a float field
+        // is a proven float for the slot inference and every emitter path.
+        ret_reprs.insert(crate::repr::float_attr_key(a), Repr::Float);
     }
-    let all_attrs: BTreeSet<&String> = classes.decls.iter().flat_map(|d| &d.slots).collect();
+    for d in &mut classes.decls {
+        let layout = layouts.get(&d.name).cloned().unwrap_or_default();
+        (d.slots, d.fslots) = crate::attrs::split_layout(&layout, &classes.float_attrs);
+    }
+    let all_attrs: BTreeSet<&String> = classes
+        .decls
+        .iter()
+        .flat_map(|d| d.slots.iter().chain(&d.fslots))
+        .collect();
     classes.attr_ids = all_attrs
         .into_iter()
         .enumerate()
@@ -547,34 +563,51 @@ fn emit_class_glue(classes: &ClassTable, dispatchers: &[(String, usize)]) -> (St
     defs.push_str(&body);
     defs.push('\n');
 
-    // --- p2w_slot_of(class_id, attr_id): the slot of a module-wide attribute
-    // id in a class, or -1. ALWAYS defined — the runtime links against it.
+    // --- p2w_slot_of(class_id, attr_id): where a module-wide attribute id
+    // lives in a class — value slot `k`, float field `f` as `-(f + 2)`, or
+    // -1 for none. ALWAYS defined — the runtime links against it.
     {
+        // Each class's (attribute id, code) pairs.
+        let places: Vec<Vec<(i32, i32)>> = classes
+            .decls
+            .iter()
+            .map(|d| {
+                let values = d.slots.iter().enumerate().map(|(k, a)| (a, k as i32));
+                let floats = d
+                    .fslots
+                    .iter()
+                    .enumerate()
+                    .map(|(f, a)| (a, -(f as i32 + 2)));
+                values
+                    .chain(floats)
+                    .map(|(a, code)| (classes.attr_ids[a], code))
+                    .collect()
+            })
+            .collect();
         let mut b = String::from("define i32 @p2w_slot_of(i32 %cid, i32 %aid) {\nentry:\n");
-        let arms: Vec<String> = (0..classes.decls.len())
-            .filter(|&i| !classes.decls[i].slots.is_empty())
+        let arms: Vec<String> = (0..places.len())
+            .filter(|&i| !places[i].is_empty())
             .map(|i| format!("i32 {i}, label %c{i}"))
             .collect();
         b.push_str(&format!(
             "  switch i32 %cid, label %none [ {} ]\n",
             arms.join(" ")
         ));
-        for (i, d) in classes.decls.iter().enumerate() {
-            if d.slots.is_empty() {
+        for (i, class_places) in places.iter().enumerate() {
+            if class_places.is_empty() {
                 continue;
             }
-            let cases: Vec<String> = d
-                .slots
+            let cases: Vec<String> = class_places
                 .iter()
                 .enumerate()
-                .map(|(k, a)| format!("i32 {}, label %c{i}s{k}", classes.attr_ids[a]))
+                .map(|(k, (aid, _))| format!("i32 {aid}, label %c{i}s{k}"))
                 .collect();
             b.push_str(&format!(
                 "c{i}:\n  switch i32 %aid, label %none [ {} ]\n",
                 cases.join(" ")
             ));
-            for k in 0..d.slots.len() {
-                b.push_str(&format!("c{i}s{k}:\n  ret i32 {k}\n"));
+            for (k, (_, code)) in class_places.iter().enumerate() {
+                b.push_str(&format!("c{i}s{k}:\n  ret i32 {code}\n"));
             }
         }
         b.push_str("none:\n  ret i32 -1\n}\n");
@@ -833,9 +866,13 @@ struct ClassDecl {
     /// fallback (an attr miss); values live in per-class module globals
     /// initialized in main's prologue.
     class_vars: Vec<(String, Expr)>,
-    /// The instance's attribute slots (`attrs::slot_layouts`): the base's
-    /// first, so an inherited attribute has the same index in subclasses.
+    /// The instance's value slots (`attrs::slot_layouts`, minus float
+    /// fields): the base's first, so an inherited attribute has the same
+    /// index in subclasses.
     slots: Vec<String>,
+    /// The instance's float fields, stored raw after the value slots, in
+    /// the same base-first order.
+    fslots: Vec<String>,
 }
 
 /// All classes in the module, id-ordered (the id is what `p2w_class_id`
@@ -848,6 +885,9 @@ struct ClassTable {
     /// what `p2w_getattr`/`p2w_setattr` pass when the object's class isn't
     /// known at compile time, mapped to a slot by the generated `p2w_slot_of`.
     attr_ids: BTreeMap<String, i32>,
+    /// Attribute names stored as raw floats in every object that has them
+    /// (`attrs::float_fields`); every read of one is a raw `double`.
+    float_attrs: BTreeSet<String>,
 }
 
 impl ClassTable {
@@ -2381,6 +2421,29 @@ impl<'a> FuncEmitter<'a> {
                 // CPython evaluates the value first, then the object. The
                 // other order borrowed `g` before `g.x = f()` ran f, and f
                 // could free the object being written to.
+                if self.classes.float_attrs.contains(attr) {
+                    // A float field: the raw double goes straight into the
+                    // object, nothing boxed. Every write is a proven float
+                    // (`infer_float_attrs`); a boxed one is unboxed.
+                    let (v, vr) = self.expr_typed(value)?;
+                    let d = self.promote_double(v.clone(), vr);
+                    if is_heap_repr(vr) {
+                        self.release(&v);
+                    }
+                    let (ov, oo) = self.expr_borrow(obj)?;
+                    if let Some(f) = self.self_fslot(obj, attr) {
+                        self.line(&format!(
+                            "call void @p2w_fslot_set(i32 {ov}, i32 {f}, double {d})"
+                        ));
+                    } else {
+                        let aid = self.classes.attr_ids[attr];
+                        self.line(&format!(
+                            "call void @p2w_setattr_f(i32 {ov}, i32 {aid}, double {d})"
+                        ));
+                    }
+                    self.release_if_owned(&ov, oo);
+                    return Ok(());
+                }
                 let v = self.expr(value)?;
                 let (ov, oo) = self.expr_borrow(obj)?;
                 if let Some(k) = self.self_slot(obj, attr) {
@@ -3538,9 +3601,11 @@ impl<'a> FuncEmitter<'a> {
                             args.len()
                         ));
                     }
-                    let nslots = self.classes.decls[cid as usize].slots.len();
-                    let o =
-                        self.call_value(&format!("call i32 @p2w_obj_new(i32 {cid}, i32 {nslots})"));
+                    let decl = &self.classes.decls[cid as usize];
+                    let (nslots, nfloats) = (decl.slots.len(), decl.fslots.len());
+                    let o = self.call_value(&format!(
+                        "call i32 @p2w_obj_new(i32 {cid}, i32 {nslots}, i32 {nfloats})"
+                    ));
                     if let Some((owner, _)) = init {
                         self.line(&format!("call void @p2w_retain(i32 {o})"));
                         let mut ops = vec![format!("i32 {o}")];
@@ -3806,6 +3871,19 @@ impl<'a> FuncEmitter<'a> {
                 // module-wide id finds the slot, and the interned name (owned
                 // +1, borrowed by getattr) serves the class-variable fallback.
                 let (ov, oo) = self.expr_borrow(obj)?;
+                if self.classes.float_attrs.contains(attr) {
+                    // A float field: a raw double, nothing allocated. No
+                    // class has a class variable of this name, so an unset
+                    // field is simply an AttributeError.
+                    let r = if let Some(f) = self.self_fslot(obj, attr) {
+                        self.call_value(&format!("call double @p2w_fslot_get(i32 {ov}, i32 {f})"))
+                    } else {
+                        let aid = self.classes.attr_ids[attr];
+                        self.call_value(&format!("call double @p2w_getattr_f(i32 {ov}, i32 {aid})"))
+                    };
+                    self.release_if_owned(&ov, oo);
+                    return Ok((r, Repr::Float));
+                }
                 if let Some(k) = self.self_slot(obj, attr) {
                     // One load when the slot is set. An unset slot takes the
                     // full lookup: `self` may be a subclass instance whose
@@ -4138,6 +4216,20 @@ impl<'a> FuncEmitter<'a> {
     /// and the class has that attribute. A read must still treat an unset
     /// slot as "look further" (class variables, possibly a subclass's).
     fn self_slot(&self, obj: &Expr, attr: &str) -> Option<usize> {
+        let decl = self.self_decl(obj)?;
+        decl.slots.iter().position(|s| s == attr)
+    }
+
+    /// The float-field index of `self.<attr>`, under `self_slot`'s conditions.
+    fn self_fslot(&self, obj: &Expr, attr: &str) -> Option<usize> {
+        let decl = self.self_decl(obj)?;
+        decl.fslots.iter().position(|s| s == attr)
+    }
+
+    /// The method's own class when `obj` is its never-rebound `self`: `self`
+    /// is then an instance of that class or a subclass, and subclasses keep
+    /// the base's slots and float fields at the same indices.
+    fn self_decl(&self, obj: &Expr) -> Option<&ClassDecl> {
         if !self.self_fixed {
             return None;
         }
@@ -4149,10 +4241,7 @@ impl<'a> FuncEmitter<'a> {
         }
         let class = self.current_class.as_deref()?;
         let id = *self.classes.ids.get(class)?;
-        self.classes.decls[id as usize]
-            .slots
-            .iter()
-            .position(|s| s == attr)
+        Some(&self.classes.decls[id as usize])
     }
 
     fn method_call(&mut self, obj: &Expr, method: &str, args: &[Expr]) -> Result<String, String> {

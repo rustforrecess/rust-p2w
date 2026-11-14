@@ -586,6 +586,19 @@ pub fn groups() -> Vec<Group> {
             ],
         },
         Group {
+            title: "Float fields",
+            note: "An attribute whose every assignment in the program is \
+                   provably a float is stored raw in the object \
+                   (docs/CLASS_LAYOUT.md, step 3), so `self.x + self.v` \
+                   allocates nothing. One int write keeps a field boxed \
+                   (`mixed` below prints 0, then 1.0), so only the \
+                   representation changes, never what a program prints.",
+            probes: vec![p(
+                "float fields, a mixed field, a subclass, access from a function and a loop",
+                "class Body:\n    def __init__(self):\n        self.x = 0.0\n        self.v = 1.5\n        self.n = 0\n        self.mixed = 0\n    def step(self):\n        self.x = self.x + self.v\n        self.n = self.n + 1\n        self.mixed = self.mixed + 0.5\n    def speed_up(self, by: float):\n        self.v = self.v * by\n    def where(self):\n        t = self.x\n        return t / 2.0\n\nclass Rocket(Body):\n    def __init__(self):\n        super().__init__()\n        self.fuel = 10.0\n    def burn(self):\n        self.fuel = self.fuel - 2.5\n        self.step()\n        return self.fuel\n\ndef nudge(b):\n    b.x = b.x + 0.25\n    return b.x\n\nb = Body()\nprint(b.x, b.v, b.n, b.mixed)\nb.step()\nb.step()\nprint(b.x, b.v, b.n, b.mixed)\nb.speed_up(2.0)\nprint(b.v, b.where())\nprint(nudge(b), b.x > 3.0, b.x == 3.25)\nprint(\"x is\", b.x, b.v, [b.x, b.v])\nr = Rocket()\nprint(r.burn(), r.x, r.fuel, nudge(r))\nbodies = [Body(), Rocket()]\ntotal = 0.0\nfor it in bodies:\n    it.step()\n    total = total + it.x\nprint(total)\nb.x = b.x * -1.0\nprint(b.x, abs(b.x), int(b.x), round(b.x))\n",
+            )],
+        },
+        Group {
             title: "Comprehension variables have their own scope",
             note: "As in Python 3, a comprehension's loop variables don't leak: \
                    `x = 5; ys = [x * 2 for x in range(3)]` leaves `x` at 5. The \

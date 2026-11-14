@@ -1,7 +1,7 @@
 # Class layout — proposal
 
-**Status (2026-11-10): steps 1 and 2 BUILT on both backends; steps 3–5
-PROPOSED.** Claims about
+**Status (2026-11-13): steps 1, 2 and 3 (float fields) BUILT on both
+backends; steps 2b, 4 and 5 PROPOSED.** Claims about
 p2w today were checked by running programs and reading the generated code
 the same day.
 
@@ -21,7 +21,8 @@ time because the compiler sees every class.
 
 | | WASM | native |
 |---|---|---|
-| an instance | `$OBJECT` = class + `$ITEMS` slot array (since step 2) | `[tag][rc][class_id][slot count][slots…]` (since step 2) |
+| an instance | `$OBJECT` = class + `$ITEMS` slot array + `$FITEMS` float array (steps 2, 3) | `[tag][rc][class_id][counts][slots…][f64 fields…]` (steps 2, 3) |
+| a float field `self.x` | in a method: `array.get $FITEMS` at a constant index, a raw `f64`; elsewhere `$obj_getattr_f` by attribute id | in a method: `p2w_fslot_get(self, f)`, a raw `double`; elsewhere `p2w_getattr_f` by attribute id |
 | `self.speed` | in a method: `array.get` at a constant index; elsewhere: `$obj_getattr` by attribute id through the class's `$SLOTMAP` (since step 2) | in a method: `p2w_slot_get(self, k)`, a direct slot read; elsewhere: `p2w_getattr` by attribute id (since step 2) |
 | a method | in a `$DICT` on `$CLASS`; uniform `(self, args)` signature, so each call builds and unpacks an argument list | compile-time switch on the class id |
 
@@ -40,9 +41,10 @@ attribute and the program printed the old `speed`.
    WASM-GC struct, a fixed offset natively. `self.speed` is one field read.
    A subclass's fields extend its base's as a prefix, which WASM-GC struct
    subtyping supports directly (a struct declares one supertype).
-3. **Unboxed fields.** Where the checker knows a field is an int or a float,
-   it holds the raw number, as typed locals already do (`VALUE_MODEL.md`).
-   The biggest win for robot code full of numbers.
+3. **Float fields.** A field whose every assignment is provably a float
+   holds the raw `f64`, as typed locals already do (`VALUE_MODEL.md`). Ints
+   need nothing: a small int is already an immediate tagged value, so only
+   floats allocate. The biggest win for robot code full of numbers.
 4. **Method tables.** Each class has an array of method references at fixed
    indices, built at compile time, with real typed parameters instead of an
    argument list. A call is one indexed load and a call; when the exact class
@@ -174,12 +176,57 @@ A shared probe group ("Object attributes in fixed slots") runs a subclass,
 a class variable shadowed through an instance, and an attribute set from a
 plain function on both backends; both match CPython.
 
+## Step 3, float fields — built (2026-11-13)
+
+**Which fields.** Decided for the whole program, per attribute NAME
+(`repr::infer_float_attrs`): `x` is a float field only if every assignment
+to any `.x`, on `self` or any other object, is provably a float. One int
+(`self.x = 0`) keeps the field boxed, because a float slot would print
+`0.0` where CPython prints `0`. So the pass changes representation only,
+never what a program prints, like the slot inference for locals. The proof
+is circular on purpose (`self.x = self.x + self.v` is a float only if `x`
+and `v` are): it assumes every candidate is a float field and removes any
+name with a write that isn't, until nothing changes.
+
+A name can't be a float field if any class has a class variable of that
+name (an unset slot there means "read the class variable"), or if a module
+exports it (`math.pi`, `robot.tilt`); so an attribute read never needs to
+know what kind of thing its receiver is. Typing by name rather than by
+class is what makes an access from outside the class (`def nudge(b):
+b.x = b.x + 0.25`) sound without knowing `b`'s class: every object with an
+`x` stores it the same way.
+
+**Where they live.** Native: raw `f64`s after the value slots, the base's
+first, the two counts packed in one header word; only value slots are
+released on free. WASM: a second array, `$FITEMS`. An unset field holds a
+NaN bit pattern no arithmetic produces (`0x7ff8dead00000000`), checked on
+read, so reading a field `__init__` set only on some paths is still
+CPython's AttributeError.
+
+**How they flow.** A read of a float field is a proven float for the shared
+inference (recorded under `repr::float_attr_key` in the map
+`infer_expr_repr` already takes), so `self.x + self.v` is raw arithmetic and
+`t = self.x` gives `t` a raw slot. In a method that never rebinds `self`,
+access is by constant index; elsewhere by attribute id through
+`p2w_getattr_f` / `$obj_getattr_f`. A dynamic sink (`print`, a list, an
+untyped parameter) boxes as for any raw float.
+
+**Measured** on the same step program (3 million calls):
+
+| | before (slots, boxed floats) | after (float fields) |
+|---|---|---|
+| native allocations | 3,000,005 | 3 |
+| native, median of nine | 401 ms | 275 ms (start-up is about 27 ms of each) |
+| WASM (wasmtime runner), median of seven | 7,452 ms | 5,050 ms |
+
+Same output on CPython, WASM and native; `live=0`. What remains in that
+loop is the method call and the boxed `self.n + 1`: step 4.
+
 ## Plan for the rest
 
 | Step | Work | Gate |
 |---|---|---|
 | 2b | The checker types objects, so attribute assignments outside methods check against the object's own class rather than "some class has it" | a typo through a typed variable (`r.speeed = 5` after `r = Robot()`) refused naming `Robot`; the class probes and oracle programs unchanged; zero backend divergence |
-| 3 | Unboxed int/float fields | as above, plus the existing leak gate (`live=0`) |
 | 4 | Method tables with typed parameters; direct calls when the class is known | as above; a microbenchmark of method calls before and after |
 | 5 | Mixins | when a lesson asks for them |
 

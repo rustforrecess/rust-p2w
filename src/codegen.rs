@@ -292,6 +292,20 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
         g.ensure_global(n);
     }
 
+    // Float fields, now that every function's return repr is known. They are
+    // recorded where `infer_expr_repr` looks, so a read of one is a proven
+    // float for the slot inference and every emitter path.
+    g.float_attrs = crate::attrs::float_fields(stmts, &g.func_ret_reprs);
+    for a in &g.float_attrs {
+        g.func_ret_reprs
+            .insert(crate::repr::float_attr_key(a), Repr::Float);
+    }
+    for (class, layout) in std::mem::take(&mut g.slot_layouts) {
+        let (values, floats) = crate::attrs::split_layout(&layout, &g.float_attrs);
+        g.slot_layouts.insert(class.clone(), values);
+        g.fslot_layouts.insert(class, floats);
+    }
+
     // Pass 1.5: top-level slot inference. The prefix rule: count how many
     // leading statements are plain assignments; only globals FIRST BOUND in
     // that prefix may be typed (nothing else has run yet, so no code path —
@@ -475,17 +489,23 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     // $SLOTMAP: a class's attribute-id -> slot table (-1 = no such slot).
     module.types.push("(type $SLOTMAP (array i32))".into());
     // $CLASS self-references via $base, so it lives in a singleton rec group.
-    // Fields: name, methods + class variables, base, slot map, slot count.
+    // Fields: name, methods + class variables, base, slot map, slot count,
+    // float-field count.
     module.types.push(
-        "(rec (type $CLASS (struct (field (ref null any)) (field (ref null $DICT)) (field (ref null $CLASS)) (field (ref null $SLOTMAP)) (field i32))))".into(),
+        "(rec (type $CLASS (struct (field (ref null any)) (field (ref null $DICT)) (field (ref null $CLASS)) (field (ref null $SLOTMAP)) (field i32) (field i32))))".into(),
     );
-    // An instance: its class and its attribute slots (null = not set yet).
+    // An instance: its class, its value slots (null = not set yet) and its
+    // float fields.
     // A class's attributes are fixed at compile time (docs/CLASS_LAYOUT.md);
     // a base's slots come first, so an inherited attribute has the same
     // index in every subclass.
-    module
-        .types
-        .push("(type $OBJECT (struct (field (ref $CLASS)) (field (ref $ITEMS))))".into());
+    module.types.push("(type $FITEMS (array (mut f64)))".into());
+    // Float fields (docs/CLASS_LAYOUT.md, step 3) live raw in a second array;
+    // an unset one holds a NaN bit pattern no arithmetic produces.
+    module.types.push(
+        "(type $OBJECT (struct (field (ref $CLASS)) (field (ref $ITEMS)) (field (ref $FITEMS))))"
+            .into(),
+    );
     module
         .imports
         .push(r#"(import "env" "write_char" (func $write_char (param i32)))"#.into());
@@ -6093,7 +6113,7 @@ fn class_helpers() -> Vec<Func> {
     // (if defined) with self prepended.
     let mut b = Body::new();
     b.push(
-        "(local.set $obj (struct.new $OBJECT (ref.cast (ref $CLASS) (local.get $class)) (array.new $ITEMS (ref.null any) (struct.get $CLASS 4 (local.get $class)))))",
+        "(local.set $obj (struct.new $OBJECT (ref.cast (ref $CLASS) (local.get $class)) (array.new $ITEMS (ref.null any) (struct.get $CLASS 4 (local.get $class))) (array.new $FITEMS (f64.reinterpret_i64 (i64.const 0x7ff8dead00000000)) (struct.get $CLASS 5 (local.get $class)))))",
     );
     b.push(format!(
         "(local.set $init (call $class_lookup_method (local.get $class) {}))",
@@ -6138,6 +6158,18 @@ fn class_helpers() -> Vec<Func> {
         2,
         "(if (i32.eqz (ref.is_null (local.get $m))) (then (return (local.get $m))))))",
     );
+    // A float field read where a boxed value is wanted (the compiler reads
+    // these raw; this keeps the generic entry complete).
+    b.push("(if (i32.le_s (local.get $idx) (i32.const -2))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(local.set $x (array.get $FITEMS (struct.get $OBJECT 2 (ref.cast (ref $OBJECT) (local.get $obj))) (i32.sub (i32.const -2) (local.get $idx))))",
+    );
+    b.push_in(
+        2,
+        "(if (i64.ne (i64.reinterpret_f64 (local.get $x)) (i64.const 0x7ff8dead00000000)) (then (return (struct.new $FLOAT (local.get $x)))))))",
+    );
     // Fall back to the class namespace (class variables shared by instances).
     b.push(
         "(local.set $m (call $class_lookup_method (struct.get $OBJECT 0 (ref.cast (ref $OBJECT) (local.get $obj))) (local.get $name)))",
@@ -6157,7 +6189,11 @@ fn class_helpers() -> Vec<Func> {
         signature:
             "(func $obj_getattr (param $obj (ref null any)) (param $aid i32) (param $name (ref null any)) (result (ref null any))"
                 .into(),
-        locals: vec!["(local $idx i32)".into(), "(local $m (ref null any))".into()],
+        locals: vec![
+            "(local $idx i32)".into(),
+            "(local $m (ref null any))".into(),
+            "(local $x f64)".into(),
+        ],
         body: b,
     });
 
@@ -6230,6 +6266,60 @@ fn class_helpers() -> Vec<Func> {
         body: b,
     });
 
+    // $obj_getattr_f / $obj_setattr_f: a float field read or written raw when
+    // the object's class isn't known at compile time. An object without the
+    // field, or with it unset, is an AttributeError.
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push("(local.set $idx (call $slot_of (local.get $obj) (local.get $aid)))");
+    b.push("(if (i32.gt_s (local.get $idx) (i32.const -2))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push(
+        "(local.set $x (array.get $FITEMS (struct.get $OBJECT 2 (ref.cast (ref $OBJECT) (local.get $obj))) (i32.sub (i32.const -2) (local.get $idx))))",
+    );
+    b.push("(if (i64.eq (i64.reinterpret_f64 (local.get $x)) (i64.const 0x7ff8dead00000000))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push("(local.get $x)");
+    fs.push(Func {
+        signature:
+            "(func $obj_getattr_f (param $obj (ref null any)) (param $aid i32) (param $name (ref null any)) (result f64)"
+                .into(),
+        locals: vec!["(local $idx i32)".into(), "(local $x f64)".into()],
+        body: b,
+    });
+    let mut b = Body::new();
+    b.push("(if (i32.eqz (ref.test (ref $OBJECT) (local.get $obj)))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push("(local.set $idx (call $slot_of (local.get $obj) (local.get $aid)))");
+    b.push("(if (i32.gt_s (local.get $idx) (i32.const -2))");
+    b.push_in(
+        1,
+        "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
+    );
+    b.push(
+        "(array.set $FITEMS (struct.get $OBJECT 2 (ref.cast (ref $OBJECT) (local.get $obj))) (i32.sub (i32.const -2) (local.get $idx)) (local.get $x))",
+    );
+    fs.push(Func {
+        signature:
+            "(func $obj_setattr_f (param $obj (ref null any)) (param $aid i32) (param $name (ref null any)) (param $x f64)"
+                .into(),
+        locals: vec!["(local $idx i32)".into()],
+        body: b,
+    });
+
     // $obj_setattr: instance attribute write when the object's class isn't
     // known at compile time. A class without that attribute is CPython's
     // AttributeError for a class with __slots__: the compiler has already
@@ -6241,6 +6331,14 @@ fn class_helpers() -> Vec<Func> {
         "(then (call $raise_no_attr (local.get $obj) (local.get $name))))",
     );
     b.push("(local.set $idx (call $slot_of (local.get $obj) (local.get $aid)))");
+    // A float field given a boxed number (the compiler passes these raw).
+    b.push("(if (i32.le_s (local.get $idx) (i32.const -2))");
+    b.push_in(1, "(then");
+    b.push_in(
+        2,
+        "(array.set $FITEMS (struct.get $OBJECT 2 (ref.cast (ref $OBJECT) (local.get $obj))) (i32.sub (i32.const -2) (local.get $idx)) (call $unbox_f64 (local.get $val)))",
+    );
+    b.push_in(2, "(return)))");
     b.push("(if (i32.lt_s (local.get $idx) (i32.const 0))");
     b.push_in(
         1,
@@ -6447,6 +6545,11 @@ struct Gen {
     /// known at compile time.
     slot_layouts: std::collections::BTreeMap<String, Vec<String>>,
     attr_ids: std::collections::BTreeMap<String, i32>,
+    /// Attribute names stored as raw floats in every object that has them
+    /// (`attrs::float_fields`), and each class's float fields in layout
+    /// order. `slot_layouts` holds only the value slots once these are set.
+    float_attrs: std::collections::BTreeSet<String>,
+    fslot_layouts: std::collections::BTreeMap<String, Vec<String>>,
     /// Top-level Python variables, in definition order — WASM globals named
     /// `$g_<name>` so function bodies can read them.
     globals: Vec<String>,
@@ -6731,6 +6834,30 @@ impl Gen {
                         "(call $dict_set (struct.get $CLASS 1 (global.get $g_class_{owner})) {} {v})",
                         str_lit(attr)
                     ));
+                    return Ok(());
+                }
+                if self.float_attrs.contains(attr) {
+                    // A float field: the raw f64 goes straight into the
+                    // object, nothing boxed. Every write is a proven float
+                    // (`infer_float_attrs`); a boxed one is unboxed. Value
+                    // first, then the object, as below.
+                    let raw = match self.scalar_expr(cx, value, Repr::Float) {
+                        Some(r) => r,
+                        None => format!("(call $unbox_f64 {})", self.value_expr(cx, value)?),
+                    };
+                    let tmp = cx.scratch_local("f64");
+                    out.push(format!("(local.set ${tmp} {raw})"));
+                    let o = self.value_expr(cx, obj)?;
+                    out.push(match self.self_fslot(cx, obj, attr) {
+                        Some(f) => format!(
+                            "(array.set $FITEMS (struct.get $OBJECT 2 (ref.cast (ref $OBJECT) {o})) (i32.const {f}) (local.get ${tmp}))"
+                        ),
+                        None => format!(
+                            "(call $obj_setattr_f {o} (i32.const {}) {} (local.get ${tmp}))",
+                            self.attr_ids[attr],
+                            str_lit(attr)
+                        ),
+                    });
                     return Ok(());
                 }
                 // CPython evaluates the value first, then the object:
@@ -7200,6 +7327,24 @@ impl Gen {
         self.slot_layouts.get(class)?.iter().position(|s| s == attr)
     }
 
+    /// The float-field index of `self.<attr>`, under `self_slot`'s conditions.
+    fn self_fslot(&self, cx: &FuncCx, obj: &Expr, attr: &str) -> Option<usize> {
+        if !cx.self_fixed {
+            return None;
+        }
+        let ExprKind::Name(n) = &obj.kind else {
+            return None;
+        };
+        if Some(n) != cx.self_name.as_ref() {
+            return None;
+        }
+        let class = cx.current_class.as_deref()?;
+        self.fslot_layouts
+            .get(class)?
+            .iter()
+            .position(|s| s == attr)
+    }
+
     /// `obj.attr = value` as WAT: a direct slot store for `self.x` in a
     /// method, otherwise through the attribute's module-wide id.
     fn set_attr_wat(&self, cx: &FuncCx, obj: &Expr, o: &str, attr: &str, v: &str) -> String {
@@ -7555,6 +7700,9 @@ impl Gen {
             current_class: Some(class.to_string()),
             self_name: Some(self_name.clone()),
             self_fixed: !crate::attrs::rebinds(&m.body, self_name),
+            // Float fields are recorded here, so `self.x` reads type as raw
+            // floats in methods as they do in functions.
+            rets: self.func_ret_reprs.clone(),
             ..Default::default()
         };
         for p in &m.params {
@@ -7642,20 +7790,30 @@ impl Gen {
             None => "(ref.null $CLASS)".to_string(),
         };
         let slots = self.slot_layouts.get(name).cloned().unwrap_or_default();
+        let fslots = self.fslot_layouts.get(name).cloned().unwrap_or_default();
+        // Per attribute id: value slot `k`, float field `f` as `-(f + 2)`,
+        // or -1 for none.
         let map: Vec<String> = self
             .attr_ids
             .keys()
             .map(|a| {
-                let k = slots.iter().position(|s| s == a).map_or(-1, |k| k as i32);
-                format!("(i32.const {k})")
+                let code = match slots.iter().position(|s| s == a) {
+                    Some(k) => k as i32,
+                    None => fslots
+                        .iter()
+                        .position(|s| s == a)
+                        .map_or(-1, |f| -(f as i32 + 2)),
+                };
+                format!("(i32.const {code})")
             })
             .collect();
         out.push(format!(
-            "(global.set $g_class_{name} (struct.new $CLASS {} (local.get $.cd) {base_ref} (array.new_fixed $SLOTMAP {} {}) (i32.const {})))",
+            "(global.set $g_class_{name} (struct.new $CLASS {} (local.get $.cd) {base_ref} (array.new_fixed $SLOTMAP {} {}) (i32.const {}) (i32.const {})))",
             str_lit(name),
             map.len(),
             map.join(" "),
-            slots.len()
+            slots.len(),
+            fslots.len()
         ));
         Ok(())
     }
@@ -8319,6 +8477,17 @@ impl Gen {
                     )
                     .with_kind(crate::error::ErrorKind::Attribute)
                     .with_fact(Fact::missing_part(cn, name, &[])));
+                }
+                if self.float_attrs.contains(name) {
+                    // A float field where a boxed value is wanted: read it
+                    // raw (below, in `scalar_expr`) and box the result.
+                    let raw = self.scalar_expr(cx, e, Repr::Float).ok_or_else(|| {
+                        CompileError::at_expr(
+                            e,
+                            format!("can't read the float field '{name}' here"),
+                        )
+                    })?;
+                    return Ok(format!("(struct.new $FLOAT {raw})"));
                 }
                 let o = self.value_expr(cx, obj)?;
                 if let Some(k) = self.self_slot(cx, obj, name) {
@@ -9672,6 +9841,26 @@ impl Gen {
                     (Repr::Int, Repr::Int) | (Repr::Float, Repr::Float) => Some(get),
                     (Repr::Int, Repr::Float) => Some(format!("(f64.convert_i32_s {get})")),
                     _ => None,
+                }
+            }
+            (ExprKind::Attr(obj, name), Repr::Float) if self.float_attrs.contains(name) => {
+                // A float field: a raw f64, nothing allocated. No class has a
+                // class variable of this name, so an unset field is simply
+                // an AttributeError; the name literal is built only then.
+                let o = self.value_expr(cx, obj).ok()?;
+                match self.self_fslot(cx, obj, name) {
+                    Some(f) => {
+                        let t = cx.scratch_local("f64");
+                        Some(format!(
+                            "(block (result f64) (local.set ${t} (array.get $FITEMS (struct.get $OBJECT 2 (ref.cast (ref $OBJECT) {o})) (i32.const {f}))) (if (i64.eq (i64.reinterpret_f64 (local.get ${t})) (i64.const 0x7ff8dead00000000)) (then (call $raise_no_attr {o} {}))) (local.get ${t}))",
+                            str_lit(name)
+                        ))
+                    }
+                    None => Some(format!(
+                        "(call $obj_getattr_f {o} (i32.const {}) {})",
+                        self.attr_ids[name],
+                        str_lit(name)
+                    )),
                 }
             }
             (ExprKind::Call(f, args), _) => {

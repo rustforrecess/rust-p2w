@@ -225,6 +225,47 @@ pub(crate) fn slot_layouts(program: &[Stmt]) -> BTreeMap<String, Vec<String>> {
     out
 }
 
+/// The program's float fields (`repr::infer_float_attrs`): attribute names
+/// stored as a raw `f64` in every object that has them. A name can't be one
+/// if any class has a class variable of that name (an unset slot there means
+/// "read the class variable", which a raw float can't express), or if a
+/// module also exports it (`math.pi`, `robot.tilt`), so an attribute read
+/// never needs to know what kind of thing its receiver is.
+pub(crate) fn float_fields(
+    program: &[Stmt],
+    rets: &std::collections::HashMap<String, crate::repr::Repr>,
+) -> BTreeSet<String> {
+    let mut candidates: BTreeSet<String> = slot_layouts(program).into_values().flatten().collect();
+    for s in program {
+        if let StmtKind::ClassDef { class_vars, .. } = &s.kind {
+            for (v, _) in class_vars {
+                candidates.remove(v);
+            }
+        }
+    }
+    for m in crate::hostmod::HOST_MODULES {
+        for n in m.names() {
+            candidates.remove(n);
+        }
+    }
+    for n in ["pi", "e", "tau"] {
+        candidates.remove(n);
+    }
+    crate::repr::infer_float_attrs(program, rets, candidates)
+}
+
+/// A class's slot layout split into value slots and float fields, each
+/// keeping the layout's order, so both stay prefix-stable across subclasses.
+pub(crate) fn split_layout(
+    layout: &[String],
+    float_attrs: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    layout
+        .iter()
+        .cloned()
+        .partition(|a| !float_attrs.contains(a))
+}
+
 /// The names in `__slots__ = ("x", "y")` (a tuple or list of strings), if the
 /// class declares it that way.
 fn declared_slots(class_vars: &[(String, crate::ast::Expr)]) -> Option<Vec<String>> {

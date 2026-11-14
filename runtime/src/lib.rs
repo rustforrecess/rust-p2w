@@ -1812,7 +1812,8 @@ fn free_object(o: usize) {
         T_OBJECT => {
             // The instance owns one reference per set slot (unset slots are
             // 0, which release ignores); the cascade handles nested objects.
-            for i in 0..rd(o + 12) as usize {
+            // Float fields, stored after the slots, hold no references.
+            for i in 0..(rd(o + 12) & 0xffff) as usize {
                 p2w_release(rd(o + 16 + 4 * i) as Value);
             }
         }
@@ -2175,38 +2176,111 @@ const OP_GE: i32 = 7;
 const OP_LEN: i32 = 8;
 const OP_GETITEM: i32 = 9;
 
-/// A fresh instance of class `class_id` with `slots` attribute slots, all
-/// unset. Layout: `[tag][rc][class_id][slot count][slot 0]…`. A class's
-/// attributes are fixed at compile time (docs/CLASS_LAYOUT.md), so each has
-/// a slot index; a base class's slots come first, so an inherited attribute
-/// has the same index in every subclass. An unset slot holds 0, which no
-/// value ever is (`is_heap` excludes it and every tagged value is nonzero).
+/// A fresh instance of class `class_id` with `slots` value slots and
+/// `floats` float fields, all unset. Layout:
+/// `[tag][rc][class_id][counts][value slot 0]…[f64 field 0]…`, where
+/// `counts` packs the slot count (low 16 bits) and the float-field count
+/// (high 16). A class's attributes are fixed at compile time
+/// (docs/CLASS_LAYOUT.md), so each has an index; a base class's come first in
+/// both areas, so an inherited attribute has the same index in every
+/// subclass. An unset value slot holds 0, which no value ever is (`is_heap`
+/// excludes it and every tagged value is nonzero); an unset float field
+/// holds `UNSET_F64`.
 #[unsafe(no_mangle)]
-pub extern "C" fn p2w_obj_new(class_id: i32, slots: i32) -> Value {
-    let n = slots.max(0) as usize;
-    let p = alloc(16 + 4 * n);
+pub extern "C" fn p2w_obj_new(class_id: i32, slots: i32, floats: i32) -> Value {
+    let n = slots.clamp(0, 0xffff) as usize;
+    let nf = floats.clamp(0, 0xffff) as usize;
+    let p = alloc(16 + 4 * n + 8 * nf);
     wr(p, T_OBJECT);
     wr(p + 4, 1);
     live_inc();
     wr(p + 8, class_id as u32);
-    wr(p + 12, n as u32);
+    wr(p + 12, (n | (nf << 16)) as u32);
     for i in 0..n {
         wr(p + 16 + 4 * i, 0);
     }
+    for i in 0..nf {
+        wr_f64(p + 16 + 4 * n + 8 * i, f64::from_bits(UNSET_F64));
+    }
     p as Value
+}
+
+/// The bit pattern of a float field that hasn't been set: a NaN with a
+/// payload no arithmetic produces (`float("nan")` and every computed NaN are
+/// 0x7ff8_0000_0000_0000). Fields are checked on read, so it never reaches
+/// a program.
+const UNSET_F64: u64 = 0x7ff8_dead_0000_0000;
+
+fn rd_f64(off: usize) -> f64 {
+    unsafe { core::ptr::read_unaligned(heap_base().add(off) as *const f64) }
+}
+fn wr_f64(off: usize, x: f64) {
+    unsafe { core::ptr::write_unaligned(heap_base().add(off) as *mut f64, x) }
+}
+
+/// `obj`'s value-slot count and float-field count; traps on a non-object.
+fn obj_counts(obj: Value) -> (usize, usize) {
+    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
+        trap_msg(&messages::ATTR_NOT_OBJECT, type_label(obj));
+    }
+    let w = rd(obj as usize + 12);
+    ((w & 0xffff) as usize, (w >> 16) as usize)
 }
 
 /// The address of `obj`'s slot `idx`, trapping on a non-object or an index
 /// past its slots (a compiler bug, never a student's).
 fn slot_addr(obj: Value, idx: i32) -> usize {
-    if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
-        trap_msg(&messages::ATTR_NOT_OBJECT, type_label(obj));
-    }
-    let o = obj as usize;
-    if idx < 0 || idx as u32 >= rd(o + 12) {
+    let (n, _) = obj_counts(obj);
+    if idx < 0 || idx as usize >= n {
         trap_msg(&messages::ATTR_SLOT_RANGE, "");
     }
-    o + 16 + 4 * idx as usize
+    obj as usize + 16 + 4 * idx as usize
+}
+
+/// The address of `obj`'s float field `f`, past its value slots.
+fn fslot_addr(obj: Value, f: i32) -> usize {
+    let (n, nf) = obj_counts(obj);
+    if f < 0 || f as usize >= nf {
+        trap_msg(&messages::ATTR_SLOT_RANGE, "");
+    }
+    obj as usize + 16 + 4 * n + 8 * f as usize
+}
+
+/// `self.x` where `x` is a float field whose index the compiler knows: the
+/// raw float, nothing allocated. BORROWS `obj`. A field never set is
+/// CPython's AttributeError.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_fslot_get(obj: Value, f: i32) -> f64 {
+    let x = rd_f64(fslot_addr(obj, f));
+    if x.to_bits() == UNSET_F64 {
+        trap_msg(&messages::ATTR_NOT_FOUND, "");
+    }
+    x
+}
+
+/// `self.x = value` for a float field whose index the compiler knows.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_fslot_set(obj: Value, f: i32, x: f64) {
+    wr_f64(fslot_addr(obj, f), x);
+}
+
+/// `obj.x` for a float field when the object's class isn't known at compile
+/// time: the raw float. An object without that field is an AttributeError.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_getattr_f(obj: Value, attr_id: i32) -> f64 {
+    match slot_of(obj, attr_id) {
+        idx if idx <= -2 => p2w_fslot_get(obj, -(idx + 2)),
+        _ => trap_msg(&messages::ATTR_NOT_FOUND, ""),
+    }
+}
+
+/// `obj.x = value` for a float field when the object's class isn't known.
+#[unsafe(no_mangle)]
+pub extern "C" fn p2w_setattr_f(obj: Value, attr_id: i32, x: f64) {
+    match slot_of(obj, attr_id) {
+        idx if idx <= -2 => p2w_fslot_set(obj, -(idx + 2), x),
+        _ => trap_msg(&messages::ATTR_NO_SLOT, ""),
+    }
 }
 
 /// `self.x` where the compiler knows x's slot: the value, owned (+1), or 0
@@ -2229,7 +2303,8 @@ pub extern "C" fn p2w_slot_set(obj: Value, idx: i32, value: Value) {
     p2w_release(old);
 }
 
-/// The slot of attribute `attr_id` in `obj`'s class, or -1. The table is
+/// Where attribute `attr_id` lives in `obj`'s class: a value slot `k >= 0`,
+/// float field `f` encoded as `-(f + 2)`, or -1 for none. The table is
 /// generated per module (`p2w_slot_of`).
 fn slot_of(obj: Value, attr_id: i32) -> i32 {
     if !(is_heap(obj) && obj_tag(obj) == T_OBJECT) {
@@ -2263,9 +2338,16 @@ pub extern "C" fn p2w_class_id(v: Value) -> i32 {
 pub extern "C" fn p2w_getattr(obj: Value, attr_id: i32, name: Value) -> Value {
     let idx = slot_of(obj, attr_id);
     if idx >= 0 {
-        let v = rd(obj as usize + 16 + 4 * idx as usize) as Value;
+        let v = rd(slot_addr(obj, idx)) as Value;
         if v != 0 {
             return owned(v);
+        }
+    } else if idx <= -2 {
+        // A float field read where a boxed value is wanted (the compiler
+        // reads these raw; this keeps the generic entry complete).
+        let x = rd_f64(fslot_addr(obj, -(idx + 2)));
+        if x.to_bits() != UNSET_F64 {
+            return float_alloc(x);
         }
     }
     unsafe { p2w_classvar(obj, name) }
@@ -2335,6 +2417,13 @@ pub extern "C" fn p2w_method_not_value() -> Value {
 #[unsafe(no_mangle)]
 pub extern "C" fn p2w_setattr(obj: Value, attr_id: i32, value: Value) {
     let idx = slot_of(obj, attr_id);
+    if idx <= -2 {
+        // A float field given a boxed number (the compiler passes these
+        // raw; this keeps the generic entry complete).
+        let x = p2w_unbox_float(value);
+        p2w_release(value);
+        return p2w_fslot_set(obj, -(idx + 2), x);
+    }
     if idx < 0 {
         trap_msg(&messages::ATTR_NO_SLOT, "");
     }
@@ -4844,7 +4933,12 @@ mod tests {
     #[test]
     fn objects_hold_attrs_and_release_them() {
         let _g = heap_guard();
-        let obj = p2w_obj_new(3, 2);
+        let obj = p2w_obj_new(3, 2, 2);
+        // Float fields sit after the value slots and hold raw floats.
+        p2w_fslot_set(obj, 1, 2.5);
+        assert_eq!(p2w_fslot_get(obj, 1), 2.5);
+        p2w_fslot_set(obj, 0, f64::NAN); // an ordinary NaN is a value
+        assert!(p2w_fslot_get(obj, 0).is_nan());
         assert_eq!(p2w_class_id(obj), 3);
         assert_eq!(p2w_class_id(p2w_int(5)), -1, "non-objects are -1");
         // A known slot: set TRANSFERS the value in, peek returns an owned

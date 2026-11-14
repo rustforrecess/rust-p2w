@@ -5,7 +5,7 @@
 //! every variant; the GC emitter (typed-slot tier) uses `Int`/`Float`/`Boxed`
 //! today and ignores the packed-array reprs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 
@@ -120,7 +120,149 @@ pub(crate) fn infer_expr_repr(
             Some(Repr::FloatArray) => Some(Repr::Float),
             _ => None,
         },
+        // `obj.x` where `x` is a float field (`infer_float_attrs`): every
+        // object that has an `x` stores it as a raw float. A module's
+        // attribute (`math.pi`, `robot.tilt`) is not an object's.
+        ExprKind::Attr(obj, name) => {
+            if let ExprKind::Name(m) = &obj.kind
+                && look(m).is_none()
+                && (m == "math" || m == "random" || crate::hostmod::module(m).is_some())
+            {
+                return None;
+            }
+            rets.get(&float_attr_key(name)).copied()
+        }
         _ => None,
+    }
+}
+
+/// The key a float field is recorded under in the function-return map that
+/// `infer_expr_repr` already takes (`rets`). A leading `.` can't be a
+/// function name, so the two never collide; this keeps one inference
+/// signature for every caller instead of a second map threaded everywhere.
+pub(crate) fn float_attr_key(attr: &str) -> String {
+    format!(".{attr}")
+}
+
+/// `rets` with every float field added under its `float_attr_key`.
+pub(crate) fn with_float_attrs(
+    rets: &HashMap<String, Repr>,
+    float_attrs: &BTreeSet<String>,
+) -> HashMap<String, Repr> {
+    let mut out = rets.clone();
+    for a in float_attrs {
+        out.insert(float_attr_key(a), Repr::Float);
+    }
+    out
+}
+
+/// Which attribute names are FLOAT FIELDS: stored as a raw `f64` in every
+/// object that has them (docs/CLASS_LAYOUT.md, step 3), so `self.x + self.v`
+/// allocates nothing. Decided for the whole program, per attribute name:
+/// `x` is a float field only if EVERY assignment to any `.x`, on `self` or
+/// any other object, is provably a float. One int (`self.x = 0`) keeps the
+/// field boxed, because a float slot would print `0.0` where CPython prints
+/// `0`: this can only change representation, never behavior, like the
+/// slot inference above.
+///
+/// `candidates` are the names allowed to be float fields at all (the caller
+/// leaves out class-variable names, where an unset slot means "read the
+/// class variable", and names a host module also exports).
+///
+/// The proof is circular on purpose: `self.x = self.x + self.v` is a float
+/// only if `x` and `v` are. So it starts by assuming every candidate is a
+/// float field and removes any name with a write that isn't, until nothing
+/// changes. What remains is consistent: under the assumption that exactly
+/// these are floats, every write to them is a float.
+pub(crate) fn infer_float_attrs(
+    program: &[Stmt],
+    rets: &HashMap<String, Repr>,
+    candidates: BTreeSet<String>,
+) -> BTreeSet<String> {
+    fn check(
+        body: &[Stmt],
+        look: &dyn Fn(&str) -> Option<Repr>,
+        rets: &HashMap<String, Repr>,
+        set: &BTreeSet<String>,
+        bad: &mut BTreeSet<String>,
+    ) {
+        for s in body {
+            match &s.kind {
+                StmtKind::SetAttr { attr, value, .. } if set.contains(attr) => {
+                    if infer_expr_repr(value, look, rets) != Some(Repr::Float) {
+                        bad.insert(attr.clone());
+                    }
+                }
+                // An unpacked element's type isn't tracked.
+                StmtKind::UnpackAssign { targets, .. } => {
+                    for t in targets {
+                        if let ExprKind::Attr(_, attr) = &t.kind {
+                            bad.insert(attr.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            crate::lint::for_each_child_block(s, |b, scope| {
+                if scope == crate::lint::BlockScope::Same {
+                    check(b, look, rets, set, bad);
+                }
+            });
+        }
+    }
+    // One scope: its proven local reprs, then its writes.
+    fn scope(
+        body: &[Stmt],
+        fixed: &HashMap<String, Repr>,
+        rets: &HashMap<String, Repr>,
+        set: &BTreeSet<String>,
+        bad: &mut BTreeSet<String>,
+    ) {
+        let env = infer_slot_reprs(body, fixed, rets);
+        let look = |n: &str| -> Option<Repr> {
+            match fixed.get(n).or_else(|| env.get(n)) {
+                Some(r @ (Repr::Int | Repr::Float | Repr::IntArray | Repr::FloatArray)) => Some(*r),
+                _ => None,
+            }
+        };
+        check(body, &look, rets, set, bad);
+    }
+
+    let mut set = candidates;
+    loop {
+        let rets = with_float_attrs(rets, &set);
+        let mut bad = BTreeSet::new();
+        // Module level: `infer_slot_reprs` skips defs and classes.
+        scope(program, &HashMap::new(), &rets, &set, &mut bad);
+        for s in program {
+            match &s.kind {
+                StmtKind::Def {
+                    params,
+                    param_types,
+                    body,
+                    ..
+                } => {
+                    let fixed = params
+                        .iter()
+                        .zip(param_types)
+                        .map(|(p, t)| (p.clone(), repr_of_ann(t)))
+                        .collect();
+                    scope(body, &fixed, &rets, &set, &mut bad);
+                }
+                StmtKind::ClassDef { methods, .. } => {
+                    for m in methods {
+                        // Method parameters are untyped (boxed).
+                        let fixed = m.params.iter().map(|p| (p.clone(), Repr::Boxed)).collect();
+                        scope(&m.body, &fixed, &rets, &set, &mut bad);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if bad.iter().all(|b| !set.contains(b)) {
+            return set;
+        }
+        set.retain(|a| !bad.contains(a));
     }
 }
 
@@ -276,5 +418,52 @@ pub(crate) fn walk_bindings(
             // Defs/classes are separate scopes; nothing else binds names.
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn float_attrs(src: &str, candidates: &[&str]) -> Vec<String> {
+        let tokens = crate::lexer::lex(src).unwrap();
+        let program = crate::parser::parse(&tokens).unwrap();
+        infer_float_attrs(
+            &program,
+            &HashMap::new(),
+            candidates.iter().map(|c| c.to_string()).collect(),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// A field is a float field only when every write to it is a float; the
+    /// circular case (`x = x + v`) holds when both are.
+    #[test]
+    fn float_fields_need_every_write_to_be_a_float() {
+        let body = "class Body:\n    def __init__(self):\n        self.x = 0.0\n        self.v = 1.5\n        self.n = 0\n    def step(self):\n        self.x = self.x + self.v\n        self.n = self.n + 1\n";
+        assert_eq!(float_attrs(body, &["x", "v", "n"]), vec!["v", "x"]);
+
+        // One int write keeps the field boxed: a float slot would print 0.0.
+        let mixed = "class B:\n    def __init__(self):\n        self.x = 0\n    def step(self):\n        self.x = self.x + 0.5\n";
+        assert!(float_attrs(mixed, &["x"]).is_empty());
+
+        // A write from outside the class counts too, and one bad name takes
+        // down a field that depends on it.
+        let outside = "class B:\n    def __init__(self):\n        self.x = 0.0\n        self.v = 1.0\n    def step(self):\n        self.x = self.x + self.v\nb = B()\nb.v = \"fast\"\n";
+        assert!(float_attrs(outside, &["x", "v"]).is_empty());
+        let fine =
+            "class B:\n    def __init__(self):\n        self.x = 0.0\nb = B()\nb.x = b.x * 2.0\n";
+        assert_eq!(float_attrs(fine, &["x"]), vec!["x"]);
+
+        // An untyped parameter proves nothing; an annotated one does.
+        let param = "class B:\n    def __init__(self, x):\n        self.x = x\n";
+        assert!(float_attrs(param, &["x"]).is_empty());
+        let typed = "class B:\n    def __init__(self):\n        self.x = 0.0\ndef push(b, dx: float):\n    b.x = b.x + dx\n";
+        assert_eq!(float_attrs(typed, &["x"]), vec!["x"]);
+
+        // Unpacking into the field isn't tracked.
+        let unpack = "class B:\n    def __init__(self):\n        self.x, self.y = 0.0, 1.0\n";
+        assert!(float_attrs(unpack, &["x", "y"]).is_empty());
     }
 }

@@ -931,7 +931,10 @@ print(\"sum of evens:\", total)
         .unwrap();
         // One slot (`n`); inside a method `self.n` is a direct slot access,
         // while `a.n` from outside goes through the attribute id.
-        assert!(ir.contains("call i32 @p2w_obj_new(i32 0, i32 1)"), "{ir}");
+        assert!(
+            ir.contains("call i32 @p2w_obj_new(i32 0, i32 1, i32 0)"),
+            "{ir}"
+        );
         assert!(ir.contains("call i32 @p2w_slot_peek(i32 "), "{ir}");
         assert!(ir.contains("call void @p2w_slot_set(i32 "), "{ir}");
         assert!(
@@ -980,6 +983,33 @@ print(\"sum of evens:\", total)
         assert!(e_m.contains("isn't a value"), "{e_m}");
         let e_w = compile_to_llvm_ir("class K:\n    v = 1\nK.other = 2\n").unwrap_err();
         assert!(e_w.contains("declare it in the class body"), "{e_w}");
+        // A field every write proves float is a raw f64 on both backends:
+        // one value slot (n), two float fields (v, x), no boxing in `step`.
+        let body = "class Body:\n    def __init__(self):\n        self.x = 0.0\n        self.v = 1.5\n        self.n = 0\n    def step(self):\n        self.x = self.x + self.v\n        self.n = self.n + 1\nb = Body()\nb.step()\nprint(b.x)\n";
+        let ir = compile_to_llvm_ir(body).unwrap();
+        assert!(
+            ir.contains("call i32 @p2w_obj_new(i32 0, i32 1, i32 2)"),
+            "{ir}"
+        );
+        assert!(ir.contains("call double @p2w_fslot_get(i32 "), "{ir}");
+        assert!(ir.contains("call void @p2w_fslot_set(i32 "), "{ir}");
+        // Outside the class the object's class isn't known: by attribute id.
+        assert!(ir.contains("call double @p2w_getattr_f(i32 "), "{ir}");
+        let step = ir.split("define i32 @m_Body_step").nth(1).unwrap();
+        let step = step.split("\n}\n").next().unwrap();
+        assert!(!step.contains("@p2w_float("), "step boxes a float: {step}");
+        let wat = compile_to_wat(body).unwrap();
+        assert!(wat.contains("(array.set $FITEMS"), "{wat}");
+        assert!(wat.contains("(array.get $FITEMS"), "{wat}");
+        assert_valid_wasm(body);
+        // One int write keeps the field boxed everywhere.
+        let mixed = "class B:\n    def __init__(self):\n        self.x = 0\n    def step(self):\n        self.x = self.x + 0.5\nb = B()\nb.step()\nprint(b.x)\n";
+        let ir = compile_to_llvm_ir(mixed).unwrap();
+        assert!(
+            ir.contains("call i32 @p2w_obj_new(i32 0, i32 1, i32 0)"),
+            "{ir}"
+        );
+        assert!(!ir.contains("call double @p2w_fslot_get"), "{ir}");
         // super() outside a method / unknown base are clean errors.
         let e3 = compile_to_llvm_ir("class B(Missing):\n    def m(self):\n        return 1\n")
             .unwrap_err();

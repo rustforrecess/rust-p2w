@@ -288,6 +288,14 @@ An object's attributes are fixed by its class (docs/CLASS_LAYOUT.md), so each ha
 | `attributes as unpacking targets` | value | `[1] x` |
 | `__init__ calls a helper that sets attributes` | value | `1 0` |
 
+## Float fields
+
+An attribute whose every assignment in the program is provably a float is stored raw in the object (docs/CLASS_LAYOUT.md, step 3), so `self.x + self.v` allocates nothing. One int write keeps a field boxed (`mixed` below prints 0, then 1.0), so only the representation changes, never what a program prints.
+
+| program | where | result |
+|---|---|---|
+| `float fields, a mixed field, a subclass, access from a function and a loop` | value | `0.0 1.5 0 0 ⏎ 3.0 1.5 2 1.0 ⏎ 3.0 1.5 ⏎ 3.25 True True ⏎ x is 3.25 3.0 [3.25, 3.0] ⏎ 7.5 1.5 7.5 1.75 ⏎ 3.0 ⏎ -3.25 3.25 -3 -3` |
+
 ## Comprehension variables have their own scope
 
 As in Python 3, a comprehension's loop variables don't leak: `x = 5; ys = [x * 2 for x in range(3)]` leaves `x` at 5. The shared front end renames them inside the comprehension, so both backends agree by construction. The first iterable is evaluated in the enclosing scope, and a nested comprehension can read the outer one's variables.

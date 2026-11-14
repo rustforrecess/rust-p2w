@@ -103,6 +103,11 @@ semantics and leak-freedom are oracle-gated). Differences:
   would create the attribute, so this is a subset rule (every accepted
   program is valid Python); it is the rule CPython applies to classes with
   `__slots__`. See `docs/CLASS_LAYOUT.md`.
+- **Float fields are stored raw** (since 2026-11-13): an attribute whose
+  every assignment in the program is provably a float lives unboxed in the
+  object, so `self.x = self.x + self.v` allocates nothing on either backend.
+  This is invisible: a field that ever takes an int stays boxed, so nothing
+  prints differently. See `docs/CLASS_LAYOUT.md`, step 3.
 - **Default display is `<Dog object>`**, not CPython's
   `<__main__.Dog object at 0x...>` (no addresses on a deterministic teaching
   device — CPython's form isn't reproducible anyway).
