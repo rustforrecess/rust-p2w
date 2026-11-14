@@ -518,6 +518,31 @@ pub fn generate(stmts: &[Stmt]) -> Result<String> {
     module
         .imports
         .push(r#"(import "env" "write_f64" (func $write_f64 (param f64)))"#.into());
+    // The three float-text functions import from `p2w:float`, not `env`:
+    // they are pure (they reach nothing outside the program), so they are
+    // not capabilities, and `capabilities()` reads the `env` imports. The
+    // `wasm:js-string` builtins sit outside `env` for the same reason.
+    //
+    // `str(1.5)`, `f"{x}"`: the float's text as a VALUE. The host formats it
+    // (CPython's shortest round-trip repr, the same routine behind
+    // write_f64), since the guest has no float formatter of its own.
+    module.imports.push(
+        r#"(import "p2w:float" "fmt_f64" (func $fmt_f64 (param f64) (result externref)))"#.into(),
+    );
+    // `float("0.3")`: the host parses the text. A digit-by-digit reader in
+    // the guest is not correctly rounded (it made 0.30000000000000004 of
+    // "0.3"); the host's is, and agrees with CPython and the native backend.
+    // Whether the text is a number at all is a separate yes/no question
+    // (`is_f64`), not a special value of the result: every f64 is a possible
+    // parse (`float("nan")`), and a NaN bit pattern used as a signal would
+    // not survive a JavaScript host, which may canonicalize NaNs.
+    module.imports.push(
+        r#"(import "p2w:float" "is_f64" (func $is_f64 (param externref) (result i32)))"#.into(),
+    );
+    module.imports.push(
+        r#"(import "p2w:float" "parse_f64" (func $parse_f64 (param externref) (result f64)))"#
+            .into(),
+    );
     module
         .globals
         .push("(global $TRUE (ref $BOOL) (struct.new $BOOL (i32.const 1)))".into());
@@ -3057,8 +3082,14 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         "(then (return (call $i32_to_str (call $unbox (local.get $r)))))",
     );
     b.push(")");
-    // Collections render to their repr (elements in repr form). Floats inside
-    // still hit $raise_no_str — str(float) is unsupported.
+    // A float: the host's CPython-exact text (see the `fmt_f64` import).
+    b.push("(if (ref.test (ref $FLOAT) (local.get $r))");
+    b.push_in(
+        1,
+        "(then (return (struct.new $JSSTR (ref.as_non_null (call $fmt_f64 (struct.get $FLOAT 0 (ref.cast (ref $FLOAT) (local.get $r))))))))",
+    );
+    b.push(")");
+    // Collections render to their repr (elements in repr form).
     b.push("(if (ref.test (ref $LIST) (local.get $r)) (then (return (call $list_to_str (ref.cast (ref $LIST) (local.get $r))))))");
     b.push("(if (ref.test (ref $TUPLE) (local.get $r)) (then (return (call $tuple_to_str (ref.cast (ref $TUPLE) (local.get $r))))))");
     b.push("(if (ref.test (ref $DICT) (local.get $r)) (then (return (call $dict_to_str (ref.cast (ref $DICT) (local.get $r))))))");
@@ -5847,110 +5878,17 @@ fn runtime_helpers(uses_math: bool) -> Vec<Func> {
         body: b,
     });
 
-    // $str_to_float / $py_float: float(x) — parse a string (sign, digits, an
-    // optional fraction, an optional exponent) or convert a number to f64.
+    // $str_to_float / $py_float: float(x) — a string is parsed by the host
+    // (`is_f64` then `parse_f64`: correctly rounded, CPython's rules); a
+    // number converts.
     let mut b = Body::new();
-    b.push("(local.set $n (call $slen (local.get $s)))");
-    b.push("(local.set $sign (f64.const 1))");
-    b.push("(local.set $acc (f64.const 0))");
-    // leading spaces
-    b.push("(block $l1 (loop $l1n (br_if $l1 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l1 (i32.eqz (call $is_space (call $sat (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l1n)))");
-    // sign
-    b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then");
-    b.push_in(
-        1,
-        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
+    b.push(
+        "(if (i32.eqz (call $is_f64 (call $unwrap (local.get $s)))) (then (call $raise_float_parse (local.get $s)) (unreachable)))",
     );
-    b.push_in(1, "(if (i32.eq (local.get $c) (i32.const 45)) (then (local.set $sign (f64.const -1)) (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
-    b.push_in(1, "(if (i32.eq (local.get $c) (i32.const 43)) (then (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
-    b.push("))");
-    // integer part
-    b.push("(block $l2 (loop $l2n");
-    b.push_in(1, "(br_if $l2 (i32.ge_s (local.get $i) (local.get $n)))");
-    b.push_in(
-        1,
-        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
-    );
-    b.push_in(1, "(br_if $l2 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
-    b.push_in(1, "(local.set $acc (f64.add (f64.mul (local.get $acc) (f64.const 10)) (f64.convert_i32_s (i32.sub (local.get $c) (i32.const 48)))))");
-    b.push_in(1, "(local.set $seen (i32.const 1))");
-    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
-    b.push_in(1, "(br $l2n)))");
-    // fraction (peek without reading past the end)
-    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (call $sat (local.get $s) (local.get $i))) (else (i32.const 0))))");
-    b.push("(if (i32.eq (local.get $c) (i32.const 46)) (then");
-    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
-    b.push_in(1, "(local.set $scale (f64.const 0.1))");
-    b.push_in(1, "(block $l3 (loop $l3n");
-    b.push_in(2, "(br_if $l3 (i32.ge_s (local.get $i) (local.get $n)))");
-    b.push_in(
-        2,
-        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
-    );
-    b.push_in(2, "(br_if $l3 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
-    b.push_in(2, "(local.set $acc (f64.add (local.get $acc) (f64.mul (f64.convert_i32_s (i32.sub (local.get $c) (i32.const 48))) (local.get $scale))))");
-    b.push_in(
-        2,
-        "(local.set $scale (f64.mul (local.get $scale) (f64.const 0.1)))",
-    );
-    b.push_in(2, "(local.set $seen (i32.const 1))");
-    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
-    b.push_in(2, "(br $l3n)))");
-    b.push("))");
-    b.push("(if (i32.eqz (local.get $seen)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
-    // exponent (peek without reading past the end)
-    b.push("(local.set $esign (i32.const 1))");
-    b.push("(local.set $c (if (result i32) (i32.lt_s (local.get $i) (local.get $n)) (then (call $sat (local.get $s) (local.get $i))) (else (i32.const 0))))");
-    b.push("(if (i32.or (i32.eq (local.get $c) (i32.const 101)) (i32.eq (local.get $c) (i32.const 69))) (then");
-    b.push_in(1, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
-    b.push_in(1, "(if (i32.lt_s (local.get $i) (local.get $n)) (then");
-    b.push_in(
-        2,
-        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
-    );
-    b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 45)) (then (local.set $esign (i32.const -1)) (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
-    b.push_in(2, "(if (i32.eq (local.get $c) (i32.const 43)) (then (local.set $i (i32.add (local.get $i) (i32.const 1)))))");
-    b.push_in(1, "))");
-    b.push_in(1, "(local.set $edig (i32.const 0))");
-    b.push_in(1, "(block $l4 (loop $l4n");
-    b.push_in(2, "(br_if $l4 (i32.ge_s (local.get $i) (local.get $n)))");
-    b.push_in(
-        2,
-        "(local.set $c (call $sat (local.get $s) (local.get $i)))",
-    );
-    b.push_in(2, "(br_if $l4 (i32.or (i32.lt_u (local.get $c) (i32.const 48)) (i32.gt_u (local.get $c) (i32.const 57))))");
-    b.push_in(2, "(local.set $exp (i32.add (i32.mul (local.get $exp) (i32.const 10)) (i32.sub (local.get $c) (i32.const 48))))");
-    b.push_in(2, "(local.set $edig (i32.const 1))");
-    b.push_in(2, "(local.set $i (i32.add (local.get $i) (i32.const 1)))");
-    b.push_in(2, "(br $l4n)))");
-    b.push_in(1, "(if (i32.eqz (local.get $edig)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
-    b.push_in(1, "(block $l5 (loop $l5n");
-    b.push_in(2, "(br_if $l5 (i32.le_s (local.get $exp) (i32.const 0)))");
-    b.push_in(2, "(if (i32.gt_s (local.get $esign) (i32.const 0)) (then (local.set $acc (f64.mul (local.get $acc) (f64.const 10)))) (else (local.set $acc (f64.mul (local.get $acc) (f64.const 0.1)))))");
-    b.push_in(
-        2,
-        "(local.set $exp (i32.sub (local.get $exp) (i32.const 1)))",
-    );
-    b.push_in(2, "(br $l5n)))");
-    b.push("))");
-    // trailing spaces
-    b.push("(block $l6 (loop $l6n (br_if $l6 (i32.ge_s (local.get $i) (local.get $n))) (br_if $l6 (i32.eqz (call $is_space (call $sat (local.get $s) (local.get $i))))) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l6n)))");
-    b.push("(if (i32.lt_s (local.get $i) (local.get $n)) (then (call $raise_float_parse (local.get $s)) (unreachable)))");
-    b.push("(struct.new $FLOAT (f64.mul (local.get $sign) (local.get $acc)))");
+    b.push("(struct.new $FLOAT (call $parse_f64 (call $unwrap (local.get $s))))");
     fs.push(Func {
         signature: "(func $str_to_float (param $s (ref null any)) (result (ref null any))".into(),
-        locals: vec![
-            "(local $n i32)".into(),
-            "(local $i i32)".into(),
-            "(local $c i32)".into(),
-            "(local $sign f64)".into(),
-            "(local $acc f64)".into(),
-            "(local $scale f64)".into(),
-            "(local $seen i32)".into(),
-            "(local $exp i32)".into(),
-            "(local $esign i32)".into(),
-            "(local $edig i32)".into(),
-        ],
+        locals: vec![],
         body: b,
     });
     let mut b = Body::new();

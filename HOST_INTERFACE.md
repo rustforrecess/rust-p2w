@@ -157,6 +157,25 @@ the boundary.
 No standard covers motors, a tilt reading or an IR tag, so this is bespoke for
 the same reason as the domain capabilities below.
 
+### Float text — bespoke, three pure functions
+
+`fmt_f64(f64) -> string`, `is_f64(string) -> i32` and
+`parse_f64(string) -> f64`, imported from the module **`p2w:float`** (WASM-GC
+backend only; the native runtime formats and parses for itself). They are
+not capabilities, since they reach nothing outside the program, so they do
+not import from `env` and do not appear in `capabilities()`; the
+`wasm:js-string` builtins sit outside `env` for the same reason. They exist
+because the
+guest has no correctly rounded float formatter or parser, and a hand-rolled
+one drifts (`float("0.3")` was `0.30000000000000004`). Every host answers
+with `rust_p2w::py_float_repr` / `py_parse_float`, so the text is CPython's
+exactly and the same everywhere.
+
+"Not a number" is a separate yes/no call rather than a special value of
+the result, for two reasons: every f64 is a possible parse
+(`float("nan")`), and a NaN bit pattern used as a signal does not survive a
+JavaScript host, which may canonicalize NaNs.
+
 ### Domain capabilities — bespoke by necessity
 
 `seed`, `set_field`/`get_field`, `report`, `evidence`, `on_frame`, the DOM and

@@ -288,6 +288,16 @@ An object's attributes are fixed by its class (docs/CLASS_LAYOUT.md), so each ha
 | `attributes as unpacking targets` | value | `[1] x` |
 | `__init__ calls a helper that sets attributes` | value | `1 0` |
 
+## Float text and float parsing
+
+`str(x)`, f-strings and collections give a float's CPython-exact text, and `float("...")` is correctly rounded with CPython's rules (whitespace, inf/nan, one underscore between digits). On WASM the host formats and parses (`fmt_f64`, `is_f64`, `parse_f64`); a parser in the guest made `float("0.3")` 0.30000000000000004.
+
+| program | where | result |
+|---|---|---|
+| `str(), f-strings and collections of floats` | value | `3.25 1.0 -0.5 1e+16 1.5e-07 0.30000000000000004 ⏎ x is 3.25 3.25 and 2.0 v=6.5 ⏎ [1.5, 2.0] (0.5,) {'k': 2.5} ⏎ 304.8 mm inf 1.1805916207174113e+21` |
+| `float() of decimal strings is correctly rounded` | value | `0.3 1.15 123.456 2.675 ⏎ True 1e+22 1.7976931348623157e+308 5e-324 ⏎ 1.5 1000.5 nan inf -inf 0.5 5.0` |
+| `float() of text that isn't a number` | trap | `ValueError: could not convert string to float: 'abc'` |
+
 ## Float fields
 
 An attribute whose every assignment in the program is provably a float is stored raw in the object (docs/CLASS_LAYOUT.md, step 3), so `self.x + self.v` allocates nothing. One int write keeps a field boxed (`mixed` below prints 0, then 1.0), so only the representation changes, never what a program prints.

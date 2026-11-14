@@ -2729,7 +2729,28 @@ pub extern "C" fn p2w_float_of(v: Value) -> Value {
 fn parse_float_str(v: Value) -> Option<f64> {
     let len = str_len(v);
     let bytes = unsafe { core::slice::from_raw_parts(heap_base().add(v as usize + 12), len) };
-    core::str::from_utf8(bytes).ok()?.trim().parse::<f64>().ok()
+    let s = core::str::from_utf8(bytes).ok()?.trim();
+    if !s.contains('_') {
+        return s.parse::<f64>().ok();
+    }
+    // CPython allows one underscore between two digits (`1_000.5`). Copy the
+    // text without them into a stack buffer; anything longer isn't a number
+    // a student types.
+    let b = s.as_bytes();
+    let mut buf = [0u8; 64];
+    let mut n = 0;
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'_' {
+            let digit = |j: Option<usize>| j.and_then(|j| b.get(j)).is_some_and(u8::is_ascii_digit);
+            if !digit(i.checked_sub(1)) || !digit(Some(i + 1)) {
+                return None;
+            }
+        } else {
+            *buf.get_mut(n)? = c;
+            n += 1;
+        }
+    }
+    core::str::from_utf8(&buf[..n]).ok()?.parse::<f64>().ok()
 }
 
 /// A fresh 2-tuple owning `a` and `b` (both transferred in) — the element shape

@@ -93,9 +93,31 @@ pub fn py_float_repr(f: f64) -> String {
     out
 }
 
+/// Parse `s` exactly as CPython's `float(s)` would, or `None` where CPython
+/// raises ValueError. Surrounding whitespace is ignored; `inf`, `infinity`
+/// and `nan` are accepted in any case, with a sign; a single underscore may
+/// sit between two digits (`1_000.5`). The digits go through Rust's
+/// correctly rounded parser, so the result is bit-identical to CPython's.
+pub fn py_parse_float(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if !s.contains('_') {
+        return s.parse::<f64>().ok();
+    }
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'_' {
+            let digit = |j: Option<usize>| j.and_then(|j| b.get(j)).is_some_and(u8::is_ascii_digit);
+            if !digit(i.checked_sub(1)) || !digit(Some(i + 1)) {
+                return None;
+            }
+        }
+    }
+    s.replace('_', "").parse::<f64>().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::py_float_repr;
+    use super::{py_float_repr, py_parse_float};
 
     #[test]
     fn matches_cpython_on_representative_values() {
@@ -127,6 +149,32 @@ mod tests {
         ];
         for (v, want) in cases {
             assert_eq!(py_float_repr(v), want, "repr({v:?})");
+        }
+    }
+
+    #[test]
+    fn parses_what_cpython_float_accepts() {
+        for (s, want) in [
+            ("0.3", 0.3),
+            ("1.15", 1.15),
+            ("  1.5  ", 1.5),
+            ("1_000.5", 1000.5),
+            ("1e5", 1e5),
+            (".5", 0.5),
+            ("5.", 5.0),
+            ("+2", 2.0),
+            ("-INF", f64::NEG_INFINITY),
+            ("Infinity", f64::INFINITY),
+            ("1.7976931348623157e308", f64::MAX),
+            ("0.000001", 0.000001),
+        ] {
+            assert_eq!(py_parse_float(s), Some(want), "float({s:?})");
+        }
+        assert!(py_parse_float("nan").unwrap().is_nan());
+        for s in [
+            "abc", "", "1.5.2", "0x10", "1__0", "_1", "1_", "1 000", "1_.5", "1e",
+        ] {
+            assert_eq!(py_parse_float(s), None, "float({s:?})");
         }
     }
 }

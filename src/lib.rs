@@ -59,7 +59,7 @@ pub use component::{ComponentExtract, WitExport, WitWiring, to_component};
 pub use debug::{FieldValue, ObjectFields, Status, Stepper, Value, Vm};
 pub use error::{CompileError, ErrorKind, Fact};
 pub use evidence::{Concept, concept_evidence, concept_vocab};
-pub use floatfmt::py_float_repr;
+pub use floatfmt::{py_float_repr, py_parse_float};
 pub use hostmod::{HOST_MODULES, HostConst, HostFn, HostModule, HostTy, c_stand_ins};
 pub use kid_messages::explain_runtime_error;
 pub use lexer::Comment;

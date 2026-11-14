@@ -106,6 +106,8 @@ pub fn probe(src: &str) -> Outcome {
         .unwrap();
 
     add_js_string_builtins(&mut linker);
+    add_fmt_f64(&mut linker, rust_p2w::py_float_repr);
+    add_parse_f64(&mut linker, rust_p2w::py_parse_float);
     define_string_literals(&mut linker, &mut store, &module);
     let instance = match linker.instantiate(&mut store, &module) {
         Ok(i) => i,
@@ -586,6 +588,29 @@ pub fn groups() -> Vec<Group> {
             ],
         },
         Group {
+            title: "Float text and float parsing",
+            note: "`str(x)`, f-strings and collections give a float's \
+                   CPython-exact text, and `float(\"...\")` is correctly \
+                   rounded with CPython's rules (whitespace, inf/nan, one \
+                   underscore between digits). On WASM the host formats and \
+                   parses (`fmt_f64`, `is_f64`, `parse_f64`); a parser in \
+                   the guest made `float(\"0.3\")` 0.30000000000000004.",
+            probes: vec![
+                p(
+                    "str(), f-strings and collections of floats",
+                    "x = 3.25\nprint(str(x), str(1.0), str(-0.5), str(1e16), str(1.5e-7), str(0.1 + 0.2))\nprint(f\"x is {x}\", f\"{x} and {2.0}\", \"v=\" + str(x * 2))\nprint(str([1.5, 2.0]), str((0.5,)), str({\"k\": 2.5}))\nclass Distance:\n    def __init__(self, mm: float):\n        self.mm = mm\n    def __str__(self) -> str:\n        return str(self.mm) + \" mm\"\nprint(Distance(304.8), str(float(\"inf\")), str(2.0 ** 70))\n",
+                ),
+                p(
+                    "float() of decimal strings is correctly rounded",
+                    "print(float(\"0.3\"), float(\"1.15\"), float(\"123.456\"), float(\"2.675\"))\nprint(float(\"0.3\") == 0.3, float(\"1e22\"), float(\"1.7976931348623157e308\"), float(\"5e-324\"))\nprint(float(\"  1.5  \"), float(\"1_000.5\"), float(\"nan\"), float(\"Infinity\"), float(\"-INF\"), float(\".5\"), float(\"5.\"))\n",
+                ),
+                p(
+                    "float() of text that isn't a number",
+                    "print(float(\"abc\"))\n",
+                ),
+            ],
+        },
+        Group {
             title: "Float fields",
             note: "An attribute whose every assignment in the program is \
                    provably a float is stored raw in the object \
@@ -667,7 +692,9 @@ pub fn groups() -> Vec<Group> {
 // profile, so the tests cannot reach it through the library.
 #[path = "../../src/js_string_host.rs"]
 mod js_string_host;
-pub use js_string_host::{add_js_string_builtins, define_string_literals, js_str};
+pub use js_string_host::{
+    add_fmt_f64, add_js_string_builtins, add_parse_f64, define_string_literals, js_str,
+};
 
 /// Every host-module import (`robot_tilt`, ...) answering with the table's
 /// stand-in, so these programs run here exactly as with nothing attached.

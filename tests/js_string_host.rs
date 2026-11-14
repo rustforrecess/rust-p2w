@@ -53,6 +53,8 @@ fn js_string_polyfill_honors_the_contract() {
     let mut store: Store<()> = Store::new(&engine, ());
     let mut linker: Linker<()> = Linker::new(&engine);
     common::add_js_string_builtins(&mut linker);
+    common::add_fmt_f64(&mut linker, rust_p2w::py_float_repr);
+    common::add_parse_f64(&mut linker, rust_p2w::py_parse_float);
     common::define_string_literals(&mut linker, &mut store, &module);
     let instance = linker
         .instantiate(&mut store, &module)

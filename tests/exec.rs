@@ -204,6 +204,8 @@ fn execute_io(src: &str, stdin: &str) -> (String, Result<i32, wasmtime::Error>) 
         .unwrap();
 
     common::add_js_string_builtins(&mut linker);
+    common::add_fmt_f64(&mut linker, rust_p2w::py_float_repr);
+    common::add_parse_f64(&mut linker, rust_p2w::py_parse_float);
     common::define_string_literals(&mut linker, &mut store, &module);
     let instance = linker
         .instantiate(&mut store, &module)
@@ -1269,12 +1271,18 @@ fn abs_min_max_int_builtins() {
 
 #[test]
 fn fstring_and_str_error_cases() {
-    // str(float) is still unsupported; str(list) now works.
-    assert_raises(
-        "print(str(2.5))",
-        "TypeError: str() of 'float' values isn't supported yet",
-    );
+    // str(float) works: the host formats it (`p2w:float.fmt_f64`).
+    assert_output("print(str(2.5), f\"{1.0}\", str([0.5]))", "2.5 1.0 [0.5]\n");
     assert_output("print(str([1, 2]))", "[1, 2]\n");
+    // float(text) is correctly rounded, and text that isn't a number raises.
+    assert_output(
+        "print(float(\"0.3\") == 0.3, float(\"1_0.5\"))",
+        "True 10.5\n",
+    );
+    assert_raises(
+        "print(float(\"abc\"))",
+        "ValueError: could not convert string to float: 'abc'",
+    );
 }
 
 // --- the in operator ---
@@ -1915,10 +1923,16 @@ fn str_of_object_uses_dunder() {
     );
 }
 
+/// `str()` of a float, and of a collection holding one: CPython's text, from
+/// the host's formatter. (Until 2026-11-14 both were TypeErrors on WASM.)
 #[test]
-fn str_of_float_still_unsupported() {
-    assert_raises("print(str(3.14))", "str()");
-    assert_raises("print(str([1.5]))", "str()"); // float element
+fn str_of_float_matches_cpython() {
+    assert_output("print(str(3.14))", "3.14\n");
+    assert_output("print(str([1.5]))", "[1.5]\n"); // float element
+    assert_output(
+        "print(str(1e16), str(1.5e-7), str(0.1 + 0.2), str(100.0))",
+        "1e+16 1.5e-07 0.30000000000000004 100.0\n",
+    );
 }
 
 // --- more string methods ---

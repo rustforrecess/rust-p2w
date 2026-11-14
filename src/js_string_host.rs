@@ -26,6 +26,51 @@ pub fn js_new(store: &mut impl AsContextMut, s: String) -> Rooted<ExternRef> {
     ExternRef::new(&mut *store, s).expect("alloc externref")
 }
 
+/// The import module of the float-text functions. Not `env`: they are pure,
+/// so they are not capabilities (see `codegen`).
+pub const FLOAT_MODULE: &str = "p2w:float";
+
+/// Define `p2w:float.fmt_f64`: a float's text as a string value, for `str(1.5)`
+/// and `f"{x}"`. `fmt` is the caller's CPython-exact formatter
+/// (`rust_p2w::py_float_repr`), passed in because this file is linked both
+/// inside the crate and from the test hosts.
+pub fn add_fmt_f64<T: 'static>(linker: &mut Linker<T>, fmt: fn(f64) -> String) {
+    linker
+        .func_wrap(
+            FLOAT_MODULE,
+            "fmt_f64",
+            move |mut c: Caller<'_, T>, v: f64| -> Option<Rooted<ExternRef>> {
+                Some(js_new(&mut c, fmt(v)))
+            },
+        )
+        .unwrap();
+}
+
+/// Define `p2w:float.is_f64` and `.parse_f64`: `float("0.3")`. `parse` is the
+/// caller's CPython-exact parser (`rust_p2w::py_parse_float`). The guest
+/// asks `is_f64` first and calls `parse_f64` only for a yes, so "not a
+/// number" never has to be encoded in the result.
+pub fn add_parse_f64<T: 'static>(linker: &mut Linker<T>, parse: fn(&str) -> Option<f64>) {
+    linker
+        .func_wrap(
+            FLOAT_MODULE,
+            "is_f64",
+            move |mut c: Caller<'_, T>, s: Option<Rooted<ExternRef>>| -> i32 {
+                parse(&js_str(&mut c, &s)).is_some() as i32
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            FLOAT_MODULE,
+            "parse_f64",
+            move |mut c: Caller<'_, T>, s: Option<Rooted<ExternRef>>| -> f64 {
+                parse(&js_str(&mut c, &s)).unwrap_or(f64::NAN)
+            },
+        )
+        .unwrap();
+}
+
 /// Define every `wasm:js-string` builtin the emitter uses on `linker`.
 pub fn add_js_string_builtins<T: 'static>(linker: &mut Linker<T>) {
     let m = "wasm:js-string";

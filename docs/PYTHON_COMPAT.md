@@ -55,7 +55,21 @@ Differences:
 ## Floats
 
 - **Parsing is correctly rounded** (`float("...")` and float literals give the
-  same `f64` as CPython, bit for bit).
+  same `f64` as CPython, bit for bit), on both backends **since 2026-11-14**.
+  Before that this was true natively only: the WASM backend parsed strings
+  with a digit-by-digit reader in the guest, so `float("0.3")` was
+  `0.30000000000000004` and `float("0.3") == 0.3` was `False` in the browser,
+  and `float("inf")` was a ValueError. No probe compared the two. Now the
+  host parses (`p2w:float.is_f64` + `.parse_f64`, `rust_p2w::py_parse_float`),
+  with CPython's rules: surrounding whitespace, `inf`/`infinity`/`nan` in any
+  case, and one underscore between two digits (`1_000.5`); the native
+  runtime gained the underscore rule to match.
+- **`str(x)` and f-strings work for floats** on both backends (since
+  2026-11-14): `str(1.5)`, `f"x is {x}"`, `str([1.5, 2.0])`, and a
+  `__str__` that returns `str(self.mm) + " mm"`. On WASM the text comes from
+  the host (`p2w:float.fmt_f64`), the same CPython-exact formatter that prints
+  floats; before, it was "TypeError: str() of 'float' values isn't supported
+  yet" in the browser while native worked.
 - **Display matches CPython's `repr` exactly** on all three surfaces (browser,
   native, step debugger): the shortest string that round-trips (via `ryu`, with
   round-half-to-even), scientific notation when `decpt <= -4 || decpt > 16`

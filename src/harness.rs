@@ -340,6 +340,8 @@ pub fn run_with_files(
         .unwrap();
 
     crate::js_string_host::add_js_string_builtins(&mut linker);
+    crate::js_string_host::add_fmt_f64(&mut linker, crate::py_float_repr);
+    crate::js_string_host::add_parse_f64(&mut linker, crate::py_parse_float);
     crate::js_string_host::define_string_literals(&mut linker, &mut store, &module);
 
     let instance = match linker.instantiate(&mut store, &module) {

@@ -164,7 +164,7 @@ state enums add two more:
 |---|---|---|
 | `isinstance(x, C)` with a user class | "unknown name 'C'" | `feet(d)` telling a number from a distance |
 | `__float__` dispatch | "expected a number, got 'D'" | `float(inches(d))` |
-| `str(float)` | "str() of 'float' values isn't supported yet" | `__str__` printing `1.0 feet` |
+| ~~`str(float)`~~ | FIXED 2026-11-14 (was "str() of 'float' values isn't supported yet" on WASM) | `__str__` printing `1.0 feet` |
 | A module written partly in Python | host modules are native function tables only | shipping the classes |
 | `class C(Enum)` | "unknown base class 'Enum'" | `robot.Tag`, and students' own state machines |
 | `robot.AngleEnum`: an enum whose members are angles | not present | `robot.Tilt` being an angle; see below |
