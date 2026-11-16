@@ -1,0 +1,33 @@
+name: Audit
+
+# Check every lockfile against the RustSec advisory database. Its own
+# workflow, so it can also run on a schedule: advisories are published
+# without any change here (wasmtime 44.x went unpatched for a month before
+# anyone noticed), so an audit that only runs on push misses them.
+#
+# Fails on vulnerabilities (cargo audit's default) and also on crates marked
+# unsound or yanked. "Unmaintained" notices are reported but don't fail the
+# build: they are rarely urgent and often have no drop-in replacement.
+#
+# The three lockfiles are separate because the crates are: the compiler,
+# the native runtime (runtime/) and the math vendoring tool (tools/mathwat/)
+# each have their own manifest.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny unsound --deny yanked
+      - run: cargo audit --file runtime/Cargo.lock --deny unsound --deny yanked
+      - run: cargo audit --file tools/mathwat/Cargo.lock --deny unsound --deny yanked
