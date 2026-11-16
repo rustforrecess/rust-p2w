@@ -11,7 +11,7 @@ ryu = "1"
 # library and the compiler keeps exactly one runtime dependency, which is the
 # crate's stated character. Executing a program is a different job from
 # compiling one, and only the harness needs it.
-wasmtime = { version = "44.0.2", default-features = false, features = [
+wasmtime = { version = "50.0.1", default-features = false, features = [
     "cranelift",
     "gc",
     "gc-null",
@@ -25,7 +25,7 @@ default = []
 run = ["dep:wasmtime", "dep:wat"]
 
 [dev-dependencies]
-wasmtime = { version = "44.0.2", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime"] }
+wasmtime = { version = "50.0.1", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime"] }
 wat = "1"
 # The oracle for the vendored WAT math (src/math_wat.rs): tests assert the
 # extracted functions return BIT-IDENTICAL results to this crate, which is
