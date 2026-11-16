@@ -128,6 +128,8 @@ definition.
 - `PICO_BACKEND.md` — native backend design and status.
 - `docs/CLASS_LAYOUT.md` — fixed attribute sets (built) and the path to
   fixed layouts, unboxed fields and method tables.
+- `docs/TS2PY.md` — proposal: deterministic TypeScript-subset to Python
+  conversion, checked by running both; exceptions and async left open.
 - `docs/COMPUTE.md` — proposal: heterogeneous compute (CPU, GPU, NPU) through
   `compute.map` and a device-neutral graph; WebNN status as of 2026-11.
 - `docs/UNITS.md` — proposal: units as casts (`inches(12)`, `feet(d)`) and
